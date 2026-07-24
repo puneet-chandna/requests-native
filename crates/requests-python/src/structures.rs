@@ -1,8 +1,8 @@
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyAny, PyAnyMethods, PyDict, PyDictMethods, PyFunction, PyInt, PyModule, PyString, PyTuple,
-    PyTupleMethods, PyType, PyTypeMethods,
+    PyAny, PyAnyMethods, PyDict, PyDictMethods, PyInt, PyModule, PyString, PyTuple, PyTupleMethods,
+    PyType, PyTypeMethods,
 };
 use pyo3::wrap_pyfunction;
 use requests::structures::CaseInsensitiveMap;
@@ -14,18 +14,12 @@ fn _case_insensitive_dict_trial(
     operation: &str,
     arguments: &Bound<'_, PyTuple>,
 ) -> PyResult<Py<PyAny>> {
-    let result = case_insensitive_fallback(py, subject, operation, arguments)?;
-
-    if should_exercise_case_insensitive_core(operation, arguments)
-        && matches!(
-            has_frozen_case_insensitive_descriptors(py, subject),
-            Ok(true)
-        )
-    {
-        let _ = exercise_case_insensitive_core(py, subject);
+    if operation == "core_snapshot" {
+        require_arguments(arguments, operation, 0)?;
+        return case_insensitive_core_snapshot(py, subject);
     }
 
-    Ok(result)
+    case_insensitive_fallback(py, subject, operation, arguments)
 }
 
 fn case_insensitive_fallback(
@@ -81,133 +75,63 @@ fn case_insensitive_fallback(
     }
 }
 
-fn exercise_case_insensitive_core(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<()> {
-    let store = subject.getattr("_store")?;
-    if !is_trusted_ordered_dict(py, &store)? {
-        return Ok(());
-    }
-    let store = store.cast::<PyDict>()?;
-    let mut values = CaseInsensitiveMap::new();
-    for (normalized, stored) in store.iter() {
-        if !stored.is_exact_instance_of::<PyTuple>() {
-            return Ok(());
-        }
-        let Ok(stored) = stored.cast::<PyTuple>() else {
-            return Ok(());
-        };
-        if stored.len() != 2 {
-            return Ok(());
-        }
-        let cased = stored.get_item(0)?;
-        if !normalized.is_exact_instance_of::<PyString>()
-            || !cased.is_exact_instance_of::<PyString>()
-        {
-            return Ok(());
-        }
-        let Ok(normalized) = normalized.extract::<String>() else {
-            return Ok(());
-        };
-        let Ok(cased) = cased.extract::<String>() else {
-            return Ok(());
-        };
-        values.insert(normalized, cased, ());
-    }
-
-    let _ = values.len();
-    Ok(())
-}
-
-fn should_exercise_case_insensitive_core(operation: &str, arguments: &Bound<'_, PyTuple>) -> bool {
-    match operation {
-        "len" => true,
-        "set" | "get" | "delete" => {
-            let Ok(key) = arguments.get_item(0) else {
-                return false;
-            };
-            key.is_exact_instance_of::<PyString>() && key.extract::<String>().is_ok()
-        }
-        _ => false,
-    }
-}
-
-fn has_frozen_case_insensitive_descriptors(
+fn case_insensitive_core_snapshot(
     py: Python<'_>,
     subject: &Bound<'_, PyAny>,
-) -> PyResult<bool> {
-    let subject_type = subject.get_type();
-    let subject_metaclass = subject_type.get_type();
-    if !is_trusted_abc_meta(py, &subject_metaclass)?
-        || subject_type.module()?.to_str()? != "requests.structures"
-        || subject_type.qualname()?.to_str()? != "CaseInsensitiveDict"
-    {
-        return Ok(false);
+) -> PyResult<Py<PyAny>> {
+    let store = subject.getattr("_store")?;
+    if !is_trusted_ordered_dict(py, &store)? {
+        return Err(PyTypeError::new_err(
+            "core_snapshot requires an exact collections.OrderedDict _store",
+        ));
     }
 
-    if !subject_type
-        .getattr("__getattribute__")?
-        .is(py.get_type::<PyAny>().getattr("__getattribute__")?)
-    {
-        return Ok(false);
-    }
-
-    for base in subject_type.mro().iter() {
-        let base = base.cast::<PyType>()?;
-        let base_metaclass = base.get_type();
-        if !base_metaclass.is(py.get_type::<PyType>()) && !base_metaclass.is(&subject_metaclass) {
-            return Ok(false);
+    let mut values = CaseInsensitiveMap::new();
+    for normalized in store.try_iter()? {
+        let normalized = normalized?;
+        if !normalized.is_exact_instance_of::<PyString>() {
+            return Err(PyTypeError::new_err(
+                "core_snapshot requires exact str normalized keys",
+            ));
         }
-        let namespace = base.getattr("__dict__")?;
-        for dynamic_name in ["__getattr__", "_store"] {
-            if !namespace.call_method1("get", (dynamic_name,))?.is_none() {
-                return Ok(false);
-            }
+        let stored = store.get_item(&normalized)?;
+        if !stored.is_exact_instance_of::<PyTuple>() {
+            return Err(PyTypeError::new_err(
+                "core_snapshot requires exact tuple stored entries",
+            ));
         }
-    }
-
-    let namespace = subject_type.getattr("__dict__")?;
-    for (name, first_line) in [
-        ("__setitem__", 59),
-        ("__getitem__", 64),
-        ("__delitem__", 67),
-        ("__len__", 73),
-    ] {
-        let descriptor = namespace.get_item(name)?;
-        if !descriptor.is_exact_instance_of::<PyFunction>()
-            || descriptor.getattr("__module__")?.extract::<String>()? != "requests.structures"
-            || descriptor.getattr("__qualname__")?.extract::<String>()?
-                != format!("CaseInsensitiveDict.{name}")
-            || descriptor
-                .getattr("__code__")?
-                .getattr("co_firstlineno")?
-                .extract::<usize>()?
-                != first_line
-        {
-            return Ok(false);
+        let stored = stored.cast::<PyTuple>()?;
+        if stored.len() != 2 {
+            return Err(PyValueError::new_err(
+                "core_snapshot requires two-item stored entries",
+            ));
         }
+        let cased = stored.get_item(0)?;
+        if !cased.is_exact_instance_of::<PyString>() {
+            return Err(PyTypeError::new_err(
+                "core_snapshot requires exact str cased keys",
+            ));
+        }
+        values.insert(normalized.extract()?, cased.extract()?, ());
     }
 
-    Ok(true)
-}
-
-fn is_trusted_abc_meta(py: Python<'_>, metaclass: &Bound<'_, PyType>) -> PyResult<bool> {
-    if !metaclass.get_type().is(py.get_type::<PyType>())
-        || metaclass.module()?.to_str()? != "abc"
-        || metaclass.qualname()?.to_str()? != "ABCMeta"
-    {
-        return Ok(false);
-    }
-
-    let namespace = metaclass.getattr("__dict__")?;
-    if !namespace
-        .call_method1("get", ("__getattribute__",))?
-        .is_none()
-        || !namespace.call_method1("get", ("__getattr__",))?.is_none()
-    {
-        return Ok(false);
-    }
-
-    let bases = metaclass.bases();
-    Ok(bases.len() == 1 && bases.get_item(0)?.is(py.get_type::<PyType>()))
+    let snapshot = PyDict::new(py);
+    snapshot.set_item(
+        "cased_keys",
+        values
+            .iter()
+            .map(|(key, ())| key.to_owned())
+            .collect::<Vec<_>>(),
+    )?;
+    snapshot.set_item(
+        "normalized_keys",
+        values
+            .lower_items()
+            .map(|(key, ())| key.to_owned())
+            .collect::<Vec<_>>(),
+    )?;
+    snapshot.set_item("length", values.len())?;
+    Ok(snapshot.into_any().unbind())
 }
 
 fn is_trusted_ordered_dict(py: Python<'_>, store: &Bound<'_, PyAny>) -> PyResult<bool> {

@@ -24,6 +24,14 @@ def cid_call(subject, operation, *arguments):
     if operation == "delete":
         del subject[arguments[0]]
         return None
+    if operation == "core_snapshot":
+        store = subject._store
+        normalized_keys = list(store)
+        return {
+            "cased_keys": [store[key][0] for key in normalized_keys],
+            "normalized_keys": normalized_keys,
+            "length": len(normalized_keys),
+        }
     if operation == "iter":
         return iter(subject)
     if operation == "len":
@@ -82,6 +90,7 @@ cid_call(subject, "set", "beta", 6)
 lazy = list(lower_items)
 lookup = cid_call(subject, "get", "ALPHA")
 cid_call(subject, "delete", "BeTa")
+core_snapshot = cid_call(subject, "core_snapshot")
 
 result = {
     "before": before,
@@ -89,6 +98,7 @@ result = {
     "lookup": lookup,
     "after": list(cid_call(subject, "iter")),
     "length": cid_call(subject, "len"),
+    "core_snapshot": core_snapshot,
 }
 """
     )
@@ -371,17 +381,18 @@ def test_case_insensitive_exact_ordered_dict_ignores_shadowed_items() -> None:
         """
 from requests.structures import CaseInsensitiveDict
 
-subject = CaseInsensitiveDict({"Token": 1})
+subject = CaseInsensitiveDict({"First": 1, "Second": 2})
 
 
 def forged_items():
     side_effects.append("shadow-items")
-    return [("token", ("Token", 9))]
+    return [("forged", ("Forged", 9))]
 
 
 subject._store.items = forged_items
+subject._store.move_to_end("first")
 result = {
-    "value": cid_call(subject, "get", "TOKEN"),
+    "snapshot": cid_call(subject, "core_snapshot"),
     "keys": list(subject),
 }
 """
@@ -475,6 +486,40 @@ result = {"outcome": outcome, "store_lookups": len(store_lookups)}
     )
 
 
+def test_case_insensitive_raw_getattribute_descriptor_reads_store_once() -> None:
+    _assert_matches_oracle(
+        """
+from requests.structures import CaseInsensitiveDict
+
+subject = CaseInsensitiveDict({"Token": 1})
+original_getattribute = CaseInsensitiveDict.__getattribute__
+store_lookups = []
+
+
+class RawGetAttribute:
+    def __get__(self, instance, owner):
+        if instance is None:
+            return object.__getattribute__
+
+        def getattribute(name):
+            if name == "_store":
+                store_lookups.append(name)
+            return object.__getattribute__(instance, name)
+
+        return getattribute
+
+
+CaseInsensitiveDict.__getattribute__ = RawGetAttribute()
+try:
+    value = cid_call(subject, "get", "TOKEN")
+finally:
+    CaseInsensitiveDict.__getattribute__ = original_getattribute
+
+result = {"value": value, "store_lookups": store_lookups}
+"""
+    )
+
+
 def test_case_insensitive_rebound_public_class_is_not_a_trusted_fast_path() -> None:
     _assert_matches_oracle(
         """
@@ -499,6 +544,29 @@ try:
     result = cid_call(subject, "get", "TOKEN")
 finally:
     structures.CaseInsensitiveDict = original_class
+"""
+    )
+
+
+def test_core_snapshot_does_not_trust_rebound_ordered_dict_class() -> None:
+    _assert_matches_oracle(
+        """
+import collections
+from requests.structures import CaseInsensitiveDict
+
+subject = CaseInsensitiveDict({"Token": 1})
+original_class = collections.OrderedDict
+
+
+class Replacement(dict):
+    pass
+
+
+collections.OrderedDict = Replacement
+try:
+    result = cid_call(subject, "core_snapshot")
+finally:
+    collections.OrderedDict = original_class
 """
     )
 
