@@ -14,12 +14,21 @@ use requests::{
 
 struct ModelsState {
     internal_utils: Py<PyModule>,
+    builtins: Py<PyModule>,
     models: Py<PyModule>,
+    model_types: Py<PyModule>,
+    structures: Py<PyModule>,
     utils: Py<PyModule>,
     prepared_request: Py<PyType>,
+    method_type: Py<PyType>,
     case_insensitive_dict: Py<PyType>,
     case_insensitive_dict_init: Py<PyAny>,
+    case_insensitive_dict_new: Py<PyAny>,
+    case_insensitive_dict_getattribute: Py<PyAny>,
+    case_insensitive_dict_setattr: Py<PyAny>,
+    case_insensitive_dict_update: Py<PyAny>,
     case_insensitive_dict_setitem: Py<PyAny>,
+    ordered_dict: Py<PyAny>,
     check_header_validity: Py<PyAny>,
     validate_header_part: Py<PyAny>,
     header_validators_str: Py<PyAny>,
@@ -34,6 +43,9 @@ struct ModelsState {
     parse_url: Py<PyAny>,
     requote_uri: Py<PyAny>,
     basestring: Py<PyAny>,
+    python_str: Py<PyAny>,
+    python_bytes: Py<PyAny>,
+    has_read: Py<PyAny>,
     to_key_val_list: Py<PyAny>,
     unicode_is_ascii: Py<PyAny>,
     urlencode: Py<PyAny>,
@@ -49,55 +61,112 @@ struct ModelsState {
 
 static MODELS_STATE: PyOnceLock<ModelsState> = PyOnceLock::new();
 
+fn raw_type_entry<'py>(
+    class: &Bound<'py, PyType>,
+    name: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    for owner in class.mro().iter() {
+        let namespace = owner.getattr("__dict__")?;
+        if namespace.contains(name)? {
+            return Ok(Some(namespace.get_item(name)?));
+        }
+    }
+    Ok(None)
+}
+
+fn required_raw_type_entry<'py>(
+    class: &Bound<'py, PyType>,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    raw_type_entry(class, name)?.ok_or_else(|| {
+        pyo3::exceptions::PyAttributeError::new_err(format!("type has no raw {name} descriptor"))
+    })
+}
+
+fn required_module_entry<'py>(
+    module: &Bound<'py, PyModule>,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    module.dict().get_item(name)?.ok_or_else(|| {
+        pyo3::exceptions::PyAttributeError::new_err(format!("module has no raw {name} entry"))
+    })
+}
+
 fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
     let internal_utils = PyModule::import(py, "requests._internal_utils")?;
+    let builtins = PyModule::import(py, "builtins")?;
     let models = PyModule::import(py, "requests.models")?;
+    let model_types = required_module_entry(&models, "_t")?.cast_into::<PyModule>()?;
+    let structures = PyModule::import(py, "requests.structures")?;
     let utils = PyModule::import(py, "requests.utils")?;
-    let prepared_request = models.getattr("PreparedRequest")?.cast_into::<PyType>()?;
-    let case_insensitive_dict = models
-        .getattr("CaseInsensitiveDict")?
+    let method_type = PyModule::import(py, "types")?
+        .getattr("MethodType")?
         .cast_into::<PyType>()?;
-    let case_insensitive_dict_init = case_insensitive_dict.getattr("__init__")?;
-    let case_insensitive_dict_setitem = case_insensitive_dict.getattr("__setitem__")?;
-    let check_header_validity = models.getattr("check_header_validity")?;
-    let validate_header_part = utils.getattr("_validate_header_part")?;
-    let header_validators_str = utils.getattr("_HEADER_VALIDATORS_STR")?;
-    let header_validators_byte = utils.getattr("_HEADER_VALIDATORS_BYTE")?;
-    let utils_str = utils.getattr("str")?;
-    let utils_bytes = utils.getattr("bytes")?;
-    let to_native_string = models.getattr("to_native_string")?;
-    let invalid_header = utils.getattr("InvalidHeader")?;
-    let invalid_url = models.getattr("InvalidURL")?;
-    let location_parse_error = models.getattr("LocationParseError")?;
-    let missing_schema = models.getattr("MissingSchema")?;
-    let parse_url = models.getattr("parse_url")?;
-    let requote_uri = models.getattr("requote_uri")?;
-    let basestring = models.getattr("basestring")?;
-    let to_key_val_list = models.getattr("to_key_val_list")?;
-    let unicode_is_ascii = models.getattr("unicode_is_ascii")?;
-    let urlencode = models.getattr("urlencode")?;
-    let urlunparse = models.getattr("urlunparse")?;
-    let request_encoding_mixin = models
-        .getattr("RequestEncodingMixin")?
-        .cast_into::<PyType>()?;
+    let prepared_request =
+        required_module_entry(&models, "PreparedRequest")?.cast_into::<PyType>()?;
+    let case_insensitive_dict =
+        required_module_entry(&models, "CaseInsensitiveDict")?.cast_into::<PyType>()?;
+    let case_insensitive_dict_init = required_raw_type_entry(&case_insensitive_dict, "__init__")?;
+    let case_insensitive_dict_new = required_raw_type_entry(&case_insensitive_dict, "__new__")?;
+    let case_insensitive_dict_getattribute =
+        required_raw_type_entry(&case_insensitive_dict, "__getattribute__")?;
+    let case_insensitive_dict_setattr =
+        required_raw_type_entry(&case_insensitive_dict, "__setattr__")?;
+    let case_insensitive_dict_update = required_raw_type_entry(&case_insensitive_dict, "update")?;
+    let case_insensitive_dict_setitem =
+        required_raw_type_entry(&case_insensitive_dict, "__setitem__")?;
+    let ordered_dict = required_module_entry(&structures, "OrderedDict")?;
+    let check_header_validity = required_module_entry(&models, "check_header_validity")?;
+    let validate_header_part = required_module_entry(&utils, "_validate_header_part")?;
+    let header_validators_str = required_module_entry(&utils, "_HEADER_VALIDATORS_STR")?;
+    let header_validators_byte = required_module_entry(&utils, "_HEADER_VALIDATORS_BYTE")?;
+    let utils_str = required_module_entry(&utils, "str")?;
+    let utils_bytes = required_module_entry(&utils, "bytes")?;
+    let to_native_string = required_module_entry(&models, "to_native_string")?;
+    let invalid_header = required_module_entry(&utils, "InvalidHeader")?;
+    let invalid_url = required_module_entry(&models, "InvalidURL")?;
+    let location_parse_error = required_module_entry(&models, "LocationParseError")?;
+    let missing_schema = required_module_entry(&models, "MissingSchema")?;
+    let parse_url = required_module_entry(&models, "parse_url")?;
+    let requote_uri = required_module_entry(&models, "requote_uri")?;
+    let basestring = required_module_entry(&models, "basestring")?;
+    let python_str = required_module_entry(&builtins, "str")?;
+    let python_bytes = required_module_entry(&builtins, "bytes")?;
+    let has_read = required_module_entry(&model_types, "has_read")?;
+    let to_key_val_list = required_module_entry(&models, "to_key_val_list")?;
+    let unicode_is_ascii = required_module_entry(&models, "unicode_is_ascii")?;
+    let urlencode = required_module_entry(&models, "urlencode")?;
+    let urlunparse = required_module_entry(&models, "urlunparse")?;
+    let request_encoding_mixin =
+        required_module_entry(&models, "RequestEncodingMixin")?.cast_into::<PyType>()?;
     let encode_params_descriptor = request_encoding_mixin
         .getattr("__dict__")?
         .get_item("_encode_params")?;
-    let builtin_str = internal_utils.getattr("builtin_str")?;
-    let prepare_method = prepared_request.getattr("prepare_method")?;
-    let prepare_headers = prepared_request.getattr("prepare_headers")?;
-    let prepare_url = prepared_request.getattr("prepare_url")?;
-    let object_getattribute = py.get_type::<PyAny>().getattr("__getattribute__")?;
-    let object_setattr = py.get_type::<PyAny>().getattr("__setattr__")?;
+    let builtin_str = required_module_entry(&internal_utils, "builtin_str")?;
+    let prepare_method = required_raw_type_entry(&prepared_request, "prepare_method")?;
+    let prepare_headers = required_raw_type_entry(&prepared_request, "prepare_headers")?;
+    let prepare_url = required_raw_type_entry(&prepared_request, "prepare_url")?;
+    let object_type = py.get_type::<PyAny>();
+    let object_getattribute = required_raw_type_entry(&object_type, "__getattribute__")?;
+    let object_setattr = required_raw_type_entry(&object_type, "__setattr__")?;
 
     Ok(ModelsState {
         internal_utils: internal_utils.unbind(),
+        builtins: builtins.unbind(),
         models: models.unbind(),
+        model_types: model_types.unbind(),
+        structures: structures.unbind(),
         utils: utils.unbind(),
         prepared_request: prepared_request.unbind(),
+        method_type: method_type.unbind(),
         case_insensitive_dict: case_insensitive_dict.unbind(),
         case_insensitive_dict_init: case_insensitive_dict_init.unbind(),
+        case_insensitive_dict_new: case_insensitive_dict_new.unbind(),
+        case_insensitive_dict_getattribute: case_insensitive_dict_getattribute.unbind(),
+        case_insensitive_dict_setattr: case_insensitive_dict_setattr.unbind(),
+        case_insensitive_dict_update: case_insensitive_dict_update.unbind(),
         case_insensitive_dict_setitem: case_insensitive_dict_setitem.unbind(),
+        ordered_dict: ordered_dict.unbind(),
         check_header_validity: check_header_validity.unbind(),
         validate_header_part: validate_header_part.unbind(),
         header_validators_str: header_validators_str.unbind(),
@@ -112,6 +181,9 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         parse_url: parse_url.unbind(),
         requote_uri: requote_uri.unbind(),
         basestring: basestring.unbind(),
+        python_str: python_str.unbind(),
+        python_bytes: python_bytes.unbind(),
+        has_read: has_read.unbind(),
         to_key_val_list: to_key_val_list.unbind(),
         unicode_is_ascii: unicode_is_ascii.unbind(),
         urlencode: urlencode.unbind(),
@@ -130,6 +202,40 @@ fn models_state(py: Python<'_>) -> PyResult<&ModelsState> {
     MODELS_STATE.get_or_try_init(py, || initialize_models_state(py))
 }
 
+fn raw_module_entry_is(
+    py: Python<'_>,
+    module: &Py<PyModule>,
+    name: &str,
+    expected: &Py<PyAny>,
+) -> PyResult<bool> {
+    Ok(module
+        .bind(py)
+        .dict()
+        .get_item(name)?
+        .is_some_and(|value| value.is(expected.bind(py))))
+}
+
+fn raw_type_entry_is(
+    py: Python<'_>,
+    class: &Bound<'_, PyType>,
+    name: &str,
+    expected: &Py<PyAny>,
+) -> PyResult<bool> {
+    Ok(raw_type_entry(class, name)?.is_some_and(|value| value.is(expected.bind(py))))
+}
+
+fn raw_instance_dict<'py>(
+    py: Python<'py>,
+    state: &ModelsState,
+    subject: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    Ok(state
+        .object_getattribute
+        .bind(py)
+        .call1((subject, "__dict__"))?
+        .cast_into::<PyDict>()?)
+}
+
 fn trusted_bound_method<'py>(
     py: Python<'py>,
     subject: &Bound<'py, PyAny>,
@@ -139,22 +245,28 @@ fn trusted_bound_method<'py>(
     let callable = subject.getattr(name)?;
     let state = models_state(py)?;
     if !subject.get_type().is(state.prepared_request.bind(py))
-        || !subject
-            .get_type()
-            .getattr("__getattribute__")?
-            .is(state.object_getattribute.bind(py))
-        || !subject
-            .get_type()
-            .getattr("__setattr__")?
-            .is(state.object_setattr.bind(py))
+        || !raw_type_entry_is(
+            py,
+            &subject.get_type(),
+            "__getattribute__",
+            &state.object_getattribute,
+        )?
+        || !raw_type_entry_is(
+            py,
+            &subject.get_type(),
+            "__setattr__",
+            &state.object_setattr,
+        )?
+        || !raw_type_entry_is(py, &subject.get_type(), name, expected)?
+        || raw_instance_dict(py, state, subject)?.contains(name)?
+        || !callable.get_type().is(state.method_type.bind(py))
     {
         return Ok((callable, false));
     }
 
-    let Ok(function) = callable.getattr("__func__") else {
-        return Ok((callable, false));
-    };
-    Ok((callable, function.is(expected.bind(py))))
+    let trusted = callable.getattr("__self__")?.is(subject)
+        && callable.getattr("__func__")?.is(expected.bind(py));
+    Ok((callable, trusted))
 }
 
 #[pyfunction]
@@ -166,16 +278,24 @@ fn _prepare_method_trial(
     let state = models_state(py)?;
     let (callable, trusted) =
         trusted_bound_method(py, subject, "prepare_method", &state.prepare_method)?;
-    if !trusted
-        || !authoritative_field_is_none(subject, "method")?
-        || !trusted_native_string_dependencies(py, state)?
-    {
+    if !trusted || !authoritative_field_is_none(py, state, subject, "method")? {
         return Ok(callable.call1((method,))?.unbind());
     }
 
     if method.is_none() {
         subject.setattr("method", method)?;
         return Ok(py.None());
+    }
+
+    let is_one_character = if method.is_exact_instance_of::<PyString>() {
+        method.cast::<PyString>()?.len()? == 1
+    } else if method.is_exact_instance_of::<PyBytes>() {
+        method.cast::<PyBytes>()?.len()? == 1
+    } else {
+        false
+    };
+    if is_one_character {
+        return Ok(callable.call1((method,))?.unbind());
     }
 
     let prepared = if method.is_exact_instance_of::<PyString>() {
@@ -200,11 +320,11 @@ fn _prepare_method_trial(
     let Some(prepared) = prepared else {
         return Ok(callable.call1((method,))?.unbind());
     };
-
-    subject.setattr("method", method)?;
     if !trusted_native_string_dependencies(py, state)? {
         return Ok(callable.call1((method,))?.unbind());
     }
+
+    subject.setattr("method", method)?;
     subject.setattr("method", prepared)?;
     Ok(py.None())
 }
@@ -247,6 +367,9 @@ fn _prepare_url_trial(
     let base_url = match prepare_url(&raw_url, "") {
         Ok(prepared) => prepared,
         Err(error) => {
+            if !trusted_url_error_dependencies(py, state, error)? {
+                return Ok(callable.call1((url, params))?.unbind());
+            }
             return Err(url_preparation_error(
                 py, state, error, &raw_url, &url_repr,
             )?);
@@ -255,7 +378,7 @@ fn _prepare_url_trial(
     let encoded_params = if params.is_none() {
         String::new()
     } else {
-        if !trusted_url_parameter_dependencies(py, state, subject)? {
+        if !trusted_url_parameter_dependencies(py, state, subject, params)? {
             return Ok(callable.call1((url, params))?.unbind());
         }
         let Some(encoded_params) = exact_encoded_params(params)? else {
@@ -268,50 +391,84 @@ fn _prepare_url_trial(
 }
 
 fn trusted_native_string_dependencies(py: Python<'_>, state: &ModelsState) -> PyResult<bool> {
-    Ok(state
-        .models
-        .bind(py)
-        .getattr("to_native_string")?
-        .is(state.to_native_string.bind(py))
-        && state
-            .internal_utils
-            .bind(py)
-            .getattr("builtin_str")?
-            .is(state.builtin_str.bind(py)))
+    Ok(raw_module_entry_is(
+        py,
+        &state.models,
+        "to_native_string",
+        &state.to_native_string,
+    )? && raw_module_entry_is(py, &state.internal_utils, "builtin_str", &state.builtin_str)?)
 }
 
 fn trusted_url_parse_dependencies(py: Python<'_>, state: &ModelsState) -> PyResult<bool> {
-    let models = state.models.bind(py);
-    Ok(models.getattr("parse_url")?.is(state.parse_url.bind(py))
-        && models
-            .getattr("requote_uri")?
-            .is(state.requote_uri.bind(py))
-        && models
-            .getattr("unicode_is_ascii")?
-            .is(state.unicode_is_ascii.bind(py))
-        && models.getattr("urlunparse")?.is(state.urlunparse.bind(py))
-        && models
-            .getattr("LocationParseError")?
-            .is(state.location_parse_error.bind(py))
-        && models.getattr("InvalidURL")?.is(state.invalid_url.bind(py))
-        && models
-            .getattr("MissingSchema")?
-            .is(state.missing_schema.bind(py)))
+    Ok(
+        raw_module_entry_is(py, &state.models, "parse_url", &state.parse_url)?
+            && raw_module_entry_is(py, &state.models, "requote_uri", &state.requote_uri)?
+            && raw_module_entry_is(
+                py,
+                &state.models,
+                "unicode_is_ascii",
+                &state.unicode_is_ascii,
+            )?
+            && raw_module_entry_is(py, &state.models, "urlunparse", &state.urlunparse)?,
+    )
+}
+
+fn trusted_url_error_dependencies(
+    py: Python<'_>,
+    state: &ModelsState,
+    error: UrlPreparationError,
+) -> PyResult<bool> {
+    match error {
+        UrlPreparationError::InvalidLabel | UrlPreparationError::MissingHost => {
+            raw_module_entry_is(py, &state.models, "InvalidURL", &state.invalid_url)
+        }
+        UrlPreparationError::MissingScheme => {
+            raw_module_entry_is(py, &state.models, "MissingSchema", &state.missing_schema)
+        }
+        UrlPreparationError::Parse => {
+            Ok(raw_module_entry_is(
+                py,
+                &state.models,
+                "LocationParseError",
+                &state.location_parse_error,
+            )? && raw_module_entry_is(py, &state.models, "InvalidURL", &state.invalid_url)?)
+        }
+    }
 }
 
 fn trusted_url_parameter_dependencies(
     py: Python<'_>,
     state: &ModelsState,
     subject: &Bound<'_, PyAny>,
+    params: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
-    let models = state.models.bind(py);
-    Ok(trusted_native_string_dependencies(py, state)?
-        && models.getattr("basestring")?.is(state.basestring.bind(py))
-        && models
-            .getattr("to_key_val_list")?
-            .is(state.to_key_val_list.bind(py))
-        && models.getattr("urlencode")?.is(state.urlencode.bind(py))
-        && has_original_encode_params_descriptor(py, state, subject)?)
+    let models_dict = state.models.bind(py).dict();
+    if !has_original_encode_params_descriptor(py, state, subject)?
+        || models_dict.contains("str")?
+        || models_dict.contains("bytes")?
+        || !raw_module_entry_is(py, &state.builtins, "str", &state.python_str)?
+        || !raw_module_entry_is(py, &state.builtins, "bytes", &state.python_bytes)?
+    {
+        return Ok(false);
+    }
+    if params.is_exact_instance_of::<PyString>() || params.is_exact_instance_of::<PyBytes>() {
+        return trusted_native_string_dependencies(py, state);
+    }
+    if !params.is_exact_instance_of::<PyDict>() {
+        return Ok(false);
+    }
+
+    let model_types_is_original = state
+        .models
+        .bind(py)
+        .dict()
+        .get_item("_t")?
+        .is_some_and(|value| value.is(state.model_types.bind(py)));
+    Ok(model_types_is_original
+        && raw_module_entry_is(py, &state.model_types, "has_read", &state.has_read)?
+        && raw_module_entry_is(py, &state.models, "basestring", &state.basestring)?
+        && raw_module_entry_is(py, &state.models, "to_key_val_list", &state.to_key_val_list)?
+        && raw_module_entry_is(py, &state.models, "urlencode", &state.urlencode)?)
 }
 
 fn has_original_encode_params_descriptor(
@@ -319,20 +476,13 @@ fn has_original_encode_params_descriptor(
     state: &ModelsState,
     subject: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
-    let instance_dict = subject.getattr("__dict__")?.cast_into::<PyDict>()?;
+    let instance_dict = raw_instance_dict(py, state, subject)?;
     if instance_dict.contains("_encode_params")? {
         return Ok(false);
     }
 
-    for class in subject.get_type().mro().iter() {
-        let class_dict = class.getattr("__dict__")?;
-        if class_dict.contains("_encode_params")? {
-            return Ok(class_dict
-                .get_item("_encode_params")?
-                .is(state.encode_params_descriptor.bind(py)));
-        }
-    }
-    Ok(false)
+    Ok(raw_type_entry(&subject.get_type(), "_encode_params")?
+        .is_some_and(|descriptor| descriptor.is(state.encode_params_descriptor.bind(py))))
 }
 
 fn exact_url_text(url: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
@@ -466,19 +616,10 @@ fn _prepare_headers_trial(
     let state = models_state(py)?;
     let (callable, trusted) =
         trusted_bound_method(py, subject, "prepare_headers", &state.prepare_headers)?;
-    if !trusted
-        || !authoritative_field_is_none(subject, "headers")?
-        || !trusted_header_dependencies(py, state)?
-    {
+    if !trusted || !authoritative_field_is_none(py, state, subject, "headers")? {
         return Ok(callable.call1((headers,))?.unbind());
     }
     if !is_exact_header_candidate(py, headers)? {
-        return Ok(callable.call1((headers,))?.unbind());
-    }
-
-    let output = state.case_insensitive_dict.bind(py).call0()?;
-    subject.setattr("headers", &output)?;
-    if !trusted_header_runtime_dependencies(py, state)? {
         return Ok(callable.call1((headers,))?.unbind());
     }
 
@@ -490,6 +631,17 @@ fn _prepare_headers_trial(
         Ok(prepared) => (prepared, None),
         Err(error) => (error.prepared.clone(), Some(error)),
     };
+    if !trusted_header_constructor_dependencies(py, state)?
+        || (!native_headers.is_empty() && !trusted_header_validation_dependencies(py, state)?)
+        || (!prepared.is_empty() && !trusted_header_materialization_dependencies(py, state)?)
+        || (error.is_some()
+            && !raw_module_entry_is(py, &state.utils, "InvalidHeader", &state.invalid_header)?)
+    {
+        return Ok(callable.call1((headers,))?.unbind());
+    }
+
+    let output = state.case_insensitive_dict.bind(py).call0()?;
+    subject.setattr("headers", &output)?;
     materialize_headers(py, &output, &python_rows, &prepared)?;
 
     if let Some(error) = error {
@@ -498,38 +650,41 @@ fn _prepare_headers_trial(
     Ok(py.None())
 }
 
-fn authoritative_field_is_none(subject: &Bound<'_, PyAny>, name: &str) -> PyResult<bool> {
-    let instance_dict = subject.getattr("__dict__")?.cast_into::<PyDict>()?;
+fn authoritative_field_is_none(
+    py: Python<'_>,
+    state: &ModelsState,
+    subject: &Bound<'_, PyAny>,
+    name: &str,
+) -> PyResult<bool> {
+    let instance_dict = raw_instance_dict(py, state, subject)?;
     Ok(instance_dict
         .get_item(name)?
         .is_some_and(|value| value.is_none()))
 }
 
-fn trusted_header_runtime_dependencies(py: Python<'_>, state: &ModelsState) -> PyResult<bool> {
-    let models = state.models.bind(py);
-    let utils = state.utils.bind(py);
-    let class = state.case_insensitive_dict.bind(py);
-    Ok(trusted_native_string_dependencies(py, state)?
-        && models
-            .getattr("check_header_validity")?
-            .is(state.check_header_validity.bind(py))
-        && utils
-            .getattr("_validate_header_part")?
-            .is(state.validate_header_part.bind(py))
-        && utils
-            .getattr("_HEADER_VALIDATORS_STR")?
-            .is(state.header_validators_str.bind(py))
-        && utils
-            .getattr("_HEADER_VALIDATORS_BYTE")?
-            .is(state.header_validators_byte.bind(py))
-        && utils.getattr("str")?.is(state.utils_str.bind(py))
-        && utils.getattr("bytes")?.is(state.utils_bytes.bind(py))
-        && utils
-            .getattr("InvalidHeader")?
-            .is(state.invalid_header.bind(py))
-        && class
-            .getattr("__setitem__")?
-            .is(state.case_insensitive_dict_setitem.bind(py)))
+fn trusted_header_validation_dependencies(py: Python<'_>, state: &ModelsState) -> PyResult<bool> {
+    Ok(raw_module_entry_is(
+        py,
+        &state.models,
+        "check_header_validity",
+        &state.check_header_validity,
+    )? && raw_module_entry_is(
+        py,
+        &state.utils,
+        "_validate_header_part",
+        &state.validate_header_part,
+    )? && raw_module_entry_is(
+        py,
+        &state.utils,
+        "_HEADER_VALIDATORS_STR",
+        &state.header_validators_str,
+    )? && raw_module_entry_is(
+        py,
+        &state.utils,
+        "_HEADER_VALIDATORS_BYTE",
+        &state.header_validators_byte,
+    )? && raw_module_entry_is(py, &state.utils, "str", &state.utils_str)?
+        && raw_module_entry_is(py, &state.utils, "bytes", &state.utils_bytes)?)
 }
 
 fn is_exact_header_candidate(py: Python<'_>, headers: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -543,16 +698,43 @@ fn is_exact_header_candidate(py: Python<'_>, headers: &Bound<'_, PyAny>) -> PyRe
     Ok(!instance_dict.contains("items")?)
 }
 
-fn trusted_header_dependencies(py: Python<'_>, state: &ModelsState) -> PyResult<bool> {
-    let models = state.models.bind(py);
+fn trusted_header_constructor_dependencies(py: Python<'_>, state: &ModelsState) -> PyResult<bool> {
     let class = state.case_insensitive_dict.bind(py);
-    Ok(trusted_header_runtime_dependencies(py, state)?
-        && models
-            .getattr("CaseInsensitiveDict")?
-            .is(state.case_insensitive_dict.bind(py))
-        && class
-            .getattr("__init__")?
-            .is(state.case_insensitive_dict_init.bind(py)))
+    Ok(state
+        .models
+        .bind(py)
+        .dict()
+        .get_item("CaseInsensitiveDict")?
+        .is_some_and(|value| value.is(class))
+        && raw_module_entry_is(py, &state.structures, "OrderedDict", &state.ordered_dict)?
+        && raw_type_entry_is(py, class, "__init__", &state.case_insensitive_dict_init)?
+        && raw_type_entry_is(py, class, "__new__", &state.case_insensitive_dict_new)?
+        && raw_type_entry_is(
+            py,
+            class,
+            "__getattribute__",
+            &state.case_insensitive_dict_getattribute,
+        )?
+        && raw_type_entry_is(
+            py,
+            class,
+            "__setattr__",
+            &state.case_insensitive_dict_setattr,
+        )?
+        && raw_type_entry_is(py, class, "update", &state.case_insensitive_dict_update)?)
+}
+
+fn trusted_header_materialization_dependencies(
+    py: Python<'_>,
+    state: &ModelsState,
+) -> PyResult<bool> {
+    Ok(trusted_native_string_dependencies(py, state)?
+        && raw_type_entry_is(
+            py,
+            state.case_insensitive_dict.bind(py),
+            "__setitem__",
+            &state.case_insensitive_dict_setitem,
+        )?)
 }
 
 fn exact_header_rows(

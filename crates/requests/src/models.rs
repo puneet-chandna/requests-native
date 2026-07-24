@@ -1,8 +1,8 @@
 use crate::structures::CaseInsensitiveMap;
 use crate::utils::{
-    HeaderValidationError, normalize_parsed_percent_escapes, requote_uri,
-    trim_python_whitespace_start, validate_header_name, validate_header_name_bytes,
-    validate_header_value, validate_header_value_bytes,
+    HeaderValidationError, normalize_percent_escape_hex, requote_uri, trim_python_whitespace_start,
+    validate_header_name, validate_header_name_bytes, validate_header_value,
+    validate_header_value_bytes,
 };
 use crate::{BodySource, Error, Result};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
@@ -148,7 +148,24 @@ pub fn prepare_url(
         return Err(UrlPreparationError::Parse);
     }
 
-    let prepared = normalize_parsed_percent_escapes(parsed.as_str());
+    let (_, remainder) = raw_url
+        .split_once("://")
+        .ok_or(UrlPreparationError::Parse)?;
+    let raw_authority = remainder
+        .split_once(['/', '?', '#'])
+        .map_or(remainder, |(authority, _)| authority);
+    let raw_suffix = &remainder[raw_authority.len()..];
+    let raw_suffix = if raw_suffix.starts_with('/') {
+        raw_suffix.to_owned()
+    } else {
+        format!("/{raw_suffix}")
+    };
+    let (authority, suffix) = if parsed.scheme() == "http+unix" {
+        (raw_authority, raw_suffix)
+    } else {
+        (host, normalize_percent_escape_hex(&raw_suffix))
+    };
+    let prepared = format!("{}://{authority}{suffix}", parsed.scheme());
     Ok(append_url_params(&prepared, encoded_params))
 }
 

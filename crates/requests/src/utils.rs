@@ -99,7 +99,7 @@ fn quote_form_component(value: &[u8]) -> String {
     quote_bytes(value, b"", true)
 }
 
-pub fn normalize_parsed_percent_escapes(uri: &str) -> String {
+pub fn normalize_percent_escape_hex(uri: &str) -> String {
     let bytes = uri.as_bytes();
     let mut normalized = String::with_capacity(uri.len());
     let mut index = 0;
@@ -197,7 +197,7 @@ fn quote_bytes(value: &[u8], safe: &[u8], plus_for_space: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HeaderValidationError, encode_query_pairs, normalize_parsed_percent_escapes, requote_uri,
+        HeaderValidationError, encode_query_pairs, normalize_percent_escape_hex, requote_uri,
         trim_python_whitespace_start, validate_header, validate_header_bytes,
     };
 
@@ -212,7 +212,7 @@ mod tests {
             "http://example.com/%25zz?q=%25"
         );
         assert_eq!(
-            normalize_parsed_percent_escapes("http://x/%7e/%2f"),
+            normalize_percent_escape_hex("http://x/%7e/%2f"),
             "http://x/%7E/%2F"
         );
     }

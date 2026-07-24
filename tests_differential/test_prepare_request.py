@@ -162,6 +162,38 @@ for label, method in cases:
     )
 
 
+def test_prepare_method_one_character_identity_matches_frozen_python() -> None:
+    _assert_matches_oracle(
+        """
+from requests.models import PreparedRequest
+
+
+text_method = "G"
+text_subject = PreparedRequest()
+text = capture(
+    "uppercase-one-character-text",
+    text_subject,
+    lambda: prepare_method_call(text_subject, text_method),
+)
+text["is_input"] = text_subject.method is text_method
+
+
+bytes_method = b"G"
+canonical_text = "G"
+bytes_subject = PreparedRequest()
+bytes_result = capture(
+    "uppercase-one-character-bytes",
+    bytes_subject,
+    lambda: prepare_method_call(bytes_subject, bytes_method),
+)
+bytes_result["is_input"] = bytes_subject.method is bytes_method
+bytes_result["is_canonical_text"] = bytes_subject.method is canonical_text
+
+result = [text, bytes_result]
+"""
+    )
+
+
 def test_prepare_method_shadowed_descriptor_is_resolved_once() -> None:
     _assert_matches_oracle(
         """
@@ -228,6 +260,97 @@ finally:
     PreparedRequest.__getattribute__ = original_getattribute
 
 result = [method, headers]
+"""
+    )
+
+
+def test_rebound_special_method_descriptors_have_no_class_probe_callbacks() -> None:
+    _assert_matches_oracle(
+        """
+from requests.models import PreparedRequest
+
+
+class ObservedSpecialMethod:
+    def __init__(self, label, function):
+        self.label = label
+        self.function = function
+
+    def __get__(self, subject, owner):
+        side_effects.append([self.label, subject is None])
+        if subject is None:
+            return self.function
+        return self.function.__get__(subject, owner)
+
+
+PreparedRequest.__getattribute__ = ObservedSpecialMethod(
+    "getattribute-bind", object.__getattribute__
+)
+try:
+    get_subject = PreparedRequest()
+    getattribute = capture(
+        "rebound-getattribute-descriptor",
+        get_subject,
+        lambda: prepare_method_call(get_subject, "get"),
+    )
+finally:
+    del PreparedRequest.__getattribute__
+
+
+PreparedRequest.__setattr__ = ObservedSpecialMethod(
+    "setattr-bind", object.__setattr__
+)
+try:
+    set_subject = PreparedRequest()
+    setattr = capture(
+        "rebound-setattr-descriptor",
+        set_subject,
+        lambda: prepare_method_call(set_subject, "post"),
+    )
+finally:
+    del PreparedRequest.__setattr__
+
+result = [getattribute, setattr]
+"""
+    )
+
+
+def test_bound_method_trust_rejects_decoy_and_forged_instance_shadows() -> None:
+    _assert_matches_oracle(
+        """
+import types
+from requests.models import PreparedRequest
+
+
+target = PreparedRequest()
+decoy = PreparedRequest()
+target.prepare_method = types.MethodType(
+    PreparedRequest.prepare_method,
+    decoy,
+)
+decoy_bound = capture(
+    "instance-shadow-bound-to-decoy",
+    target,
+    lambda: prepare_method_call(target, "get"),
+)
+decoy_bound["decoy_method"] = decoy.method
+
+
+class ForgedCallable:
+    __func__ = PreparedRequest.prepare_method
+
+    def __call__(self, method):
+        side_effects.append(["forged-call", method])
+        forged_target.method = "FORGED"
+
+
+forged_target = PreparedRequest()
+forged_target.prepare_method = ForgedCallable()
+forged = capture(
+    "instance-shadow-forged-func",
+    forged_target,
+    lambda: prepare_method_call(forged_target, "post"),
+)
+result = [decoy_bound, forged]
 """
     )
 
@@ -309,6 +432,73 @@ result = [method, url, shadowed_params, headers]
     )
 
 
+def test_raw_module_dependency_checks_preserve_frozen_lookup_order() -> None:
+    _assert_matches_oracle(
+        """
+import types
+import requests.models as models
+from requests.models import PreparedRequest
+
+
+class ObservedModelsModule(types.ModuleType):
+    def __getattribute__(self, name):
+        if name in {
+            "to_native_string",
+            "parse_url",
+            "InvalidURL",
+            "MissingSchema",
+        }:
+            side_effects.append(["models-module-getattribute", name])
+        return super().__getattribute__(name)
+
+
+original_module_type = models.__class__
+models.__class__ = ObservedModelsModule
+try:
+    module_subject = PreparedRequest()
+    module_class = capture(
+        "custom-models-module-class",
+        module_subject,
+        lambda: prepare_method_call(module_subject, "get"),
+    )
+finally:
+    models.__class__ = original_module_type
+
+
+original_to_native_string = models.to_native_string
+del models.to_native_string
+try:
+    missing_helper_subject = PreparedRequest()
+    missing_helper = capture(
+        "deleted-used-helper",
+        missing_helper_subject,
+        lambda: prepare_method_call(missing_helper_subject, "post"),
+    )
+finally:
+    models.to_native_string = original_to_native_string
+
+
+original_invalid_url = models.InvalidURL
+del models.InvalidURL
+try:
+    unused_exception_subject = PreparedRequest()
+    unused_exception = capture(
+        "deleted-unused-exception",
+        unused_exception_subject,
+        lambda: prepare_url_call(
+            unused_exception_subject,
+            "http://example.com/path",
+            None,
+        ),
+    )
+finally:
+    models.InvalidURL = original_invalid_url
+
+result = [module_class, missing_helper, unused_exception]
+"""
+    )
+
+
 def test_prepare_url_does_not_resolve_unused_encode_params_descriptor() -> None:
     _assert_matches_oracle(
         """
@@ -349,6 +539,32 @@ finally:
     del PreparedRequest._encode_params
 
 result = [non_http, no_params]
+"""
+    )
+
+
+def test_prepare_url_rebound_has_read_delegates_to_authoritative_encoder() -> None:
+    _assert_matches_oracle(
+        """
+import requests.models as models
+from requests.models import PreparedRequest
+
+
+original_has_read = models._t.has_read
+models._t.has_read = lambda value: True
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "rebound-has-read",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    models._t.has_read = original_has_read
 """
     )
 
@@ -407,6 +623,87 @@ result = [method, headers]
     )
 
 
+def test_prepare_headers_preflights_before_observable_construction() -> None:
+    _assert_matches_oracle(
+        """
+import requests.models as models
+import requests.structures as structures
+from requests.models import PreparedRequest
+
+
+original_ordered_dict = structures.OrderedDict
+
+
+class ObservedStore(original_ordered_dict):
+    events = side_effects
+
+    def __init__(self, label):
+        self.label = label
+        super().__init__()
+
+    def __del__(self):
+        self.events.append(["ordered-dict-del", self.label])
+
+
+construction_count = 0
+
+
+def observed_factory():
+    global construction_count
+    construction_count += 1
+    label = f"unsupported-{construction_count}"
+    side_effects.append(["ordered-dict-construct", label])
+    return ObservedStore(label)
+
+
+structures.OrderedDict = observed_factory
+try:
+    unsupported_subject = PreparedRequest()
+    unsupported = capture(
+        "unsupported-exact-dict",
+        unsupported_subject,
+        lambda: prepare_headers_call(unsupported_subject, {7: "value"}),
+    )
+finally:
+    structures.OrderedDict = original_ordered_dict
+
+
+original_check_header_validity = models.check_header_validity
+dynamic_count = 0
+
+
+def observed_check(header):
+    side_effects.append(["dynamic-check", header])
+
+
+def mutating_factory():
+    global dynamic_count
+    dynamic_count += 1
+    side_effects.append(["mutating-ordered-dict", dynamic_count])
+    models.check_header_validity = observed_check
+    return original_ordered_dict()
+
+
+structures.OrderedDict = mutating_factory
+try:
+    dynamic_subject = PreparedRequest()
+    dynamic = capture(
+        "dynamic-constructor-dependency",
+        dynamic_subject,
+        lambda: prepare_headers_call(
+            dynamic_subject,
+            {"Name": " leading-is-accepted"},
+        ),
+    )
+finally:
+    structures.OrderedDict = original_ordered_dict
+    models.check_header_validity = original_check_header_validity
+
+result = [unsupported, dynamic]
+"""
+    )
+
+
 def test_prepare_headers_rebound_internal_validators_fall_back_once() -> None:
     _assert_matches_oracle(
         """
@@ -458,6 +755,52 @@ finally:
     utils._HEADER_VALIDATORS_STR = original_validators
 
 result = [helper, validators]
+"""
+    )
+
+
+def test_http_unix_preserves_lowercase_reserved_percent_escapes() -> None:
+    _assert_matches_oracle(
+        """
+from requests.models import PreparedRequest
+
+
+cases = [
+    (
+        "ordinary-http-parser-only",
+        "HtTp://Example.COM/a%2fb?q=%2f#part=%2f",
+    ),
+    (
+        "authority",
+        "http+unix://%2fvar%2frun%2fsock/path",
+    ),
+    (
+        "path",
+        "http+unix://%2Fvar%2Frun%2Fsock/a%2fb",
+    ),
+    (
+        "query",
+        "http+unix://%2Fvar%2Frun%2Fsock/path?q=%2f",
+    ),
+    (
+        "fragment",
+        "http+unix://%2Fvar%2Frun%2Fsock/path#part=%2f",
+    ),
+]
+result = []
+for label, url in cases:
+    subject = PreparedRequest()
+    result.append(
+        capture(
+            label,
+            subject,
+            lambda subject=subject, url=url: prepare_url_call(
+                subject,
+                url,
+                None,
+            ),
+        )
+    )
 """
     )
 
