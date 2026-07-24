@@ -6,3 +6,39 @@ documentation_commit = "c5a69855228cc61120883a069e3cbeb78bd6f151"
 copied_on = "2026-07-24"
 oracle_path = "../requests"
 verification = "git -C ../requests diff --exit-code 69f84847045bef7a849cc994a26fe7ba8a169e95 -- src/requests tests pyproject.toml setup.py"
+
+[bootstrap_matrix]
+repository = "https://github.com/puneet-chandna/requests-rust"
+commit = "90a9f161b77dfdbfe650df2100a66351ad1afa9c"
+run_id = 30097996085
+run_url = "https://github.com/puneet-chandna/requests-rust/actions/runs/30097996085"
+started_at = "2026-07-24T13:43:01Z"
+completed_at = "2026-07-24T13:50:24Z"
+jobs_passed = 23
+jobs_total = 23
+operating_systems = ["ubuntu-22.04", "macos-latest", "windows-latest"]
+interpreters = ["CPython 3.10", "CPython 3.11", "CPython 3.12", "CPython 3.13", "CPython 3.14", "CPython 3.14t", "CPython 3.15-dev", "PyPy 3.11"]
+excluded = ["PyPy 3.11 on Windows"]
+
+[build]
+rustc = "1.97.1"
+maturin = "1.14.1"
+pyo3 = "0.29.0"
+wheel_strategy = "version-specific"
+abi3 = false
+cp314t_artifact = "requests-2.34.2-cp314-cp314t-manylinux_2_34_x86_64.whl"
+cp315_artifact = "requests-2.34.2-cp315-cp315-manylinux_2_34_x86_64.whl"
+pypy311_artifact = "requests-2.34.2-pp311-pypy311_pp73-manylinux_2_34_x86_64.whl"
+
+[tls]
+hyper_rustls = "0.27.9"
+rustls = "0.23.42"
+tokio_rustls = "0.26.4"
+crypto_provider = "ring 0.17.14"
+root_loader = "rustls-native-certs 0.8.4"
+hyper_util = "0.1.20"
+tokio = "1.53.1"
+
+[proxy]
+implementation = "in-tree Tokio I/O state machines"
+socks_crate = "none"
