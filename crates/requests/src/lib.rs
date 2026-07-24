@@ -5,6 +5,7 @@ pub mod blocking;
 mod body;
 mod error;
 mod models;
+pub mod structures;
 
 pub use body::BodySource;
 pub use error::{Error, ErrorKind, Result};

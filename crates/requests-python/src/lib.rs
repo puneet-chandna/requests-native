@@ -5,6 +5,7 @@ use pyo3::wrap_pyfunction;
 
 mod bridge;
 mod runtime;
+mod structures;
 
 #[pyfunction]
 fn backend_name() -> &'static str {
@@ -15,5 +16,6 @@ fn backend_name() -> &'static str {
 fn _requests_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(backend_name, module)?)?;
     runtime::register(module)?;
+    structures::register(module)?;
     Ok(())
 }
