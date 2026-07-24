@@ -364,3 +364,167 @@ result = {
 }
 """
     )
+
+
+def test_case_insensitive_exact_ordered_dict_ignores_shadowed_items() -> None:
+    _assert_matches_oracle(
+        """
+from requests.structures import CaseInsensitiveDict
+
+subject = CaseInsensitiveDict({"Token": 1})
+
+
+def forged_items():
+    side_effects.append("shadow-items")
+    return [("token", ("Token", 9))]
+
+
+subject._store.items = forged_items
+result = {
+    "value": cid_call(subject, "get", "TOKEN"),
+    "keys": list(subject),
+}
+"""
+    )
+
+
+def test_case_insensitive_custom_key_does_not_delay_value_destruction() -> None:
+    _assert_matches_oracle(
+        """
+from requests.structures import CaseInsensitiveDict
+
+subject = CaseInsensitiveDict()
+
+
+class Tracked:
+    def __del__(self):
+        side_effects.append("drop")
+
+
+class ClearingKey(str):
+    def lower(self):
+        subject._store.clear()
+        side_effects.append("after-clear")
+        return "token"
+
+
+subject["Token"] = Tracked()
+try:
+    cid_call(subject, "get", ClearingKey("TOKEN"))
+except KeyError:
+    outcome = "missing"
+else:
+    outcome = "found"
+
+result = {"outcome": outcome}
+"""
+    )
+
+
+def test_lookup_dict_exact_instance_honors_shadowed_get() -> None:
+    _assert_matches_oracle(
+        """
+from requests.structures import LookupDict
+
+subject = LookupDict("lookup")
+subject.answer = 1
+
+
+def shadowed_get(*arguments):
+    side_effects.append(["shadow-get", list(arguments)])
+    return 9
+
+
+subject.get = shadowed_get
+result = lookup_call(subject, "get", "answer", "fallback")
+"""
+    )
+
+
+def test_case_insensitive_store_lookup_preserves_first_error_without_retry() -> None:
+    _assert_matches_oracle(
+        """
+from requests.structures import CaseInsensitiveDict
+
+subject = CaseInsensitiveDict({"Token": 1})
+original_getattribute = CaseInsensitiveDict.__getattribute__
+store_lookups = []
+
+
+def stateful_getattribute(self, name):
+    if name == "_store":
+        store_lookups.append(name)
+        if len(store_lookups) == 1:
+            raise RuntimeError("first store lookup")
+    return original_getattribute(self, name)
+
+
+CaseInsensitiveDict.__getattribute__ = stateful_getattribute
+try:
+    try:
+        cid_call(subject, "get", "TOKEN")
+    except RuntimeError as error:
+        outcome = [type(error).__name__, str(error)]
+    else:
+        outcome = "returned"
+finally:
+    CaseInsensitiveDict.__getattribute__ = original_getattribute
+
+result = {"outcome": outcome, "store_lookups": len(store_lookups)}
+"""
+    )
+
+
+def test_case_insensitive_rebound_public_class_is_not_a_trusted_fast_path() -> None:
+    _assert_matches_oracle(
+        """
+from collections import OrderedDict
+import requests.structures as structures
+
+original_class = structures.CaseInsensitiveDict
+
+
+class Replacement:
+    def __init__(self):
+        self._store = OrderedDict({"token": ("Token", 9)})
+
+    def __getitem__(self, key):
+        side_effects.append(["replacement-getitem", key])
+        return 1
+
+
+structures.CaseInsensitiveDict = Replacement
+try:
+    subject = Replacement()
+    result = cid_call(subject, "get", "TOKEN")
+finally:
+    structures.CaseInsensitiveDict = original_class
+"""
+    )
+
+
+def test_lookup_dict_rebound_public_class_keeps_dynamic_get_semantics() -> None:
+    _assert_matches_oracle(
+        """
+import requests.structures as structures
+
+original_class = structures.LookupDict
+
+
+class Replacement:
+    def __init__(self):
+        self.answer = 1
+
+    def get(self, *arguments):
+        side_effects.append(["replacement-get", list(arguments)])
+        return 9
+
+
+structures.LookupDict = Replacement
+try:
+    subject = Replacement()
+    result = lookup_call(subject, "get", "answer", "fallback")
+finally:
+    structures.LookupDict = original_class
+"""
+    )
