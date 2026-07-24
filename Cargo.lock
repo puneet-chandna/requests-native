@@ -315,6 +315,8 @@ dependencies = [
 name = "requests"
 version = "2.34.2"
 dependencies = [
+ "bytes",
+ "http",
  "hyper-rustls",
  "hyper-util",
  "rustls",

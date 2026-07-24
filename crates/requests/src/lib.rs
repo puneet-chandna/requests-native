@@ -1,5 +1,14 @@
 #![forbid(unsafe_code)]
 
+mod body;
+mod error;
+mod models;
+
+pub use body::BodySource;
+pub use error::{Error, ErrorKind, Result};
+pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
+pub use models::{Request, RequestBuilder};
+
 #[cfg(feature = "platform-smoke")]
 #[allow(dead_code)] // These probes are compiled by the matrix before transport implementation.
 mod platform_smoke {
