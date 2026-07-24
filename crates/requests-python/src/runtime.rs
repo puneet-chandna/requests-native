@@ -1,0 +1,531 @@
+use std::cell::Cell;
+use std::future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyDict};
+use pyo3::wrap_pyfunction;
+use requests::blocking::{
+    BlockingDriverError, BlockingRuntimeDriver, BlockingSubmission, BlockingTaskError,
+};
+
+use crate::bridge::{ActionReceiver, BridgeClosed, action_channel};
+
+const WAKE_INTERVAL: Duration = Duration::from_millis(10);
+const CANCEL_WAIT: Duration = Duration::from_millis(500);
+
+static SIGNAL_FUTURE_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug)]
+enum ProbeAction {
+    SetStarted,
+    ObserveAffinity,
+    RaiseOriginal,
+    RunNested,
+    ObserveNested,
+    CancellationPoint,
+}
+
+#[derive(Debug)]
+enum ProbeReply {
+    Ack,
+    Affinity(AffinityReport),
+    Nested(NestedReport),
+    HandlerFailed,
+}
+
+#[derive(Debug)]
+enum ProbeOutcome {
+    Affinity(AffinityReport),
+    OriginalRaised,
+    Nested(NestedReport),
+    HandlerFailed,
+    BridgeClosed(BridgeClosed),
+    Ready,
+}
+
+#[derive(Debug)]
+struct AffinityReport {
+    observer_ran: bool,
+    action_thread: String,
+    action_interpreter: usize,
+}
+
+#[derive(Debug)]
+struct NestedReport {
+    value: &'static str,
+    generation: u64,
+    action_thread: String,
+    action_interpreter: usize,
+}
+
+pub(crate) struct PythonCallContext {
+    origin_thread: thread::ThreadId,
+    interpreter: usize,
+}
+
+impl PythonCallContext {
+    fn capture(py: Python<'_>) -> PyResult<Self> {
+        Ok(Self {
+            origin_thread: thread::current().id(),
+            interpreter: interpreter_identity(py)?,
+        })
+    }
+
+    fn drive<T, A, R, F>(
+        &self,
+        py: Python<'_>,
+        submission: BlockingSubmission<T>,
+        actions: ActionReceiver<A, R>,
+        execute: F,
+    ) -> PyResult<T>
+    where
+        T: Send + 'static,
+        A: Send + 'static,
+        R: Send + 'static,
+        F: for<'py> FnMut(Python<'py>, A) -> R,
+    {
+        self.drive_with_signal_checker(py, submission, actions, execute, |py| py.check_signals())
+    }
+
+    fn drive_with_signal_checker<T, A, R, F, S>(
+        &self,
+        py: Python<'_>,
+        mut submission: BlockingSubmission<T>,
+        mut actions: ActionReceiver<A, R>,
+        mut execute: F,
+        mut check_signals: S,
+    ) -> PyResult<T>
+    where
+        T: Send + 'static,
+        A: Send + 'static,
+        R: Send + 'static,
+        F: for<'py> FnMut(Python<'py>, A) -> R,
+        S: for<'py> FnMut(Python<'py>) -> PyResult<()>,
+    {
+        self.ensure_affinity(py)?;
+        loop {
+            let task_state =
+                match signal_before_task_state(py, &mut check_signals, || submission.try_wait()) {
+                    Ok(task_state) => task_state,
+                    Err(signal) => {
+                        cancel_and_wait(py, &mut submission).map_err(task_error)?;
+                        return Err(signal);
+                    }
+                };
+            match task_state {
+                Ok(Some(output)) => return Ok(output),
+                Ok(None) => {}
+                Err(error) => return Err(task_error(error)),
+            }
+
+            match py.detach(|| actions.recv_timeout(WAKE_INTERVAL)) {
+                Ok(request) => {
+                    self.ensure_affinity(py)?;
+                    let (action, reply) = request.into_parts();
+                    let _ = reply.send(execute(py, action));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    py.detach(|| thread::sleep(WAKE_INTERVAL));
+                }
+            }
+        }
+    }
+
+    fn ensure_affinity(&self, py: Python<'_>) -> PyResult<()> {
+        if thread::current().id() != self.origin_thread {
+            return Err(PyRuntimeError::new_err(
+                "Python action moved off its entering OS thread",
+            ));
+        }
+        if interpreter_identity(py)? != self.interpreter {
+            return Err(PyRuntimeError::new_err(
+                "Python action moved to a different interpreter",
+            ));
+        }
+        Ok(())
+    }
+
+    fn thread_label(&self) -> String {
+        format!("{:?}", self.origin_thread)
+    }
+}
+
+fn signal_before_task_state<T, S, W>(
+    py: Python<'_>,
+    check_signals: &mut S,
+    task_state: W,
+) -> PyResult<Result<Option<T>, BlockingTaskError>>
+where
+    S: for<'py> FnMut(Python<'py>) -> PyResult<()>,
+    W: FnOnce() -> Result<Option<T>, BlockingTaskError>,
+{
+    check_signals(py)?;
+    Ok(task_state())
+}
+
+fn cancel_and_wait<T>(
+    py: Python<'_>,
+    submission: &mut BlockingSubmission<T>,
+) -> Result<(), BlockingTaskError> {
+    submission.cancel()?;
+    let deadline = Instant::now() + CANCEL_WAIT;
+    loop {
+        match submission.try_wait() {
+            Ok(None) if Instant::now() < deadline => {
+                py.detach(|| thread::sleep(WAKE_INTERVAL));
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn interpreter_identity(py: Python<'_>) -> PyResult<usize> {
+    Ok(py.import("sys")?.getattr("modules")?.as_ptr() as usize)
+}
+
+fn driver() -> PyResult<BlockingRuntimeDriver> {
+    BlockingRuntimeDriver::process_local()
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+}
+
+fn submit<F>(driver: &BlockingRuntimeDriver, future: F) -> PyResult<BlockingSubmission<F::Output>>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    driver.submit(future).map_err(driver_error)
+}
+
+fn driver_error(error: BlockingDriverError) -> PyErr {
+    PyRuntimeError::new_err(error.to_string())
+}
+
+fn task_error(error: BlockingTaskError) -> PyErr {
+    PyRuntimeError::new_err(error.to_string())
+}
+
+fn bridge_error(error: BridgeClosed) -> PyErr {
+    PyRuntimeError::new_err(error.to_string())
+}
+
+fn internal_probe_error(message: &'static str) -> PyErr {
+    PyRuntimeError::new_err(message)
+}
+
+fn store_handler_error(slot: &mut Option<PyErr>, error: PyErr) -> ProbeReply {
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+    ProbeReply::HandlerFailed
+}
+
+fn unexpected_action(slot: &mut Option<PyErr>) -> ProbeReply {
+    store_handler_error(
+        slot,
+        internal_probe_error("runtime probe received an unexpected action"),
+    )
+}
+
+#[pyfunction]
+fn _runtime_affinity_probe(
+    py: Python<'_>,
+    value: Py<PyAny>,
+    action_started: Py<PyAny>,
+    observer_ran: Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let context = PythonCallContext::capture(py)?;
+    let entry_thread = context.thread_label();
+    let entry_interpreter = context.interpreter;
+    let runtime = driver()?;
+    let (actions, receiver) = action_channel::<ProbeAction, ProbeReply>();
+    let future = async move {
+        match actions.request(ProbeAction::SetStarted).await {
+            Ok(ProbeReply::Ack) => {}
+            Ok(ProbeReply::HandlerFailed) => return ProbeOutcome::HandlerFailed,
+            Ok(_) => return ProbeOutcome::HandlerFailed,
+            Err(error) => return ProbeOutcome::BridgeClosed(error),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match actions.request(ProbeAction::ObserveAffinity).await {
+            Ok(ProbeReply::Affinity(report)) => ProbeOutcome::Affinity(report),
+            Ok(ProbeReply::HandlerFailed) => ProbeOutcome::HandlerFailed,
+            Ok(_) => ProbeOutcome::HandlerFailed,
+            Err(error) => ProbeOutcome::BridgeClosed(error),
+        }
+    };
+    let submission = submit(&runtime, future)?;
+    let mut handler_error = None;
+    let outcome = context.drive(py, submission, receiver, |py, action| match action {
+        ProbeAction::SetStarted => match action_started.bind(py).call_method0("set") {
+            Ok(_) => ProbeReply::Ack,
+            Err(error) => store_handler_error(&mut handler_error, error),
+        },
+        ProbeAction::ObserveAffinity => {
+            let observer_ran = match observer_ran.bind(py).call_method0("is_set") {
+                Ok(result) => match result.extract::<bool>() {
+                    Ok(result) => result,
+                    Err(error) => return store_handler_error(&mut handler_error, error),
+                },
+                Err(error) => return store_handler_error(&mut handler_error, error),
+            };
+            let action_interpreter = match interpreter_identity(py) {
+                Ok(identity) => identity,
+                Err(error) => return store_handler_error(&mut handler_error, error),
+            };
+            ProbeReply::Affinity(AffinityReport {
+                observer_ran,
+                action_thread: format!("{:?}", thread::current().id()),
+                action_interpreter,
+            })
+        }
+        _ => unexpected_action(&mut handler_error),
+    })?;
+    if let Some(error) = handler_error {
+        return Err(error);
+    }
+    let ProbeOutcome::Affinity(report) = outcome else {
+        return Err(outcome_error(outcome));
+    };
+
+    let result = PyDict::new(py);
+    result.set_item("value", value.bind(py))?;
+    result.set_item("observer_ran", report.observer_ran)?;
+    result.set_item("entry_thread", entry_thread)?;
+    result.set_item("action_thread", report.action_thread)?;
+    result.set_item("entry_interpreter", entry_interpreter)?;
+    result.set_item("action_interpreter", report.action_interpreter)?;
+    Ok(result.into_any().unbind())
+}
+
+#[pyfunction]
+fn _runtime_error_probe(py: Python<'_>, error: Py<PyAny>) -> PyResult<()> {
+    let context = PythonCallContext::capture(py)?;
+    let runtime = driver()?;
+    let (actions, receiver) = action_channel::<ProbeAction, ProbeReply>();
+    let future = async move {
+        match actions.request(ProbeAction::RaiseOriginal).await {
+            Ok(ProbeReply::Ack) => ProbeOutcome::OriginalRaised,
+            Ok(ProbeReply::HandlerFailed) => ProbeOutcome::HandlerFailed,
+            Ok(_) => ProbeOutcome::HandlerFailed,
+            Err(error) => ProbeOutcome::BridgeClosed(error),
+        }
+    };
+    let submission = submit(&runtime, future)?;
+    let mut original_error = None;
+    let outcome = context.drive(py, submission, receiver, |py, action| match action {
+        ProbeAction::RaiseOriginal => {
+            original_error = Some(PyErr::from_value(error.bind(py).clone()));
+            ProbeReply::Ack
+        }
+        _ => unexpected_action(&mut original_error),
+    })?;
+    match outcome {
+        ProbeOutcome::OriginalRaised => Err(original_error
+            .take()
+            .ok_or_else(|| internal_probe_error("runtime probe lost its original exception"))?),
+        other => {
+            drop(original_error);
+            Err(outcome_error(other))
+        }
+    }
+}
+
+fn nested_probe_report(py: Python<'_>) -> PyResult<NestedReport> {
+    let context = PythonCallContext::capture(py)?;
+    let runtime = driver()?;
+    let generation = runtime.generation();
+    let (actions, receiver) = action_channel::<ProbeAction, ProbeReply>();
+    let future = async move {
+        match actions.request(ProbeAction::ObserveNested).await {
+            Ok(ProbeReply::Nested(report)) => ProbeOutcome::Nested(report),
+            Ok(ProbeReply::HandlerFailed) => ProbeOutcome::HandlerFailed,
+            Ok(_) => ProbeOutcome::HandlerFailed,
+            Err(error) => ProbeOutcome::BridgeClosed(error),
+        }
+    };
+    let submission = submit(&runtime, future)?;
+    let mut handler_error = None;
+    let outcome = context.drive(py, submission, receiver, |py, action| match action {
+        ProbeAction::ObserveNested => match interpreter_identity(py) {
+            Ok(action_interpreter) => ProbeReply::Nested(NestedReport {
+                value: "nested",
+                generation,
+                action_thread: format!("{:?}", thread::current().id()),
+                action_interpreter,
+            }),
+            Err(error) => store_handler_error(&mut handler_error, error),
+        },
+        _ => unexpected_action(&mut handler_error),
+    })?;
+    if let Some(error) = handler_error {
+        return Err(error);
+    }
+    match outcome {
+        ProbeOutcome::Nested(report) => Ok(report),
+        other => Err(outcome_error(other)),
+    }
+}
+
+#[pyfunction]
+fn _runtime_nested_probe(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let context = PythonCallContext::capture(py)?;
+    let entry_thread = context.thread_label();
+    let entry_interpreter = context.interpreter;
+    let runtime = driver()?;
+    let outer_generation = runtime.generation();
+    let (actions, receiver) = action_channel::<ProbeAction, ProbeReply>();
+    let future = async move {
+        match actions.request(ProbeAction::RunNested).await {
+            Ok(ProbeReply::Nested(report)) => ProbeOutcome::Nested(report),
+            Ok(ProbeReply::HandlerFailed) => ProbeOutcome::HandlerFailed,
+            Ok(_) => ProbeOutcome::HandlerFailed,
+            Err(error) => ProbeOutcome::BridgeClosed(error),
+        }
+    };
+    let submission = submit(&runtime, future)?;
+    let mut handler_error = None;
+    let outcome = context.drive(py, submission, receiver, |py, action| match action {
+        ProbeAction::RunNested => match nested_probe_report(py) {
+            Ok(report) => ProbeReply::Nested(report),
+            Err(error) => store_handler_error(&mut handler_error, error),
+        },
+        _ => unexpected_action(&mut handler_error),
+    })?;
+    if let Some(error) = handler_error {
+        return Err(error);
+    }
+    let ProbeOutcome::Nested(report) = outcome else {
+        return Err(outcome_error(outcome));
+    };
+
+    let result = PyDict::new(py);
+    result.set_item("value", report.value)?;
+    result.set_item("outer_generation", outer_generation)?;
+    result.set_item("nested_generation", report.generation)?;
+    result.set_item("entry_thread", entry_thread)?;
+    result.set_item("nested_action_thread", report.action_thread)?;
+    result.set_item("entry_interpreter", entry_interpreter)?;
+    result.set_item("nested_action_interpreter", report.action_interpreter)?;
+    Ok(result.into_any().unbind())
+}
+
+struct CancellationProbe;
+
+impl Drop for CancellationProbe {
+    fn drop(&mut self) {
+        SIGNAL_FUTURE_CANCELLED.store(true, Ordering::Release);
+    }
+}
+
+#[pyfunction]
+fn _runtime_signal_probe(py: Python<'_>) -> PyResult<()> {
+    SIGNAL_FUTURE_CANCELLED.store(false, Ordering::Release);
+    let context = PythonCallContext::capture(py)?;
+    let runtime = driver()?;
+    let (actions, receiver) = action_channel::<ProbeAction, ProbeReply>();
+    let future = async move {
+        let _cancel_probe = CancellationProbe;
+        let _keep_actions_open = actions;
+        future::pending::<()>().await;
+    };
+    let submission = submit(&runtime, future)?;
+    context.drive(py, submission, receiver, |_py, _action| {
+        ProbeReply::HandlerFailed
+    })
+}
+
+#[pyfunction]
+fn _runtime_ready_error_probe(py: Python<'_>, error: Py<PyAny>) -> PyResult<()> {
+    let mut task_state_was_polled = false;
+    let mut injected_signal = |py: Python<'_>| Err(PyErr::from_value(error.bind(py).clone()));
+    let result = signal_before_task_state(py, &mut injected_signal, || {
+        task_state_was_polled = true;
+        Ok(Some(ProbeOutcome::Ready))
+    });
+    match result {
+        Err(error) if !task_state_was_polled => Err(error),
+        Err(_) => Err(internal_probe_error(
+            "runtime probe polled a ready result before its signal",
+        )),
+        Ok(_) => Err(internal_probe_error(
+            "runtime probe accepted a ready result over its signal",
+        )),
+    }
+}
+
+#[pyfunction]
+fn _runtime_cancel_ownership_probe(
+    py: Python<'_>,
+    holder: Py<PyAny>,
+    error: Py<PyAny>,
+) -> PyResult<()> {
+    SIGNAL_FUTURE_CANCELLED.store(false, Ordering::Release);
+    let origin_owned_value = holder.bind(py).call_method0("pop")?.unbind();
+    let context = PythonCallContext::capture(py)?;
+    let runtime = driver()?;
+    let (actions, receiver) = action_channel::<ProbeAction, ProbeReply>();
+    let future = async move {
+        let _cancel_probe = CancellationProbe;
+        match actions.request(ProbeAction::CancellationPoint).await {
+            Ok(ProbeReply::Ack) => future::pending::<ProbeOutcome>().await,
+            Ok(ProbeReply::HandlerFailed) => ProbeOutcome::HandlerFailed,
+            Ok(_) => ProbeOutcome::HandlerFailed,
+            Err(error) => ProbeOutcome::BridgeClosed(error),
+        }
+    };
+    let submission = submit(&runtime, future)?;
+    let action_seen = Cell::new(false);
+    let mut injected_signal = |py: Python<'_>| {
+        if action_seen.get() {
+            Err(PyErr::from_value(error.bind(py).clone()))
+        } else {
+            Ok(())
+        }
+    };
+    let result = context.drive_with_signal_checker(
+        py,
+        submission,
+        receiver,
+        |_py, action| match action {
+            ProbeAction::CancellationPoint => {
+                action_seen.set(true);
+                ProbeReply::Ack
+            }
+            _ => ProbeReply::HandlerFailed,
+        },
+        &mut injected_signal,
+    );
+    drop(origin_owned_value);
+    result.map(|_outcome| ())
+}
+
+#[pyfunction]
+fn _runtime_signal_was_cancelled() -> bool {
+    SIGNAL_FUTURE_CANCELLED.load(Ordering::Acquire)
+}
+
+fn outcome_error(outcome: ProbeOutcome) -> PyErr {
+    match outcome {
+        ProbeOutcome::BridgeClosed(error) => bridge_error(error),
+        ProbeOutcome::HandlerFailed => {
+            internal_probe_error("runtime probe action handler failed without a Python exception")
+        }
+        _ => internal_probe_error("runtime probe returned an unexpected outcome"),
+    }
+}
+
+pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(_runtime_affinity_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_error_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_nested_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_signal_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_ready_error_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_cancel_ownership_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_signal_was_cancelled, module)?)?;
+    Ok(())
+}

@@ -3,6 +3,9 @@
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 
+mod bridge;
+mod runtime;
+
 #[pyfunction]
 fn backend_name() -> &'static str {
     "requests-rust"
@@ -11,5 +14,6 @@ fn backend_name() -> &'static str {
 #[pymodule]
 fn _requests_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(backend_name, module)?)?;
+    runtime::register(module)?;
     Ok(())
 }

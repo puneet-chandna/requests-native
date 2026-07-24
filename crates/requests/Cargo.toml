@@ -8,7 +8,8 @@ license.workspace = true
 workspace = true
 
 [features]
-default = []
+default = ["blocking"]
+blocking = ["dep:tokio"]
 platform-smoke = [
     "dep:hyper-rustls",
     "dep:hyper-util",
@@ -22,4 +23,4 @@ http = "1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"], optional = true }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
-tokio = { version = "1", features = ["io-util"], optional = true }
+tokio = { version = "1", features = ["io-util", "rt-multi-thread", "sync", "time"], optional = true }

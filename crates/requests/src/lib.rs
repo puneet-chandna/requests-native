@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "blocking")]
+pub mod blocking;
 mod body;
 mod error;
 mod models;
