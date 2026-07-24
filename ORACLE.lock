@@ -1,0 +1,8 @@
+package = "requests"
+version = "2.34.2"
+frozen_source_commit = "69f84847045bef7a849cc994a26fe7ba8a169e95"
+frozen_source_tree = "46c952e2f504ba2f2ee03559661e4b25a402bc23"
+documentation_commit = "c5a69855228cc61120883a069e3cbeb78bd6f151"
+copied_on = "2026-07-24"
+oracle_path = "../requests"
+verification = "git -C ../requests diff --exit-code 69f84847045bef7a849cc994a26fe7ba8a169e95 -- src/requests tests pyproject.toml setup.py"

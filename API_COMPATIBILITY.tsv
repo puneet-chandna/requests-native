@@ -1,0 +1,367 @@
+module	symbol	kind	signature_or_shape	compatibility_requirement	oracle_source	port_status	evidence
+requests	__all__	export tuple	25 named exports	Preserve names, order, and import identity	src/requests/__init__.py	NOT_PORTED	API snapshot
+requests	request	function	(method, url, **kwargs)	Preserve keyword forwarding and temporary Session close	api.py:request	NOT_PORTED	unchanged tests + signature snapshot
+requests	get	function	(url, params=None, **kwargs)	Preserve default redirects	api.py:get	NOT_PORTED	unchanged tests + signature snapshot
+requests	options	function	(url, **kwargs)	Preserve default redirects	api.py:options	NOT_PORTED	unchanged tests + signature snapshot
+requests	head	function	(url, **kwargs)	Default allow_redirects is False	api.py:head	NOT_PORTED	unchanged tests + signature snapshot
+requests	post	function	(url, data=None, json=None, **kwargs)	Preserve data/json precedence	api.py:post	NOT_PORTED	unchanged tests + signature snapshot
+requests	put	function	(url, data=None, **kwargs)	Preserve keyword forwarding	api.py:put	NOT_PORTED	unchanged tests + signature snapshot
+requests	patch	function	(url, data=None, **kwargs)	Preserve keyword forwarding	api.py:patch	NOT_PORTED	unchanged tests + signature snapshot
+requests	delete	function	(url, **kwargs)	Preserve keyword forwarding	api.py:delete	NOT_PORTED	unchanged tests + signature snapshot
+requests	Request	class	exported models.Request	Preserve class identity	src/requests/__init__.py	NOT_PORTED	import identity snapshot
+requests	PreparedRequest	class	exported models.PreparedRequest	Preserve class identity	src/requests/__init__.py	NOT_PORTED	import identity snapshot
+requests	Response	class	exported models.Response	Preserve class identity	src/requests/__init__.py	NOT_PORTED	import identity snapshot
+requests	Session	class	exported sessions.Session	Preserve class identity	src/requests/__init__.py	NOT_PORTED	import identity snapshot
+requests	session	function	() -> Session	Preserve deprecated compatibility function	sessions.py:session	NOT_PORTED	unchanged tests + signature snapshot
+requests	codes	object	exported status_codes.codes	Preserve singleton identity and aliases	src/requests/__init__.py	NOT_PORTED	identity + alias snapshot
+requests	packages	module	exported compatibility module	Preserve module identity aliases	src/requests/__init__.py	NOT_PORTED	import identity tests
+requests	utils	module	exported utility module	Preserve module identity	src/requests/__init__.py	NOT_PORTED	import identity tests
+requests	check_compatibility	function	(urllib3_version, chardet_version, charset_normalizer_version)	Preserve assertions and warning behavior	src/requests/__init__.py	NOT_PORTED	warning/exception snapshot
+requests	import dependency checks	side effect	import-time compatibility validation	Preserve RequestsDependencyWarning cases and text	src/requests/__init__.py	NOT_PORTED	subprocess import tests
+requests	urllib3 DependencyWarning filter	side effect	simplefilter ignore	Preserve warning-filter insertion	src/requests/__init__.py	NOT_PORTED	warnings.filters snapshot
+requests	logging NullHandler	side effect	logger requests gets NullHandler	Preserve no-handler behavior	src/requests/__init__.py	NOT_PORTED	logger snapshot
+requests	FileModeWarning filter	side effect	simplefilter default append=True	Preserve warning-filter behavior	src/requests/__init__.py	NOT_PORTED	warnings.filters snapshot
+requests	__version__	metadata	str 2.34.2	Preserve exact value	__version__.py	NOT_PORTED	value snapshot
+requests	__build__	metadata	int 0x023402	Preserve exact value	__version__.py	NOT_PORTED	value snapshot
+requests	__title__	metadata	str requests	Preserve exact value	__version__.py	NOT_PORTED	value snapshot
+requests	__description__	metadata	str Python HTTP for Humans.	Preserve exact value	__version__.py	NOT_PORTED	value snapshot
+requests	__url__	metadata	str URL	Preserve exact value	__version__.py	NOT_PORTED	value snapshot
+requests	__author__	metadata	str Kenneth Reitz	Preserve exact value	__version__.py	NOT_PORTED	value snapshot
+requests	__author_email__	metadata	str email	Preserve exact value	__version__.py	NOT_PORTED	value snapshot
+requests	__license__	metadata	str Apache-2.0	Preserve exact value	__version__.py	NOT_PORTED	value snapshot
+requests	__copyright__	metadata	str copyright	Preserve exact value	__version__.py	NOT_PORTED	value snapshot
+requests	__cake__	metadata	str emoji	Preserve exact Unicode value	__version__.py	NOT_PORTED	value snapshot
+requests.api	request	function	(method, url, **kwargs)	Same object/behavior as root request	api.py	NOT_PORTED	identity + signature snapshot
+requests.api	get	function	(url, params=None, **kwargs)	Same object/behavior as root get	api.py	NOT_PORTED	identity + signature snapshot
+requests.api	options	function	(url, **kwargs)	Same object/behavior as root options	api.py	NOT_PORTED	identity + signature snapshot
+requests.api	head	function	(url, **kwargs)	Same object/behavior as root head	api.py	NOT_PORTED	identity + signature snapshot
+requests.api	post	function	(url, data=None, json=None, **kwargs)	Same object/behavior as root post	api.py	NOT_PORTED	identity + signature snapshot
+requests.api	put	function	(url, data=None, **kwargs)	Same object/behavior as root put	api.py	NOT_PORTED	identity + signature snapshot
+requests.api	patch	function	(url, data=None, **kwargs)	Same object/behavior as root patch	api.py	NOT_PORTED	identity + signature snapshot
+requests.api	delete	function	(url, **kwargs)	Same object/behavior as root delete	api.py	NOT_PORTED	identity + signature snapshot
+requests.exceptions	RequestException	exception	IOError	Preserve inheritance, args, request/response attachment	exceptions.py	NOT_PORTED	inheritance + pickle + context tests
+requests.exceptions	InvalidJSONError	exception	RequestException	Preserve hierarchy	exceptions.py	NOT_PORTED	inheritance snapshot
+requests.exceptions	JSONDecodeError	exception	InvalidJSONError + selected JSONDecodeError	Preserve multiple inheritance, constructor, reduce, pickle	exceptions.py	NOT_PORTED	inheritance + pickle + alternate decoder tests
+requests.exceptions	HTTPError	exception	RequestException	Preserve response/request context	exceptions.py	NOT_PORTED	inheritance + context tests
+requests.exceptions	ConnectionError	exception	RequestException	Preserve hierarchy	exceptions.py	NOT_PORTED	inheritance snapshot
+requests.exceptions	ProxyError	exception	ConnectionError	Preserve hierarchy and mapping	exceptions.py	NOT_PORTED	failure-path tests
+requests.exceptions	SSLError	exception	ConnectionError	Preserve hierarchy and mapping	exceptions.py	NOT_PORTED	failure-path tests
+requests.exceptions	Timeout	exception	RequestException	Preserve common timeout base	exceptions.py	NOT_PORTED	inheritance snapshot
+requests.exceptions	ConnectTimeout	exception	ConnectionError + Timeout	Preserve multiple inheritance and safe-to-retry meaning	exceptions.py	NOT_PORTED	failure-path + inheritance tests
+requests.exceptions	ReadTimeout	exception	Timeout	Preserve distinction from ConnectTimeout	exceptions.py	NOT_PORTED	failure-path + inheritance tests
+requests.exceptions	URLRequired	exception	RequestException	Preserve hierarchy and message	exceptions.py	NOT_PORTED	failure-path tests
+requests.exceptions	TooManyRedirects	exception	RequestException	Preserve response/request context	exceptions.py	NOT_PORTED	redirect tests
+requests.exceptions	MissingSchema	exception	RequestException + ValueError	Preserve multiple inheritance and message	exceptions.py	NOT_PORTED	inheritance + URL tests
+requests.exceptions	InvalidSchema	exception	RequestException + ValueError	Preserve multiple inheritance and message	exceptions.py	NOT_PORTED	inheritance + adapter tests
+requests.exceptions	InvalidURL	exception	RequestException + ValueError	Preserve multiple inheritance and message	exceptions.py	NOT_PORTED	inheritance + URL tests
+requests.exceptions	InvalidHeader	exception	RequestException + ValueError	Preserve multiple inheritance and message	exceptions.py	NOT_PORTED	inheritance + header tests
+requests.exceptions	InvalidProxyURL	exception	InvalidURL	Preserve hierarchy and mapping	exceptions.py	NOT_PORTED	proxy failure tests
+requests.exceptions	ChunkedEncodingError	exception	RequestException	Preserve hierarchy and low-level mapping	exceptions.py	NOT_PORTED	chunked response tests
+requests.exceptions	ContentDecodingError	exception	RequestException + urllib3 BaseHTTPError	Preserve multiple inheritance while dependency remains public	exceptions.py	NOT_PORTED	inheritance + decoding tests
+requests.exceptions	StreamConsumedError	exception	RequestException + TypeError	Preserve multiple inheritance	exceptions.py	NOT_PORTED	stream reuse tests
+requests.exceptions	RetryError	exception	RequestException	Preserve retry mapping	exceptions.py	NOT_PORTED	retry tests
+requests.exceptions	UnrewindableBodyError	exception	RequestException	Preserve redirect/resend mapping	exceptions.py	NOT_PORTED	body rewind tests
+requests.exceptions	RequestsWarning	warning	Warning	Preserve hierarchy	exceptions.py	NOT_PORTED	inheritance snapshot
+requests.exceptions	FileModeWarning	warning	RequestsWarning + DeprecationWarning	Preserve multiple inheritance and filter behavior	exceptions.py	NOT_PORTED	warning tests
+requests.exceptions	RequestsDependencyWarning	warning	RequestsWarning	Preserve import-time warning category	exceptions.py	NOT_PORTED	subprocess import tests
+requests.structures	CaseInsensitiveDict	class	MutableMapping[str, value]	Preserve ordered case-insensitive mapping protocol	structures.py	NOT_PORTED	unchanged tests + protocol snapshot
+requests.structures	CaseInsensitiveDict.__init__	method	(data=None, **kwargs)	Preserve accepted mapping/iterable inputs	structures.py	NOT_PORTED	signature + differential tests
+requests.structures	CaseInsensitiveDict mapping dunders	protocol	__setitem__, __getitem__, __delitem__, __iter__, __len__	Preserve last key casing and insertion order	structures.py	NOT_PORTED	unchanged tests + mapping corpus
+requests.structures	CaseInsensitiveDict.lower_items	method	() -> iterator	Preserve lazy ordered lowercase-key iteration	structures.py	NOT_PORTED	unchanged tests
+requests.structures	CaseInsensitiveDict.__eq__	method	(other)	Preserve Mapping comparison and NotImplemented behavior	structures.py	NOT_PORTED	unchanged tests
+requests.structures	CaseInsensitiveDict.copy	method	()	Preserve value shape and independent store	structures.py	NOT_PORTED	unchanged tests + identity test
+requests.structures	CaseInsensitiveDict.__repr__	method	() -> str	Preserve dict-like repr and casing	structures.py	NOT_PORTED	unchanged tests
+requests.structures	LookupDict	class	dict subclass with dynamic attributes	Preserve inheritance and None fallback	structures.py	NOT_PORTED	unchanged tests + inheritance snapshot
+requests.structures	LookupDict.__init__	method	(name=None)	Preserve arbitrary name and empty dict base	structures.py	NOT_PORTED	signature + unchanged tests
+requests.structures	LookupDict.__repr__	method	() -> str	Preserve <lookup 'name'> formatting	structures.py	NOT_PORTED	unchanged tests
+requests.structures	LookupDict.__getattr__	method	(key) -> value | None	Preserve instance-dict lookup and None default	structures.py	NOT_PORTED	unchanged tests
+requests.structures	LookupDict.__getitem__	method	(key) -> value | None	Preserve attribute-backed lookup instead of dict entries	structures.py	NOT_PORTED	unchanged tests
+requests.structures	LookupDict.get	method	(key, default=None)	Preserve default behavior and dynamic attributes	structures.py	NOT_PORTED	unchanged tests
+requests.status_codes	codes	object	LookupDict[int] singleton	Preserve object type, name, repr, item/attribute access	status_codes.py	NOT_PORTED	API snapshot
+requests.status_codes	all status aliases	dynamic attributes	lowercase and uppercase aliases from _codes	Preserve every numeric mapping including symbolic aliases	status_codes.py:_codes	NOT_PORTED	generated exhaustive alias snapshot
+requests.status_codes	module __doc__	generated documentation	one line per status code	Preserve import-time generated documentation	status_codes.py:_init	NOT_PORTED	doc snapshot
+requests.hooks	HOOKS	constant	["response"]	Preserve mutable list value and order	hooks.py	NOT_PORTED	value snapshot
+requests.hooks	default_hooks	function	() -> {"response": []}	Return fresh lists and dict each call	hooks.py	NOT_PORTED	identity + value tests
+requests.hooks	dispatch_hook	function	(key, hooks, hook_data, **kwargs)	Preserve callable/list acceptance, ordering, replacement, exceptions	hooks.py	NOT_PORTED	differential callback tests
+requests.auth	CONTENT_TYPE_FORM_URLENCODED	constant	str	Preserve exact value	auth.py	NOT_PORTED	value snapshot
+requests.auth	CONTENT_TYPE_MULTI_PART	constant	str	Preserve exact value	auth.py	NOT_PORTED	value snapshot
+requests.auth	_basic_auth_str	compatibility function	(username, password)	Preserve coercion, Latin-1, Base64, warning text/category	auth.py	NOT_PORTED	unchanged + warning corpus
+requests.auth	AuthBase	class	callable base	Preserve instantiability and NotImplementedError on call	auth.py	NOT_PORTED	inheritance + call tests
+requests.auth	AuthBase.__call__	method	(prepared_request)	Preserve error type/message	auth.py	NOT_PORTED	differential test
+requests.auth	HTTPBasicAuth	class	AuthBase	Preserve class identity, attrs, equality	auth.py	NOT_PORTED	inheritance + protocol snapshot
+requests.auth	HTTPBasicAuth.__init__	method	(username, password)	Preserve bytes/text and arbitrary-value legacy acceptance	auth.py	NOT_PORTED	signature + differential tests
+requests.auth	HTTPBasicAuth.__call__	method	(prepared_request)	Preserve Authorization mutation and returned identity	auth.py	NOT_PORTED	request mutation tests
+requests.auth	HTTPBasicAuth equality	protocol	__eq__, __ne__	Preserve getattr-based comparison	auth.py	NOT_PORTED	differential tests
+requests.auth	HTTPProxyAuth	class	HTTPBasicAuth	Preserve inheritance	auth.py	NOT_PORTED	inheritance snapshot
+requests.auth	HTTPProxyAuth.__call__	method	(prepared_request)	Preserve Proxy-Authorization mutation	auth.py	NOT_PORTED	request mutation tests
+requests.auth	HTTPDigestAuth	class	AuthBase	Preserve public attrs, thread-local behavior, equality	auth.py	NOT_PORTED	inheritance + state tests
+requests.auth	HTTPDigestAuth.__init__	method	(username, password)	Preserve arbitrary Python values, public mutation, and fresh thread local	auth.py	NOT_PORTED	signature + arbitrary-object/state tests
+requests.auth	HTTPDigestAuth._thread_local state	attributes	init, last_nonce, nonce_count, chal, pos, num_401_calls	Preserve actual OS-thread-local Python attributes, arbitrary replacement/mutation, and resulting Python errors	auth.py	NOT_PORTED	thread identity + arbitrary state/mapping mutation corpus
+requests.auth	HTTPDigestAuth.init_per_thread_state	method	()	Preserve lazy per-OS-thread initialization	auth.py	NOT_PORTED	threaded differential tests
+requests.auth	HTTPDigestAuth.build_digest_header	method	(method, url) -> str | None	Preserve algorithms, qop, counters, formatting	auth.py	NOT_PORTED	digest corpus
+requests.auth	HTTPDigestAuth.handle_redirect	method	(response, **kwargs)	Preserve 401 counter reset on redirect	auth.py	NOT_PORTED	low-level redirect tests
+requests.auth	HTTPDigestAuth.handle_401	method	(response, **kwargs) -> Response	Preserve one resend, cookies, history, connection use	auth.py	NOT_PORTED	low-level digest tests
+requests.auth	HTTPDigestAuth.__call__	method	(prepared_request)	Preserve preemptive header, exact tell result, origin-thread state, and hook order	auth.py	NOT_PORTED	differential state/thread/cursor tests including negative and huge ints
+requests.auth	HTTPDigestAuth equality	protocol	__eq__, __ne__	Preserve getattr-based comparison	auth.py	NOT_PORTED	differential tests
+requests.cookies	MockRequest	class	urllib.request-compatible wrapper	Preserve cookiejar request protocol	cookies.py	NOT_PORTED	generic CookieJar protocol tests
+requests.cookies	MockRequest.__init__	method	(prepared_request)	Preserve strong request relation, new-header dict, scheme	cookies.py	NOT_PORTED	signature + state snapshot
+requests.cookies	MockRequest request methods	protocol	get_type, get_host, get_origin_req_host, get_full_url, is_unverifiable	Preserve Host override, URL reconstruction, and unverifiable result	cookies.py	NOT_PORTED	generic CookieJar protocol tests
+requests.cookies	MockRequest header methods	protocol	has_header, get_header(name, default=None), add_header, add_unredirected_header, get_new_headers	Preserve lookup order and add_header NotImplementedError	cookies.py	NOT_PORTED	differential protocol tests
+requests.cookies	MockRequest properties	properties	unverifiable, origin_req_host, host	Preserve read-only computed values	cookies.py	NOT_PORTED	property snapshot
+requests.cookies	MockResponse	class	HTTPMessage-compatible wrapper	Preserve cookiejar response protocol	cookies.py	NOT_PORTED	generic CookieJar protocol tests
+requests.cookies	MockResponse.__init__	method	(headers)	Preserve arbitrary header provider identity	cookies.py	NOT_PORTED	signature + state snapshot
+requests.cookies	MockResponse.info	method	() -> headers	Preserve returned object identity	cookies.py	NOT_PORTED	differential protocol test
+requests.cookies	MockResponse.getheaders	method	(name)	Preserve current return behavior and delegated call	cookies.py	NOT_PORTED	differential protocol test
+requests.cookies	extract_cookies_to_jar	function	(jar, request, response)	Preserve _original_response guard and policy invocation	cookies.py	NOT_PORTED	redirect/cookie integration tests
+requests.cookies	get_cookie_header	function	(jar, request) -> str | None	Preserve CookieJar policy and new-header behavior	cookies.py	NOT_PORTED	differential cookie corpus
+requests.cookies	remove_cookie_by_name	function	(cookiejar, name, domain=None, path=None)	Preserve matching and clear calls	cookies.py	NOT_PORTED	differential cookie corpus
+requests.cookies	CookieConflictError	exception	RuntimeError	Preserve hierarchy and conflict message	cookies.py	NOT_PORTED	inheritance + duplicate tests
+requests.cookies	RequestsCookieJar	class	CookieJar + MutableMapping[str, str | None]	Preserve multiple inheritance and pickle support	cookies.py	NOT_PORTED	inheritance + protocol + pickle tests
+requests.cookies	RequestsCookieJar.get	method	(name, default=None, domain=None, path=None)	Preserve duplicate resolution and default	cookies.py	NOT_PORTED	signature + duplicate corpus
+requests.cookies	RequestsCookieJar.set	method	(name, value, **kwargs) -> Cookie | None	Preserve None deletion, Morsel conversion, kwargs	cookies.py	NOT_PORTED	differential cookie corpus
+requests.cookies	RequestsCookieJar key iteration	methods	iterkeys(), keys()	Preserve cookie order and list versus iterator shapes	cookies.py	NOT_PORTED	protocol snapshot
+requests.cookies	RequestsCookieJar value iteration	methods	itervalues(), values()	Preserve None values and list versus iterator shapes	cookies.py	NOT_PORTED	protocol snapshot
+requests.cookies	RequestsCookieJar item iteration	methods	iteritems(), items()	Preserve tuple/list shapes and cookie order	cookies.py	NOT_PORTED	protocol snapshot
+requests.cookies	RequestsCookieJar domain/path helpers	methods	list_domains(), list_paths(), multiple_domains()	Preserve order and current duplicate-domain behavior	cookies.py	NOT_PORTED	differential cookie corpus
+requests.cookies	RequestsCookieJar.get_dict	method	(domain=None, path=None) -> dict	Preserve filtering and last-value behavior	cookies.py	NOT_PORTED	signature + differential tests
+requests.cookies	RequestsCookieJar mapping dunders	protocol	__iter__, __contains__, __getitem__, __setitem__, __delitem__	Preserve Cookie iteration and conflict semantics	cookies.py	NOT_PORTED	mapping protocol tests
+requests.cookies	RequestsCookieJar.set_cookie	method	(cookie, *args, **kwargs)	Preserve quoted-value cleanup and super delegation	cookies.py	NOT_PORTED	differential cookie corpus
+requests.cookies	RequestsCookieJar.update	method	(other)	Preserve CookieJar copy versus mapping update	cookies.py	NOT_PORTED	differential + identity tests
+requests.cookies	RequestsCookieJar pickle	protocol	__getstate__, __setstate__	Preserve lock omission and recreation	cookies.py	NOT_PORTED	pickle roundtrip tests
+requests.cookies	RequestsCookieJar.copy	method	() -> RequestsCookieJar	Preserve policy identity and copied cookies	cookies.py	NOT_PORTED	copy identity tests
+requests.cookies	RequestsCookieJar.get_policy	method	() -> CookiePolicy	Preserve object identity	cookies.py	NOT_PORTED	identity test
+requests.cookies	create_cookie	function	(name, value, **kwargs) -> Cookie	Preserve defaults, validation, rest attrs, expiry	cookies.py	NOT_PORTED	signature + exhaustive kwargs corpus
+requests.cookies	morsel_to_cookie	function	(morsel) -> Cookie	Preserve max-age/expires conversion and flags	cookies.py	NOT_PORTED	differential Morsel corpus
+requests.cookies	cookiejar_from_dict	function	(cookie_dict, cookiejar=None, overwrite=True) -> CookieJar	Preserve target identity and overwrite behavior	cookies.py	NOT_PORTED	signature + differential tests
+requests.cookies	merge_cookies	function	(cookiejar, cookies) -> CookieJar	Preserve type errors, target identity, CookieJar/mapping behavior	cookies.py	NOT_PORTED	signature + differential tests
+requests.models	REDIRECT_STATI	constant	(301, 302, 303, 307, 308)	Preserve tuple type, order, and reexport	models.py	NOT_PORTED	value + identity snapshot
+requests.models	DEFAULT_REDIRECT_LIMIT	constant	30	Preserve exact value and reexport	models.py	NOT_PORTED	value snapshot
+requests.models	CONTENT_CHUNK_SIZE	constant	10240	Preserve exact content buffering chunk size	models.py	NOT_PORTED	value + read-pattern test
+requests.models	ITER_CHUNK_SIZE	constant	512	Preserve exact utility default	models.py	NOT_PORTED	value snapshot
+requests.models	RequestEncodingMixin	class	mixin with url and encoding helpers	Preserve subclass usability	models.py	NOT_PORTED	subclass protocol tests
+requests.models	RequestEncodingMixin.path_url	property	() -> str	Preserve empty path and query behavior	models.py	NOT_PORTED	differential URL corpus
+requests.models	RequestEncodingMixin._encode_params	compatibility staticmethod	(data) -> str | bytes | file-like	Preserve string/bytes/file identity and ordered iterable encoding	models.py	NOT_PORTED	differential parameter corpus
+requests.models	RequestEncodingMixin._encode_files	compatibility staticmethod	(files, data) -> (body, content_type)	Preserve tuple shapes, eager file read/buffering, read/exception timing, multipart semantics	models.py	NOT_PORTED	differential multipart corpus with instrumented files
+requests.models	RequestHooksMixin	class	mixin requiring hooks mapping	Preserve subclass usability	models.py	NOT_PORTED	subclass protocol tests
+requests.models	RequestHooksMixin.register_hook	method	(event, hook)	Preserve event validation, callable/iterable filtering, order	models.py	NOT_PORTED	differential callback tests
+requests.models	RequestHooksMixin.deregister_hook	method	(event, hook) -> bool	Preserve remove-first and result behavior	models.py	NOT_PORTED	differential callback tests
+requests.models	Request	class	RequestHooksMixin	Preserve Python mutability and class identity	models.py	NOT_PORTED	inheritance + API snapshot
+requests.models	Request.__init__	method	(method=None, url=None, headers=None, files=None, data=None, params=None, auth=None, cookies=None, hooks=None, json=None)	Preserve defaults as fresh empty containers and input identities	models.py	NOT_PORTED	signature + state snapshot
+requests.models	Request public attributes	attributes	hooks, method, url, headers, files, data, json, params, auth, cookies	Preserve names, default values, assignment, and __dict__ visibility	models.py	NOT_PORTED	attribute snapshot + mutation tests
+requests.models	Request.__repr__	method	() -> "<Request [METHOD]>"	Preserve exact formatting	models.py	NOT_PORTED	repr snapshot
+requests.models	Request.prepare	method	() -> PreparedRequest	Preserve preparation order and returned type	models.py	NOT_PORTED	unchanged + differential request corpus
+requests.models	PreparedRequest	class	RequestEncodingMixin + RequestHooksMixin	Preserve multiple inheritance and mutable class identity	models.py	NOT_PORTED	inheritance + API snapshot
+requests.models	PreparedRequest.__init__	method	()	Preserve exact sentinel/default state	models.py	NOT_PORTED	state snapshot
+requests.models	PreparedRequest public attributes	attributes	method, url, headers, _cookies, body, hooks, _body_position	Preserve names, assignment, and __dict__ visibility	models.py	NOT_PORTED	attribute snapshot + mutation tests
+requests.models	PreparedRequest.prepare	method	(method=None, url=None, headers=None, files=None, data=None, params=None, auth=None, cookies=None, hooks=None, json=None)	Preserve stage order and return None	models.py	NOT_PORTED	signature + ordered instrumentation
+requests.models	PreparedRequest.__repr__	method	() -> "<PreparedRequest [METHOD]>"	Preserve exact formatting	models.py	NOT_PORTED	repr snapshot
+requests.models	PreparedRequest.copy	method	() -> PreparedRequest	Preserve headers/cookies copy and body/hooks sharing	models.py	NOT_PORTED	identity graph tests
+requests.models	PreparedRequest.prepare_method	method	(method)	Preserve uppercase and native-string conversion	models.py	NOT_PORTED	differential method corpus
+requests.models	PreparedRequest.prepare_url	method	(url, params)	Preserve non-HTTP bypass, URL validation, IDNA, query order, fragments	models.py	NOT_PORTED	differential URL corpus
+requests.models	PreparedRequest.prepare_headers	method	(headers)	Preserve iteration, validation order, native names, values	models.py	NOT_PORTED	differential header corpus
+requests.models	PreparedRequest.prepare_body	method	(data, files, json=None)	Preserve body selection, lazy iterator/file streams, eager files= multipart, errors, headers, and exact rewind sentinel/cursor	models.py	NOT_PORTED	differential body corpus + read/tell/seek instrumentation
+requests.models	PreparedRequest.prepare_content_length	method	(body)	Preserve length discovery and method-specific zero length	models.py	NOT_PORTED	differential length corpus
+requests.models	PreparedRequest.prepare_auth	method	(auth, url="")	Preserve URL auth, tuple basic auth, arbitrary callable, state update, length	models.py	NOT_PORTED	differential auth corpus
+requests.models	PreparedRequest.prepare_cookies	method	(cookies)	Preserve jar identity and one-time Cookie header behavior	models.py	NOT_PORTED	differential cookie tests
+requests.models	PreparedRequest.prepare_hooks	method	(hooks)	Preserve false-y handling and registration order	models.py	NOT_PORTED	differential callback tests
+requests.models	Response	class	mutable response object	Preserve class identity and public protocol	models.py	NOT_PORTED	API snapshot
+requests.models	Response.__attrs__	class attribute	10 names	Preserve exact names/order used for pickle	models.py	NOT_PORTED	value + pickle snapshot
+requests.models	Response.__init__	method	()	Preserve exact defaults and sentinel state	models.py	NOT_PORTED	state snapshot
+requests.models	Response public attributes	attributes	_content, _content_consumed, _next, status_code, headers, raw, url, encoding, history, reason, cookies, elapsed, request, connection	Preserve names, defaults, assignment, and observable state transitions	models.py	NOT_PORTED	attribute/state-machine snapshot
+requests.models	Response context manager	protocol	__enter__, __exit__	Preserve self return and close on exit	models.py	NOT_PORTED	context manager tests
+requests.models	Response pickle	protocol	__getstate__, __setstate__	Preserve forced consume, attrs only, raw=None, consumed=True	models.py	NOT_PORTED	pickle + read-pattern tests
+requests.models	Response.__repr__	method	() -> "<Response [STATUS]>"	Preserve exact formatting	models.py	NOT_PORTED	repr snapshot
+requests.models	Response truthiness	protocol	__bool__, __nonzero__	Preserve raise_for_status-based status behavior	models.py	NOT_PORTED	differential status corpus
+requests.models	Response.__iter__	method	() -> iter_content(128)	Preserve iterator type and chunk size	models.py	NOT_PORTED	read-pattern tests
+requests.models	Response.ok	property	bool	Preserve false only when raise_for_status raises HTTPError	models.py	NOT_PORTED	status + monkeypatch tests
+requests.models	Response.is_redirect	property	bool	Preserve location/header and redirect-status test	models.py	NOT_PORTED	differential status tests
+requests.models	Response.is_permanent_redirect	property	bool	Preserve 301/308 logic	models.py	NOT_PORTED	differential status tests
+requests.models	Response.next	property	PreparedRequest | None	Preserve _next identity	models.py	NOT_PORTED	identity test
+requests.models	Response.apparent_encoding	property	str | None	Preserve selected detector and utf-8 fallback	models.py	NOT_PORTED	detector matrix tests
+requests.models	Response.iter_content	method	(chunk_size=1, decode_unicode=False)	Preserve validation, raw.stream/read paths, consumed errors, types	models.py	NOT_PORTED	stream state-machine corpus
+requests.models	Response.iter_lines	method	(chunk_size=ITER_CHUNK_SIZE, decode_unicode=False, delimiter=None)	Preserve pending-line and delimiter behavior	models.py	NOT_PORTED	differential line corpus
+requests.models	Response.content	property	bytes | None	Preserve lazy cache, empty behavior, errors, consumed state	models.py	NOT_PORTED	stream state-machine corpus
+requests.models	Response.text	property	str	Preserve encoding, fallback decoding, replacement behavior	models.py	NOT_PORTED	encoding corpus
+requests.models	Response.json	method	(**kwargs) -> Any	Preserve BOM detection, selected decoder, exception translation	models.py	NOT_PORTED	JSON corpus + alternate decoder tests
+requests.models	Response.links	property	dict[str, dict[str, str]]	Preserve Link parsing and key selection	models.py	NOT_PORTED	differential header corpus
+requests.models	Response.raise_for_status	method	()	Preserve status ranges, reason decoding, message, attached response	models.py	NOT_PORTED	differential status/error corpus
+requests.models	Response.close	method	()	Preserve custom raw close/release_conn calls and idempotence; Rust lease reusable only after clean EOF	models.py	NOT_PORTED	resource state-machine tests for EOF, partial, error, repeated close
+requests.adapters	DEFAULT_POOLBLOCK	constant	False	Preserve exact value	adapters.py	NOT_PORTED	value snapshot
+requests.adapters	DEFAULT_POOLSIZE	constant	10	Preserve exact value	adapters.py	NOT_PORTED	value snapshot
+requests.adapters	DEFAULT_RETRIES	constant	0	Preserve exact value	adapters.py	NOT_PORTED	value snapshot
+requests.adapters	DEFAULT_POOL_TIMEOUT	constant	None	Preserve exact value	adapters.py	NOT_PORTED	value snapshot
+requests.adapters	TimeoutSauce	reexport	urllib3.util.Timeout	Preserve imported class identity while dependency surface remains	adapters.py imports	NOT_PORTED	import identity test
+requests.adapters	Retry	reexport	urllib3.util.retry.Retry	Preserve caller-supplied Retry compatibility	adapters.py imports	NOT_PORTED	import identity + conversion corpus
+requests.adapters	PoolManager	reexport	urllib3.poolmanager.PoolManager	Preserve import identity for compatibility code	adapters.py imports	NOT_PORTED	import identity test
+requests.adapters	SOCKSProxyManager	reexport/function	urllib3 class or missing-dependency function	Preserve optional dependency resolution and InvalidSchema error	adapters.py	NOT_PORTED	with/without PySocks subprocess tests
+requests.adapters	_urllib3_request_context	compatibility function	(request, verify, client_cert, poolmanager) -> (host_params, pool_kwargs)	Preserve current helper behavior while exposed by module	adapters.py	NOT_PORTED	differential TLS-key corpus
+requests.adapters	BaseAdapter	class	transport adapter base	Preserve subclass protocol	adapters.py	NOT_PORTED	inheritance + custom adapter tests
+requests.adapters	BaseAdapter.__init__	method	()	Preserve super initialization	adapters.py	NOT_PORTED	signature + subclass test
+requests.adapters	BaseAdapter.send	method	(request, stream=False, timeout=None, verify=True, cert=None, proxies=None)	Preserve NotImplementedError and override contract	adapters.py	NOT_PORTED	signature + custom adapter tests
+requests.adapters	BaseAdapter.close	method	()	Preserve NotImplementedError and override contract	adapters.py	NOT_PORTED	custom adapter tests
+requests.adapters	HTTPAdapter	class	BaseAdapter	Preserve subclassability, public state, pickle	adapters.py	NOT_PORTED	inheritance + API snapshot
+requests.adapters	HTTPAdapter.__attrs__	class attribute	max_retries, config, _pool_connections, _pool_maxsize, _pool_block	Preserve exact names/order	adapters.py	NOT_PORTED	value + pickle snapshot
+requests.adapters	HTTPAdapter.__init__	method	(pool_connections=10, pool_maxsize=10, max_retries=0, pool_block=False)	Preserve Retry conversion, public fields, pool initialization	adapters.py	NOT_PORTED	signature + state snapshot
+requests.adapters	HTTPAdapter pickle	protocol	__getstate__, __setstate__	Preserve attrs-only state and pool/proxy recreation	adapters.py	NOT_PORTED	pickle roundtrip tests
+requests.adapters	HTTPAdapter.init_poolmanager	method	(connections, maxsize, block=False, **pool_kwargs)	Preserve override hook, fields, extra kwargs	adapters.py	NOT_PORTED	subclass instrumentation
+requests.adapters	HTTPAdapter.proxy_manager_for	method	(proxy, **proxy_kwargs)	Preserve cache identity, SOCKS handling, credentials, kwargs	adapters.py	NOT_PORTED	proxy corpus + subclass tests
+requests.adapters	HTTPAdapter.cert_verify	method	(conn, url, verify, cert)	Preserve file/directory verification, mTLS, errors, connection mutations	adapters.py	NOT_PORTED	TLS/mTLS differential tests
+requests.adapters	HTTPAdapter.build_response	method	(req, resp) -> Response	Preserve field mapping, encoding, cookies, request/connection identity, and response.raw is resp exact identity	adapters.py	NOT_PORTED	fake raw response identity/state corpus
+requests.adapters	HTTPAdapter.build_connection_pool_key_attributes	method	(request, verify, cert=None) -> (host_params, pool_kwargs)	Preserve public subclass hook and TLS pool-key distinctions	adapters.py	NOT_PORTED	TLS pool-key matrix
+requests.adapters	HTTPAdapter.get_connection_with_tls_context	method	(request, verify, proxies=None, cert=None)	Preserve proxy selection, invalid proxy errors, pool selection	adapters.py	NOT_PORTED	proxy/TLS integration tests
+requests.adapters	HTTPAdapter.get_connection	method	(url, proxies=None)	Preserve deprecation warning and legacy result behavior	adapters.py	NOT_PORTED	warning + proxy corpus
+requests.adapters	HTTPAdapter.close	method	()	Preserve visible and Rust pool clearing without permanent closure	adapters.py	NOT_PORTED	repeated close + close-then-send + other-session isolation tests
+requests.adapters	HTTPAdapter.request_url	method	(request, proxies) -> str	Preserve proxy absolute-form, SOCKS, path separators, auth removal	adapters.py	NOT_PORTED	unchanged + differential URL corpus
+requests.adapters	HTTPAdapter.add_headers	method	(request, **kwargs)	Preserve no-op override hook	adapters.py	NOT_PORTED	subclass instrumentation
+requests.adapters	HTTPAdapter.proxy_headers	method	(proxy) -> dict[str, str]	Preserve Basic proxy auth extraction	adapters.py	NOT_PORTED	differential proxy corpus
+requests.adapters	HTTPAdapter.send	method	(request, stream=False, timeout=None, verify=True, cert=None, proxies=None)	Preserve adapter calls, timeout forms, streaming, retries, exception mapping	adapters.py	NOT_PORTED	protocol + failure + subclass corpus
+requests.sessions	preferred_clock	module value	time.perf_counter on Windows else time.time	Preserve platform selection and monkeypatch surface	sessions.py	NOT_PORTED	platform/value snapshot
+requests.sessions	merge_setting	function	(request_setting, session_setting, dict_class=OrderedDict)	Preserve None rules, mapping merge order, None-value deletion	sessions.py	NOT_PORTED	differential merge corpus
+requests.sessions	merge_hooks	function	(request_hooks, session_hooks, dict_class=OrderedDict)	Preserve empty-response-list special cases	sessions.py	NOT_PORTED	differential merge corpus
+requests.sessions	SessionRedirectMixin	class	redirect behavior mixin	Preserve subclass protocol	sessions.py	NOT_PORTED	subclass + inheritance tests
+requests.sessions	SessionRedirectMixin.send	method	(request, **kwargs) -> Response	Preserve abstract override point	sessions.py	NOT_PORTED	custom mixin test
+requests.sessions	SessionRedirectMixin.get_redirect_target	method	(response) -> str | None	Preserve repeated calls, latin1-to-utf8 recovery, return rules	sessions.py	NOT_PORTED	redirect location corpus
+requests.sessions	SessionRedirectMixin.should_strip_auth	method	(old_url, new_url) -> bool	Preserve host/scheme/port compatibility exceptions	sessions.py	NOT_PORTED	differential URL matrix
+requests.sessions	SessionRedirectMixin.resolve_redirects	method	(resp, req, stream=False, timeout=None, verify=True, cert=None, proxies=None, yield_requests=False, **adapter_kwargs)	Preserve lazy generator, order, methods, fragments, cookies, rewind, history	sessions.py	NOT_PORTED	exhaustive redirect state-machine tests
+requests.sessions	SessionRedirectMixin.rebuild_auth	method	(prepared_request, response)	Preserve credential stripping and netrc reapplication	sessions.py	NOT_PORTED	redirect auth matrix
+requests.sessions	SessionRedirectMixin.rebuild_proxies	method	(prepared_request, proxies) -> dict	Preserve NO_PROXY reevaluation and Proxy-Authorization	sessions.py	NOT_PORTED	proxy redirect matrix
+requests.sessions	SessionRedirectMixin.rebuild_method	method	(prepared_request, response)	Preserve 301/302/303 rewrite rules and HEAD exceptions	sessions.py	NOT_PORTED	redirect method matrix
+requests.sessions	Session	class	SessionRedirectMixin	Preserve mutable session, context manager, pickle, subclassability	sessions.py	NOT_PORTED	inheritance + API snapshot
+requests.sessions	Session.__attrs__	class attribute	headers, cookies, auth, proxies, hooks, params, verify, cert, adapters, stream, trust_env, max_redirects	Preserve exact names/order	sessions.py	NOT_PORTED	value + pickle snapshot
+requests.sessions	Session.__init__	method	()	Preserve default values and http/https mounted adapters	sessions.py	NOT_PORTED	state + identity snapshot
+requests.sessions	Session public attributes	attributes	headers, auth, proxies, hooks, params, stream, verify, cert, max_redirects, trust_env, cookies, adapters	Preserve assignment, mutation, and __dict__ visibility	sessions.py	NOT_PORTED	attribute snapshot + mutation tests
+requests.sessions	Session context manager	protocol	__enter__, __exit__	Preserve self return and close on exit	sessions.py	NOT_PORTED	context manager tests
+requests.sessions	Session.prepare_request	method	(request) -> PreparedRequest	Preserve cookie merge, netrc, setting merge, uppercase method, preparation order	sessions.py	NOT_PORTED	differential request corpus
+requests.sessions	Session.request	method	(method, url, params=None, data=None, headers=None, cookies=None, files=None, auth=None, timeout=None, allow_redirects=True, proxies=None, hooks=None, stream=None, verify=None, cert=None, json=None)	Preserve exact signature, byte URL decode, false-y data/params behavior	sessions.py	NOT_PORTED	signature + differential corpus
+requests.sessions	Session.get	method	(url, params=None, **kwargs)	Default allow_redirects True	sessions.py	NOT_PORTED	signature + unchanged tests
+requests.sessions	Session.options	method	(url, **kwargs)	Default allow_redirects True	sessions.py	NOT_PORTED	signature + unchanged tests
+requests.sessions	Session.head	method	(url, **kwargs)	Default allow_redirects False	sessions.py	NOT_PORTED	signature + unchanged tests
+requests.sessions	Session.post	method	(url, data=None, json=None, **kwargs)	Preserve forwarding	sessions.py	NOT_PORTED	signature + unchanged tests
+requests.sessions	Session.put	method	(url, data=None, **kwargs)	Preserve forwarding	sessions.py	NOT_PORTED	signature + unchanged tests
+requests.sessions	Session.patch	method	(url, data=None, **kwargs)	Preserve forwarding	sessions.py	NOT_PORTED	signature + unchanged tests
+requests.sessions	Session.delete	method	(url, **kwargs)	Preserve forwarding	sessions.py	NOT_PORTED	signature + unchanged tests
+requests.sessions	Session.send	method	(request, **kwargs) -> Response	Preserve defaults, adapter selection, elapsed, hooks, cookies, redirects, stream consumption	sessions.py	NOT_PORTED	ordered instrumentation + integration corpus
+requests.sessions	Session.merge_environment_settings	method	(url, proxies, stream, verify, cert) -> dict	Preserve env proxy/CA handling, mutation, merge rules	sessions.py	NOT_PORTED	environment matrix
+requests.sessions	Session.get_adapter	method	(url) -> BaseAdapter	Preserve case-insensitive longest-prefix selection and InvalidSchema	sessions.py	NOT_PORTED	mount corpus
+requests.sessions	Session.close	method	()	Preserve adapter iteration/calls and allow session reuse; never stop shared driver	sessions.py	NOT_PORTED	custom adapter + repeated close + close-then-request + other-session tests
+requests.sessions	Session.mount	method	(prefix, adapter)	Preserve assignment and descending prefix-length order	sessions.py	NOT_PORTED	mount identity/order tests
+requests.sessions	Session pickle	protocol	__getstate__, __setstate__	Preserve __attrs__ state and adapter pickling	sessions.py	NOT_PORTED	pickle roundtrip tests
+requests.sessions	session	function	() -> Session	Preserve fresh Session each call	sessions.py	NOT_PORTED	identity + signature tests
+requests.sessions	model reexports	reexports	DEFAULT_REDIRECT_LIMIT, REDIRECT_STATI, PreparedRequest, Request, Response	Preserve object identity	sessions.py imports	NOT_PORTED	import identity snapshot
+requests.sessions	utility reexports	reexports	DEFAULT_PORTS, default_headers, get_auth_from_url, get_environ_proxies, get_netrc_auth, requote_uri, resolve_proxies, rewind_body, should_bypass_proxies, to_key_val_list	Preserve object identity for external consumers	sessions.py imports	NOT_PORTED	import identity snapshot
+requests._internal_utils	HEADER_VALIDATORS	constant	map of str/bytes to compiled regex pairs	Preserve key identities and validation patterns	_internal_utils.py	NOT_PORTED	value/regex corpus
+requests._internal_utils	to_native_string	function	(string, encoding="ascii") -> str	Preserve string identity versus bytes decode and exceptions	_internal_utils.py	NOT_PORTED	differential encoding corpus
+requests._internal_utils	unicode_is_ascii	function	(u_string) -> bool	Preserve assertion and Unicode behavior	_internal_utils.py	NOT_PORTED	differential Unicode corpus
+requests._types	SupportsRead	runtime protocol	read(length=..., /)	Preserve runtime isinstance behavior; remain documented internal	_types.py	NOT_PORTED	protocol snapshot
+requests._types	has_read	internal function	(obj) -> bool	Preserve __getattr__ proxy support	_types.py	NOT_PORTED	differential proxy tests
+requests._types	SupportsItems	runtime protocol	items()	Preserve runtime isinstance behavior; remain documented internal	_types.py	NOT_PORTED	protocol snapshot
+requests._types	HookType	runtime type alias	Callable[[Response], Any]	Preserve module namespace value; remain documented internal	_types.py	NOT_PORTED	namespace snapshot
+requests._types	HooksInputType	runtime type alias	Mapping[str, Iterable[HookType] | HookType]	Preserve module namespace value; remain documented internal	_types.py	NOT_PORTED	namespace snapshot
+requests._types	is_prepared	internal function	(request) -> True at runtime	Preserve current no-op runtime behavior	_types.py	NOT_PORTED	differential test
+requests.utils	NETRC_FILES	constant	(".netrc", "_netrc")	Preserve tuple type/order	utils.py	NOT_PORTED	value snapshot
+requests.utils	DEFAULT_CA_BUNDLE_PATH	constant	certs.where() result	Preserve import-time value and environment packaging behavior	utils.py	NOT_PORTED	value + packaged-wheel test
+requests.utils	DEFAULT_PORTS	constant	{"http": 80, "https": 443}	Preserve mutable dict value and reexport	utils.py	NOT_PORTED	value + identity snapshot
+requests.utils	DEFAULT_ACCEPT_ENCODING	constant	urllib3 make_headers-derived str	Preserve delimiter and installed-urllib3-dependent value	utils.py	NOT_PORTED	urllib3 1.x/2.x matrix snapshot
+requests.utils	HEADER_VALIDATORS	reexport	_internal_utils.HEADER_VALIDATORS	Preserve object identity	utils.py imports	NOT_PORTED	import identity test
+requests.utils	to_native_string	reexport	_internal_utils.to_native_string	Preserve function identity	utils.py imports	NOT_PORTED	import identity test
+requests.utils	proxy_bypass_registry	Windows function	(host) -> bool	Preserve registry parsing, wildcard, local, error behavior	utils.py	NOT_PORTED	Windows mocked-registry tests
+requests.utils	proxy_bypass	Windows override	(host) -> bool	Preserve environment-before-registry choice	utils.py	NOT_PORTED	Windows mocked-registry tests
+requests.utils	dict_to_sequence	function	(mapping_or_iterable) -> iterable	Preserve .items protocol and identity otherwise	utils.py	NOT_PORTED	differential protocol tests
+requests.utils	super_len	function	(object) -> int	Preserve probe order, UTF-8 rule, file mode warning, cursor restoration	utils.py	NOT_PORTED	unchanged + differential probe corpus
+requests.utils	get_netrc_auth	function	(url, raise_errors=False) -> tuple | None	Preserve NETRC path search, parsing, errors, host auth selection	utils.py	NOT_PORTED	netrc corpus
+requests.utils	guess_filename	function	(object) -> str | None	Preserve .name handling and angle-bracket exclusion	utils.py	NOT_PORTED	differential protocol tests
+requests.utils	extract_zipped_paths	function	(path) -> str	Preserve archive member extraction, cache/temp naming, invalid paths	utils.py	NOT_PORTED	unchanged + filesystem tests
+requests.utils	atomic_open	context manager	(filename) -> BufferedWriter	Preserve temp placement, replace, cleanup on error	utils.py	NOT_PORTED	filesystem failure tests
+requests.utils	from_key_val_list	function	(value) -> OrderedDict | None	Preserve None, Mapping/list/tuple acceptance and ValueError	utils.py	NOT_PORTED	differential input corpus
+requests.utils	to_key_val_list	function	(value) -> list | None	Preserve None, Mapping/list/tuple acceptance and ValueError	utils.py	NOT_PORTED	differential input corpus
+requests.utils	parse_list_header	function	(value) -> list[str]	Preserve urllib parse_http_list semantics and unquoting	utils.py	NOT_PORTED	differential header corpus
+requests.utils	parse_dict_header	function	(value) -> dict[str, str | None]	Preserve list parsing, key/value splitting, quoted values	utils.py	NOT_PORTED	unchanged + differential corpus
+requests.utils	unquote_header_value	function	(value, is_filename=False) -> str	Preserve backslash/unquote and Windows filename special case	utils.py	NOT_PORTED	differential header corpus
+requests.utils	dict_from_cookiejar	function	(cookiejar) -> dict	Preserve iteration and last duplicate value	utils.py	NOT_PORTED	differential cookie tests
+requests.utils	add_dict_to_cookiejar	function	(cookiejar, cookie_dict) -> CookieJar	Preserve target identity	utils.py	NOT_PORTED	unchanged + identity tests
+requests.utils	get_encodings_from_content	function	(content) -> list[str]	Preserve regex precedence and DeprecationWarning behavior	utils.py	NOT_PORTED	unchanged + warning tests
+requests.utils	_parse_content_type_header	compatibility function	(header) -> (content_type, params)	Preserve exposed helper behavior despite underscore	utils.py	NOT_PORTED	unchanged differential corpus
+requests.utils	get_encoding_from_headers	function	(headers) -> str | None	Preserve charset parsing and text/application-json defaults	utils.py	NOT_PORTED	unchanged + differential corpus
+requests.utils	stream_decode_response_unicode	function	(iterator, response) -> iterator	Preserve pass-through without encoding and incremental replacement decoding	utils.py	NOT_PORTED	chunk-boundary differential tests
+requests.utils	iter_slices	function	(string, slice_length) -> iterator	Preserve text/bytes/None and lazy slicing	utils.py	NOT_PORTED	unchanged + type corpus
+requests.utils	get_unicode_from_response	function	(response) -> str | bytes | None	Preserve header encoding and fallback behavior	utils.py	NOT_PORTED	differential encoding corpus
+requests.utils	UNRESERVED_SET	constant	frozenset of RFC 3986 unreserved characters	Preserve exact immutable set and module export	utils.py	NOT_PORTED	value snapshot
+requests.utils	unquote_unreserved	function	(uri) -> str	Preserve invalid escape errors and unreserved-only decoding	utils.py	NOT_PORTED	unchanged + differential URI corpus
+requests.utils	requote_uri	function	(uri) -> str	Preserve unquote/quote safe sets and invalid-percent fallback	utils.py	NOT_PORTED	unchanged + differential URI corpus
+requests.utils	address_in_network	function	(ip, net) -> bool	Preserve IPv4 packing and mask behavior	utils.py	NOT_PORTED	unchanged + invalid corpus
+requests.utils	dotted_netmask	function	(mask) -> str	Preserve integer mask conversion	utils.py	NOT_PORTED	unchanged boundary tests
+requests.utils	is_ipv4_address	function	(string_ip) -> bool	Preserve socket parse behavior	utils.py	NOT_PORTED	unchanged + platform tests
+requests.utils	is_valid_cidr	function	(string_network) -> bool	Preserve slash/mask/IP validation	utils.py	NOT_PORTED	unchanged + differential corpus
+requests.utils	set_environ	context manager	(env_name, value)	Preserve temporary set/delete and exception-safe restoration	utils.py	NOT_PORTED	unchanged environment tests
+requests.utils	should_bypass_proxies	function	(url, no_proxy) -> bool	Preserve env isolation, CIDR, suffix boundaries, platform bypass	utils.py	NOT_PORTED	unchanged + environment matrix
+requests.utils	get_environ_proxies	function	(url, no_proxy=None) -> dict	Preserve bypass result and urllib proxy mapping	utils.py	NOT_PORTED	unchanged environment tests
+requests.utils	select_proxy	function	(url, proxies) -> str | None	Preserve key precedence scheme://host, scheme, all://host, all	utils.py	NOT_PORTED	unchanged exhaustive matrix
+requests.utils	resolve_proxies	function	(request, proxies, trust_env=True) -> dict	Preserve input non-mutation except documented copy and env setdefault	utils.py	NOT_PORTED	differential environment tests
+requests.utils	default_user_agent	function	(name="python-requests") -> str	Preserve version formatting	utils.py	NOT_PORTED	value + signature snapshot
+requests.utils	default_headers	function	() -> CaseInsensitiveDict	Preserve fresh object, values, key casing, order	utils.py	NOT_PORTED	value + identity snapshot
+requests.utils	parse_header_links	function	(value) -> list[dict[str, str]]	Preserve loose parsing, ordering, malformed parameter stop	utils.py	NOT_PORTED	unchanged + differential corpus
+requests.utils	guess_json_utf	function	(data) -> str | None	Preserve BOM/null detection from first four bytes	utils.py	NOT_PORTED	unchanged exhaustive prefix corpus
+requests.utils	prepend_scheme_if_needed	function	(url, new_scheme) -> str	Preserve legacy netloc/path swap and auth reconstruction	utils.py	NOT_PORTED	unchanged + differential URI corpus
+requests.utils	get_auth_from_url	function	(url) -> (username, password)	Preserve unquote and empty-string fallbacks	utils.py	NOT_PORTED	unchanged + differential URI corpus
+requests.utils	check_header_validity	function	(header) -> None	Preserve accepted types, validation order, exception messages	utils.py	NOT_PORTED	header fuzz/differential tests
+requests.utils	urldefragauth	function	(url) -> str	Preserve fragment/auth removal and legacy path swap	utils.py	NOT_PORTED	unchanged + differential URI corpus
+requests.utils	rewind_body	function	(prepared_request) -> None	Preserve seek conditions, OSError mapping, messages	utils.py	NOT_PORTED	body protocol tests
+requests.compat	urllib3_version	reexport	urllib3.__version__	Preserve exact value and import timing	compat.py	NOT_PORTED	import/value snapshot
+requests.compat	is_urllib3_1	value	bool with fallback True	Preserve version parse and fallback behavior	compat.py	NOT_PORTED	subprocess monkeypatch tests
+requests.compat	chardet	module selection	chardet else charset_normalizer else None	Preserve preference and module identity	compat.py	NOT_PORTED	dependency matrix subprocess tests
+requests.compat	is_py2	value	bool	Preserve current value and existence	compat.py	NOT_PORTED	value snapshot
+requests.compat	is_py3	value	bool	Preserve current value and existence	compat.py	NOT_PORTED	value snapshot
+requests.compat	has_simplejson	value	bool	Preserve optional dependency resolution	compat.py	NOT_PORTED	with/without simplejson tests
+requests.compat	json	module reexport	simplejson or stdlib json	Preserve selected module identity	compat.py	NOT_PORTED	dependency matrix identity tests
+requests.compat	JSONDecodeError	class reexport	selected decoder error	Preserve class identity	compat.py	NOT_PORTED	dependency matrix identity tests
+requests.compat	OrderedDict	reexport	collections.OrderedDict	Preserve object identity	compat.py	NOT_PORTED	import identity test
+requests.compat	Callable	reexport	collections.abc.Callable	Preserve object identity	compat.py	NOT_PORTED	import identity test
+requests.compat	Mapping	reexport	collections.abc.Mapping	Preserve object identity	compat.py	NOT_PORTED	import identity test
+requests.compat	MutableMapping	reexport	collections.abc.MutableMapping	Preserve object identity	compat.py	NOT_PORTED	import identity test
+requests.compat	cookielib	reexport	http.cookiejar module	Preserve module identity	compat.py	NOT_PORTED	import identity test
+requests.compat	Morsel	reexport	http.cookies.Morsel	Preserve class identity	compat.py	NOT_PORTED	import identity test
+requests.compat	StringIO	reexport	io.StringIO	Preserve class identity	compat.py	NOT_PORTED	import identity test
+requests.compat	urllib.parse reexports	reexports	quote, quote_plus, unquote, unquote_plus, urldefrag, urlencode, urljoin, urlparse, urlsplit, urlunparse	Preserve every function identity	compat.py	NOT_PORTED	import identity snapshot
+requests.compat	urllib.request reexports	reexports	getproxies, getproxies_environment, parse_http_list, proxy_bypass, proxy_bypass_environment	Preserve every function identity and platform availability	compat.py	NOT_PORTED	import identity snapshot
+requests.compat	builtin_str	reexport	str	Preserve identity	compat.py	NOT_PORTED	identity test
+requests.compat	str	reexport	builtins.str	Preserve identity	compat.py	NOT_PORTED	identity test
+requests.compat	bytes	reexport	builtins.bytes	Preserve identity	compat.py	NOT_PORTED	identity test
+requests.compat	basestring	legacy tuple	(str, bytes)	Preserve tuple values/order	compat.py	NOT_PORTED	value snapshot
+requests.compat	numeric_types	legacy tuple	(int, float)	Preserve tuple values/order	compat.py	NOT_PORTED	value snapshot
+requests.compat	integer_types	legacy tuple	(int,)	Preserve tuple values	compat.py	NOT_PORTED	value snapshot
+requests.packages	urllib3	module alias	requests.packages.urllib3 is urllib3	Preserve package and loaded-submodule identities	packages.py	NOT_PORTED	recursive sys.modules identity tests
+requests.packages	idna	module alias	requests.packages.idna is idna	Preserve package and loaded-submodule identities	packages.py	NOT_PORTED	recursive sys.modules identity tests
+requests.packages	chardet	module alias	selected detector under chardet and real name	Preserve both alias families and loaded-submodule identities	packages.py	NOT_PORTED	dependency matrix identity tests
+requests.certs	where	reexport	certifi.where	Preserve function identity and script output	certs.py	NOT_PORTED	import identity + CLI test
+requests.help	info	function	() -> dict[str, Any]	Preserve keys, nested shapes, optional dependency values, SSL formatting	help.py	NOT_PORTED	unchanged + dependency matrix snapshots
+requests.help	main	function	()	Preserve sorted indented JSON to stdout	help.py	NOT_PORTED	CLI snapshot
+requests.help	module CLI	entry point	python -m requests.help	Preserve executable behavior	help.py	NOT_PORTED	subprocess CLI test
+cross-cutting	call signatures	protocol	inspect.signature-visible Python callables	Preserve positional-only, keyword, duplicate, missing, and unexpected argument errors	all public callables	NOT_PORTED	generated signature/call-error snapshot
+cross-cutting	module public namespaces	protocol	all names from dir() and importable retained module paths	Preserve contractual names plus incidental non-underscore reexports and their identities	all 19 frozen source modules	NOT_PORTED	generated namespace and identity snapshot with reviewed exclusions
+cross-cutting	public mutable attributes	protocol	instance __dict__, assignment, deletion where allowed	Preserve mutation visibility before subsequent operations	models.py/sessions.py/adapters.py/auth.py	NOT_PORTED	generated attribute mutation corpus
+cross-cutting	subclassing and monkeypatching	extension protocol	Request, PreparedRequest, Response, Session, adapters, auth, structures	Preserve Python method dispatch; exact-type fast paths only	public classes	NOT_PORTED	subclass/monkeypatch matrix
+cross-cutting	module-global monkeypatching	extension protocol	behavior-sensitive helper/module/constant globals resolved at call time	Inventory every translated callable's global dependencies; changed globals must affect behavior or select Python fallback	all translated Python callables	NOT_PORTED	generated dependency inventory + one replacement-effect test per global
+cross-cutting	HTTPAdapter visible/shadow authority	extension protocol	real urllib3-visible state plus binding-owned Rust side table	Preserve direct public methods, Retry/PoolManager identities, pickle, mutations, and pristine-only Rust send	adapters.py	NOT_PORTED	state identity/mutation/pickle/fast-path/fallback matrix
+cross-cutting	custom adapters	extension protocol	Session.mount(prefix, adapter) with send/close	Preserve object identity, kwargs, longest-prefix dispatch	sessions.py/adapters.py	NOT_PORTED	instrumented custom adapter corpus
+cross-cutting	custom auth	extension protocol	callable(PreparedRequest) -> PreparedRequest	Preserve arbitrary callable, state replacement, exceptions	models.py/auth.py	NOT_PORTED	instrumented callback corpus
+cross-cutting	response hooks	extension protocol	callable(Response, **kwargs) -> Response | None	Preserve order, replacement, kwargs, exceptions	hooks.py/sessions.py	NOT_PORTED	instrumented callback corpus
+cross-cutting	file-like bodies	extension protocol	len/fileno/tell/seek/read/mode and dynamic proxies	Preserve probe/read timing, cursor, warnings, exceptions	utils.py/models.py	NOT_PORTED	instrumented protocol corpus
+cross-cutting	Python body cursor values	extension protocol	arbitrary tell() result stored; PreparedRequest rewind accepts only int; digest passes any non-None value	Preserve exact objects without integer narrowing and exact UnrewindableBodyError gate	models.py/utils.py/auth.py	NOT_PORTED	negative/huge/bool/non-int cursor identity and seek-argument tests
+cross-cutting	iterable bodies	extension protocol	__iter__ yielding bytes/text	Preserve lazy iteration, chunking, errors, non-rewindability	models.py/adapters.py	NOT_PORTED	instrumented stream corpus
+cross-cutting	Python files multipart	extension protocol	files= file-like objects are read eagerly	Preserve full buffering and read/exception timing; do not convert to streaming multipart	models.py:_encode_files	NOT_PORTED	instrumented multipart read-order/error corpus
+cross-cutting	external CookieJar	extension protocol	http.cookiejar-compatible object and policy	Preserve identity, callbacks, redirects, pickle behavior	cookies.py/sessions.py	NOT_PORTED	custom policy/jar corpus
+cross-cutting	Python cookie authority	extension protocol	RequestsCookieJar and inherited directly mutable _cookies hierarchy	Python jar is authoritative; Rust snapshots/writeback occur on origin thread; resnapshot after callbacks/direct mutation	cookies.py/models.py/sessions.py	NOT_PORTED	direct hierarchy mutation + hook/policy mutation + writeback/no-lost-update tests
+cross-cutting	raw response	extension protocol	file-like object with stream/read/close/release_conn	Preserve built-in wrapper protocol; custom raw exact identity; explicit close callbacks; no added callbacks on Response drop	models.py/adapters.py	NOT_PORTED	instrumented raw identity/read/explicit-close/drop callback corpus
+cross-cutting	pickling	protocol	Response, Session, HTTPAdapter, RequestsCookieJar, JSONDecodeError	Preserve state shape, side effects, inheritance, roundtrip behavior	multiple modules	NOT_PORTED	cross-version pickle corpus
+cross-cutting	context managers	protocol	Session, Response, atomic_open	Preserve enter return, exit cleanup, exception propagation	multiple modules	NOT_PORTED	instrumented context tests
+cross-cutting	warnings	protocol	category, message, count, stack behavior, filters	Preserve all observable warning behavior	multiple modules	NOT_PORTED	warning snapshot matrix
+cross-cutting	Python user exceptions	protocol	hooks, auth, adapters, bodies, cookie policies	Preserve object identity and traceback; do not wrap	dynamic boundaries	NOT_PORTED	sentinel exception identity tests
+cross-cutting	network interpreter release	concurrency protocol	Python threads progress during DNS/connect/read/write waits	Release the interpreter for Rust waits; reacquire only for Python operations	approved design	NOT_PORTED	multithreaded progress tests
+cross-cutting	Python callback thread affinity	concurrency protocol	auth, hooks, adapters, body protocols, cookie policies, JSON/detectors, clocks, module globals	Run on the OS thread/interpreter that entered synchronous Requests; support nested Requests calls	approved design + frozen synchronous call flow	NOT_PORTED	thread identity + threading.local + nested-call action-pump tests
+cross-cutting	Python signal interruption	concurrency protocol	KeyboardInterrupt/BaseException during a hung synchronous wait	Wake/check signals on origin thread, cancel future, clean non-EOF lease, propagate original exception	frozen Python synchronous behavior + approved bridge	NOT_PORTED	hung connect/read/write interruption and cleanup tests
+cross-cutting	post-fork runtime lifecycle	concurrency protocol	import-before-fork and idle-session-before-fork	Characterize oracle; child invalidates inherited driver/pools and lazily creates process-local state without harming parent	frozen oracle characterization gate	NOT_PORTED	POSIX differential fork tests + PID/at-fork resource tests
+cross-cutting	close and reuse	resource protocol	Session.close, HTTPAdapter.close, Response close/drop/cancel	Session/adapter clear pool generations and remain reusable; only clean EOF returns a connection; active stream stays readable but cannot rejoin cleared generation; driver is independent	multiple modules	NOT_PORTED	repeated-close, close-then-reuse, isolation, active-stream-close, EOF/partial/error lease tests
+cross-cutting	free-threaded Python	concurrency protocol	CPython 3.14t supported without GIL assumptions	Use explicit synchronization rather than relying on a process-wide GIL	current CI matrix	NOT_PORTED	free-threaded wheel + race tests
+cross-cutting	platform matrix	distribution	CPython 3.10-3.15-dev, 3.14t, PyPy 3.11; Linux/macOS/Windows	Preserve existing exclusions only	.github/workflows/run-tests.yml	NOT_PORTED	source/wheel CI matrix
+cross-cutting	distribution surface	distribution	metadata, dependencies/extras, py.typed, licenses, sdist, compiled wheels, editable install, publish artifacts	Preserve frozen Python metadata/package data and install workflows while allowing required native wheel fan-out	pyproject.toml + MANIFEST.in + publish workflow + package tree	NOT_PORTED	artifact metadata/file snapshots + fresh wheel/sdist/editable install tests
+cross-cutting	default backend	architecture	built-in HTTPAdapter sends through Rust	Do not route default network I/O through urllib3	approved design	NOT_PORTED	transport instrumentation/import boundary test
