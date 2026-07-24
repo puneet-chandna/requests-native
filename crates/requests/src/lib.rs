@@ -6,11 +6,16 @@ mod body;
 mod error;
 mod models;
 pub mod structures;
+pub mod utils;
 
 pub use body::BodySource;
 pub use error::{Error, ErrorKind, Result};
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
-pub use models::{Request, RequestBuilder};
+pub use models::{
+    HeaderInput, HeaderPart, HeaderPreparationError, InvalidHeaderPart, PreparedHeader, Request,
+    RequestBuilder, UrlPreparationError, append_url_params, is_non_http_url, prepare_headers,
+    prepare_method, prepare_method_bytes, prepare_url, url_is_native_safe,
+};
 
 #[cfg(feature = "platform-smoke")]
 #[allow(dead_code)] // These probes are compiled by the matrix before transport implementation.

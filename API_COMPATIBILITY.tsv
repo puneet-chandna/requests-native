@@ -140,7 +140,7 @@ requests.models	CONTENT_CHUNK_SIZE	constant	10240	Preserve exact content bufferi
 requests.models	ITER_CHUNK_SIZE	constant	512	Preserve exact utility default	models.py	NOT_PORTED	value snapshot
 requests.models	RequestEncodingMixin	class	mixin with url and encoding helpers	Preserve subclass usability	models.py	NOT_PORTED	subclass protocol tests
 requests.models	RequestEncodingMixin.path_url	property	() -> str	Preserve empty path and query behavior	models.py	NOT_PORTED	differential URL corpus
-requests.models	RequestEncodingMixin._encode_params	compatibility staticmethod	(data) -> str | bytes | file-like	Preserve string/bytes/file identity and ordered iterable encoding	models.py	NOT_PORTED	differential parameter corpus
+requests.models	RequestEncodingMixin._encode_params	compatibility staticmethod	(data) -> str | bytes | file-like	Preserve string/bytes/file identity and ordered iterable encoding	models.py	IN_PROGRESS	Task 7 core query encoding + exact-safe/fallback differential parameter corpus; public Python wiring pending
 requests.models	RequestEncodingMixin._encode_files	compatibility staticmethod	(files, data) -> (body, content_type)	Preserve tuple shapes, eager file read/buffering, read/exception timing, multipart semantics	models.py	NOT_PORTED	differential multipart corpus with instrumented files
 requests.models	RequestHooksMixin	class	mixin requiring hooks mapping	Preserve subclass usability	models.py	NOT_PORTED	subclass protocol tests
 requests.models	RequestHooksMixin.register_hook	method	(event, hook)	Preserve event validation, callable/iterable filtering, order	models.py	NOT_PORTED	differential callback tests
@@ -156,9 +156,9 @@ requests.models	PreparedRequest public attributes	attributes	method, url, header
 requests.models	PreparedRequest.prepare	method	(method=None, url=None, headers=None, files=None, data=None, params=None, auth=None, cookies=None, hooks=None, json=None)	Preserve stage order and return None	models.py	NOT_PORTED	signature + ordered instrumentation
 requests.models	PreparedRequest.__repr__	method	() -> "<PreparedRequest [METHOD]>"	Preserve exact formatting	models.py	NOT_PORTED	repr snapshot
 requests.models	PreparedRequest.copy	method	() -> PreparedRequest	Preserve headers/cookies copy and body/hooks sharing	models.py	NOT_PORTED	identity graph tests
-requests.models	PreparedRequest.prepare_method	method	(method)	Preserve uppercase and native-string conversion	models.py	NOT_PORTED	differential method corpus
-requests.models	PreparedRequest.prepare_url	method	(url, params)	Preserve non-HTTP bypass, URL validation, IDNA, query order, fragments	models.py	NOT_PORTED	differential URL corpus
-requests.models	PreparedRequest.prepare_headers	method	(headers)	Preserve iteration, validation order, native names, values	models.py	NOT_PORTED	differential header corpus
+requests.models	PreparedRequest.prepare_method	method	(method)	Preserve uppercase and native-string conversion	models.py	IN_PROGRESS	Task 7 Rust-derived exact-safe trial + dynamic/global fallback and differential method corpus; public Python wiring pending
+requests.models	PreparedRequest.prepare_url	method	(url, params)	Preserve non-HTTP bypass, URL validation, IDNA, query order, fragments	models.py	IN_PROGRESS	Task 7 url-parser exact-safe trial + conservative lossy-case fallback and differential URL corpus; public Python wiring pending
+requests.models	PreparedRequest.prepare_headers	method	(headers)	Preserve iteration, validation order, native names, values	models.py	IN_PROGRESS	Task 7 ordered Rust preparation + validation/partial-state/dynamic fallback differential corpus; public Python wiring pending
 requests.models	PreparedRequest.prepare_body	method	(data, files, json=None)	Preserve body selection, lazy iterator/file streams, eager files= multipart, errors, headers, and exact rewind sentinel/cursor	models.py	NOT_PORTED	differential body corpus + read/tell/seek instrumentation
 requests.models	PreparedRequest.prepare_content_length	method	(body)	Preserve length discovery and method-specific zero length	models.py	NOT_PORTED	differential length corpus
 requests.models	PreparedRequest.prepare_auth	method	(auth, url="")	Preserve URL auth, tuple basic auth, arbitrary callable, state update, length	models.py	NOT_PORTED	differential auth corpus
@@ -286,8 +286,8 @@ requests.utils	stream_decode_response_unicode	function	(iterator, response) -> i
 requests.utils	iter_slices	function	(string, slice_length) -> iterator	Preserve text/bytes/None and lazy slicing	utils.py	NOT_PORTED	unchanged + type corpus
 requests.utils	get_unicode_from_response	function	(response) -> str | bytes | None	Preserve header encoding and fallback behavior	utils.py	NOT_PORTED	differential encoding corpus
 requests.utils	UNRESERVED_SET	constant	frozenset of RFC 3986 unreserved characters	Preserve exact immutable set and module export	utils.py	NOT_PORTED	value snapshot
-requests.utils	unquote_unreserved	function	(uri) -> str	Preserve invalid escape errors and unreserved-only decoding	utils.py	NOT_PORTED	unchanged + differential URI corpus
-requests.utils	requote_uri	function	(uri) -> str	Preserve unquote/quote safe sets and invalid-percent fallback	utils.py	NOT_PORTED	unchanged + differential URI corpus
+requests.utils	unquote_unreserved	function	(uri) -> str	Preserve invalid escape errors and unreserved-only decoding	utils.py	IN_PROGRESS	Task 7 Python-free URI core unit tests + preparation differential corpus; public Python wiring pending
+requests.utils	requote_uri	function	(uri) -> str	Preserve unquote/quote safe sets and invalid-percent fallback	utils.py	IN_PROGRESS	Task 7 Python-free URI core unit tests + malformed-percent differential corpus; public Python wiring pending
 requests.utils	address_in_network	function	(ip, net) -> bool	Preserve IPv4 packing and mask behavior	utils.py	NOT_PORTED	unchanged + invalid corpus
 requests.utils	dotted_netmask	function	(mask) -> str	Preserve integer mask conversion	utils.py	NOT_PORTED	unchanged boundary tests
 requests.utils	is_ipv4_address	function	(string_ip) -> bool	Preserve socket parse behavior	utils.py	NOT_PORTED	unchanged + platform tests
@@ -303,7 +303,7 @@ requests.utils	parse_header_links	function	(value) -> list[dict[str, str]]	Prese
 requests.utils	guess_json_utf	function	(data) -> str | None	Preserve BOM/null detection from first four bytes	utils.py	NOT_PORTED	unchanged exhaustive prefix corpus
 requests.utils	prepend_scheme_if_needed	function	(url, new_scheme) -> str	Preserve legacy netloc/path swap and auth reconstruction	utils.py	NOT_PORTED	unchanged + differential URI corpus
 requests.utils	get_auth_from_url	function	(url) -> (username, password)	Preserve unquote and empty-string fallbacks	utils.py	NOT_PORTED	unchanged + differential URI corpus
-requests.utils	check_header_validity	function	(header) -> None	Preserve accepted types, validation order, exception messages	utils.py	NOT_PORTED	header fuzz/differential tests
+requests.utils	check_header_validity	function	(header) -> None	Preserve accepted types, validation order, exception messages	utils.py	IN_PROGRESS	Task 7 Python-free text/byte validators + exact-error/dynamic-fallback differential tests; public Python wiring pending
 requests.utils	urldefragauth	function	(url) -> str	Preserve fragment/auth removal and legacy path swap	utils.py	NOT_PORTED	unchanged + differential URI corpus
 requests.utils	rewind_body	function	(prepared_request) -> None	Preserve seek conditions, OSError mapping, messages	utils.py	NOT_PORTED	body protocol tests
 requests.compat	urllib3_version	reexport	urllib3.__version__	Preserve exact value and import timing	compat.py	NOT_PORTED	import/value snapshot

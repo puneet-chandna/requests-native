@@ -25,3 +25,4 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 tokio = { version = "1", features = ["io-util", "rt-multi-thread", "sync", "time"], optional = true }
+url = "2"
