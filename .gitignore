@@ -16,6 +16,8 @@ requests.egg-info/
 env/
 .venv/
 .worktrees/
+/target/
+src/requests/_requests_rust.*
 .eggs/
 .tox/
 .pytest_cache/

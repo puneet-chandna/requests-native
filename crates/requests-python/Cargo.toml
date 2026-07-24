@@ -1,0 +1,16 @@
+[package]
+name = "requests-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "_requests_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true, features = ["extension-module"] }
+requests = { path = "../requests" }
+
+[lints]
+workspace = true

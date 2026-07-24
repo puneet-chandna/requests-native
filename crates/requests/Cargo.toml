@@ -1,0 +1,23 @@
+[package]
+name = "requests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+platform-smoke = [
+    "dep:hyper-rustls",
+    "dep:hyper-util",
+    "dep:rustls",
+    "dep:tokio",
+]
+
+[dependencies]
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio = { version = "1", features = ["io-util"], optional = true }

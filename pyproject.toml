@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.13,<2"]
+build-backend = "maturin"
 
 [project]
 name = "requests"
@@ -64,6 +64,8 @@ test = [
     "pytest-mock",
     "pytest-xdist",
     "pytest>=3",
+    "PyYAML>=6",
+    "tomli>=2; python_version < '3.11'",
     "trustme",
 ]
 typecheck = [
@@ -74,14 +76,11 @@ typecheck = [
     "PyOpenSSL",
 ]
 
-[tool.setuptools]
-license-files = ["LICENSE", "NOTICE"]
-
-[tool.setuptools.dynamic]
-version = {attr = "requests.__version__.__version__"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.maturin]
+manifest-path = "crates/requests-python/Cargo.toml"
+python-source = "src"
+module-name = "requests._requests_rust"
+bindings = "pyo3"
 
 [tool.ruff]
 target-version = "py310"
