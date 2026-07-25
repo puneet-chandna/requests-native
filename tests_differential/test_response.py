@@ -4713,3 +4713,233 @@ result = {
         ["content->iter_content", 10240, False, True],
         ["iter_lines->iter_content", 11, False, True],
     ]
+
+
+def test_preimport_all_response_aliases_reject_descriptor_copy() -> None:
+    state = _run_rewrite_only(
+        """
+import sys
+
+
+target = OriginalResponse.text.fget.__code__
+seen = []
+
+
+def profile(frame, event, argument):
+    if event == "call" and frame.f_code is target:
+        seen.append(frame.f_code.co_name)
+
+
+def text_value(response_type, value):
+    subject = response_type()
+    subject._content = value
+    subject._content_consumed = True
+    subject.encoding = "ascii"
+    return response_text_call(subject)
+
+
+sys.setprofile(profile)
+try:
+    copied_value = text_value(CopiedResponse, b"copied")
+    copied_seen = list(seen)
+    for module, alias in ReplacedResponseAliases:
+        module.__dict__[alias] = OriginalResponse
+
+    restored_aliases = all(
+        module.__dict__.get(alias) is OriginalResponse
+        for module, alias in ReplacedResponseAliases
+    )
+    stale_aliases = sorted(
+        f"{module_name}.{alias}"
+        for module_name, module in tuple(sys.modules.items())
+        if (
+            module is not None
+            and (
+                module_name == "requests"
+                or module_name.startswith("requests.")
+            )
+        )
+        for alias, value in tuple(module.__dict__.items())
+        if value is CopiedResponse
+    )
+
+    if _requests_rust is None:
+        assert copied_value == "copied"
+        assert copied_seen == ["text"]
+        assert restored_aliases
+        assert stale_aliases == []
+        result = {"target": "oracle-control"}
+    else:
+        restored_value = text_value(OriginalResponse, b"restored")
+        restored_seen = seen[len(copied_seen):]
+        result = {
+            "target": "rewrite",
+            "aliases": ReplacedResponseAliasNames,
+            "copied_value": copied_value,
+            "copied_seen": copied_seen,
+            "restored_value": restored_value,
+            "restored_seen": restored_seen,
+            "restored_aliases": restored_aliases,
+            "stale_aliases": stale_aliases,
+        }
+finally:
+    sys.setprofile(None)
+    for module, alias in ReplacedResponseAliases:
+        module.__dict__[alias] = OriginalResponse
+""",
+        before_extension="""
+import sys
+
+
+OriginalResponse = Response
+copied_namespace = {
+    name: value
+    for name, value in OriginalResponse.__dict__.items()
+    if name not in {"__dict__", "__weakref__"}
+}
+CopiedResponse = type("Response", (), copied_namespace)
+ReplacedResponseAliases = []
+for module_name, module in tuple(sys.modules.items()):
+    if (
+        module is None
+        or (
+            module_name != "requests"
+            and not module_name.startswith("requests.")
+        )
+    ):
+        continue
+    for alias, value in tuple(module.__dict__.items()):
+        if value is OriginalResponse:
+            ReplacedResponseAliases.append((module, alias))
+            module.__dict__[alias] = CopiedResponse
+
+ReplacedResponseAliasNames = sorted(
+    f"{module.__name__}.{alias}"
+    for module, alias in ReplacedResponseAliases
+)
+assert not any(
+    value is OriginalResponse
+    for module_name, module in tuple(sys.modules.items())
+    if (
+        module is not None
+        and (
+            module_name == "requests"
+            or module_name.startswith("requests.")
+        )
+    )
+    for value in tuple(module.__dict__.values())
+)
+""",
+    )
+
+    assert state["target"] == "rewrite"
+    assert set(state["aliases"]) >= {
+        "requests.Response",
+        "requests.adapters.Response",
+        "requests.api.Response",
+        "requests.models.Response",
+        "requests.sessions.Response",
+    }
+    assert state["copied_value"] == "copied"
+    assert state["copied_seen"] == ["text"]
+    assert state["restored_value"] == "restored"
+    assert state["restored_seen"] == []
+    assert state["restored_aliases"] is True
+    assert state["stale_aliases"] == []
+
+
+def test_response_function_builtins_provenance_is_live() -> None:
+    state = _run_rewrite_only(
+        """
+import sys
+
+
+target = Response.text.fget.__code__
+builtins_mapping = Response.text.fget.__builtins__
+original_str = builtins_mapping["str"]
+events = []
+seen = []
+
+
+def patched_str(value, encoding=None, errors=None):
+    events.append([
+        value == b"patched",
+        encoding,
+        errors,
+        same_thread(),
+    ])
+    return "patched-text"
+
+
+def profile(frame, event, argument):
+    if event == "call" and frame.f_code is target:
+        seen.append(frame.f_code.co_name)
+
+
+patched_subject = Response()
+patched_subject._content = b"patched"
+patched_subject._content_consumed = True
+patched_subject.encoding = "ascii"
+
+sys.setprofile(profile)
+builtins_mapping["str"] = patched_str
+try:
+    patched_value = response_text_call(patched_subject)
+finally:
+    builtins_mapping["str"] = original_str
+    sys.setprofile(None)
+
+patched_seen = list(seen)
+assert patched_value == "patched-text"
+assert patched_seen == ["text"]
+assert events == [
+    [
+        True,
+        "ascii",
+        "replace",
+        True,
+    ]
+]
+
+if _requests_rust is None:
+    result = {"target": "oracle-control"}
+else:
+    restored_subject = Response()
+    restored_subject._content = b"restored"
+    restored_subject._content_consumed = True
+    restored_subject.encoding = "ascii"
+
+    sys.setprofile(profile)
+    try:
+        restored_value = response_text_call(restored_subject)
+    finally:
+        sys.setprofile(None)
+
+    result = {
+        "target": "rewrite",
+        "patched_value": patched_value,
+        "patched_seen": patched_seen,
+        "events": events,
+        "restored_value": restored_value,
+        "restored_seen": seen[len(patched_seen):],
+        "builtin_restored": builtins_mapping["str"] is original_str,
+    }
+"""
+    )
+
+    assert state == {
+        "target": "rewrite",
+        "patched_value": "patched-text",
+        "patched_seen": ["text"],
+        "events": [
+            [
+                True,
+                "ascii",
+                "replace",
+                True,
+            ]
+        ],
+        "restored_value": "restored",
+        "restored_seen": [],
+        "builtin_restored": True,
+    }
