@@ -1132,6 +1132,44 @@ finally:
     )
 
 
+def test_prepare_url_basestring_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import requests.models as models
+from requests.models import PreparedRequest
+
+
+original_basestring = models.basestring
+models.basestring = ()
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url(
+                "http://example.com/path",
+                {"x": "ab"},
+            )
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/path",
+                {"x": "ab"},
+            )
+        ),
+    )
+finally:
+    models.basestring = original_basestring
+"""
+    )
+
+
 def test_prepare_url_parameter_builtin_and_transitive_shadows_delegate() -> None:
     _assert_matches_oracle(
         """
@@ -1269,6 +1307,47 @@ try:
             subject,
             "http://EXAMPLE.com/path",
             None,
+        ),
+    )
+finally:
+    url_utils._IPV4_RE = original
+"""
+    )
+
+
+def test_prepare_url_nested_nonfunction_global_replaced_before_extension_import() -> (
+    None
+):
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import re
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+original = url_utils._IPV4_RE
+url_utils._IPV4_RE = re.compile(".*")
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url(
+                "http://EXAMPLE.com/path",
+                None,
+            )
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://EXAMPLE.com/path",
+                None,
+            )
         ),
     )
 finally:
@@ -1831,6 +1910,47 @@ finally:
     del structures._task7_effects
     del structures._task7_models
     del structures._task7_accept
+"""
+    )
+
+
+def test_prepare_headers_validators_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import re
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+original = utils._HEADER_VALIDATORS_STR
+utils._HEADER_VALIDATORS_STR = (
+    re.compile(".*"),
+    re.compile(".*"),
+)
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_headers({"Bad": " leading"})
+            if _requests_rust is None
+            else _requests_rust._prepare_headers_trial(
+                subject,
+                {"Bad": " leading"},
+            )
+        ),
+    )
+    result["headers"] = (
+        None if subject.headers is None else list(subject.headers.items())
+    )
+finally:
+    utils._HEADER_VALIDATORS_STR = original
 """
     )
 
