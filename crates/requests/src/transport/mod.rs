@@ -22,23 +22,43 @@ pub(crate) struct TransportResponse {
 }
 
 pub(crate) struct ConnectionDriver {
-    task: JoinHandle<Result<()>>,
+    task: Option<JoinHandle<Result<()>>>,
 }
 
 impl ConnectionDriver {
     fn spawn(task: impl Future<Output = Result<()>> + Send + 'static) -> Self {
         Self {
-            task: tokio::spawn(task),
+            task: Some(tokio::spawn(task)),
         }
     }
 
-    pub(crate) fn task_mut(&mut self) -> &mut JoinHandle<Result<()>> {
-        &mut self.task
+    pub(crate) fn is_running(&self) -> bool {
+        self.task.is_some()
+    }
+
+    pub(crate) fn task_mut(&mut self) -> Option<&mut JoinHandle<Result<()>>> {
+        self.task.as_mut()
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    ) -> Result<()> {
+        self.task.take();
+        match result {
+            Ok(result) => result,
+            Err(error) => Err(Error::connection(error)),
+        }
     }
 
     pub(crate) async fn abort_and_wait(&mut self) -> Result<()> {
-        self.task.abort();
-        match (&mut self.task).await {
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
+        task.abort();
+        let result = task.await;
+        self.task.take();
+        match result {
             Ok(result) => result,
             Err(error) if error.is_cancelled() => Ok(()),
             Err(error) => Err(Error::connection(error)),
@@ -48,7 +68,9 @@ impl ConnectionDriver {
 
 impl Drop for ConnectionDriver {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
     }
 }
 
@@ -79,24 +101,29 @@ impl Transport {
 
         let sending = sender.send_request(outgoing);
         tokio::pin!(sending);
-        let (response, driver_pending) = tokio::select! {
-            biased;
-            driver_result = driver.task_mut() => {
-                let error = match driver_result {
-                    Ok(Ok(())) => Err(Error::connection_stopped()),
-                    Ok(Err(error)) => Err(error),
-                    Err(error) => Err(Error::connection(error)),
-                };
-                (error, false)
+        let response = loop {
+            if !driver.is_running() {
+                break sending.as_mut().await.map_err(Error::send);
             }
-            result = &mut sending => (result.map_err(Error::send), true),
+
+            let Some(driver_task) = driver.task_mut() else {
+                continue;
+            };
+            tokio::select! {
+                biased;
+                result = &mut sending => break result.map_err(Error::send),
+                driver_result = driver_task => {
+                    match driver.finish(driver_result) {
+                        Ok(()) => continue,
+                        Err(error) => break Err(error),
+                    }
+                }
+            }
         };
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                if driver_pending {
-                    drop(driver.abort_and_wait().await);
-                }
+                driver.abort_and_wait().await?;
                 return Err(error);
             }
         };

@@ -15,6 +15,8 @@ const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const SCRIPTED_RESPONSE: &[u8] =
     b"HTTP/1.1 201 Created\r\nx-fixture: direct\r\nContent-Length: 7\r\n\r\ndirect\n";
+const CONNECTION_CLOSE_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
 
 #[derive(Debug)]
 struct Observation {
@@ -30,6 +32,10 @@ struct ScriptedServer {
 
 impl ScriptedServer {
     fn spawn() -> Self {
+        Self::spawn_with_response(SCRIPTED_RESPONSE)
+    }
+
+    fn spawn_with_response(response: &'static [u8]) -> Self {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .expect("bind loopback fixture");
         listener
@@ -37,7 +43,7 @@ impl ScriptedServer {
             .expect("make fixture listener nonblocking");
         let address = listener.local_addr().expect("read fixture address");
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        let worker = thread::spawn(move || serve(listener, &shutdown_rx));
+        let worker = thread::spawn(move || serve(listener, &shutdown_rx, response));
 
         Self {
             address,
@@ -82,7 +88,11 @@ fn join_worker(
         .map_err(|_| "fixture worker panicked".to_owned())?
 }
 
-fn serve(listener: TcpListener, shutdown: &Receiver<()>) -> Result<Observation, String> {
+fn serve(
+    listener: TcpListener,
+    shutdown: &Receiver<()>,
+    response: &[u8],
+) -> Result<Observation, String> {
     let deadline = Instant::now() + ACCEPT_TIMEOUT;
     let (mut stream, _) = loop {
         match listener.accept() {
@@ -112,7 +122,7 @@ fn serve(listener: TcpListener, shutdown: &Receiver<()>) -> Result<Observation, 
 
     let mut request_bytes = read_through_request_head(&mut stream)?;
     stream
-        .write_all(SCRIPTED_RESPONSE)
+        .write_all(response)
         .map_err(|error| format!("write scripted response: {error}"))?;
     stream
         .flush()
@@ -304,4 +314,62 @@ fn get_over_new_plain_connection() {
         observation.request_bytes,
         format!("GET /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\n\r\n").into_bytes()
     );
+}
+
+#[test]
+fn complete_connection_close_response_is_successful() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build caller-owned Tokio runtime");
+
+    for iteration in 0..8 {
+        let server = ScriptedServer::spawn_with_response(CONNECTION_CLOSE_RESPONSE);
+        let url = server.url();
+        let authority = server.authority();
+        let host = HeaderValue::from_bytes(authority.as_bytes()).expect("valid loopback Host");
+
+        let exchange = runtime.block_on(async {
+            tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+                let client = Client::new()?;
+                let response = client
+                    .get(&url)
+                    .header(HeaderName::from_static("host"), host)
+                    .send()
+                    .await?;
+                let status = response.status();
+                let connection = response.headers().get("connection").cloned();
+                let body = response.bytes().await?;
+
+                Ok::<_, requests::Error>((status, connection, body))
+            })
+            .await
+        });
+
+        let observation = server.finish();
+        let (status, connection, body) = match exchange {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                panic!("connection-close exchange {iteration} failed: {error}")
+            }
+            Err(error) => {
+                panic!("connection-close exchange {iteration} timed out: {error}")
+            }
+        };
+        let observation = observation.expect("loopback fixture completed");
+
+        assert_eq!(status, StatusCode::OK, "iteration {iteration}");
+        assert_eq!(
+            connection.as_ref().map(HeaderValue::as_bytes),
+            Some(&b"close"[..]),
+            "iteration {iteration}"
+        );
+        assert_eq!(body.as_ref(), b"ok", "iteration {iteration}");
+        assert_eq!(observation.accepted_connections, 1, "iteration {iteration}");
+        assert_eq!(
+            observation.request_bytes,
+            format!("GET /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\n\r\n").into_bytes(),
+            "iteration {iteration}"
+        );
+    }
 }

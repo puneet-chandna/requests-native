@@ -55,31 +55,40 @@ impl Response {
 
         let collection = body.collect();
         tokio::pin!(collection);
-        let mut driver_pending = true;
         let body_result = loop {
+            if !driver.is_running() {
+                break collection
+                    .as_mut()
+                    .await
+                    .map(|collected| collected.to_bytes())
+                    .map_err(Error::response_body);
+            }
+
+            let Some(driver_task) = driver.task_mut() else {
+                continue;
+            };
             tokio::select! {
                 biased;
-                driver_result = driver.task_mut(), if driver_pending => {
-                    driver_pending = false;
-                    match driver_result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => break Err(error),
-                        Err(error) => break Err(Error::connection(error)),
-                    }
-                }
                 result = &mut collection => {
                     break result
                         .map(|collected| collected.to_bytes())
                         .map_err(Error::response_body);
                 }
+                driver_result = driver_task => {
+                    match driver.finish(driver_result) {
+                        Ok(()) => continue,
+                        Err(error) => break Err(error),
+                    }
+                }
             }
         };
 
-        if driver_pending {
+        if driver.is_running() {
             // Once Hyper has collected the complete framed body, this request
-            // succeeded. The biased select above reports any driver failure
-            // ready before body completion; abort-and-wait here only closes
-            // the deliberately non-pooled connection.
+            // succeeded. The body-first select reports driver failure only
+            // while the body is still pending; abort-and-wait here only closes
+            // the deliberately non-pooled connection and cannot override the
+            // completed response.
             drop(driver.abort_and_wait().await);
         }
         let result = body_result;
