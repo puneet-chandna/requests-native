@@ -5,6 +5,7 @@ pub mod blocking;
 mod body;
 mod error;
 mod models;
+mod response;
 pub mod structures;
 pub mod utils;
 
@@ -15,6 +16,10 @@ pub use models::{
     HeaderInput, HeaderPart, HeaderPreparationError, InvalidHeaderPart, PreparedHeader, Request,
     RequestBuilder, UrlPreparationError, append_url_params, is_non_http_url, prepare_headers,
     prepare_method, prepare_method_bytes, prepare_url, url_is_native_safe,
+};
+pub use response::{
+    ResponseCache, ResponseContent, ResponseDecision, ResponseDisposition,
+    ResponseDispositionState, ResponseEvent,
 };
 
 #[cfg(feature = "platform-smoke")]
