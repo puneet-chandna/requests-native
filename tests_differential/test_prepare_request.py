@@ -2165,6 +2165,80 @@ finally:
     )
 
 
+def test_prepare_url_result_type_forged_globals_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+from types import FunctionType
+
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+original = url_utils.Url
+base = original.__mro__[1]
+canonical_code = original.__dict__["__new__"].__func__.__code__
+
+
+class ForgedUrl(base):
+    __module__ = "urllib3.util.url"
+
+
+ForgedUrl.__name__ = "Url"
+ForgedUrl.__qualname__ = "Url"
+
+
+def make_cell(value):
+    def read():
+        return value
+
+    return read.__closure__[0]
+
+
+def forged_super(*args, **kwargs):
+    side_effects.append(["forged-super", args, kwargs])
+    raise RuntimeError("forged super callback")
+
+
+forged_globals = {
+    "__name__": "urllib3.util.url",
+    "__builtins__": {"super": forged_super},
+    "super": forged_super,
+}
+forged_new = FunctionType(
+    canonical_code,
+    forged_globals,
+    "__new__",
+    (None, None, None, None, None, None, None),
+    (make_cell(ForgedUrl),),
+)
+ForgedUrl.__new__ = staticmethod(forged_new)
+url_utils.Url = ForgedUrl
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url("http://example.com/a path", None)
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/a path",
+                None,
+            )
+        ),
+    )
+finally:
+    url_utils.Url = original
+"""
+    )
+
+
 def test_prepare_url_imported_helper_replaced_before_extension_import() -> None:
     _assert_matches_oracle_before_extension_import(
         _PREIMPORT_CAPTURE_HELPER
