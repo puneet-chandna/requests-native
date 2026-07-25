@@ -1322,6 +1322,10 @@ fn known_single_character_is(value: &Bound<'_, PyAny>, expected: &str) -> PyResu
             .is_ok_and(|value| value.len() == 1 && expected.contains(value)))
 }
 
+fn conservative_structural_proof(result: PyResult<bool>) -> PyResult<bool> {
+    Ok(result.unwrap_or(false))
+}
+
 fn known_value_is(
     py: Python<'_>,
     builtins: &Bound<'_, PyModule>,
@@ -1421,7 +1425,7 @@ fn known_value_is(
             else {
                 return Ok(false);
             };
-            known_url_type_is(py, current, new, globals, builtins)
+            conservative_structural_proof(known_url_type_is(py, current, new, globals, builtins))
         }
         KnownValue::RuntimeProtocol {
             module,
@@ -1443,7 +1447,7 @@ fn known_value_is(
             let Some(protocol_hook) = protocol_hook else {
                 return Ok(false);
             };
-            known_runtime_protocol_is(
+            conservative_structural_proof(known_runtime_protocol_is(
                 py,
                 current,
                 module,
@@ -1456,7 +1460,7 @@ fn known_value_is(
                 typing_globals,
                 abc_module,
                 abc_dump,
-            )
+            ))
         }
         KnownValue::ByteQuoterFactory => {
             let Some(KnownCode::ByteQuoterFactory {
@@ -1468,7 +1472,14 @@ fn known_value_is(
             else {
                 return Ok(false);
             };
-            known_byte_quoter_factory_is(py, current, factory, quoter_init, quoter_missing, globals)
+            conservative_structural_proof(known_byte_quoter_factory_is(
+                py,
+                current,
+                factory,
+                quoter_init,
+                quoter_missing,
+                globals,
+            ))
         }
         KnownValue::QuoterType {
             name,
@@ -1482,7 +1493,7 @@ fn known_value_is(
             else {
                 return Ok(false);
             };
-            known_quoter_type_is(
+            conservative_structural_proof(known_quoter_type_is(
                 py,
                 current,
                 globals.bind(py),
@@ -1490,7 +1501,7 @@ fn known_value_is(
                 default_dict_base,
                 init,
                 missing,
-            )
+            ))
         }
         KnownValue::Regex(expected) => known_regex_is(py, current, expected),
         KnownValue::RegexPair(first, second) => {
