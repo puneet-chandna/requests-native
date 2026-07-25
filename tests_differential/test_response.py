@@ -7,13 +7,16 @@ from tests_differential.runner import run_oracle_case, run_rewrite_case
 
 _TRIAL_HELPERS = """
 import gc
+import os
 import threading
 
 from requests import Response
 
 try:
     from requests import _requests_rust
-except ImportError:
+except ImportError as extension_error:
+    if os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "rewrite":
+        raise RuntimeError("rewrite response extension is unavailable") from extension_error
     _requests_rust = None
 
 
@@ -29,6 +32,8 @@ _RESPONSE_TRIAL_SYMBOLS = {
     "_response_pickle_trial",
     "_response_close_trial",
     "_response_drop_trial",
+    "_response_disposition_trial",
+    "_response_lifecycle_trial",
     "_response_fields_snapshot",
 }
 
@@ -228,6 +233,92 @@ def response_drop_call(raw, operation, chunk_size=2):
         gc.collect()
 
 
+def local_response_disposition(events):
+    state = "Open"
+    decision = None
+    decision_count = 0
+    native_lease = True
+    states = [state]
+    dirty_events = {
+        "close",
+        "drop",
+        "read-error",
+        "decode-error",
+        "protocol-error",
+        "cancel",
+        "action-disconnect",
+        "reply-disconnect",
+    }
+    for event in events:
+        if event == "python-exact" and state == "Open":
+            state = "PythonExact"
+            native_lease = False
+        elif state in ("Reusable", "CloseDirty", "PythonExact"):
+            pass
+        elif event == "partial":
+            state = "Partial"
+        elif event == "clean-eof":
+            state = "Reusable"
+            decision = "Reusable"
+            decision_count += 1
+        elif event in dirty_events:
+            state = "CloseDirty"
+            decision = "CloseDirty"
+            decision_count += 1
+        else:
+            raise AssertionError(event)
+        states.append(state)
+    return {
+        "states": states,
+        "final": state,
+        "decision": decision,
+        "decision_count": decision_count,
+        "native_lease": native_lease,
+        "implicit_python_callbacks": 0,
+    }
+
+
+def response_disposition_call(events):
+    if _requests_rust is not None:
+        return _requests_rust._response_disposition_trial(events)
+    return local_response_disposition(events)
+
+
+def response_lifecycle_call(subject, error, phase, audit):
+    if _requests_rust is not None:
+        return _requests_rust._response_lifecycle_trial(
+            subject, error, phase, audit
+        )
+    if phase == "before-poll":
+        audit.update({
+            "queued": 0,
+            "execute": 0,
+            "reply_observed": False,
+            "worker_dropped": True,
+            "raw_actions": 0,
+        })
+    elif phase == "queued-before-dequeue":
+        audit.update({
+            "queued": 1,
+            "execute": 0,
+            "reply_observed": False,
+            "worker_dropped": True,
+            "raw_actions": 0,
+        })
+    elif phase == "reply-observed":
+        next(subject.iter_content(1))
+        audit.update({
+            "queued": 1,
+            "execute": 1,
+            "reply_observed": True,
+            "worker_dropped": True,
+            "raw_actions": 1,
+        })
+    else:
+        raise AssertionError(phase)
+    raise error
+
+
 class ObservedStreamRaw:
     def __init__(self, chunks=(), error=None):
         self.chunks = list(chunks)
@@ -301,6 +392,19 @@ def _run_matching(source: str):
     return _normalize_literal(ast.literal_eval(oracle.observations["result"]["repr"]))
 
 
+def _run_rewrite_only(source: str):
+    case = {"source": dedent(_TRIAL_HELPERS + source)}
+    oracle = run_oracle_case(case)
+    rewrite = run_rewrite_case(case)
+
+    assert oracle.observations["exception"] is None
+    assert oracle.observations["result"]["repr"] == "{'target': 'oracle-control'}"
+    assert oracle.stderr == ""
+    assert rewrite.observations["exception"] is None
+    assert rewrite.stderr == ""
+    return _normalize_literal(ast.literal_eval(rewrite.observations["result"]["repr"]))
+
+
 def _normalize_literal(value):
     if isinstance(value, (list, tuple)):
         return [_normalize_literal(item) for item in value]
@@ -347,6 +451,428 @@ result = states
     assert by_name["fully-consumed-cached"]["content_consumed"] is True
     assert by_name["empty-none"]["content"]["payload"] is None
     assert by_name["empty-none"]["content_consumed"] is True
+
+
+def test_pristine_exact_candidates_avoid_authoritative_response_frames() -> None:
+    state = _run_rewrite_only(
+        """
+if _requests_rust is None:
+    result = {"target": "oracle-control"}
+else:
+    import sys
+
+    targets = {
+        Response.content.fget.__code__,
+        Response.iter_content.__code__,
+        Response.iter_lines.__code__,
+        Response.text.fget.__code__,
+        Response.apparent_encoding.fget.__code__,
+        Response.json.__code__,
+        Response.__repr__.__code__,
+        Response.__bool__.__code__,
+        Response.ok.fget.__code__,
+        Response.is_redirect.fget.__code__,
+        Response.is_permanent_redirect.fget.__code__,
+        Response.next.fget.__code__,
+        Response.raise_for_status.__code__,
+        Response.__getstate__.__code__,
+        Response.__setstate__.__code__,
+        Response.close.__code__,
+    }
+    seen = []
+
+    def profile(frame, event, argument):
+        if event == "call" and frame.f_code in targets:
+            seen.append(frame.f_code.co_qualname)
+
+    sys.setprofile(profile)
+    try:
+        content_subject = Response()
+        content_subject.status_code = 200
+        content_subject.raw = ObservedReadRaw([b"content"])
+        content = response_content_call(content_subject)
+
+        iter_subject = Response()
+        iter_subject.raw = ObservedReadRaw([b"ab", b"cd"])
+        chunks = list(response_iter_content_call(iter_subject, 2))
+
+        lines_subject = Response()
+        lines_subject.raw = ObservedReadRaw([b"a\\nb", b"c\\n"])
+        lines = list(response_iter_lines_call(lines_subject, 2))
+
+        unicode_subject = Response()
+        unicode_subject.raw = ObservedReadRaw([b"\\xe2", b"\\x82", b"\\xac"])
+        unicode_subject.encoding = "utf-8"
+        decoded = list(
+            response_iter_content_call(unicode_subject, 1, True)
+        )
+
+        text_subject = Response()
+        text_subject._content = b"text"
+        text_subject._content_consumed = True
+        text_subject.encoding = "ascii"
+        text = response_text_call(text_subject)
+
+        apparent_subject = Response()
+        apparent_subject._content = b"plain ascii"
+        apparent_subject._content_consumed = True
+        apparent = response_apparent_encoding_call(apparent_subject)
+
+        json_subject = Response()
+        json_subject._content = b'{"value": 3}'
+        json_subject._content_consumed = True
+        json_value = response_json_call(json_subject, {})
+
+        metadata_subject = Response()
+        metadata_subject.status_code = 302
+        metadata_subject.reason = "Found"
+        metadata_subject.url = "https://example.test/"
+        metadata_subject.headers["Location"] = "/next"
+        metadata = [
+            response_metadata_call(metadata_subject, operation)
+            for operation in (
+                "repr",
+                "bool",
+                "ok",
+                "is_redirect",
+                "is_permanent_redirect",
+                "next",
+                "raise_for_status",
+            )
+        ]
+
+        pickle_subject = Response()
+        pickle_subject._content = b"pickle"
+        pickle_subject._content_consumed = True
+        pickle_state = response_pickle_call(pickle_subject, "get")
+        restored = Response.__new__(Response)
+        response_pickle_call(restored, "set", pickle_state)
+
+        close_subject = Response()
+        close_subject._content_consumed = True
+        response_close_call(close_subject)
+    finally:
+        sys.setprofile(None)
+
+    assert seen == []
+    result = {
+        "target": "rewrite",
+        "content": value_record(content),
+        "chunks": [value_record(chunk) for chunk in chunks],
+        "lines": [value_record(line) for line in lines],
+        "decoded": decoded,
+        "text": text,
+        "apparent_type": value_record(apparent)["type"],
+        "json": json_value,
+        "metadata": [
+            value_record(value)
+            if not isinstance(value, (bool, str, type(None)))
+            else value
+            for value in metadata
+        ],
+        "pickle_keys": list(pickle_state),
+        "restored_consumed": restored._content_consumed,
+        "seen": seen,
+    }
+"""
+    )
+
+    assert state["target"] == "rewrite"
+    assert state["content"]["payload"] == ["bytes", b"content".hex()]
+    assert [chunk["payload"][1] for chunk in state["chunks"]] == [
+        b"ab".hex(),
+        b"cd".hex(),
+    ]
+    assert [line["payload"][1] for line in state["lines"]] == [
+        b"a".hex(),
+        b"bc".hex(),
+    ]
+    assert state["decoded"] == ["€"]
+    assert state["text"] == "text"
+    assert state["json"] == {"value": 3}
+    assert state["pickle_keys"][0] == "_content"
+    assert state["restored_consumed"] is True
+    assert state["seen"] == []
+
+
+def test_dynamic_candidates_execute_their_authoritative_python_frames() -> None:
+    state = _run_matching(
+        """
+import sys
+
+
+class DynamicResponse(Response):
+    @property
+    def content(self):
+        return b"dynamic-content"
+
+    def iter_content(self, chunk_size=1, decode_unicode=False):
+        yield b"dynamic-iter"
+
+    def iter_lines(
+        self,
+        chunk_size=512,
+        decode_unicode=False,
+        delimiter=None,
+    ):
+        yield b"dynamic-line"
+
+    @property
+    def text(self):
+        return "dynamic-text"
+
+    @property
+    def apparent_encoding(self):
+        return "dynamic-encoding"
+
+    def json(self, **kwargs):
+        return {"dynamic": kwargs["value"]}
+
+    def __repr__(self):
+        return "<dynamic-profile>"
+
+    def __bool__(self):
+        return False
+
+    @property
+    def ok(self):
+        return "dynamic-ok"
+
+    def raise_for_status(self):
+        return "dynamic-raise"
+
+    def __getstate__(self):
+        return {"dynamic": self}
+
+    def __setstate__(self, state):
+        self.dynamic_state = state
+        return self
+
+    def close(self):
+        return self
+
+
+dynamic = DynamicResponse()
+targets = {
+    DynamicResponse.content.fget.__code__: "content",
+    DynamicResponse.iter_content.__code__: "iter_content",
+    DynamicResponse.iter_lines.__code__: "iter_lines",
+    DynamicResponse.text.fget.__code__: "text",
+    DynamicResponse.apparent_encoding.fget.__code__: "apparent_encoding",
+    DynamicResponse.json.__code__: "json",
+    DynamicResponse.__repr__.__code__: "__repr__",
+    DynamicResponse.__bool__.__code__: "__bool__",
+    DynamicResponse.ok.fget.__code__: "ok",
+    DynamicResponse.raise_for_status.__code__: "raise_for_status",
+    DynamicResponse.__getstate__.__code__: "__getstate__",
+    DynamicResponse.__setstate__.__code__: "__setstate__",
+    DynamicResponse.close.__code__: "close",
+}
+seen = []
+
+def profile(frame, event, argument):
+    if event == "call" and frame.f_code in targets:
+        seen.append(targets[frame.f_code])
+
+sys.setprofile(profile)
+try:
+    response_content_call(dynamic)
+    list(response_iter_content_call(dynamic, 3))
+    list(response_iter_lines_call(dynamic, 4))
+    response_text_call(dynamic)
+    response_apparent_encoding_call(dynamic)
+    response_json_call(dynamic, {"value": 5})
+    response_metadata_call(dynamic, "repr")
+    response_metadata_call(dynamic, "bool")
+    response_metadata_call(dynamic, "ok")
+    response_metadata_call(dynamic, "raise_for_status")
+    dynamic_state = response_pickle_call(dynamic, "get")
+    response_pickle_call(dynamic, "set", dynamic_state)
+    response_close_call(dynamic)
+finally:
+    sys.setprofile(None)
+
+result = seen
+"""
+    )
+
+    assert state == [
+        "content",
+        "iter_content",
+        "iter_content",
+        "iter_lines",
+        "iter_lines",
+        "text",
+        "apparent_encoding",
+        "json",
+        "__repr__",
+        "__bool__",
+        "ok",
+        "raise_for_status",
+        "__getstate__",
+        "__setstate__",
+        "close",
+    ]
+
+
+def test_abstract_disposition_is_clean_eof_only_monotonic_and_exactly_once() -> None:
+    state = _run_matching(
+        """
+scenarios = {
+    "clean": ["clean-eof"],
+    "clean-then-close": ["clean-eof", "close", "drop"],
+    "partial-open": ["partial"],
+    "partial-close": ["partial", "close", "clean-eof"],
+    "partial-drop": ["partial", "drop", "clean-eof"],
+    "read-error": ["read-error", "clean-eof"],
+    "decode-error": ["decode-error", "clean-eof"],
+    "protocol-error": ["protocol-error", "clean-eof"],
+    "cancel": ["cancel", "clean-eof"],
+    "action-disconnect": ["action-disconnect", "clean-eof"],
+    "reply-disconnect": ["reply-disconnect", "clean-eof"],
+    "python-exact-drop": ["python-exact", "drop"],
+}
+result = {
+    name: response_disposition_call(events)
+    for name, events in scenarios.items()
+}
+"""
+    )
+
+    assert state["clean"] == {
+        "states": ["Open", "Reusable"],
+        "final": "Reusable",
+        "decision": "Reusable",
+        "decision_count": 1,
+        "native_lease": True,
+        "implicit_python_callbacks": 0,
+    }
+    assert state["clean-then-close"]["states"] == [
+        "Open",
+        "Reusable",
+        "Reusable",
+        "Reusable",
+    ]
+    assert state["clean-then-close"]["decision_count"] == 1
+    assert state["partial-open"]["states"] == ["Open", "Partial"]
+    assert state["partial-open"]["decision"] is None
+    assert state["partial-open"]["decision_count"] == 0
+    for name in (
+        "partial-close",
+        "partial-drop",
+        "read-error",
+        "decode-error",
+        "protocol-error",
+        "cancel",
+        "action-disconnect",
+        "reply-disconnect",
+    ):
+        assert state[name]["final"] == "CloseDirty"
+        assert state[name]["decision"] == "CloseDirty"
+        assert state[name]["decision_count"] == 1
+        assert state[name]["states"][-1] == "CloseDirty"
+    assert state["python-exact-drop"] == {
+        "states": ["Open", "PythonExact", "PythonExact"],
+        "final": "PythonExact",
+        "decision": None,
+        "decision_count": 0,
+        "native_lease": False,
+        "implicit_python_callbacks": 0,
+    }
+
+
+def test_native_lifecycle_audit_keeps_origin_owner_until_worker_drop() -> None:
+    state = _run_matching(
+        """
+class LifecycleRaw(ObservedReadRaw):
+    def __init__(self, label, audit):
+        super().__init__([b"x"])
+        self.label = label
+        self.audit = audit
+
+    def __del__(self):
+        side_effects.append([
+            "raw-del",
+            self.label,
+            self.audit.get("worker_dropped"),
+            same_thread(),
+        ])
+
+
+rows = []
+for phase in (
+    "before-poll",
+    "queued-before-dequeue",
+    "reply-observed",
+):
+    audit = {}
+    raw = LifecycleRaw(phase, audit)
+    subject = Response()
+    subject.raw = raw
+    del raw
+    original = BaseException(phase)
+    outcome = capture(
+        lambda: response_lifecycle_call(
+            subject, original, phase, audit
+        )
+    )
+    rows.append({
+        "phase": phase,
+        "record": outcome["exception"],
+        "is_original": outcome["error"] is original,
+        "audit": dict(audit),
+        "events": list(subject.raw.events),
+    })
+    original.__traceback__ = None
+    del outcome
+    del subject
+    gc.collect()
+    side_effects.append(["after-subject-drop", phase])
+
+result = {"rows": rows, "side_effects": side_effects}
+"""
+    )
+
+    rows = {row["phase"]: row for row in state["rows"]}
+    assert rows["before-poll"]["audit"] == {
+        "queued": 0,
+        "execute": 0,
+        "reply_observed": False,
+        "worker_dropped": True,
+        "raw_actions": 0,
+    }
+    assert rows["before-poll"]["events"] == []
+    assert rows["queued-before-dequeue"]["audit"] == {
+        "queued": 1,
+        "execute": 0,
+        "reply_observed": False,
+        "worker_dropped": True,
+        "raw_actions": 0,
+    }
+    assert rows["queued-before-dequeue"]["events"] == []
+    assert rows["reply-observed"]["audit"] == {
+        "queued": 1,
+        "execute": 1,
+        "reply_observed": True,
+        "worker_dropped": True,
+        "raw_actions": 1,
+    }
+    assert rows["reply-observed"]["events"] == [
+        ["getattr-missing", "stream", True],
+        ["read", {"type": ["builtins", "int"], "payload": 1}, True],
+    ]
+    assert all(
+        row["record"]["type"] == ["builtins", "BaseException"] for row in rows.values()
+    )
+    assert all(row["is_original"] for row in rows.values())
+    assert state["side_effects"] == [
+        ["raw-del", "before-poll", True, True],
+        ["after-subject-drop", "before-poll"],
+        ["raw-del", "queued-before-dequeue", True, True],
+        ["after-subject-drop", "queued-before-dequeue"],
+        ["raw-del", "reply-observed", True, True],
+        ["after-subject-drop", "reply-observed"],
+    ]
 
 
 def test_content_is_lazy_then_caches_or_selects_empty_none() -> None:
@@ -528,6 +1054,14 @@ cached_bool = [
     value_record(value)
     for value in response_iter_content_call(cached, True)
 ]
+cached_zero = [
+    value_record(value)
+    for value in response_iter_content_call(cached, 0)
+]
+cached_negative = [
+    value_record(value)
+    for value in response_iter_content_call(cached, -2)
+]
 
 invalid = Response()
 invalid.raw = ObservedReadRaw([b"x"])
@@ -546,6 +1080,8 @@ result = {
     "cached_three": cached_three,
     "cached_none": cached_none,
     "cached_bool": cached_bool,
+    "cached_zero": cached_zero,
+    "cached_negative": cached_negative,
     "invalid_chunk": invalid_chunk["exception"],
 }
 """
@@ -591,6 +1127,8 @@ result = {
         b"d".hex(),
         b"e".hex(),
     ]
+    assert [item["payload"][1] for item in state["cached_zero"]] == [b"abcde".hex()]
+    assert [item["payload"][1] for item in state["cached_negative"]] == [b"abcde".hex()]
     assert state["invalid_chunk"]["type"] == ["builtins", "TypeError"]
     assert state["invalid_chunk"]["args"] == [
         "chunk_size must be an int, it is instead a <class 'str'>."
@@ -1132,6 +1670,7 @@ def decode(chunks, encoding):
         if captured["error"] is not None
         else [value_record(value) for value in captured["returned"]],
         "exception": captured["exception"],
+        "events": raw.events,
         "state": response_fields_snapshot(subject),
     }
 
@@ -1164,6 +1703,7 @@ result = {
         "type": ["builtins", "LookupError"],
         "args": ["unknown encoding: not-a-codec"],
     }
+    assert state["invalid"]["events"] == []
     assert state["invalid"]["state"]["content_consumed"] is False
 
 
@@ -1469,6 +2009,8 @@ result = {
         "context_is_original": wrapped_error.__context__ is json_error,
         "cause_is_none": wrapped_error.__cause__ is None,
         "suppress_context": wrapped_error.__suppress_context__,
+        "response_is_none": wrapped_error.response is None,
+        "request_is_none": wrapped_error.request is None,
         "msg": wrapped_error.msg,
         "doc": wrapped_error.doc,
         "pos": wrapped_error.pos,
@@ -1503,6 +2045,8 @@ result = {
     assert state["wrapped"]["context_is_original"] is True
     assert state["wrapped"]["cause_is_none"] is True
     assert state["wrapped"]["suppress_context"] is False
+    assert state["wrapped"]["response_is_none"] is True
+    assert state["wrapped"]["request_is_none"] is True
     assert state["wrapped"]["msg"] == "bad json"
     assert state["wrapped"]["doc"] == "document"
     assert state["wrapped"]["pos"] == 2
@@ -1697,6 +2241,7 @@ rows = [
     status_row(399, "Odd"),
     status_row(400, "Bad Request"),
     status_row(404, "Komponenttia ei löydy".encode("utf-8")),
+    status_row(499, "Client Boundary"),
     status_row(500, b"\\xff"),
     status_row(599, "Network"),
     status_row(600, "Outside"),
@@ -1739,6 +2284,9 @@ result = {
     ]
     assert rows[404]["raise"]["record"]["args"] == [
         "404 Client Error: Komponenttia ei löydy for url: https://example.test/resource"
+    ]
+    assert rows[499]["raise"]["record"]["args"] == [
+        "499 Client Error: Client Boundary for url: https://example.test/resource"
     ]
     assert rows[500]["raise"]["record"]["args"] == [
         "500 Server Error: ÿ for url: https://example.test/resource"
@@ -1908,12 +2456,19 @@ history = [history_item]
 subject.history = history
 request = PreparedRequest()
 subject.request = request
+next_request = PreparedRequest()
+subject._next = next_request
+subject.connection = object()
+subject.extra_state = object()
 before = response_fields_snapshot(subject)
 pickled_state = response_pickle_call(subject, "get")
 after = response_fields_snapshot(subject)
 
 restored = Response.__new__(Response)
 set_result = response_pickle_call(restored, "set", pickled_state)
+restored_next = capture(
+    lambda: response_metadata_call(restored, "next")
+)
 
 class ObservedState(dict):
     def items(self):
@@ -1934,6 +2489,9 @@ result = {
     "content": value_record(pickled_state["_content"]),
     "raw_absent": "raw" not in pickled_state,
     "consumed_absent": "_content_consumed" not in pickled_state,
+    "next_absent": "_next" not in pickled_state,
+    "connection_absent": "connection" not in pickled_state,
+    "extra_absent": "extra_state" not in pickled_state,
     "history_identity": pickled_state["history"] is history,
     "history_item_identity": pickled_state["history"][0] is history_item,
     "request_identity": pickled_state["request"] is request,
@@ -1946,6 +2504,10 @@ result = {
         "history_identity": restored.history is history,
         "request_identity": restored.request is request,
         "content": value_record(restored._content),
+        "has_next": hasattr(restored, "_next"),
+        "has_connection": hasattr(restored, "connection"),
+        "has_extra": hasattr(restored, "extra_state"),
+        "next_error": restored_next["exception"],
     },
     "manual_return": value_record(manual_result),
     "manual": {
@@ -1978,6 +2540,9 @@ result = {
     assert state["content"]["payload"] == ["bytes", b"abc".hex()]
     assert state["raw_absent"] is True
     assert state["consumed_absent"] is True
+    assert state["next_absent"] is True
+    assert state["connection_absent"] is True
+    assert state["extra_absent"] is True
     assert state["history_identity"] is True
     assert state["history_item_identity"] is True
     assert state["request_identity"] is True
@@ -1996,6 +2561,15 @@ result = {
         "content": {
             "type": ["builtins", "bytes"],
             "payload": ["bytes", b"abc".hex()],
+        },
+        "has_next": False,
+        "has_connection": False,
+        "has_extra": False,
+        "next_error": {
+            "type": ["builtins", "AttributeError"],
+            "args": [
+                "'Response' object has no attribute '_next'",
+            ],
         },
     }
     assert state["manual_return"]["payload"] is None
@@ -2367,3 +2941,1010 @@ result = {
         ["raw-del", "failed", True],
         ["after-raw-del", "failed"],
     ]
+
+
+def test_partial_and_interleaved_iterators_share_the_authoritative_cursor() -> None:
+    state = _run_matching(
+        """
+raw = ObservedReadRaw([b"a", b"b", b"c"])
+subject = Response()
+subject.raw = raw
+first_iterator = response_iter_content_call(subject, 1)
+first_value = next(first_iterator)
+second_iterator = response_iter_content_call(subject, 1)
+second_value = next(second_iterator)
+third_value = next(first_iterator)
+second_tail = list(second_iterator)
+first_tail = list(first_iterator)
+consumed = capture(
+    lambda: response_iter_content_call(subject, 1)
+)
+
+line_raw = ObservedReadRaw([b"a\\nb", b"c\\nd", b"e\\n"])
+line_subject = Response()
+line_subject.raw = line_raw
+first_lines = response_iter_lines_call(line_subject, 2)
+second_lines = response_iter_lines_call(line_subject, 2)
+line_values = [
+    next(first_lines),
+    next(second_lines),
+    next(first_lines),
+]
+second_line_tail = list(second_lines)
+first_line_tail = list(first_lines)
+
+result = {
+    "content": {
+        "values": [
+            value_record(first_value),
+            value_record(second_value),
+            value_record(third_value),
+        ],
+        "second_tail": [
+            value_record(value) for value in second_tail
+        ],
+        "first_tail": [
+            value_record(value) for value in first_tail
+        ],
+        "events": raw.events,
+        "state": response_fields_snapshot(subject),
+        "consumed_error": consumed["exception"],
+    },
+    "lines": {
+        "values": [value_record(value) for value in line_values],
+        "second_tail": [
+            value_record(value) for value in second_line_tail
+        ],
+        "first_tail": [
+            value_record(value) for value in first_line_tail
+        ],
+        "events": line_raw.events,
+        "state": response_fields_snapshot(line_subject),
+    },
+}
+"""
+    )
+
+    assert [value["payload"][1] for value in state["content"]["values"]] == [
+        b"a".hex(),
+        b"b".hex(),
+        b"c".hex(),
+    ]
+    assert state["content"]["second_tail"] == []
+    assert state["content"]["first_tail"] == []
+    assert state["content"]["state"]["content_is_false"] is True
+    assert state["content"]["state"]["content_consumed"] is True
+    assert state["content"]["consumed_error"] == {
+        "type": ["requests.exceptions", "StreamConsumedError"],
+        "args": [],
+    }
+    assert [value["payload"][1] for value in state["lines"]["values"]] == [
+        b"a".hex(),
+        b"c".hex(),
+        b"be".hex(),
+    ]
+    assert [value["payload"][1] for value in state["lines"]["second_tail"]] == [
+        b"d".hex()
+    ]
+    assert state["lines"]["first_tail"] == []
+    assert state["lines"]["state"]["content_consumed"] is True
+
+
+def test_python_exact_stream_failure_can_retry_the_same_raw_successfully() -> None:
+    state = _run_matching(
+        """
+from urllib3.exceptions import ProtocolError
+
+
+class FailOnceRaw:
+    def __init__(self):
+        self.attempts = 0
+        self.events = []
+        self.original = ProtocolError("first attempt failed")
+
+    def stream(self, chunk_size, decode_content=True):
+        self.attempts += 1
+        attempt = self.attempts
+        self.events.append([
+            "stream",
+            attempt,
+            chunk_size,
+            decode_content,
+            same_thread(),
+        ])
+        if attempt == 1:
+            raise self.original
+        yield b"retry-ok"
+
+    def close(self):
+        self.events.append(["close", same_thread()])
+
+    def release_conn(self):
+        self.events.append(["release", same_thread()])
+
+
+raw = FailOnceRaw()
+subject = Response()
+subject.raw = raw
+first = capture(
+    lambda: next(response_iter_content_call(subject, 4))
+)
+first_error = first["error"]
+after_first = response_fields_snapshot(subject)
+second = list(response_iter_content_call(subject, 4))
+after_second = response_fields_snapshot(subject)
+
+result = {
+    "first": {
+        "record": first["exception"],
+        "argument_is_original": first_error.args[0] is raw.original,
+        "context_is_original": first_error.__context__ is raw.original,
+    },
+    "second": [value_record(value) for value in second],
+    "same_raw": subject.raw is raw,
+    "after_first": after_first,
+    "after_second": after_second,
+    "events": raw.events,
+    "implicit_callbacks_absent": not any(
+        event[0] in ("close", "release") for event in raw.events
+    ),
+}
+"""
+    )
+
+    assert state["first"]["record"]["type"] == [
+        "requests.exceptions",
+        "ChunkedEncodingError",
+    ]
+    assert state["first"]["argument_is_original"] is True
+    assert state["first"]["context_is_original"] is True
+    assert state["after_first"]["content_is_false"] is True
+    assert state["after_first"]["content_consumed"] is False
+    assert [value["payload"][1] for value in state["second"]] == [b"retry-ok".hex()]
+    assert state["same_raw"] is True
+    assert state["after_second"]["content_is_false"] is True
+    assert state["after_second"]["content_consumed"] is True
+    assert state["events"] == [
+        ["stream", 1, 4, True, True],
+        ["stream", 2, 4, True, True],
+    ]
+    assert state["implicit_callbacks_absent"] is True
+
+
+def test_raw_resolution_observes_replacement_at_each_frozen_lookup_boundary() -> None:
+    state = _run_matching(
+        """
+before_first_old = ObservedStreamRaw([b"old"])
+before_first_new = ObservedStreamRaw([b"new"])
+before_first = Response()
+before_first.raw = before_first_old
+before_first_iterator = response_iter_content_call(before_first, 1)
+before_first.raw = before_first_new
+before_first_values = list(before_first_iterator)
+
+between_stream_old = ObservedStreamRaw([b"old-a", b"old-b"])
+between_stream_new = ObservedStreamRaw([b"new-stream"])
+between_stream = Response()
+between_stream.raw = between_stream_old
+between_stream_iterator = response_iter_content_call(between_stream, 1)
+between_stream_first = next(between_stream_iterator)
+between_stream.raw = between_stream_new
+between_stream_rest = list(between_stream_iterator)
+
+class ReadAndStreamRaw(ObservedReadRaw):
+    def stream(self, chunk_size, decode_content=True):
+        self.events.append([
+            "unexpected-stream",
+            chunk_size,
+            decode_content,
+            same_thread(),
+        ])
+        yield b"wrong"
+
+
+between_read_old = ObservedReadRaw([b"old-read"])
+between_read_new = ReadAndStreamRaw([b"new-read"])
+between_read = Response()
+between_read.raw = between_read_old
+between_read_iterator = response_iter_content_call(between_read, 1)
+between_read_first = next(between_read_iterator)
+between_read.raw = between_read_new
+between_read_second = next(between_read_iterator)
+between_read_tail = list(between_read_iterator)
+
+result = {
+    "before_first": {
+        "values": [
+            value_record(value) for value in before_first_values
+        ],
+        "old_events": before_first_old.events,
+        "new_events": before_first_new.events,
+        "raw_identity": before_first.raw is before_first_new,
+    },
+    "between_stream": {
+        "first": value_record(between_stream_first),
+        "rest": [
+            value_record(value) for value in between_stream_rest
+        ],
+        "old_events": between_stream_old.events,
+        "new_events": between_stream_new.events,
+        "raw_identity": between_stream.raw is between_stream_new,
+    },
+    "between_read": {
+        "first": value_record(between_read_first),
+        "second": value_record(between_read_second),
+        "tail": [
+            value_record(value) for value in between_read_tail
+        ],
+        "old_events": between_read_old.events,
+        "new_events": between_read_new.events,
+        "raw_identity": between_read.raw is between_read_new,
+    },
+}
+"""
+    )
+
+    assert [value["payload"][1] for value in state["before_first"]["values"]] == [
+        b"new".hex()
+    ]
+    assert state["before_first"]["old_events"] == []
+    assert state["before_first"]["new_events"][0] == [
+        "getattr",
+        "stream",
+        True,
+    ]
+    assert state["before_first"]["raw_identity"] is True
+    assert state["between_stream"]["first"]["payload"][1] == b"old-a".hex()
+    assert [value["payload"][1] for value in state["between_stream"]["rest"]] == [
+        b"old-b".hex()
+    ]
+    assert state["between_stream"]["new_events"] == []
+    assert state["between_stream"]["raw_identity"] is True
+    assert state["between_read"]["first"]["payload"][1] == b"old-read".hex()
+    assert state["between_read"]["second"]["payload"][1] == b"new-read".hex()
+    assert state["between_read"]["tail"] == []
+    assert not any(
+        event[0] == "unexpected-stream" for event in state["between_read"]["new_events"]
+    )
+    assert state["between_read"]["raw_identity"] is True
+
+
+def test_lines_and_unicode_yield_before_consuming_later_raw_chunks() -> None:
+    state = _run_matching(
+        """
+line_raw = ObservedStreamRaw([
+    b"first\\npending",
+    b"-rest\\n",
+    b"tail\\n",
+])
+line_subject = Response()
+line_subject.raw = line_raw
+line_iterator = response_iter_lines_call(line_subject, 8)
+line_before = list(line_raw.events)
+line_first = next(line_iterator)
+line_after_first = list(line_raw.events)
+line_second = next(line_iterator)
+line_after_second = list(line_raw.events)
+line_third = next(line_iterator)
+line_after_third = list(line_raw.events)
+list(line_iterator)
+
+unicode_raw = ObservedStreamRaw([
+    b"\\xe2",
+    b"\\x82",
+    b"\\xacA",
+    b"B",
+])
+unicode_subject = Response()
+unicode_subject.raw = unicode_raw
+unicode_subject.encoding = "utf-8"
+unicode_iterator = response_iter_content_call(
+    unicode_subject, 1, True
+)
+unicode_first = next(unicode_iterator)
+unicode_after_first = list(unicode_raw.events)
+unicode_second = next(unicode_iterator)
+unicode_after_second = list(unicode_raw.events)
+list(unicode_iterator)
+
+class TailObservedRaw:
+    def __init__(self):
+        self.events = []
+
+    def stream(self, chunk_size, decode_content=True):
+        try:
+            for chunk in (b"A\\xe2", b"\\x82", b"\\xac", b"tail"):
+                self.events.append(["yield", value_record(chunk)])
+                yield chunk
+        finally:
+            self.events.append(["generator-close", same_thread()])
+
+
+abandoned_raw = TailObservedRaw()
+abandoned = Response()
+abandoned.raw = abandoned_raw
+abandoned.encoding = "utf-8"
+abandoned_iterator = response_iter_content_call(abandoned, 1, True)
+abandoned_first = next(abandoned_iterator)
+abandoned_after_first = list(abandoned_raw.events)
+abandoned_iterator.close()
+
+result = {
+    "lines": {
+        "before": line_before,
+        "first": value_record(line_first),
+        "after_first": line_after_first,
+        "second": value_record(line_second),
+        "after_second": line_after_second,
+        "third": value_record(line_third),
+        "after_third": line_after_third,
+    },
+    "unicode": {
+        "first": unicode_first,
+        "after_first": unicode_after_first,
+        "second": unicode_second,
+        "after_second": unicode_after_second,
+    },
+    "abandoned": {
+        "first": abandoned_first,
+        "after_first": abandoned_after_first,
+        "after_close": abandoned_raw.events,
+        "state": response_fields_snapshot(abandoned),
+    },
+}
+"""
+    )
+
+    assert state["lines"]["before"] == []
+    assert state["lines"]["first"]["payload"][1] == b"first".hex()
+    assert sum(event[0] == "yield" for event in state["lines"]["after_first"]) == 1
+    assert state["lines"]["second"]["payload"][1] == b"pending-rest".hex()
+    assert sum(event[0] == "yield" for event in state["lines"]["after_second"]) == 2
+    assert state["lines"]["third"]["payload"][1] == b"tail".hex()
+    assert sum(event[0] == "yield" for event in state["lines"]["after_third"]) == 3
+    assert state["unicode"]["first"] == "€A"
+    assert sum(event[0] == "yield" for event in state["unicode"]["after_first"]) == 3
+    assert state["unicode"]["second"] == "B"
+    assert sum(event[0] == "yield" for event in state["unicode"]["after_second"]) == 4
+    assert state["abandoned"]["first"] == "A"
+    assert state["abandoned"]["after_first"] == [
+        [
+            "yield",
+            {
+                "type": ["builtins", "bytes"],
+                "payload": ["bytes", b"A\xe2".hex()],
+            },
+        ]
+    ]
+    assert state["abandoned"]["after_close"][-1] == [
+        "generator-close",
+        True,
+    ]
+    assert not any(
+        event
+        == [
+            "yield",
+            {
+                "type": ["builtins", "bytes"],
+                "payload": ["bytes", b"tail".hex()],
+            },
+        ]
+        for event in state["abandoned"]["after_close"]
+    )
+    assert state["abandoned"]["state"]["content_consumed"] is False
+
+
+def test_non_bytes_content_join_failure_leaves_exhausted_uncached_state() -> None:
+    state = _run_matching(
+        """
+raw = ObservedStreamRaw([b"bytes", "text"])
+subject = Response()
+subject.status_code = 200
+subject.raw = raw
+first = capture(lambda: response_content_call(subject))
+after_first = response_fields_snapshot(subject)
+second = capture(lambda: response_content_call(subject))
+later_iterator = capture(
+    lambda: response_iter_content_call(subject, 1)
+)
+close_result = capture(lambda: response_close_call(subject))
+
+result = {
+    "first": first["exception"],
+    "after_first": after_first,
+    "second": second["exception"],
+    "later_iterator": later_iterator["exception"],
+    "close": close_result["exception"],
+    "events": raw.events,
+}
+"""
+    )
+
+    assert state["first"]["type"] == ["builtins", "TypeError"]
+    assert state["first"]["args"] == [
+        "sequence item 1: expected a bytes-like object, str found"
+    ]
+    assert state["after_first"]["content_is_false"] is True
+    assert state["after_first"]["content_consumed"] is True
+    assert state["second"] == {
+        "type": ["builtins", "RuntimeError"],
+        "args": ["The content for this response was already consumed"],
+    }
+    assert state["later_iterator"] == {
+        "type": ["requests.exceptions", "StreamConsumedError"],
+        "args": [],
+    }
+    assert state["close"] is None
+    assert state["events"][-1] == ["release", True]
+    assert not any(event[0] == "close" for event in state["events"])
+
+
+def test_dynamic_status_and_redirect_globals_remain_authoritative() -> None:
+    state = _run_matching(
+        """
+import requests.models as models
+
+
+original_http_error = models.HTTPError
+class DynamicHTTPError(original_http_error):
+    pass
+
+
+models.HTTPError = DynamicHTTPError
+try:
+    failed = Response()
+    failed.status_code = 499
+    failed.reason = "Dynamic"
+    failed.url = "https://example.test/dynamic"
+    raised = capture(
+        lambda: response_metadata_call(failed, "raise_for_status")
+    )
+    ok = response_metadata_call(failed, "ok")
+finally:
+    models.HTTPError = original_http_error
+
+
+redirect_events = []
+class DynamicRedirectStatuses:
+    def __contains__(self, status):
+        redirect_events.append(["contains", status, same_thread()])
+        return status == 302
+
+
+class DynamicCodes:
+    @property
+    def moved_permanently(self):
+        redirect_events.append(["codes", "moved", same_thread()])
+        return 301
+
+    @property
+    def permanent_redirect(self):
+        redirect_events.append(["codes", "permanent", same_thread()])
+        return 308
+
+
+original_redirects = models.REDIRECT_STATI
+original_codes = models.codes
+models.REDIRECT_STATI = DynamicRedirectStatuses()
+models.codes = DynamicCodes()
+try:
+    no_location = Response()
+    no_location.status_code = 302
+    no_location_values = [
+        response_metadata_call(no_location, "is_redirect"),
+        response_metadata_call(no_location, "is_permanent_redirect"),
+    ]
+    events_after_short_circuit = list(redirect_events)
+
+    temporary = Response()
+    temporary.status_code = 302
+    temporary.headers["LoCaTiOn"] = "/next"
+    redirect = response_metadata_call(temporary, "is_redirect")
+
+    permanent = Response()
+    permanent.status_code = 301
+    permanent.headers["LOCATION"] = "/forever"
+    permanent_value = response_metadata_call(
+        permanent, "is_permanent_redirect"
+    )
+finally:
+    models.REDIRECT_STATI = original_redirects
+    models.codes = original_codes
+
+
+raised_error = raised["error"]
+result = {
+    "status": {
+        "record": raised["exception"],
+        "dynamic_type": type(raised_error) is DynamicHTTPError,
+        "response_identity": raised_error.response is failed,
+        "ok": ok,
+    },
+    "redirect": {
+        "no_location": no_location_values,
+        "events_after_short_circuit": events_after_short_circuit,
+        "temporary": redirect,
+        "permanent": permanent_value,
+        "events": redirect_events,
+    },
+}
+"""
+    )
+
+    assert state["status"]["record"]["type"][1] == "DynamicHTTPError"
+    assert state["status"]["record"]["args"] == [
+        "499 Client Error: Dynamic for url: https://example.test/dynamic"
+    ]
+    assert state["status"]["dynamic_type"] is True
+    assert state["status"]["response_identity"] is True
+    assert state["status"]["ok"] is False
+    assert state["redirect"] == {
+        "no_location": [False, False],
+        "events_after_short_circuit": [],
+        "temporary": True,
+        "permanent": True,
+        "events": [
+            ["contains", 302, True],
+            ["codes", "moved", True],
+            ["codes", "permanent", True],
+        ],
+    }
+
+
+def test_dynamic_stream_source_and_wrapper_globals_remain_authoritative() -> None:
+    state = _run_matching(
+        """
+import requests.models as models
+
+
+class ProtocolSource(Exception):
+    pass
+
+
+class DecodeSource(Exception):
+    pass
+
+
+class TimeoutSource(Exception):
+    pass
+
+
+class SslSource(Exception):
+    pass
+
+
+class ProtocolTarget(Exception):
+    pass
+
+
+class DecodeTarget(Exception):
+    pass
+
+
+class TimeoutTarget(Exception):
+    pass
+
+
+class SslTarget(Exception):
+    pass
+
+
+class DynamicErrorRaw:
+    def __init__(self, error):
+        self.error = error
+
+    def stream(self, chunk_size, decode_content=True):
+        raise self.error
+        yield
+
+
+bindings = [
+    ("ProtocolError", ProtocolSource, "ChunkedEncodingError", ProtocolTarget),
+    ("DecodeError", DecodeSource, "ContentDecodingError", DecodeTarget),
+    ("ReadTimeoutError", TimeoutSource, "ConnectionError", TimeoutTarget),
+    ("SSLError", SslSource, "RequestsSSLError", SslTarget),
+]
+originals = {
+    name: getattr(models, name)
+    for row in bindings
+    for name in (row[0], row[2])
+}
+rows = []
+try:
+    for source_name, source_type, target_name, target_type in bindings:
+        setattr(models, source_name, source_type)
+        setattr(models, target_name, target_type)
+        original = source_type(source_name)
+        subject = Response()
+        subject.raw = DynamicErrorRaw(original)
+        caught = capture(
+            lambda subject=subject: next(
+                response_iter_content_call(subject, 1)
+            )
+        )
+        error = caught["error"]
+        rows.append({
+            "source": source_name,
+            "target": target_name,
+            "target_identity": type(error) is target_type,
+            "argument_identity": error.args[0] is original,
+            "context_identity": error.__context__ is original,
+            "cause_is_none": error.__cause__ is None,
+            "suppress_context": error.__suppress_context__,
+            "state": response_fields_snapshot(subject),
+        })
+finally:
+    for name, value in originals.items():
+        setattr(models, name, value)
+
+
+result = rows
+"""
+    )
+
+    assert [row["source"] for row in state] == [
+        "ProtocolError",
+        "DecodeError",
+        "ReadTimeoutError",
+        "SSLError",
+    ]
+    assert [row["target"] for row in state] == [
+        "ChunkedEncodingError",
+        "ContentDecodingError",
+        "ConnectionError",
+        "RequestsSSLError",
+    ]
+    assert all(row["target_identity"] for row in state)
+    assert all(row["argument_identity"] for row in state)
+    assert all(row["context_identity"] for row in state)
+    assert all(row["cause_is_none"] for row in state)
+    assert not any(row["suppress_context"] for row in state)
+    assert not any(row["state"]["content_consumed"] for row in state)
+
+
+def test_json_short_bom_utf32_and_guess_none_boundaries() -> None:
+    state = _run_matching(
+        """
+import requests.models as models
+
+
+class SelectedJson:
+    def __init__(self):
+        self.calls = []
+
+    def loads(self, text, **kwargs):
+        self.calls.append([
+            value_record(text),
+            sorted(kwargs.items()),
+            same_thread(),
+        ])
+        return len(self.calls)
+
+
+def cached(content):
+    subject = Response()
+    subject._content = content
+    subject._content_consumed = True
+    subject.encoding = None
+    return subject
+
+
+selected = SelectedJson()
+guess_calls = []
+original_json = models.complexjson
+original_guess = models.guess_json_utf
+original_detector = models.chardet
+models.complexjson = selected
+models.chardet = None
+try:
+    short = response_json_call(cached(b"1"), {"marker": "short"})
+    bom = response_json_call(
+        cached('{"bom": 1}'.encode("utf-8-sig")),
+        {"marker": "bom"},
+    )
+    utf32 = response_json_call(
+        cached('{"wide": 2}'.encode("utf-32")),
+        {"marker": "utf32"},
+    )
+
+    def no_guess(content):
+        guess_calls.append([value_record(content), same_thread()])
+        return None
+
+    models.guess_json_utf = no_guess
+    fallback = response_json_call(
+        cached(b'{"fallback": 3}'),
+        {"marker": "fallback"},
+    )
+finally:
+    models.complexjson = original_json
+    models.guess_json_utf = original_guess
+    models.chardet = original_detector
+
+
+result = {
+    "returns": [short, bom, utf32, fallback],
+    "calls": selected.calls,
+    "guess_calls": guess_calls,
+}
+"""
+    )
+
+    assert state["returns"] == [1, 2, 3, 4]
+    assert [call[0]["payload"] for call in state["calls"]] == [
+        ["str", "1"],
+        ["str", '{"bom": 1}'],
+        ["str", '{"wide": 2}'],
+        ["str", '{"fallback": 3}'],
+    ]
+    assert [call[1] for call in state["calls"]] == [
+        [["marker", "short"]],
+        [["marker", "bom"]],
+        [["marker", "utf32"]],
+        [["marker", "fallback"]],
+    ]
+    assert all(call[2] for call in state["calls"])
+    assert state["guess_calls"] == [
+        [
+            {
+                "type": ["builtins", "bytes"],
+                "payload": ["bytes", b'{"fallback": 3}'.hex()],
+            },
+            True,
+        ]
+    ]
+
+
+def test_history_preserves_order_mutation_aliasing_and_cycles() -> None:
+    state = _run_matching(
+        """
+oldest = Response()
+oldest.label = "oldest"
+middle = Response()
+middle.label = "middle"
+subject = Response()
+subject.label = "subject"
+alias = Response()
+
+shared = [oldest, middle]
+subject.history = shared
+alias.history = shared
+observed = response_metadata_call(subject, "history")
+before = [item.label for item in observed]
+shared.append(subject)
+after = [item.label for item in observed]
+
+result = {
+    "identity": observed is shared,
+    "alias_identity": (
+        response_metadata_call(alias, "history") is observed
+    ),
+    "before": before,
+    "after": after,
+    "oldest_identity": observed[0] is oldest,
+    "middle_identity": observed[1] is middle,
+    "cycle_identity": observed[2] is subject,
+    "cycle_back_identity": observed[2].history is observed,
+}
+"""
+    )
+
+    assert state == {
+        "identity": True,
+        "alias_identity": True,
+        "before": ["oldest", "middle"],
+        "after": ["oldest", "middle", "subject"],
+        "oldest_identity": True,
+        "middle_identity": True,
+        "cycle_identity": True,
+        "cycle_back_identity": True,
+    }
+
+
+def test_pickle_builtin_getattr_and_setattr_globals_remain_authoritative() -> None:
+    state = _run_matching(
+        """
+import builtins
+import requests.models as models
+
+
+events = []
+def observed_getattr(owner, name, default=None):
+    events.append([
+        "getattr",
+        owner is subject,
+        name,
+        value_record(default),
+        same_thread(),
+    ])
+    return builtins.getattr(owner, name, default)
+
+
+def observed_setattr(owner, name, value):
+    events.append([
+        "setattr",
+        owner is restored,
+        name,
+        value_record(value),
+        same_thread(),
+    ])
+    return builtins.setattr(owner, name, value)
+
+
+missing = object()
+original_getattr = models.__dict__.get("getattr", missing)
+original_setattr = models.__dict__.get("setattr", missing)
+models.__dict__["getattr"] = observed_getattr
+models.__dict__["setattr"] = observed_setattr
+try:
+    subject = Response()
+    subject._content = b"cached"
+    subject._content_consumed = True
+    subject.status_code = 207
+    subject.__attrs__ = ["status_code", "missing_attribute"]
+    state_value = response_pickle_call(subject, "get")
+
+    restored = Response.__new__(Response)
+    set_returned = response_pickle_call(
+        restored, "set", {"status_code": 299}
+    )
+finally:
+    if original_getattr is missing:
+        models.__dict__.pop("getattr", None)
+    else:
+        models.__dict__["getattr"] = original_getattr
+    if original_setattr is missing:
+        models.__dict__.pop("setattr", None)
+    else:
+        models.__dict__["setattr"] = original_setattr
+
+
+result = {
+    "state": state_value,
+    "set_return": value_record(set_returned),
+    "restored_status": restored.status_code,
+    "restored_consumed": restored._content_consumed,
+    "restored_raw_is_none": restored.raw is None,
+    "events": events,
+}
+"""
+    )
+
+    assert state["state"] == {
+        "status_code": 207,
+        "missing_attribute": None,
+    }
+    assert state["set_return"]["payload"] is None
+    assert state["restored_status"] == 299
+    assert state["restored_consumed"] is True
+    assert state["restored_raw_is_none"] is True
+    assert state["events"] == [
+        [
+            "getattr",
+            True,
+            "status_code",
+            {"type": ["builtins", "NoneType"], "payload": None},
+            True,
+        ],
+        [
+            "getattr",
+            True,
+            "missing_attribute",
+            {"type": ["builtins", "NoneType"], "payload": None},
+            True,
+        ],
+        [
+            "setattr",
+            True,
+            "status_code",
+            {"type": ["builtins", "int"], "payload": 299},
+            True,
+        ],
+        [
+            "setattr",
+            True,
+            "_content_consumed",
+            {"type": ["builtins", "bool"], "payload": True},
+            True,
+        ],
+        [
+            "setattr",
+            True,
+            "raw",
+            {"type": ["builtins", "NoneType"], "payload": None},
+            True,
+        ],
+    ]
+
+
+def test_release_failure_and_noncallable_release_preserve_order() -> None:
+    state = _run_matching(
+        """
+class ReleaseFailure:
+    def __init__(self, error):
+        self.error = error
+        self.events = []
+
+    def close(self):
+        self.events.append(["close", same_thread()])
+
+    def release_conn(self):
+        self.events.append(["release", same_thread()])
+        raise self.error
+
+
+unconsumed_error = BaseException("unconsumed release failed")
+unconsumed_raw = ReleaseFailure(unconsumed_error)
+unconsumed = Response()
+unconsumed.raw = unconsumed_raw
+unconsumed_failure = capture(
+    lambda: response_close_call(unconsumed)
+)
+
+consumed_error = BaseException("consumed release failed")
+consumed_raw = ReleaseFailure(consumed_error)
+consumed = Response()
+consumed.raw = consumed_raw
+consumed._content_consumed = True
+consumed_failure = capture(
+    lambda: response_close_call(consumed)
+)
+
+class NonCallableRelease:
+    def __init__(self):
+        self.events = []
+        self.release_conn = object()
+
+    def close(self):
+        self.events.append(["close", same_thread()])
+
+
+noncallable_raw = NonCallableRelease()
+noncallable = Response()
+noncallable.raw = noncallable_raw
+noncallable_failure = capture(
+    lambda: response_close_call(noncallable)
+)
+
+result = {
+    "unconsumed": {
+        "record": unconsumed_failure["exception"],
+        "identity": unconsumed_failure["error"] is unconsumed_error,
+        "events": unconsumed_raw.events,
+    },
+    "consumed": {
+        "record": consumed_failure["exception"],
+        "identity": consumed_failure["error"] is consumed_error,
+        "events": consumed_raw.events,
+    },
+    "noncallable": {
+        "record": noncallable_failure["exception"],
+        "events": noncallable_raw.events,
+    },
+}
+"""
+    )
+
+    assert state["unconsumed"] == {
+        "record": {
+            "type": ["builtins", "BaseException"],
+            "args": ["unconsumed release failed"],
+        },
+        "identity": True,
+        "events": [["close", True], ["release", True]],
+    }
+    assert state["consumed"] == {
+        "record": {
+            "type": ["builtins", "BaseException"],
+            "args": ["consumed release failed"],
+        },
+        "identity": True,
+        "events": [["release", True]],
+    }
+    assert state["noncallable"] == {
+        "record": {
+            "type": ["builtins", "TypeError"],
+            "args": ["'object' object is not callable"],
+        },
+        "events": [["close", True]],
+    }

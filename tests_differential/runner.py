@@ -26,6 +26,7 @@ _CASE_MODULE = "__differential_case__"
 _CHILD_ARGUMENT = "--child"
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 _TIMEOUT_ENVIRONMENT = "REQUESTS_DIFFERENTIAL_TIMEOUT"
+_TARGET_ENVIRONMENT = "REQUESTS_DIFFERENTIAL_TARGET"
 _MAX_DIAGNOSTIC_CHARS = 2048
 _PRESERVED_ENVIRONMENT = (
     "COMSPEC",
@@ -54,14 +55,14 @@ def run_oracle_case(case: dict[str, Any]) -> CaseRun:
     oracle_root = Path(
         os.environ.get("REQUESTS_ORACLE_ROOT", DEFAULT_ORACLE_ROOT)
     ).resolve()
-    return _run_case(case, oracle_root / "src")
+    return _run_case(case, oracle_root / "src", "oracle")
 
 
 def run_rewrite_case(case: dict[str, Any]) -> CaseRun:
-    return _run_case(case, REPOSITORY_ROOT / "src")
+    return _run_case(case, REPOSITORY_ROOT / "src", "rewrite")
 
 
-def _run_case(case: dict[str, Any], package_root: Path) -> CaseRun:
+def _run_case(case: dict[str, Any], package_root: Path, target: str) -> CaseRun:
     if not (package_root / "requests" / "__init__.py").is_file():
         raise FileNotFoundError(
             f"requests source package not found under {package_root}"
@@ -81,7 +82,7 @@ def _run_case(case: dict[str, Any], package_root: Path) -> CaseRun:
             errors="replace",
             capture_output=True,
             cwd=REPOSITORY_ROOT,
-            env=_child_environment(package_root),
+            env=_child_environment(package_root, target),
             timeout=timeout,
             check=False,
         )
@@ -165,7 +166,7 @@ def _bounded_diagnostic(output: str | bytes | None) -> str:
     return f"{text[:_MAX_DIAGNOSTIC_CHARS]}...<truncated>"
 
 
-def _child_environment(package_root: Path) -> dict[str, str]:
+def _child_environment(package_root: Path, target: str) -> dict[str, str]:
     environment = {
         name: os.environ[name] for name in _PRESERVED_ENVIRONMENT if name in os.environ
     }
@@ -177,6 +178,7 @@ def _child_environment(package_root: Path) -> dict[str, str]:
             "PYTHONNOUSERSITE": "1",
             "PYTHONPATH": str(package_root),
             "PYTHONUTF8": "1",
+            _TARGET_ENVIRONMENT: target,
         }
     )
     return environment

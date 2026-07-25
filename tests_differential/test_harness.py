@@ -10,6 +10,19 @@ from tests_differential import runner
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_children_receive_an_unforgeable_differential_target(monkeypatch) -> None:
+    monkeypatch.setenv("REQUESTS_DIFFERENTIAL_TARGET", "caller-forgery")
+    case = {
+        "source": ('import os\nresult = os.environ["REQUESTS_DIFFERENTIAL_TARGET"]\n')
+    }
+
+    oracle = runner.run_oracle_case(case)
+    rewrite = runner.run_rewrite_case(case)
+
+    assert oracle.observations["result"]["repr"] == "'oracle'"
+    assert rewrite.observations["result"]["repr"] == "'rewrite'"
+
+
 def test_runs_each_case_in_a_separate_process(oracle_root) -> None:
     case = {
         "source": dedent(
