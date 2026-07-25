@@ -1356,6 +1356,44 @@ finally:
     )
 
 
+def test_prepare_url_scheme_tuple_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+original = url_utils._NORMALIZABLE_SCHEMES
+url_utils._NORMALIZABLE_SCHEMES = ()
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url(
+                "http://EXAMPLE.com/path",
+                None,
+            )
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://EXAMPLE.com/path",
+                None,
+            )
+        ),
+    )
+finally:
+    url_utils._NORMALIZABLE_SCHEMES = original
+"""
+    )
+
+
 def test_prepare_url_internal_unicode_builtin_shadow_delegates() -> None:
     _assert_matches_oracle(
         """
