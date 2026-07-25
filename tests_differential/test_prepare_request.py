@@ -2034,6 +2034,88 @@ finally:
     )
 
 
+def test_prepare_url_uri_regex_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+class UriPattern:
+    def match(self, value):
+        side_effects.append(["uri-match", value])
+        raise RuntimeError("uri callback")
+
+
+original = url_utils._URI_RE
+url_utils._URI_RE = UriPattern()
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url("http://example.com/a path", None)
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/a path",
+                None,
+            )
+        ),
+    )
+finally:
+    url_utils._URI_RE = original
+"""
+    )
+
+
+def test_prepare_url_path_chars_subclass_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+class PathChars(set):
+    def __contains__(self, value):
+        side_effects.append(["path-contains", value])
+        return False
+
+
+original = url_utils._PATH_CHARS
+url_utils._PATH_CHARS = PathChars(original)
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url("http://example.com/path", None)
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/path",
+                None,
+            )
+        ),
+    )
+finally:
+    url_utils._PATH_CHARS = original
+"""
+    )
+
+
 def test_prepare_url_scheme_tuple_subclass_before_extension_import() -> None:
     _assert_matches_oracle_before_extension_import(
         _PREIMPORT_CAPTURE_HELPER
