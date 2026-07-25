@@ -11,7 +11,9 @@ import pytest
 from requests import _requests_rust
 
 
-def test_action_runs_on_entering_thread_and_interpreter_without_holding_python() -> None:
+def test_action_runs_on_entering_thread_and_interpreter_without_holding_python() -> (
+    None
+):
     probe = _requests_rust._runtime_affinity_probe
     action_started = threading.Event()
     observer_ran = threading.Event()

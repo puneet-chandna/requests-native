@@ -236,9 +236,7 @@ def _run_matching(source: str):
     assert oracle.stderr == ""
     assert rewrite.observations == oracle.observations
     assert rewrite.stderr == ""
-    return _normalize_literal(
-        ast.literal_eval(oracle.observations["result"]["repr"])
-    )
+    return _normalize_literal(ast.literal_eval(oracle.observations["result"]["repr"]))
 
 
 def _assert_preimport_matches(source: str) -> None:
@@ -729,11 +727,7 @@ result = {
     assert state["iterator"] == [b"one".hex(), b"two".hex()]
     assert state["failure_is_original"] is True
     assert ["nested", "nested"] in state["effects"]
-    assert all(
-        event[-1] is True
-        for event in state["effects"]
-        if event[0] != "nested"
-    )
+    assert all(event[-1] is True for event in state["effects"] if event[0] != "nested")
 
 
 def test_bad_iterator_chunk_matches_frozen_send_boundary() -> None:
@@ -876,13 +870,9 @@ result = {
         "requests.exceptions",
         "UnrewindableBodyError",
     ]
-    assert state["opaque"]["args"] == [
-        "Unable to rewind request body for redirect."
-    ]
+    assert state["opaque"]["args"] == ["Unable to rewind request body for redirect."]
     assert state["tell_position_non_none"] is True
-    assert state["tell"]["args"] == [
-        "Unable to rewind request body for redirect."
-    ]
+    assert state["tell"]["args"] == ["Unable to rewind request body for redirect."]
     assert state["seek"]["args"] == [
         "An error occurred when rewinding request body for redirect."
     ]
@@ -1115,9 +1105,7 @@ result = {
     assert state["rows"][3][2] is True
     assert state["rows"][4][2] is True
 
-    finalizers = [
-        event for event in state["effects"] if event[0] == "del"
-    ]
+    finalizers = [event for event in state["effects"] if event[0] == "del"]
     assert finalizers == [
         ["del", "failed-send", True],
         ["del", "queued-action", True],
@@ -1125,9 +1113,9 @@ result = {
         ["del", "cancel-before-poll", True],
         ["del", "cancel-after-reply", True],
     ]
-    assert [
-        event for event in state["effects"] if event[0] == "next"
-    ] == [["next", "cancel-after-reply", True]]
+    assert [event for event in state["effects"] if event[0] == "next"] == [
+        ["next", "cancel-after-reply", True]
+    ]
     assert not [event for event in state["effects"] if event[0] == "close"]
 
 
@@ -1665,15 +1653,13 @@ result = {
             },
         ],
     ]
-    assert [
-        event for event in state["effects"] if event[0] == "iter"
-    ] == [["iter", "reply-observed", True]]
-    assert [
-        event for event in state["effects"] if event[0] == "next"
-    ] == [["next", "reply-observed", True]]
-    assert [
-        event for event in state["effects"] if event[0] == "del"
-    ] == [
+    assert [event for event in state["effects"] if event[0] == "iter"] == [
+        ["iter", "reply-observed", True]
+    ]
+    assert [event for event in state["effects"] if event[0] == "next"] == [
+        ["next", "reply-observed", True]
+    ]
+    assert [event for event in state["effects"] if event[0] == "del"] == [
         ["del", "before-poll", True],
         ["del", "queued-before-dequeue", True],
         ["del", "reply-observed", True],

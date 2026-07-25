@@ -236,8 +236,8 @@ Use the narrowest type that preserves the Python contract.
 | headers | ordered case-insensitive entries | Validate exact byte/text rules and duplicate behavior |
 | cookie jar | native store or `CookieStore` bridge | External Python policies remain callable |
 | hook/auth/adapter | trait object or callback handle | Exact built-ins use Rust fast path; dynamic objects use Python |
-| file-like body | `BodySource` | Store strong owner; read/seek/tell only through its protocol |
-| iterator/generator body | streaming `BodySource` | Never pre-consume; preserve exception timing |
+| file-like body | core `BodySource` plus origin binding bridge | Keep the strong Python owner on the origin thread; workers carry only typed Python-free actions/replies |
+| iterator/generator body | streaming `BodySource` plus origin source | Never pre-consume; keep iterator state origin-owned and preserve exception timing |
 | response body | stateful `BodyHandle` | Streaming, consumed, or closed states are explicit |
 | Python exception | mapped error or pass-through handle | User exceptions keep identity and traceback |
 | `datetime.timedelta` | core duration + Python conversion | Preserve elapsed definition and output type |
