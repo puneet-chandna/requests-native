@@ -1,11 +1,12 @@
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
     PyAny, PyAnyMethods, PyBool, PyBytes, PyBytesMethods, PyCFunction, PyCode, PyDict,
-    PyDictMethods, PyFunction, PyList, PyListMethods, PyModule, PyString, PyTuple, PyTupleMethods,
-    PyType, PyTypeMethods,
+    PyDictMethods, PyFrozenSet, PyFunction, PyList, PyListMethods, PyModule, PySet, PySetMethods,
+    PyString, PyTuple, PyTupleMethods, PyType, PyTypeMethods,
 };
 use pyo3::wrap_pyfunction;
 use requests::utils::{encode_query_pairs, trim_python_whitespace_start};
@@ -75,6 +76,14 @@ enum IntrinsicBuiltin {
 enum KnownRegexPattern {
     Text(&'static str),
     Bytes(&'static [u8]),
+    Generated(GeneratedRegex),
+}
+
+#[derive(Clone, Copy)]
+enum GeneratedRegex {
+    Ipv6AddressWithZone,
+    ZoneId,
+    HostPort,
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +97,10 @@ enum KnownValue {
     Intrinsic(IntrinsicBuiltin),
     IntrinsicPair(IntrinsicBuiltin, IntrinsicBuiltin),
     TextPairAndNone(&'static str, &'static str),
+    TextSet(&'static str),
+    TextFrozenSet(&'static str),
+    TextListContaining(&'static [&'static str]),
+    Bytes(&'static [u8]),
     Regex(KnownRegex),
     RegexPair(KnownRegex, KnownRegex),
 }
@@ -265,6 +278,66 @@ fn intrinsic_builtin_for_name(name: &str) -> Option<IntrinsicBuiltin> {
     }
 }
 
+fn urllib3_ipv6_pattern() -> String {
+    const HEX: &str = "[0-9A-Fa-f]{1,4}";
+    const IPV4: &str = r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}";
+    const VARIATIONS: [&str; 9] = [
+        "(?:%(hex)s:){6}%(ls32)s",
+        "::(?:%(hex)s:){5}%(ls32)s",
+        "(?:%(hex)s)?::(?:%(hex)s:){4}%(ls32)s",
+        "(?:(?:%(hex)s:)?%(hex)s)?::(?:%(hex)s:){3}%(ls32)s",
+        "(?:(?:%(hex)s:){0,2}%(hex)s)?::(?:%(hex)s:){2}%(ls32)s",
+        "(?:(?:%(hex)s:){0,3}%(hex)s)?::%(hex)s:%(ls32)s",
+        "(?:(?:%(hex)s:){0,4}%(hex)s)?::%(ls32)s",
+        "(?:(?:%(hex)s:){0,5}%(hex)s)?::%(hex)s",
+        "(?:(?:%(hex)s:){0,6}%(hex)s)?::",
+    ];
+    let ls32 = format!("(?:{HEX}:{HEX}|{IPV4})");
+    let alternatives = VARIATIONS
+        .iter()
+        .map(|variation| variation.replace("%(hex)s", HEX).replace("%(ls32)s", &ls32))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("(?:{alternatives})")
+}
+
+fn urllib3_zone_id_pattern() -> String {
+    let mut pattern = String::from("(?:%25|%)(?:[");
+    pattern.push_str(r"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._\-~");
+    pattern.push_str("]|%[a-fA-F0-9]{2})+");
+    pattern
+}
+
+fn urllib3_ipv6_address_with_zone_body() -> String {
+    format!(
+        r"\[{}(?:{})?\]",
+        urllib3_ipv6_pattern(),
+        urllib3_zone_id_pattern()
+    )
+}
+
+fn generated_regex_pattern(regex: GeneratedRegex) -> &'static str {
+    static IPV6_ADDRESS_WITH_ZONE: OnceLock<String> = OnceLock::new();
+    static ZONE_ID: OnceLock<String> = OnceLock::new();
+    static HOST_PORT: OnceLock<String> = OnceLock::new();
+
+    match regex {
+        GeneratedRegex::Ipv6AddressWithZone => IPV6_ADDRESS_WITH_ZONE
+            .get_or_init(|| format!("^{}$", urllib3_ipv6_address_with_zone_body())),
+        GeneratedRegex::ZoneId => {
+            ZONE_ID.get_or_init(|| format!(r"({})\]$", urllib3_zone_id_pattern()))
+        }
+        GeneratedRegex::HostPort => HOST_PORT.get_or_init(|| {
+            const REG_NAME: &str = r"(?:[^\[\]%:/?#]|%[a-fA-F0-9]{2})*";
+            const IPV4: &str = r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}";
+            format!(
+                "^({REG_NAME}|{IPV4}|{})(?::0*?(|0|[1-9][0-9]{{0,4}}))?$",
+                urllib3_ipv6_address_with_zone_body()
+            )
+        }),
+    }
+}
+
 fn known_module_value(module: &str, name: &str) -> Option<KnownValue> {
     const HEADER_NAME_TEXT: KnownRegex = KnownRegex {
         pattern: KnownRegexPattern::Text(r"^[^:\s][^:\r\n]*\Z"),
@@ -286,6 +359,40 @@ fn known_module_value(module: &str, name: &str) -> Option<KnownValue> {
         pattern: KnownRegexPattern::Text(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$"),
         flags: 32,
     };
+    const SCHEME: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Text(r"^(?:[a-zA-Z][a-zA-Z0-9+-]*:|/)"),
+        flags: 32,
+    };
+    const PERCENT: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Text(r"%[a-fA-F0-9]{2}"),
+        flags: 32,
+    };
+    const URI: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Text(
+            r"^(?:([a-zA-Z][a-zA-Z0-9+.-]*):)?(?://([^\\/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$",
+        ),
+        flags: 48,
+    };
+    const IPV6_ADDRESS_WITH_ZONE: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Generated(GeneratedRegex::Ipv6AddressWithZone),
+        flags: 32,
+    };
+    const ZONE_ID: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Generated(GeneratedRegex::ZoneId),
+        flags: 32,
+    };
+    const HOST_PORT: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Generated(GeneratedRegex::HostPort),
+        flags: 48,
+    };
+    const UNRESERVED: &str = "-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~";
+    const USERINFO: &str =
+        "!$&'()*+,-.0123456789:;=ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~";
+    const PATH: &str =
+        "!$&'()*+,-./0123456789:;=@ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~";
+    const QUERY_OR_FRAGMENT: &str =
+        "!$&'()*+,-./0123456789:;=?@ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~";
+    const NATIVE_NETLOC_SCHEMES: &[&str] = &["http", "https"];
 
     match (module, name) {
         ("requests.models", "basestring") => Some(KnownValue::IntrinsicPair(
@@ -302,9 +409,28 @@ fn known_module_value(module: &str, name: &str) -> Option<KnownValue> {
         ("requests.utils", "_HEADER_VALIDATORS_BYTE") => {
             Some(KnownValue::RegexPair(HEADER_NAME_BYTES, HEADER_VALUE_BYTES))
         }
+        ("requests.utils", "UNRESERVED_SET") => Some(KnownValue::TextFrozenSet(UNRESERVED)),
+        ("urllib3.util.url", "_PERCENT_RE") => Some(KnownValue::Regex(PERCENT)),
         ("urllib3.util.url", "_IPV4_RE") => Some(KnownValue::Regex(IPV4)),
+        ("urllib3.util.url", "_SCHEME_RE") => Some(KnownValue::Regex(SCHEME)),
+        ("urllib3.util.url", "_URI_RE") => Some(KnownValue::Regex(URI)),
+        ("urllib3.util.url", "_IPV6_ADDRZ_RE") => Some(KnownValue::Regex(IPV6_ADDRESS_WITH_ZONE)),
+        ("urllib3.util.url", "_ZONE_ID_RE") => Some(KnownValue::Regex(ZONE_ID)),
+        ("urllib3.util.url", "_HOST_PORT_RE") => Some(KnownValue::Regex(HOST_PORT)),
+        ("urllib3.util.url", "_UNRESERVED_CHARS") => Some(KnownValue::TextSet(UNRESERVED)),
+        ("urllib3.util.url", "_USERINFO_CHARS") => Some(KnownValue::TextSet(USERINFO)),
+        ("urllib3.util.url", "_PATH_CHARS") => Some(KnownValue::TextSet(PATH)),
+        ("urllib3.util.url", "_QUERY_CHARS" | "_FRAGMENT_CHARS") => {
+            Some(KnownValue::TextSet(QUERY_OR_FRAGMENT))
+        }
         ("urllib3.util.url", "_NORMALIZABLE_SCHEMES") => {
             Some(KnownValue::TextPairAndNone("http", "https"))
+        }
+        ("urllib.parse", "_ALWAYS_SAFE_BYTES") => Some(KnownValue::Bytes(
+            b"-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~",
+        )),
+        ("urllib.parse", "uses_netloc") => {
+            Some(KnownValue::TextListContaining(NATIVE_NETLOC_SCHEMES))
         }
         _ => None,
     }
@@ -315,27 +441,70 @@ fn known_regex_is(
     current: &Bound<'_, PyAny>,
     expected: KnownRegex,
 ) -> PyResult<bool> {
-    let re = PyModule::import(py, "re")?;
-    let Some(pattern_type) = re.dict().get_item("Pattern")? else {
+    let pattern_type = current.get_type();
+    if !pattern_type.get_type().is(py.get_type::<PyType>()) {
         return Ok(false);
-    };
-    let Ok(pattern_type) = pattern_type.cast_into::<PyType>() else {
+    }
+    if pattern_type.name()?.to_str()? != "Pattern"
+        || !pattern_type
+            .getattr("__module__")?
+            .is_exact_instance_of::<PyString>()
+        || pattern_type
+            .getattr("__module__")?
+            .cast_into::<PyString>()?
+            .to_str()?
+            != "re"
+    {
         return Ok(false);
-    };
-    if !current.get_type().is(&pattern_type) {
-        return Ok(false);
+    }
+
+    let namespace = pattern_type.getattr("__dict__")?;
+    for (name, descriptor_type) in [
+        ("match", "method_descriptor"),
+        ("search", "method_descriptor"),
+        ("pattern", "member_descriptor"),
+        ("flags", "member_descriptor"),
+    ] {
+        let descriptor = namespace.get_item(name)?;
+        if descriptor.get_type().name()?.to_str()? != descriptor_type
+            || !descriptor.getattr("__objclass__")?.is(&pattern_type)
+            || descriptor.getattr("__name__")?.extract::<String>()? != name
+        {
+            return Ok(false);
+        }
     }
 
     let pattern = current.getattr("pattern")?;
     let pattern_matches = match expected.pattern {
-        KnownRegexPattern::Text(expected) => pattern
-            .cast::<PyString>()
-            .is_ok_and(|value| value.to_str().is_ok_and(|value| value == expected)),
-        KnownRegexPattern::Bytes(expected) => pattern
-            .cast::<PyBytes>()
-            .is_ok_and(|value| value.as_bytes() == expected),
+        KnownRegexPattern::Text(expected) => {
+            pattern.is_exact_instance_of::<PyString>()
+                && pattern
+                    .cast::<PyString>()
+                    .is_ok_and(|value| value.to_str().is_ok_and(|value| value == expected))
+        }
+        KnownRegexPattern::Bytes(expected) => {
+            pattern.is_exact_instance_of::<PyBytes>()
+                && pattern
+                    .cast::<PyBytes>()
+                    .is_ok_and(|value| value.as_bytes() == expected)
+        }
+        KnownRegexPattern::Generated(expected) => {
+            let expected = generated_regex_pattern(expected);
+            pattern.is_exact_instance_of::<PyString>()
+                && pattern
+                    .cast::<PyString>()
+                    .is_ok_and(|value| value.to_str().is_ok_and(|value| value == expected))
+        }
     };
     Ok(pattern_matches && current.getattr("flags")?.extract::<i64>()? == expected.flags)
+}
+
+fn known_single_character_is(value: &Bound<'_, PyAny>, expected: &str) -> PyResult<bool> {
+    Ok(value.is_exact_instance_of::<PyString>()
+        && value
+            .cast::<PyString>()?
+            .to_str()
+            .is_ok_and(|value| value.len() == 1 && expected.contains(value)))
 }
 
 fn known_value_is(
@@ -347,33 +516,89 @@ fn known_value_is(
     match expected {
         KnownValue::Intrinsic(expected) => intrinsic_builtin_is(py, builtins, current, expected),
         KnownValue::IntrinsicPair(first, second) => {
-            let Ok(values) = current.cast::<PyTuple>() else {
+            if !current.is_exact_instance_of::<PyTuple>() {
                 return Ok(false);
-            };
+            }
+            let values = current.cast::<PyTuple>()?;
             Ok(values.len() == 2
                 && intrinsic_builtin_is(py, builtins, &values.get_item(0)?, first)?
                 && intrinsic_builtin_is(py, builtins, &values.get_item(1)?, second)?)
         }
         KnownValue::TextPairAndNone(first, second) => {
-            let Ok(values) = current.cast::<PyTuple>() else {
+            if !current.is_exact_instance_of::<PyTuple>() {
                 return Ok(false);
-            };
-            Ok(values.len() == 3
-                && values
-                    .get_item(0)?
+            }
+            let values = current.cast::<PyTuple>()?;
+            if values.len() != 3 {
+                return Ok(false);
+            }
+            let first_value = values.get_item(0)?;
+            let second_value = values.get_item(1)?;
+            Ok(first_value.is_exact_instance_of::<PyString>()
+                && first_value
                     .cast::<PyString>()
                     .is_ok_and(|value| value.to_str().is_ok_and(|value| value == first))
-                && values
-                    .get_item(1)?
+                && second_value.is_exact_instance_of::<PyString>()
+                && second_value
                     .cast::<PyString>()
                     .is_ok_and(|value| value.to_str().is_ok_and(|value| value == second))
                 && values.get_item(2)?.is_none())
         }
+        KnownValue::TextSet(expected) => {
+            if !current.is_exact_instance_of::<PySet>() {
+                return Ok(false);
+            }
+            let values = current.cast::<PySet>()?;
+            if values.len() != expected.chars().count() {
+                return Ok(false);
+            }
+            for value in values.iter() {
+                if !known_single_character_is(&value, expected)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        KnownValue::TextFrozenSet(expected) => {
+            if !current.is_exact_instance_of::<PyFrozenSet>() {
+                return Ok(false);
+            }
+            let values = current.cast::<PyFrozenSet>()?;
+            if values.len() != expected.chars().count() {
+                return Ok(false);
+            }
+            for value in values.iter() {
+                if !known_single_character_is(&value, expected)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        KnownValue::TextListContaining(required) => {
+            if !current.is_exact_instance_of::<PyList>() {
+                return Ok(false);
+            }
+            let values = current.cast::<PyList>()?;
+            let mut found = vec![false; required.len()];
+            for value in values.iter() {
+                if !value.is_exact_instance_of::<PyString>() {
+                    return Ok(false);
+                }
+                let value = value.cast::<PyString>()?.to_str()?;
+                for (index, required) in required.iter().enumerate() {
+                    found[index] |= value == *required;
+                }
+            }
+            Ok(found.into_iter().all(|found| found))
+        }
+        KnownValue::Bytes(expected) => Ok(current.is_exact_instance_of::<PyBytes>()
+            && current.cast::<PyBytes>()?.as_bytes() == expected),
         KnownValue::Regex(expected) => known_regex_is(py, current, expected),
         KnownValue::RegexPair(first, second) => {
-            let Ok(values) = current.cast::<PyTuple>() else {
+            if !current.is_exact_instance_of::<PyTuple>() {
                 return Ok(false);
-            };
+            }
+            let values = current.cast::<PyTuple>()?;
             Ok(values.len() == 2
                 && known_regex_is(py, &values.get_item(0)?, first)?
                 && known_regex_is(py, &values.get_item(1)?, second)?)
