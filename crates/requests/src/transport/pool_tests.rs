@@ -197,26 +197,35 @@ fn lease_terminal_is_owned_exactly_once_and_dirty_never_returns_idle() {
 #[test]
 fn clear_keeps_old_active_readable_then_orphans_its_clean_return() {
     let mut pool = Pool::new(2);
-    let key = direct_key();
-    let initial_generation = pool.generation_number(&key);
+    let idle_key = direct_key();
+    let active_key = key(
+        Scheme::HTTP,
+        "active-only.test:80",
+        None,
+        "tls-default",
+        None,
+    );
+    assert!(pool.generation(&active_key).is_none());
+    let initial_generation = pool.generation_number(&active_key);
     let (idle, idle_closes) = controlled_connection(1, []);
     let (active, active_closes) = controlled_connection(2, [b'x']);
 
-    let idle = fresh_lease(&pool, key.clone(), idle).complete(LeaseTerminal::CleanEof);
+    let idle = fresh_lease(&pool, idle_key.clone(), idle).complete(LeaseTerminal::CleanEof);
     pool.release(idle);
-    let mut active = fresh_lease(&pool, key.clone(), active);
+    let mut active = fresh_lease(&pool, active_key.clone(), active);
     assert_eq!(active.generation(), initial_generation);
     assert_eq!(active.terminal(), LeaseTerminal::Active);
+    assert!(pool.generation(&active_key).is_none());
 
     pool.clear();
 
-    let after_first_clear = pool.generation_number(&key);
+    let after_first_clear = pool.generation_number(&active_key);
     assert!(after_first_clear > initial_generation);
     let generation = pool
-        .generation(&key)
-        .expect("clear retains an empty current generation");
+        .generation(&idle_key)
+        .expect("clear retains the idle key's empty current generation");
     assert_generation_shape(generation);
-    assert_eq!(generation.number, after_first_clear);
+    assert_eq!(generation.number, pool.generation_number(&idle_key));
     assert!(generation.idle.is_empty());
     assert_eq!(idle_closes.load(Ordering::SeqCst), 1);
     assert_eq!(active_closes.load(Ordering::SeqCst), 0);
@@ -225,12 +234,13 @@ fn clear_keeps_old_active_readable_then_orphans_its_clean_return() {
     let active = active.complete(LeaseTerminal::CleanEof);
     pool.release(active);
 
-    assert_eq!(pool.idle_len(&key), 0);
+    assert!(pool.generation(&active_key).is_none());
+    assert_eq!(pool.idle_len(&active_key), 0);
     assert_eq!(active_closes.load(Ordering::SeqCst), 1);
 
     pool.clear();
 
-    assert!(pool.generation_number(&key) > after_first_clear);
+    assert!(pool.generation_number(&active_key) > after_first_clear);
     assert_eq!(idle_closes.load(Ordering::SeqCst), 1);
     assert_eq!(active_closes.load(Ordering::SeqCst), 1);
 }
