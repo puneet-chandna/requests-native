@@ -1,9 +1,11 @@
+use std::collections::HashSet;
+
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
-    PyAny, PyAnyMethods, PyBool, PyBytes, PyBytesMethods, PyCode, PyDict, PyDictMethods,
-    PyFunction, PyList, PyListMethods, PyModule, PyString, PyTuple, PyTupleMethods, PyType,
-    PyTypeMethods,
+    PyAny, PyAnyMethods, PyBool, PyBytes, PyBytesMethods, PyCFunction, PyCode, PyDict,
+    PyDictMethods, PyFunction, PyList, PyListMethods, PyModule, PyString, PyTuple, PyTupleMethods,
+    PyType, PyTypeMethods,
 };
 use pyo3::wrap_pyfunction;
 use requests::utils::{encode_query_pairs, trim_python_whitespace_start};
@@ -16,6 +18,7 @@ use requests::{
 struct CanonicalFunction {
     code: Py<PyCode>,
     globals: Py<PyDict>,
+    builtins_module: Py<PyModule>,
     builtins: Py<PyDict>,
     defaults: CanonicalDefaults,
     dependencies: Vec<CanonicalGlobal>,
@@ -24,10 +27,12 @@ struct CanonicalFunction {
 enum CanonicalDefaults {
     None,
     Captured {
-        defaults: Py<PyAny>,
-        kwdefaults: Py<PyAny>,
+        defaults: Option<Py<PyAny>>,
+        kwdefaults: Option<Py<PyAny>>,
     },
     ToNativeString,
+    SingleNone,
+    SingleEmptyTuple,
     Quote {
         safe: &'static str,
     },
@@ -53,8 +58,16 @@ enum CanonicalGlobalResolution {
         expected: Py<PyAny>,
         function: Option<Box<CanonicalFunction>>,
     },
+    IntrinsicBuiltin(IntrinsicBuiltin),
     Missing,
     Unprovable,
+}
+
+#[derive(Clone, Copy)]
+enum IntrinsicBuiltin {
+    IsInstance,
+    Str,
+    Bytes,
 }
 
 #[derive(Clone, Copy)]
@@ -62,6 +75,8 @@ enum DefaultPolicy {
     None,
     Captured,
     ToNativeString,
+    SingleNone,
+    SingleEmptyTuple,
     Quote(&'static str),
     Urlencode,
 }
@@ -97,9 +112,6 @@ struct ModelsState {
     parse_url: Py<PyAny>,
     requote_uri: Py<PyAny>,
     basestring: Py<PyAny>,
-    python_str: Py<PyAny>,
-    python_bytes: Py<PyAny>,
-    builtin_isinstance: Py<PyAny>,
     has_read: Py<PyAny>,
     to_key_val_list: Py<PyAny>,
     unicode_is_ascii: Py<PyAny>,
@@ -127,9 +139,109 @@ struct ModelsState {
     urlencode_trust: CanonicalFunction,
     check_header_validity_trust: CanonicalFunction,
     validate_header_part_trust: CanonicalFunction,
+    case_insensitive_dict_init_trust: CanonicalFunction,
+    case_insensitive_dict_update_trust: CanonicalFunction,
+    case_insensitive_dict_setitem_trust: CanonicalFunction,
 }
 
 static MODELS_STATE: PyOnceLock<ModelsState> = PyOnceLock::new();
+
+#[allow(unsafe_code)]
+fn function_code<'py>(
+    py: Python<'py>,
+    function: &Bound<'py, PyFunction>,
+) -> PyResult<Bound<'py, PyCode>> {
+    // SAFETY: CPython returns a borrowed reference owned by the exact
+    // PyFunction, and both the function and returned Bound stay under `py`.
+    unsafe {
+        Ok(
+            Bound::from_borrowed_ptr(py, pyo3::ffi::PyFunction_GetCode(function.as_ptr()))
+                .cast_into::<PyCode>()?,
+        )
+    }
+}
+
+#[allow(unsafe_code)]
+fn function_globals<'py>(
+    py: Python<'py>,
+    function: &Bound<'py, PyFunction>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // SAFETY: CPython returns a borrowed reference owned by the exact
+    // PyFunction, and both the function and returned Bound stay under `py`.
+    unsafe {
+        Ok(
+            Bound::from_borrowed_ptr(py, pyo3::ffi::PyFunction_GetGlobals(function.as_ptr()))
+                .cast_into::<PyDict>()?,
+        )
+    }
+}
+
+#[allow(unsafe_code)]
+fn function_defaults<'py>(
+    py: Python<'py>,
+    function: &Bound<'py, PyFunction>,
+) -> Option<Bound<'py, PyAny>> {
+    // SAFETY: CPython returns either null or a borrowed reference owned by the
+    // exact PyFunction, and both the function and Bound stay under `py`.
+    unsafe {
+        Bound::from_borrowed_ptr_or_opt(py, pyo3::ffi::PyFunction_GetDefaults(function.as_ptr()))
+    }
+}
+
+#[allow(unsafe_code)]
+fn function_kwdefaults<'py>(
+    py: Python<'py>,
+    function: &Bound<'py, PyFunction>,
+) -> Option<Bound<'py, PyAny>> {
+    // SAFETY: CPython returns either null or a borrowed reference owned by the
+    // exact PyFunction, and both the function and Bound stay under `py`.
+    unsafe {
+        Bound::from_borrowed_ptr_or_opt(py, pyo3::ffi::PyFunction_GetKwDefaults(function.as_ptr()))
+    }
+}
+
+#[allow(unsafe_code)]
+fn c_function_self<'py>(
+    py: Python<'py>,
+    function: &Bound<'py, PyCFunction>,
+) -> Option<Bound<'py, PyAny>> {
+    // SAFETY: PyCFunction_GetSelf returns either null or a borrowed reference
+    // owned by the exact PyCFunction while `py` is attached.
+    unsafe {
+        Bound::from_borrowed_ptr_or_opt(py, pyo3::ffi::PyCFunction_GetSelf(function.as_ptr()))
+    }
+}
+
+fn intrinsic_builtin_is(
+    py: Python<'_>,
+    state_builtins: &Bound<'_, PyModule>,
+    current: &Bound<'_, PyAny>,
+    intrinsic: IntrinsicBuiltin,
+) -> PyResult<bool> {
+    match intrinsic {
+        IntrinsicBuiltin::Str => Ok(current.is(py.get_type::<PyString>())),
+        IntrinsicBuiltin::Bytes => Ok(current.is(py.get_type::<PyBytes>())),
+        IntrinsicBuiltin::IsInstance => {
+            let Ok(function) = current.cast::<PyCFunction>() else {
+                return Ok(false);
+            };
+            Ok(
+                function.getattr("__name__")?.extract::<String>()? == "isinstance"
+                    && function.getattr("__module__")?.extract::<String>()? == "builtins"
+                    && c_function_self(py, function).is_some_and(|owner| owner.is(state_builtins)),
+            )
+        }
+    }
+}
+
+fn intrinsic_builtin_for_name(name: &str) -> Option<IntrinsicBuiltin> {
+    match name {
+        "isinstance" => Some(IntrinsicBuiltin::IsInstance),
+        "str" => Some(IntrinsicBuiltin::Str),
+        "bytes" => Some(IntrinsicBuiltin::Bytes),
+        _ => None,
+    }
+}
 
 fn raw_type_entry<'py>(
     class: &Bound<'py, PyType>,
@@ -162,30 +274,34 @@ fn required_module_entry<'py>(
     })
 }
 
-fn find_code_by_qualname<'py>(
-    code: &Bound<'py, PyCode>,
-    qualname: &str,
+fn direct_nested_code<'py>(
+    scope: &Bound<'py, PyCode>,
+    name: &str,
 ) -> PyResult<Option<Bound<'py, PyCode>>> {
-    let (code_name, qualified) = match code.getattr("co_qualname") {
-        Ok(name) => (name.extract::<String>()?, true),
-        Err(_) => (code.getattr("co_name")?.extract::<String>()?, false),
-    };
-    let expected_name = qualname.rsplit('.').next().unwrap_or(qualname);
-    let matches = if qualified {
-        code_name == qualname
-    } else {
-        code_name == expected_name
-    };
-    let mut found = matches.then(|| code.clone());
-    for constant in code.getattr("co_consts")?.cast_into::<PyTuple>()?.iter() {
+    let mut found = None;
+    for constant in scope.getattr("co_consts")?.cast_into::<PyTuple>()?.iter() {
         let Ok(nested) = constant.cast_into::<PyCode>() else {
             continue;
         };
-        if let Some(nested) = find_code_by_qualname(&nested, qualname)? {
+        if nested.getattr("co_name")?.extract::<String>()? == name {
             found = Some(nested);
         }
     }
     Ok(found)
+}
+
+fn find_code_by_scope<'py>(
+    root: &Bound<'py, PyCode>,
+    qualname: &str,
+) -> PyResult<Option<Bound<'py, PyCode>>> {
+    let mut scope = root.clone();
+    for component in qualname.split('.').filter(|part| *part != "<locals>") {
+        let Some(nested) = direct_nested_code(&scope, component)? else {
+            return Ok(None);
+        };
+        scope = nested;
+    }
+    Ok(Some(scope))
 }
 
 fn canonical_module_code<'py>(py: Python<'py>, module_name: &str) -> PyResult<Bound<'py, PyCode>> {
@@ -203,7 +319,7 @@ fn canonical_code<'py>(
     qualname: &str,
 ) -> PyResult<Bound<'py, PyCode>> {
     let root = canonical_module_code(py, module_name)?;
-    find_code_by_qualname(&root, qualname)?.ok_or_else(|| {
+    find_code_by_scope(&root, qualname)?.ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
             "canonical code not found for {module_name}.{qualname}"
         ))
@@ -219,7 +335,33 @@ fn build_canonical_function(
     include_globals: bool,
     ignored_globals: &[&str],
 ) -> PyResult<CanonicalFunction> {
+    build_canonical_function_inner(
+        py,
+        current,
+        module_name,
+        qualname,
+        policy,
+        include_globals,
+        ignored_globals,
+        &HashSet::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_canonical_function_inner(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    module_name: &str,
+    qualname: &str,
+    policy: DefaultPolicy,
+    include_globals: bool,
+    ignored_globals: &[&str],
+    ancestors: &HashSet<(String, String)>,
+) -> PyResult<CanonicalFunction> {
+    let mut descendants = ancestors.clone();
+    descendants.insert((module_name.to_owned(), qualname.to_owned()));
     let module = PyModule::import(py, module_name)?;
+    let builtins_module = PyModule::import(py, "builtins")?;
     let code = canonical_code(py, module_name, qualname)?;
     let builtins = required_module_entry(&module, "__builtins__")?.cast_into::<PyDict>()?;
     let module_globals = canonical_module_globals(py, module_name)?;
@@ -228,17 +370,19 @@ fn build_canonical_function(
         DefaultPolicy::Captured => {
             let function = current.cast::<PyFunction>()?;
             CanonicalDefaults::Captured {
-                defaults: function.getattr("__defaults__")?.unbind(),
-                kwdefaults: function.getattr("__kwdefaults__")?.unbind(),
+                defaults: function_defaults(py, function).map(Bound::unbind),
+                kwdefaults: function_kwdefaults(py, function).map(Bound::unbind),
             }
         }
         DefaultPolicy::ToNativeString => CanonicalDefaults::ToNativeString,
+        DefaultPolicy::SingleNone => CanonicalDefaults::SingleNone,
+        DefaultPolicy::SingleEmptyTuple => CanonicalDefaults::SingleEmptyTuple,
         DefaultPolicy::Quote(safe) => CanonicalDefaults::Quote { safe },
         DefaultPolicy::Urlencode => {
             let urllib_parse = PyModule::import(py, "urllib.parse")?;
             let quote_plus = required_module_entry(&urllib_parse, "quote_plus")?;
             let quote = required_module_entry(&urllib_parse, "quote")?;
-            let quote_plus_trust = build_canonical_function(
+            let quote_plus_trust = build_canonical_function_inner(
                 py,
                 &quote_plus,
                 "urllib.parse",
@@ -246,8 +390,9 @@ fn build_canonical_function(
                 DefaultPolicy::Quote(""),
                 true,
                 &[],
+                &descendants,
             )?;
-            let quote_trust = build_canonical_function(
+            let quote_trust = build_canonical_function_inner(
                 py,
                 &quote,
                 "urllib.parse",
@@ -255,6 +400,7 @@ fn build_canonical_function(
                 DefaultPolicy::Quote("/"),
                 true,
                 &["TypeError"],
+                &descendants,
             )?;
             CanonicalDefaults::Urlencode {
                 quote_plus: quote_plus.unbind(),
@@ -272,6 +418,7 @@ fn build_canonical_function(
             &code,
             &module_globals,
             ignored_globals,
+            &descendants,
         )?
     } else {
         Vec::new()
@@ -280,6 +427,7 @@ fn build_canonical_function(
     Ok(CanonicalFunction {
         code: code.unbind(),
         globals: module.dict().unbind(),
+        builtins_module: builtins_module.unbind(),
         builtins: builtins.unbind(),
         defaults,
         dependencies,
@@ -313,6 +461,7 @@ fn build_canonical_globals(
     code: &Bound<'_, PyCode>,
     module_globals: &[String],
     ignored: &[&str],
+    ancestors: &HashSet<(String, String)>,
 ) -> PyResult<Vec<CanonicalGlobal>> {
     let instructions = PyModule::import(py, "dis")?
         .getattr("get_instructions")?
@@ -333,7 +482,7 @@ fn build_canonical_globals(
         }
         let resolution = if module_globals.contains(&name) {
             if let Some(value) = module.dict().get_item(&name)? {
-                match direct_function_trust(py, &value) {
+                match direct_function_trust(py, &value, ancestors) {
                     Ok(function) => CanonicalGlobalResolution::Module {
                         function,
                         expected: value.unbind(),
@@ -343,8 +492,10 @@ fn build_canonical_globals(
             } else {
                 CanonicalGlobalResolution::Unprovable
             }
+        } else if let Some(intrinsic) = intrinsic_builtin_for_name(&name) {
+            CanonicalGlobalResolution::IntrinsicBuiltin(intrinsic)
         } else if let Some(value) = builtins.get_item(&name)? {
-            match direct_function_trust(py, &value) {
+            match direct_function_trust(py, &value, ancestors) {
                 Ok(function) => CanonicalGlobalResolution::Builtin {
                     function,
                     expected: value.unbind(),
@@ -362,20 +513,25 @@ fn build_canonical_globals(
 fn direct_function_trust(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
+    ancestors: &HashSet<(String, String)>,
 ) -> PyResult<Option<Box<CanonicalFunction>>> {
     if !value.is_exact_instance_of::<PyFunction>() {
         return Ok(None);
     }
     let module_name = value.getattr("__module__")?.extract::<String>()?;
     let qualname = value.getattr("__qualname__")?.extract::<String>()?;
-    Ok(Some(Box::new(build_canonical_function(
+    if ancestors.contains(&(module_name.clone(), qualname.clone())) {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(build_canonical_function_inner(
         py,
         value,
         &module_name,
         &qualname,
         DefaultPolicy::Captured,
-        false,
+        true,
         &[],
+        ancestors,
     )?)))
 }
 
@@ -384,21 +540,33 @@ fn canonical_defaults_are_current(
     function: &Bound<'_, PyFunction>,
     expected: &CanonicalDefaults,
 ) -> PyResult<bool> {
-    let defaults = function.getattr("__defaults__")?;
-    let kwdefaults = function.getattr("__kwdefaults__")?;
+    let defaults = function_defaults(py, function);
+    let kwdefaults = function_kwdefaults(py, function);
     match expected {
         CanonicalDefaults::None => Ok(defaults.is_none() && kwdefaults.is_none()),
         CanonicalDefaults::Captured {
             defaults: expected_defaults,
             kwdefaults: expected_kwdefaults,
         } => {
-            Ok(defaults.is(expected_defaults.bind(py))
-                && kwdefaults.is(expected_kwdefaults.bind(py)))
+            let defaults_match = match (defaults.as_ref(), expected_defaults.as_ref()) {
+                (None, None) => true,
+                (Some(actual), Some(expected)) => actual.is(expected.bind(py)),
+                _ => false,
+            };
+            let kwdefaults_match = match (kwdefaults.as_ref(), expected_kwdefaults.as_ref()) {
+                (None, None) => true,
+                (Some(actual), Some(expected)) => actual.is(expected.bind(py)),
+                _ => false,
+            };
+            Ok(defaults_match && kwdefaults_match)
         }
         CanonicalDefaults::ToNativeString => {
-            if !kwdefaults.is_none() {
+            if kwdefaults.is_some() {
                 return Ok(false);
             }
+            let Some(defaults) = defaults else {
+                return Ok(false);
+            };
             let Ok(defaults) = defaults.cast_into::<PyTuple>() else {
                 return Ok(false);
             };
@@ -408,10 +576,41 @@ fn canonical_defaults_are_current(
                     .cast::<PyString>()
                     .is_ok_and(|value| value.to_str().is_ok_and(|value| value == "ascii")))
         }
-        CanonicalDefaults::Quote { safe } => {
-            if !kwdefaults.is_none() {
+        CanonicalDefaults::SingleNone => {
+            if kwdefaults.is_some() {
                 return Ok(false);
             }
+            let Some(defaults) = defaults else {
+                return Ok(false);
+            };
+            let Ok(defaults) = defaults.cast_into::<PyTuple>() else {
+                return Ok(false);
+            };
+            Ok(defaults.len() == 1 && defaults.get_item(0)?.is_none())
+        }
+        CanonicalDefaults::SingleEmptyTuple => {
+            if kwdefaults.is_some() {
+                return Ok(false);
+            }
+            let Some(defaults) = defaults else {
+                return Ok(false);
+            };
+            let Ok(defaults) = defaults.cast_into::<PyTuple>() else {
+                return Ok(false);
+            };
+            Ok(defaults.len() == 1
+                && defaults
+                    .get_item(0)?
+                    .cast::<PyTuple>()
+                    .is_ok_and(PyTupleMethods::is_empty))
+        }
+        CanonicalDefaults::Quote { safe } => {
+            if kwdefaults.is_some() {
+                return Ok(false);
+            }
+            let Some(defaults) = defaults else {
+                return Ok(false);
+            };
             let Ok(defaults) = defaults.cast_into::<PyTuple>() else {
                 return Ok(false);
             };
@@ -429,9 +628,12 @@ fn canonical_defaults_are_current(
             quote,
             quote_trust,
         } => {
-            if !kwdefaults.is_none() {
+            if kwdefaults.is_some() {
                 return Ok(false);
             }
+            let Some(defaults) = defaults else {
+                return Ok(false);
+            };
             let Ok(defaults) = defaults.cast_into::<PyTuple>() else {
                 return Ok(false);
             };
@@ -463,10 +665,8 @@ fn canonical_function_is(
     let Ok(function) = current.cast::<PyFunction>() else {
         return Ok(false);
     };
-    let Ok(code) = function.getattr("__code__")?.cast_into::<PyCode>() else {
-        return Ok(false);
-    };
-    let globals = function.getattr("__globals__")?.cast_into::<PyDict>()?;
+    let code = function_code(py, function)?;
+    let globals = function_globals(py, function)?;
     let builtins = function.getattr("__builtins__")?.cast_into::<PyDict>()?;
     if !code.eq(expected.code.bind(py))?
         || !globals.is(expected.globals.bind(py))
@@ -487,17 +687,37 @@ fn canonical_function_is(
                 }
                 (current, function)
             }
-            CanonicalGlobalResolution::Builtin { expected, function } => {
+            CanonicalGlobalResolution::Builtin {
+                expected: expected_value,
+                function,
+            } => {
                 if current_global.is_some() {
                     return Ok(false);
                 }
                 let Some(current) = builtins.get_item(&dependency.name)? else {
                     return Ok(false);
                 };
-                if !current.is(expected.bind(py)) {
+                if !current.is(expected_value.bind(py)) {
                     return Ok(false);
                 }
                 (current, function)
+            }
+            CanonicalGlobalResolution::IntrinsicBuiltin(intrinsic) => {
+                if current_global.is_some() {
+                    return Ok(false);
+                }
+                let Some(current) = builtins.get_item(&dependency.name)? else {
+                    return Ok(false);
+                };
+                if !intrinsic_builtin_is(
+                    py,
+                    expected.builtins_module.bind(py),
+                    &current,
+                    *intrinsic,
+                )? {
+                    return Ok(false);
+                }
+                continue;
             }
             CanonicalGlobalResolution::Missing => {
                 if current_global.is_some() || builtins.contains(&dependency.name)? {
@@ -544,8 +764,8 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
     let validate_header_part = required_module_entry(&utils, "_validate_header_part")?;
     let header_validators_str = required_module_entry(&utils, "_HEADER_VALIDATORS_STR")?;
     let header_validators_byte = required_module_entry(&utils, "_HEADER_VALIDATORS_BYTE")?;
-    let utils_str = required_module_entry(&utils, "str")?;
-    let utils_bytes = required_module_entry(&utils, "bytes")?;
+    let utils_str = py.get_type::<PyString>().into_any();
+    let utils_bytes = py.get_type::<PyBytes>().into_any();
     let to_native_string = required_module_entry(&models, "to_native_string")?;
     let invalid_header = required_module_entry(&utils, "InvalidHeader")?;
     let invalid_url = required_module_entry(&models, "InvalidURL")?;
@@ -554,9 +774,6 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
     let parse_url = required_module_entry(&models, "parse_url")?;
     let requote_uri = required_module_entry(&models, "requote_uri")?;
     let basestring = required_module_entry(&models, "basestring")?;
-    let python_str = required_module_entry(&builtins, "str")?;
-    let python_bytes = required_module_entry(&builtins, "bytes")?;
-    let builtin_isinstance = required_module_entry(&builtins, "isinstance")?;
     let has_read = required_module_entry(&model_types, "has_read")?;
     let to_key_val_list = required_module_entry(&models, "to_key_val_list")?;
     let unicode_is_ascii = required_module_entry(&models, "unicode_is_ascii")?;
@@ -568,7 +785,7 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         .getattr("__dict__")?
         .get_item("_encode_params")?;
     let encode_params_function = encode_params_descriptor.getattr("__func__")?;
-    let builtin_str = required_module_entry(&internal_utils, "builtin_str")?;
+    let builtin_str = py.get_type::<PyString>().into_any();
     let prepare_method = required_raw_type_entry(&prepared_request, "prepare_method")?;
     let prepare_headers = required_raw_type_entry(&prepared_request, "prepare_headers")?;
     let prepare_url = required_raw_type_entry(&prepared_request, "prepare_url")?;
@@ -701,6 +918,33 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         true,
         &["InvalidHeader", "type"],
     )?;
+    let case_insensitive_dict_init_trust = build_canonical_function(
+        py,
+        &case_insensitive_dict_init,
+        "requests.structures",
+        "CaseInsensitiveDict.__init__",
+        DefaultPolicy::SingleNone,
+        true,
+        &[],
+    )?;
+    let case_insensitive_dict_update_trust = build_canonical_function(
+        py,
+        &case_insensitive_dict_update,
+        "_collections_abc",
+        "MutableMapping.update",
+        DefaultPolicy::SingleEmptyTuple,
+        true,
+        &[],
+    )?;
+    let case_insensitive_dict_setitem_trust = build_canonical_function(
+        py,
+        &case_insensitive_dict_setitem,
+        "requests.structures",
+        "CaseInsensitiveDict.__setitem__",
+        DefaultPolicy::None,
+        true,
+        &[],
+    )?;
     Ok(ModelsState {
         internal_utils: internal_utils.unbind(),
         builtins: builtins.unbind(),
@@ -732,9 +976,6 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         parse_url: parse_url.unbind(),
         requote_uri: requote_uri.unbind(),
         basestring: basestring.unbind(),
-        python_str: python_str.unbind(),
-        python_bytes: python_bytes.unbind(),
-        builtin_isinstance: builtin_isinstance.unbind(),
         has_read: has_read.unbind(),
         to_key_val_list: to_key_val_list.unbind(),
         unicode_is_ascii: unicode_is_ascii.unbind(),
@@ -762,6 +1003,9 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         urlencode_trust,
         check_header_validity_trust,
         validate_header_part_trust,
+        case_insensitive_dict_init_trust,
+        case_insensitive_dict_update_trust,
+        case_insensitive_dict_setitem_trust,
     })
 }
 
@@ -782,15 +1026,20 @@ fn raw_module_entry_is(
         .is_some_and(|value| value.is(expected.bind(py))))
 }
 
-fn raw_builtin_fallback_is(
+fn raw_intrinsic_builtin_fallback_is(
     py: Python<'_>,
     state: &ModelsState,
     module: &Py<PyModule>,
     name: &str,
-    expected: &Py<PyAny>,
+    intrinsic: IntrinsicBuiltin,
 ) -> PyResult<bool> {
-    Ok(!module.bind(py).dict().contains(name)?
-        && raw_module_entry_is(py, &state.builtins, name, expected)?)
+    if module.bind(py).dict().contains(name)? {
+        return Ok(false);
+    }
+    let Some(current) = state.builtins.bind(py).dict().get_item(name)? else {
+        return Ok(false);
+    };
+    intrinsic_builtin_is(py, state.builtins.bind(py), &current, intrinsic)
 }
 
 fn raw_type_entry_is(
@@ -1000,14 +1249,25 @@ fn trusted_native_string_dependencies(py: Python<'_>, state: &ModelsState) -> Py
 }
 
 fn trusted_url_input_dependencies(py: Python<'_>, state: &ModelsState) -> PyResult<bool> {
-    Ok(raw_builtin_fallback_is(
+    Ok(raw_intrinsic_builtin_fallback_is(
         py,
         state,
         &state.models,
         "isinstance",
-        &state.builtin_isinstance,
-    )? && raw_builtin_fallback_is(py, state, &state.models, "bytes", &state.python_bytes)?
-        && raw_builtin_fallback_is(py, state, &state.models, "str", &state.python_str)?)
+        IntrinsicBuiltin::IsInstance,
+    )? && raw_intrinsic_builtin_fallback_is(
+        py,
+        state,
+        &state.models,
+        "bytes",
+        IntrinsicBuiltin::Bytes,
+    )? && raw_intrinsic_builtin_fallback_is(
+        py,
+        state,
+        &state.models,
+        "str",
+        IntrinsicBuiltin::Str,
+    )?)
 }
 
 fn trusted_url_parse_dependencies(py: Python<'_>, state: &ModelsState) -> PyResult<bool> {
@@ -1253,6 +1513,16 @@ fn _prepare_headers_trial(
     if !is_exact_header_candidate(py, headers)? {
         return Ok(callable.call1((headers,))?.unbind());
     }
+    if !trusted_header_constructor_dependencies(py, state)? {
+        return Ok(callable.call1((headers,))?.unbind());
+    }
+    let has_rows = !headers.is_none() && headers.len()? != 0;
+    if has_rows
+        && (!trusted_header_validation_dependencies(py, state)?
+            || !trusted_header_materialization_dependencies(py, state)?)
+    {
+        return Ok(callable.call1((headers,))?.unbind());
+    }
 
     let Some((native_headers, python_rows)) = exact_header_rows(py, headers)? else {
         return Ok(callable.call1((headers,))?.unbind());
@@ -1262,11 +1532,8 @@ fn _prepare_headers_trial(
         Ok(prepared) => (prepared, None),
         Err(error) => (error.prepared.clone(), Some(error)),
     };
-    if !trusted_header_constructor_dependencies(py, state)?
-        || (!native_headers.is_empty() && !trusted_header_validation_dependencies(py, state)?)
-        || (!prepared.is_empty() && !trusted_header_materialization_dependencies(py, state)?)
-        || (error.is_some()
-            && !raw_module_entry_is(py, &state.utils, "InvalidHeader", &state.invalid_header)?)
+    if error.is_some()
+        && !raw_module_entry_is(py, &state.utils, "InvalidHeader", &state.invalid_header)?
     {
         return Ok(callable.call1((headers,))?.unbind());
     }
@@ -1363,7 +1630,17 @@ fn trusted_header_constructor_dependencies(py: Python<'_>, state: &ModelsState) 
             "__setattr__",
             &state.case_insensitive_dict_setattr,
         )?
-        && raw_type_entry_is(py, class, "update", &state.case_insensitive_dict_update)?)
+        && raw_type_entry_is(py, class, "update", &state.case_insensitive_dict_update)?
+        && canonical_function_is(
+            py,
+            state.case_insensitive_dict_init.bind(py),
+            &state.case_insensitive_dict_init_trust,
+        )?
+        && canonical_function_is(
+            py,
+            state.case_insensitive_dict_update.bind(py),
+            &state.case_insensitive_dict_update_trust,
+        )?)
 }
 
 fn trusted_header_materialization_dependencies(
@@ -1376,6 +1653,11 @@ fn trusted_header_materialization_dependencies(
             state.case_insensitive_dict.bind(py),
             "__setitem__",
             &state.case_insensitive_dict_setitem,
+        )?
+        && canonical_function_is(
+            py,
+            state.case_insensitive_dict_setitem.bind(py),
+            &state.case_insensitive_dict_setitem_trust,
         )?)
 }
 

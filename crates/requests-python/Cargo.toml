@@ -13,5 +13,5 @@ pyo3 = { workspace = true, features = ["extension-module"] }
 requests = { path = "../requests" }
 tokio = { version = "1", features = ["sync", "time"] }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "deny"
