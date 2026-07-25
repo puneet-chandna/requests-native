@@ -186,13 +186,22 @@ struct ModelsState {
     prepare_method: Py<PyAny>,
     prepare_headers: Py<PyAny>,
     prepare_url: Py<PyAny>,
+    prepare_body: Py<PyAny>,
+    prepare_content_length: Py<PyAny>,
+    rewind_body: Py<PyAny>,
     object_getattribute: Py<PyAny>,
     object_setattr: Py<PyAny>,
     prepare_method_trust: CanonicalFunction,
     prepare_headers_trust: CanonicalFunction,
     prepare_url_trust: CanonicalFunction,
+    prepare_body_trust: CanonicalFunction,
+    prepare_content_length_trust: CanonicalFunction,
+    rewind_body_trust: CanonicalFunction,
     encode_params_function: Py<PyAny>,
     encode_params_trust: CanonicalFunction,
+    encode_files_descriptor: Py<PyAny>,
+    encode_files_function: Py<PyAny>,
+    encode_files_trust: CanonicalFunction,
     to_native_string_trust: CanonicalFunction,
     parse_url_trust: CanonicalFunction,
     requote_uri_trust: CanonicalFunction,
@@ -1828,10 +1837,18 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         .getattr("__dict__")?
         .get_item("_encode_params")?;
     let encode_params_function = encode_params_descriptor.getattr("__func__")?;
+    let encode_files_descriptor = request_encoding_mixin
+        .getattr("__dict__")?
+        .get_item("_encode_files")?;
+    let encode_files_function = encode_files_descriptor.getattr("__func__")?;
     let builtin_str = py.get_type::<PyString>().into_any();
     let prepare_method = required_raw_type_entry(&prepared_request, "prepare_method")?;
     let prepare_headers = required_raw_type_entry(&prepared_request, "prepare_headers")?;
     let prepare_url = required_raw_type_entry(&prepared_request, "prepare_url")?;
+    let prepare_body = required_raw_type_entry(&prepared_request, "prepare_body")?;
+    let prepare_content_length =
+        required_raw_type_entry(&prepared_request, "prepare_content_length")?;
+    let rewind_body = required_module_entry(&utils, "rewind_body")?;
     let object_type = py.get_type::<PyAny>();
     let object_getattribute = required_raw_type_entry(&object_type, "__getattribute__")?;
     let object_setattr = required_raw_type_entry(&object_type, "__setattr__")?;
@@ -1862,11 +1879,47 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         false,
         &[],
     )?;
+    let prepare_body_trust = build_canonical_function(
+        py,
+        &prepare_body,
+        "requests.models",
+        "PreparedRequest.prepare_body",
+        DefaultPolicy::SingleNone,
+        false,
+        &[],
+    )?;
+    let prepare_content_length_trust = build_canonical_function(
+        py,
+        &prepare_content_length,
+        "requests.models",
+        "PreparedRequest.prepare_content_length",
+        DefaultPolicy::None,
+        false,
+        &[],
+    )?;
+    let rewind_body_trust = build_canonical_function(
+        py,
+        &rewind_body,
+        "requests.utils",
+        "rewind_body",
+        DefaultPolicy::None,
+        false,
+        &[],
+    )?;
     let encode_params_trust = build_canonical_function(
         py,
         &encode_params_function,
         "requests.models",
         "RequestEncodingMixin._encode_params",
+        DefaultPolicy::None,
+        false,
+        &[],
+    )?;
+    let encode_files_trust = build_canonical_function(
+        py,
+        &encode_files_function,
+        "requests.models",
+        "RequestEncodingMixin._encode_files",
         DefaultPolicy::None,
         false,
         &[],
@@ -1997,13 +2050,22 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         prepare_method: prepare_method.unbind(),
         prepare_headers: prepare_headers.unbind(),
         prepare_url: prepare_url.unbind(),
+        prepare_body: prepare_body.unbind(),
+        prepare_content_length: prepare_content_length.unbind(),
+        rewind_body: rewind_body.unbind(),
         object_getattribute: object_getattribute.unbind(),
         object_setattr: object_setattr.unbind(),
         prepare_method_trust,
         prepare_headers_trust,
         prepare_url_trust,
+        prepare_body_trust,
+        prepare_content_length_trust,
+        rewind_body_trust,
         encode_params_function: encode_params_function.unbind(),
         encode_params_trust,
+        encode_files_descriptor: encode_files_descriptor.unbind(),
+        encode_files_function: encode_files_function.unbind(),
+        encode_files_trust,
         to_native_string_trust,
         parse_url_trust,
         requote_uri_trust,
@@ -2104,6 +2166,77 @@ fn trusted_bound_method<'py>(
     let trusted = callable.getattr("__self__")?.is(subject)
         && function.is(expected.bind(py))
         && canonical_function_is(py, &function, expected_trust)?;
+    Ok((callable, trusted))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PreparedBodyMethod {
+    PrepareBody,
+    PrepareContentLength,
+}
+
+pub(crate) fn trusted_prepared_body_method<'py>(
+    py: Python<'py>,
+    subject: &Bound<'py, PyAny>,
+    method: PreparedBodyMethod,
+) -> PyResult<(Bound<'py, PyAny>, bool)> {
+    let state = models_state(py)?;
+    let (name, expected, trust) = match method {
+        PreparedBodyMethod::PrepareBody => (
+            "prepare_body",
+            &state.prepare_body,
+            &state.prepare_body_trust,
+        ),
+        PreparedBodyMethod::PrepareContentLength => (
+            "prepare_content_length",
+            &state.prepare_content_length,
+            &state.prepare_content_length_trust,
+        ),
+    };
+    trusted_bound_method(py, subject, name, expected, trust)
+}
+
+pub(crate) fn trusted_body_encoding_helpers(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    let state = models_state(py)?;
+    if !subject.get_type().is(state.prepared_request.bind(py)) {
+        return Ok(false);
+    }
+    let instance_dict = raw_instance_dict(py, state, subject)?;
+    if instance_dict.contains("_encode_params")? || instance_dict.contains("_encode_files")? {
+        return Ok(false);
+    }
+
+    let Some(encode_params) = raw_type_entry(&subject.get_type(), "_encode_params")? else {
+        return Ok(false);
+    };
+    let Some(encode_files) = raw_type_entry(&subject.get_type(), "_encode_files")? else {
+        return Ok(false);
+    };
+    if !encode_params.is(state.encode_params_descriptor.bind(py))
+        || !encode_files.is(state.encode_files_descriptor.bind(py))
+    {
+        return Ok(false);
+    }
+
+    let encode_params_function = encode_params.getattr("__func__")?;
+    let encode_files_function = encode_files.getattr("__func__")?;
+    Ok(
+        encode_params_function.is(state.encode_params_function.bind(py))
+            && encode_files_function.is(state.encode_files_function.bind(py))
+            && canonical_function_is(py, &encode_params_function, &state.encode_params_trust)?
+            && canonical_function_is(py, &encode_files_function, &state.encode_files_trust)?,
+    )
+}
+
+pub(crate) fn trusted_rewind_body(py: Python<'_>) -> PyResult<(Bound<'_, PyAny>, bool)> {
+    let state = models_state(py)?;
+    let callable = state.utils.bind(py).getattr("rewind_body")?;
+    let trusted = raw_module_entry_is(py, &state.utils, "rewind_body", &state.rewind_body)?
+        && callable.is(state.rewind_body.bind(py))
+        && canonical_function_is(py, &callable, &state.rewind_body_trust)?;
     Ok((callable, trusted))
 }
 

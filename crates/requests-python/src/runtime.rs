@@ -12,7 +12,7 @@ use requests::blocking::{
     BlockingDriverError, BlockingRuntimeDriver, BlockingSubmission, BlockingTaskError,
 };
 
-use crate::bridge::{ActionReceiver, BridgeClosed, action_channel};
+use crate::bridge::{ActionReceiver, ActionSender, BridgeClosed, action_channel};
 
 const WAKE_INTERVAL: Duration = Duration::from_millis(10);
 const CANCEL_WAIT: Duration = Duration::from_millis(500);
@@ -207,6 +207,48 @@ fn driver_error(error: BlockingDriverError) -> PyErr {
 
 fn task_error(error: BlockingTaskError) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
+}
+
+pub(crate) fn run_with_actions<T, A, R, Fut, Build, Execute>(
+    py: Python<'_>,
+    build: Build,
+    execute: Execute,
+) -> PyResult<T>
+where
+    T: Send + 'static,
+    A: Send + 'static,
+    R: Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    Build: FnOnce(ActionSender<A, R>) -> Fut,
+    Execute: for<'py> FnMut(Python<'py>, A) -> R,
+{
+    let context = PythonCallContext::capture(py)?;
+    let runtime = driver()?;
+    let (actions, receiver) = action_channel();
+    let submission = submit(&runtime, build(actions))?;
+    context.drive(py, submission, receiver, execute)
+}
+
+pub(crate) fn run_with_actions_and_signal_checker<T, A, R, Fut, Build, Execute, CheckSignals>(
+    py: Python<'_>,
+    build: Build,
+    execute: Execute,
+    check_signals: CheckSignals,
+) -> PyResult<T>
+where
+    T: Send + 'static,
+    A: Send + 'static,
+    R: Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    Build: FnOnce(ActionSender<A, R>) -> Fut,
+    Execute: for<'py> FnMut(Python<'py>, A) -> R,
+    CheckSignals: for<'py> FnMut(Python<'py>) -> PyResult<()>,
+{
+    let context = PythonCallContext::capture(py)?;
+    let runtime = driver()?;
+    let (actions, receiver) = action_channel();
+    let submission = submit(&runtime, build(actions))?;
+    context.drive_with_signal_checker(py, submission, receiver, execute, check_signals)
 }
 
 fn bridge_error(error: BridgeClosed) -> PyErr {

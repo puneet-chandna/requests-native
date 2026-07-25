@@ -13,6 +13,14 @@ pub(crate) struct ActionSender<A, R> {
     sender: mpsc::Sender<ActionRequest<A, R>>,
 }
 
+impl<A, R> Clone for ActionSender<A, R> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
+}
+
 impl<A, R> ActionSender<A, R> {
     pub(crate) async fn request(&self, action: A) -> Result<R, BridgeClosed> {
         let (reply, receive_reply) = oneshot::channel();
@@ -20,6 +28,10 @@ impl<A, R> ActionSender<A, R> {
             .send(ActionRequest { action, reply })
             .map_err(|_| BridgeClosed::ActionReceiver)?;
         receive_reply.await.map_err(|_| BridgeClosed::ReplySender)
+    }
+
+    pub(crate) async fn request_owned(self, action: A) -> Result<R, BridgeClosed> {
+        self.request(action).await
     }
 }
 
