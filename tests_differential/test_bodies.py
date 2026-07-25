@@ -25,6 +25,7 @@ _BODY_TRIAL_SYMBOLS = {
     "_rewind_body_trial",
     "_body_stream_collect_trial",
     "_body_stream_cancel_before_poll_trial",
+    "_body_stream_cancel_phase_trial",
     "_body_stream_cancel_trial",
     "_body_stream_poll_state_trial",
     "_body_stream_disconnect_trial",
@@ -113,6 +114,16 @@ def cancel_body_before_poll_call(subject, error):
         return _requests_rust._body_stream_cancel_before_poll_trial(
             subject, error
         )
+    raise error
+
+
+def cancel_body_phase_call(subject, error, phase):
+    if _requests_rust is not None:
+        return _requests_rust._body_stream_cancel_phase_trial(
+            subject, error, phase
+        )
+    if phase == "reply-observed":
+        next(iter(subject.body))
     raise error
 
 
@@ -1527,3 +1538,96 @@ result = {
         "close_events": [],
         "next_events": [["next", True]],
     }
+
+
+def test_reachable_cancel_phases_drop_worker_before_origin_owner() -> None:
+    state = _run_matching(
+        """
+import gc
+
+
+class Cancelled(BaseException):
+    pass
+
+
+class TrackedBody:
+    def __init__(self, label):
+        self.label = label
+
+    def __iter__(self):
+        side_effects.append([
+            "iter",
+            self.label,
+            threading.get_ident() == ENTRY_THREAD,
+        ])
+        return self
+
+    def __next__(self):
+        side_effects.append([
+            "next",
+            self.label,
+            threading.get_ident() == ENTRY_THREAD,
+        ])
+        return b"chunk"
+
+    def close(self):
+        side_effects.append([
+            "close",
+            self.label,
+            threading.get_ident() == ENTRY_THREAD,
+        ])
+
+    def __del__(self):
+        side_effects.append([
+            "del",
+            self.label,
+            threading.get_ident() == ENTRY_THREAD,
+        ])
+
+
+rows = []
+for phase in (
+    "before-poll",
+    "queued-before-dequeue",
+    "reply-observed",
+):
+    original = Cancelled(phase)
+    subject = new_subject()
+    subject.body = TrackedBody(phase)
+    outcome = capture(
+        lambda subject=subject, original=original, phase=phase:
+            cancel_body_phase_call(subject, original, phase)
+    )
+    rows.append([phase, outcome["error"] is original])
+    outcome["error"] = None
+    subject.body = None
+    del subject
+    original = None
+    gc.collect()
+
+result = {
+    "rows": rows,
+    "effects": list(side_effects),
+}
+"""
+    )
+
+    assert state["rows"] == [
+        ["before-poll", True],
+        ["queued-before-dequeue", True],
+        ["reply-observed", True],
+    ]
+    assert [
+        event for event in state["effects"] if event[0] == "iter"
+    ] == [["iter", "reply-observed", True]]
+    assert [
+        event for event in state["effects"] if event[0] == "next"
+    ] == [["next", "reply-observed", True]]
+    assert [
+        event for event in state["effects"] if event[0] == "del"
+    ] == [
+        ["del", "before-poll", True],
+        ["del", "queued-before-dequeue", True],
+        ["del", "reply-observed", True],
+    ]
+    assert not [event for event in state["effects"] if event[0] == "close"]
