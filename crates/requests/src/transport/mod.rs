@@ -122,9 +122,11 @@ impl Transport {
         };
         let response = match response {
             Ok(response) => response,
-            Err(error) => {
-                driver.abort_and_wait().await?;
-                return Err(error);
+            Err(send_error) => {
+                return match driver.abort_and_wait().await {
+                    Ok(()) => Err(send_error),
+                    Err(driver_error) => Err(Error::send_with_cleanup(send_error, driver_error)),
+                };
             }
         };
         let (head, body) = response.into_parts();

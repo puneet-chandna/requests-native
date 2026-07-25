@@ -97,6 +97,13 @@ impl Error {
         )
     }
 
+    pub(crate) fn send_with_cleanup(primary: Self, cleanup: Self) -> Self {
+        Self::transport(
+            ErrorKind::Send,
+            format!("{primary}; connection cleanup also failed: {cleanup}"),
+        )
+    }
+
     pub(crate) fn connection(error: impl fmt::Display) -> Self {
         Self::transport(
             ErrorKind::Connection,
@@ -166,5 +173,25 @@ mod tests {
             assert_eq!(error.kind(), kind);
             assert!(!error.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn send_cleanup_failure_preserves_primary_kind_and_both_contexts() {
+        let error = Error::send_with_cleanup(
+            Error::send("primary send failure"),
+            Error::connection("secondary driver failure"),
+        );
+
+        assert_eq!(error.kind(), ErrorKind::Send);
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP/1.1 request send failed: primary send failure")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP/1.1 connection driver failed: secondary driver failure")
+        );
     }
 }
