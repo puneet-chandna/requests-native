@@ -8,7 +8,7 @@ mod models;
 pub mod structures;
 pub mod utils;
 
-pub use body::BodySource;
+pub use body::{AsyncBody, BodySource};
 pub use error::{Error, ErrorKind, Result};
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 pub use models::{

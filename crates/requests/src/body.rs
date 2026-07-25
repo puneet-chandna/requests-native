@@ -1,11 +1,34 @@
+use std::fmt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use bytes::Bytes;
 
-#[derive(Debug, Default)]
+use crate::Result;
+
+pub trait AsyncBody: Send {
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Result<Bytes>>>;
+
+    fn size_hint(&self) -> Option<u64>;
+}
+
+#[derive(Default)]
 #[non_exhaustive]
 pub enum BodySource {
     #[default]
     Empty,
     Bytes(Bytes),
+    Stream(Pin<Box<dyn AsyncBody>>),
+}
+
+impl fmt::Debug for BodySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("Empty"),
+            Self::Bytes(bytes) => formatter.debug_tuple("Bytes").field(bytes).finish(),
+            Self::Stream(_) => formatter.write_str("Stream(..)"),
+        }
+    }
 }
 
 impl From<Bytes> for BodySource {
@@ -68,15 +91,18 @@ mod tests {
 
         let waker = Waker::from(Arc::new(NoopWake));
         let mut context = Context::from_waker(&waker);
-        assert_eq!(
+        let Poll::Ready(Some(Ok(first))) = stream.as_mut().poll_next(&mut context) else {
+            panic!("expected first chunk");
+        };
+        assert_eq!(first, Bytes::from_static(b"first"));
+        let Poll::Ready(Some(Ok(second))) = stream.as_mut().poll_next(&mut context) else {
+            panic!("expected second chunk");
+        };
+        assert_eq!(second, Bytes::from_static(b"second"));
+        assert!(matches!(
             stream.as_mut().poll_next(&mut context),
-            Poll::Ready(Some(Ok(Bytes::from_static(b"first"))))
-        );
-        assert_eq!(
-            stream.as_mut().poll_next(&mut context),
-            Poll::Ready(Some(Ok(Bytes::from_static(b"second"))))
-        );
-        assert_eq!(stream.as_mut().poll_next(&mut context), Poll::Ready(None));
+            Poll::Ready(None)
+        ));
     }
 
     #[test]
