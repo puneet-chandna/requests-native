@@ -1,11 +1,15 @@
 use std::collections::HashMap;
 
-use pyo3::exceptions::{PyNameError, PyStopIteration, PyTypeError};
+use pyo3::basic::CompareOp;
+use pyo3::exceptions::{
+    PyAssertionError, PyAttributeError, PyLookupError, PyNameError, PyStopIteration, PyTypeError,
+    PyUnicodeDecodeError,
+};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
     PyAny, PyAnyMethods, PyBool, PyBytes, PyDict, PyDictMethods, PyFunction, PyInt, PyList,
-    PyListMethods, PyModule, PyString, PyType, PyTypeMethods,
+    PyListMethods, PyModule, PyString, PyTuple, PyType, PyTypeMethods,
 };
 use pyo3::wrap_pyfunction;
 use requests::{ResponseDispositionState, ResponseEvent};
@@ -659,7 +663,7 @@ fn content_dispatch(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<P
     }
 
     let content = subject.getattr("_content")?;
-    if content.is(&false.into_pyobject(py)?) {
+    if content.is(false.into_pyobject(py)?) {
         if subject.getattr("_content_consumed")?.is_truthy()? {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "The content for this response was already consumed",
@@ -685,6 +689,484 @@ fn content_dispatch(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<P
 #[pyfunction]
 fn _response_content_trial(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     content_dispatch(py, subject)
+}
+
+fn apparent_encoding_dispatch(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    if !exact_operation(py, subject, "apparent_encoding", &["chardet"])? {
+        return Ok(subject.getattr("apparent_encoding")?.unbind());
+    }
+    let detector = response_state(py)?.models.bind(py).getattr("chardet")?;
+    if detector.is_none() {
+        return Ok("utf-8".into_pyobject(py)?.into_any().unbind());
+    }
+    let content = content_dispatch(py, subject)?;
+    Ok(detector
+        .call_method1("detect", (content,))?
+        .get_item("encoding")?
+        .unbind())
+}
+
+#[pyfunction]
+fn _response_apparent_encoding_trial(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    apparent_encoding_dispatch(py, subject)
+}
+
+fn text_dispatch(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    if !exact_operation(py, subject, "text", &["str", "LookupError", "TypeError"])? {
+        return Ok(subject.getattr("text")?.unbind());
+    }
+
+    let mut encoding = subject.getattr("encoding")?.unbind();
+    if !content_dispatch(py, subject)?.bind(py).is_truthy()? {
+        return Ok("".into_pyobject(py)?.into_any().unbind());
+    }
+    if subject.getattr("encoding")?.is_none() {
+        encoding = apparent_encoding_dispatch(py, subject)?;
+    }
+
+    let string_type = py.get_type::<PyString>();
+    let content = content_dispatch(py, subject)?;
+    let selected_encoding = if encoding.bind(py).is_truthy()? {
+        encoding.clone_ref(py)
+    } else {
+        "utf-8".into_pyobject(py)?.into_any().unbind()
+    };
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("errors", "replace")?;
+    match string_type.call(
+        (content.bind(py), selected_encoding.bind(py)),
+        Some(&kwargs),
+    ) {
+        Ok(value) => Ok(value.unbind()),
+        Err(error)
+            if error.is_instance_of::<PyLookupError>(py)
+                || error.is_instance_of::<PyTypeError>(py) =>
+        {
+            let content = content_dispatch(py, subject)?;
+            Ok(string_type
+                .call((content.bind(py),), Some(&kwargs))?
+                .unbind())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[pyfunction]
+fn _response_text_trial(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    text_dispatch(py, subject)
+}
+
+fn wrap_json_error(
+    py: Python<'_>,
+    models: &Bound<'_, PyModule>,
+    original: PyErr,
+) -> PyResult<PyErr> {
+    if !original
+        .value(py)
+        .is_instance(&models.getattr("JSONDecodeError")?)?
+    {
+        return Ok(original);
+    }
+    let value = original.value(py);
+    let wrapped = PyErr::from_value(models.getattr("RequestsJSONDecodeError")?.call1((
+        value.getattr("msg")?,
+        value.getattr("doc")?,
+        value.getattr("pos")?,
+    ))?);
+    wrapped.set_context(py, Some(original));
+    Ok(wrapped)
+}
+
+fn json_loads(
+    py: Python<'_>,
+    models: &Bound<'_, PyModule>,
+    value: &Bound<'_, PyAny>,
+    kwargs: &Bound<'_, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    match models
+        .getattr("complexjson")?
+        .getattr("loads")?
+        .call((value,), Some(kwargs))
+    {
+        Ok(result) => Ok(result.unbind()),
+        Err(error) => Err(wrap_json_error(py, models, error)?),
+    }
+}
+
+fn json_dispatch(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    kwargs: &Bound<'_, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    const GLOBALS: &[&str] = &[
+        "complexjson",
+        "guess_json_utf",
+        "JSONDecodeError",
+        "RequestsJSONDecodeError",
+        "len",
+    ];
+    if !exact_operation(py, subject, "json", GLOBALS)?
+        || !exact_operation(py, subject, "content", &[])?
+        || !exact_operation(py, subject, "text", &[])?
+    {
+        return Ok(subject.call_method("json", (), Some(kwargs))?.unbind());
+    }
+
+    let models = response_state(py)?.models.bind(py);
+    let encoding = subject.getattr("encoding")?;
+    let content = content_dispatch(py, subject)?;
+    if !encoding.is_truthy()? && content.bind(py).is_truthy()? && content.bind(py).len()? > 3 {
+        let guessed = models
+            .getattr("guess_json_utf")?
+            .call1((content.bind(py),))?;
+        if !guessed.is_none() {
+            match content.bind(py).call_method1("decode", (&guessed,)) {
+                Ok(decoded) => return json_loads(py, models, &decoded, kwargs),
+                Err(error) if error.is_instance_of::<PyUnicodeDecodeError>(py) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let text = text_dispatch(py, subject)?;
+    json_loads(py, models, text.bind(py), kwargs)
+}
+
+#[pyfunction]
+fn _response_json_trial(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    kwargs: &Bound<'_, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    json_dispatch(py, subject, kwargs)
+}
+
+fn in_status_range(
+    py: Python<'_>,
+    status: &Bound<'_, PyAny>,
+    lower: i32,
+    upper: i32,
+) -> PyResult<bool> {
+    let lower = lower.into_pyobject(py)?;
+    if !lower.rich_compare(status, CompareOp::Le)?.is_truthy()? {
+        return Ok(false);
+    }
+    let upper = upper.into_pyobject(py)?;
+    status.rich_compare(upper, CompareOp::Lt)?.is_truthy()
+}
+
+fn reason_for_status<'py>(
+    py: Python<'py>,
+    reason: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if !reason.is_instance(&py.get_type::<PyBytes>())? {
+        return Ok(reason.clone());
+    }
+    match reason.call_method1("decode", ("utf-8",)) {
+        Ok(decoded) => Ok(decoded),
+        Err(error) if error.is_instance_of::<PyUnicodeDecodeError>(py) => {
+            reason.call_method1("decode", ("iso-8859-1",))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn raise_for_status_dispatch(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    if !exact_operation(
+        py,
+        subject,
+        "raise_for_status",
+        &["HTTPError", "isinstance"],
+    )? {
+        return Ok(subject.call_method0("raise_for_status")?.unbind());
+    }
+
+    let status = subject.getattr("status_code")?;
+    let reason_value = subject.getattr("reason")?;
+    let reason = reason_for_status(py, &reason_value)?;
+    let template = if in_status_range(py, &status, 400, 500)? {
+        Some("{} Client Error: {} for url: {}")
+    } else if in_status_range(py, &status, 500, 600)? {
+        Some("{} Server Error: {} for url: {}")
+    } else {
+        None
+    };
+    let Some(template) = template else {
+        return Ok(py.None());
+    };
+    let message = template
+        .into_pyobject(py)?
+        .call_method1("format", (&status, &reason, subject.getattr("url")?))?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("response", subject)?;
+    let exception = response_state(py)?
+        .models
+        .bind(py)
+        .getattr("HTTPError")?
+        .call((message,), Some(&kwargs))?;
+    Err(PyErr::from_value(exception))
+}
+
+fn ok_dispatch(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if !exact_operation(py, subject, "ok", &["HTTPError"])? {
+        return subject.getattr("ok")?.extract();
+    }
+    match raise_for_status_dispatch(py, subject) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if error
+                .value(py)
+                .is_instance(&response_state(py)?.models.bind(py).getattr("HTTPError")?)? =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn fallback_metadata(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    operation: &str,
+) -> PyResult<Py<PyAny>> {
+    let builtins = PyModule::import(py, "builtins")?;
+    match operation {
+        "repr" => Ok(builtins.getattr("repr")?.call1((subject,))?.unbind()),
+        "bool" => Ok(builtins.getattr("bool")?.call1((subject,))?.unbind()),
+        "ok" | "is_redirect" | "is_permanent_redirect" | "next" | "history" => {
+            Ok(subject.getattr(operation)?.unbind())
+        }
+        "raise_for_status" => Ok(subject.call_method0("raise_for_status")?.unbind()),
+        _ => Err(PyAssertionError::new_err(operation.to_owned())),
+    }
+}
+
+fn metadata_dispatch(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    operation: &str,
+) -> PyResult<Py<PyAny>> {
+    match operation {
+        "repr" if exact_operation(py, subject, "__repr__", &[])? => Ok("<Response [{}]>"
+            .into_pyobject(py)?
+            .call_method1("format", (subject.getattr("status_code")?,))?
+            .unbind()),
+        "bool"
+            if exact_operation(py, subject, "__bool__", &[])?
+                && exact_operation(py, subject, "ok", &["HTTPError"])? =>
+        {
+            Ok(ok_dispatch(py, subject)?
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind())
+        }
+        "ok" if exact_operation(py, subject, "ok", &["HTTPError"])? => {
+            Ok(ok_dispatch(py, subject)?
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind())
+        }
+        "is_redirect" if exact_operation(py, subject, "is_redirect", &["REDIRECT_STATI"])? => {
+            let headers = subject.getattr("headers")?;
+            let redirected = headers.contains("location")?
+                && response_state(py)?
+                    .models
+                    .bind(py)
+                    .getattr("REDIRECT_STATI")?
+                    .contains(subject.getattr("status_code")?)?;
+            Ok(redirected.into_pyobject(py)?.to_owned().into_any().unbind())
+        }
+        "is_permanent_redirect"
+            if exact_operation(py, subject, "is_permanent_redirect", &["codes"])? =>
+        {
+            let headers = subject.getattr("headers")?;
+            let permanent = if !headers.contains("location")? {
+                false
+            } else {
+                let codes = response_state(py)?.models.bind(py).getattr("codes")?;
+                let choices = PyTuple::new(
+                    py,
+                    [
+                        codes.getattr("moved_permanently")?,
+                        codes.getattr("permanent_redirect")?,
+                    ],
+                )?;
+                choices.contains(subject.getattr("status_code")?)?
+            };
+            Ok(permanent.into_pyobject(py)?.to_owned().into_any().unbind())
+        }
+        "next" if exact_operation(py, subject, "next", &[])? => {
+            Ok(subject.getattr("_next")?.unbind())
+        }
+        "history" => Ok(subject.getattr("history")?.unbind()),
+        "raise_for_status"
+            if exact_operation(
+                py,
+                subject,
+                "raise_for_status",
+                &["HTTPError", "isinstance"],
+            )? =>
+        {
+            raise_for_status_dispatch(py, subject)
+        }
+        _ => fallback_metadata(py, subject, operation),
+    }
+}
+
+#[pyfunction]
+fn _response_metadata_trial(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    operation: &str,
+) -> PyResult<Py<PyAny>> {
+    metadata_dispatch(py, subject, operation)
+}
+
+const RESPONSE_ATTRS: &[&str] = &[
+    "_content",
+    "status_code",
+    "headers",
+    "url",
+    "history",
+    "encoding",
+    "reason",
+    "cookies",
+    "elapsed",
+    "request",
+];
+
+fn response_attrs_are_current(subject: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let Some(attrs) = raw_direct_type_entry(&subject.get_type(), "__attrs__")? else {
+        return Ok(false);
+    };
+    Ok(attrs.extract::<Vec<String>>()?
+        == RESPONSE_ATTRS
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>())
+}
+
+fn pickle_get_dispatch(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    if !exact_operation(py, subject, "__getstate__", &["getattr"])?
+        || !response_attrs_are_current(subject)?
+    {
+        return Ok(subject.call_method0("__getstate__")?.unbind());
+    }
+    if !subject.getattr("_content_consumed")?.is_truthy()? {
+        let _ = content_dispatch(py, subject)?;
+    }
+    let result = PyDict::new(py);
+    let getattr = PyModule::import(py, "builtins")?.getattr("getattr")?;
+    for attr in subject.getattr("__attrs__")?.try_iter()? {
+        let attr = attr?;
+        let value = getattr.call1((subject, &attr, py.None()))?;
+        result.set_item(attr, value)?;
+    }
+    Ok(result.into_any().unbind())
+}
+
+fn pickle_set_dispatch(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    state: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    if !exact_operation(py, subject, "__setstate__", &["setattr"])? {
+        return Ok(subject.call_method1("__setstate__", (state,))?.unbind());
+    }
+    let setattr = PyModule::import(py, "builtins")?.getattr("setattr")?;
+    for item in state.call_method0("items")?.try_iter()? {
+        let item = item?;
+        let pair = item.cast::<PyTuple>()?;
+        setattr.call1((subject, pair.get_item(0)?, pair.get_item(1)?))?;
+    }
+    setattr.call1((subject, "_content_consumed", true))?;
+    setattr.call1((subject, "raw", py.None()))?;
+    Ok(py.None())
+}
+
+#[pyfunction]
+fn _response_pickle_trial(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    operation: &str,
+    state: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    match operation {
+        "get" => pickle_get_dispatch(py, subject),
+        "set" => pickle_set_dispatch(py, subject, state),
+        _ => Err(PyAssertionError::new_err(operation.to_owned())),
+    }
+}
+
+fn close_dispatch(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    if !exact_operation(py, subject, "close", &["getattr"])? {
+        return Ok(subject.call_method0("close")?.unbind());
+    }
+    if !subject.getattr("_content_consumed")?.is_truthy()? {
+        subject.getattr("raw")?.call_method0("close")?;
+    }
+    let raw = subject.getattr("raw")?;
+    let release = match raw.getattr("release_conn") {
+        Ok(release) => Some(release),
+        Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(release) = release
+        && !release.is_none()
+    {
+        release.call0()?;
+    }
+    Ok(py.None())
+}
+
+#[pyfunction]
+fn _response_close_trial(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    close_dispatch(py, subject)
+}
+
+#[pyfunction]
+fn _response_drop_trial(
+    py: Python<'_>,
+    raw: &Bound<'_, PyAny>,
+    operation: &str,
+    chunk_size: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let subject = response_state(py)?.response_type.bind(py).call0()?;
+    subject.setattr("status_code", 200)?;
+    subject.setattr("raw", raw)?;
+
+    let mut iterator = None;
+    match operation {
+        "untouched" => {}
+        "partial" | "failed" => {
+            let current = iter_content_dispatch(py, &subject, chunk_size, false)?;
+            PyModule::import(py, "builtins")?
+                .getattr("next")?
+                .call1((current.bind(py),))?;
+            iterator = Some(current);
+        }
+        "exhausted" => {
+            let current = iter_content_dispatch(py, &subject, chunk_size, false)?;
+            PyModule::import(py, "builtins")?
+                .getattr("list")?
+                .call1((current.bind(py),))?;
+            iterator = Some(current);
+        }
+        "cached" => {
+            let _ = content_dispatch(py, &subject)?;
+        }
+        _ => return Err(PyAssertionError::new_err(operation.to_owned())),
+    }
+
+    let result = PyDict::new(py);
+    result.set_item("raw_is_original", subject.getattr("raw")?.is(raw))?;
+    result.set_item("state", _response_fields_snapshot(py, &subject)?)?;
+    drop(iterator);
+    Ok(result.into_any().unbind())
 }
 
 #[pyclass(module = "requests._requests_rust")]
@@ -874,7 +1356,7 @@ fn _response_fields_snapshot(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyRe
     let content = subject.getattr("_content")?;
     let snapshot = PyDict::new(py);
     snapshot.set_item("content", value_record(py, &content)?)?;
-    snapshot.set_item("content_is_false", content.is(&false.into_pyobject(py)?))?;
+    snapshot.set_item("content_is_false", content.is(false.into_pyobject(py)?))?;
     snapshot.set_item("content_consumed", subject.getattr("_content_consumed")?)?;
     snapshot.set_item("raw_is_none", subject.getattr("raw")?.is_none())?;
     Ok(snapshot.into_any().unbind())
@@ -926,6 +1408,13 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_response_content_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_response_iter_content_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_response_iter_lines_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_response_text_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_response_apparent_encoding_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_response_json_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_response_metadata_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_response_pickle_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_response_close_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_response_drop_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_response_fields_snapshot, module)?)?;
     module.add_function(wrap_pyfunction!(_response_disposition_trial, module)?)?;
     Ok(())
