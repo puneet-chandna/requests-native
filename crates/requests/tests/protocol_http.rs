@@ -81,6 +81,13 @@ enum PoolScript {
     MalformedFirstBody,
 }
 
+enum PoolCommand {
+    CloseConnection {
+        id: usize,
+        acknowledgement: Sender<Result<(), String>>,
+    },
+}
+
 #[derive(Debug)]
 struct PoolRequestObservation {
     connection_id: usize,
@@ -113,6 +120,7 @@ struct PoolConnection {
 
 struct PoolServer {
     address: SocketAddr,
+    commands: Sender<PoolCommand>,
     shutdown: Option<Sender<()>>,
     worker: Option<JoinHandle<Result<PoolObservation, String>>>,
 }
@@ -125,10 +133,12 @@ impl PoolServer {
             .set_nonblocking(true)
             .expect("make pool fixture listener nonblocking");
         let address = listener.local_addr().expect("read pool fixture address");
+        let (command_tx, command_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
             serve_pool(
                 listener,
+                command_rx,
                 shutdown_rx,
                 script,
                 expected_requests,
@@ -137,6 +147,7 @@ impl PoolServer {
         });
         Self {
             address,
+            commands: command_tx,
             shutdown: Some(shutdown_tx),
             worker: Some(worker),
         }
@@ -144,6 +155,20 @@ impl PoolServer {
 
     fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.address, path)
+    }
+
+    fn close_connection(&self, id: usize) {
+        let (acknowledgement, acknowledged) = mpsc::channel();
+        self.commands
+            .send(PoolCommand::CloseConnection {
+                id,
+                acknowledgement,
+            })
+            .expect("send pooled connection close command");
+        acknowledged
+            .recv_timeout(POOL_TIMEOUT)
+            .expect("timed out waiting for pooled connection close acknowledgement")
+            .expect("pooled connection close failed");
     }
 
     fn finish(mut self) -> Result<PoolObservation, String> {
@@ -176,6 +201,7 @@ fn join_pool_worker(
 
 fn serve_pool(
     listener: TcpListener,
+    commands: Receiver<PoolCommand>,
     shutdown: Receiver<()>,
     script: PoolScript,
     expected_requests: usize,
@@ -220,6 +246,27 @@ fn serve_pool(
                 &mut requests,
                 &mut peer_closed_connections,
             )?;
+        }
+        connections.retain(|connection| !connection.closed);
+
+        while let Ok(PoolCommand::CloseConnection {
+            id,
+            acknowledgement,
+        }) = commands.try_recv()
+        {
+            let result = connections
+                .iter_mut()
+                .find(|connection| connection.id == id)
+                .ok_or_else(|| format!("pooled connection {id} is not open"))
+                .and_then(|connection| {
+                    connection
+                        .stream
+                        .shutdown(Shutdown::Both)
+                        .map_err(|error| format!("shutdown pooled connection {id}: {error}"))?;
+                    connection.closed = true;
+                    Ok(())
+                });
+            let _ = acknowledgement.send(result);
         }
         connections.retain(|connection| !connection.closed);
 
@@ -1436,6 +1483,66 @@ fn pool_clean_eof_reuses_one_connection_for_two_requests() {
     let observation = server.finish().expect("pool fixture completed");
     assert_eq!(observation.accepted_connections, 1);
     assert_pool_requests(&observation, &[0, 0], &["/pool/first", "/pool/second"]);
+}
+
+#[test]
+fn pool_dead_idle_connection_is_discarded_before_the_next_request() {
+    let runtime = runtime();
+    let server = PoolServer::spawn(PoolScript::KeepAlive, 2, 0);
+    let client = Client::new().expect("build pooled client");
+
+    let (_, _, first) = complete_exchange(&runtime, client.get(server.url("/pool/live")));
+    assert_eq!(first, Bytes::from_static(b"ok"));
+    server.close_connection(0);
+
+    let (_, _, second) = complete_exchange(&runtime, client.get(server.url("/pool/after-dead")));
+    assert_eq!(second, Bytes::from_static(b"ok"));
+
+    let observation = server.finish().expect("pool fixture completed");
+    assert_eq!(observation.accepted_connections, 2);
+    assert_pool_requests(&observation, &[0, 1], &["/pool/live", "/pool/after-dead"]);
+}
+
+#[test]
+fn pool_response_drop_before_body_uses_a_second_connection() {
+    let runtime = runtime();
+    let server = PoolServer::spawn(PoolScript::KeepAlive, 2, 1);
+    let client = Client::new().expect("build pooled client");
+
+    let response = send_response(&runtime, client.get(server.url("/pool/drop-response")));
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    let (_, _, second) = complete_exchange(
+        &runtime,
+        client.get(server.url("/pool/after-response-drop")),
+    );
+    assert_eq!(second, Bytes::from_static(b"ok"));
+
+    let observation = server.finish().expect("pool fixture completed");
+    assert_eq!(observation.accepted_connections, 2);
+    assert!(observation.peer_closed_connections.contains(&0));
+    assert_pool_requests(
+        &observation,
+        &[0, 1],
+        &["/pool/drop-response", "/pool/after-response-drop"],
+    );
+}
+
+#[test]
+fn pool_last_client_drop_closes_its_idle_connection() {
+    let runtime = runtime();
+    let server = PoolServer::spawn(PoolScript::KeepAlive, 1, 1);
+    let client = Client::new().expect("build pooled client");
+
+    let (_, _, body) = complete_exchange(&runtime, client.get(server.url("/pool/last-client")));
+    assert_eq!(body, Bytes::from_static(b"ok"));
+    drop(client);
+
+    let observation = server.finish().expect("pool fixture completed");
+    assert_eq!(observation.accepted_connections, 1);
+    assert!(observation.peer_closed_connections.contains(&0));
+    assert_pool_requests(&observation, &[0], &["/pool/last-client"]);
 }
 
 #[test]

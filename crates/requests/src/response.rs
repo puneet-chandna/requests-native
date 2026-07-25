@@ -20,14 +20,14 @@ use http::header::TRANSFER_ENCODING;
 use http::{HeaderMap, StatusCode};
 use hyper::body::{Body, Incoming};
 
-use crate::transport::{ConnectionDriver, TransportResponse};
+use crate::transport::{TransportLease, TransportResponse};
 use crate::{Error, Result};
 
 pub struct Response {
     head: http::response::Parts,
     body: Option<Incoming>,
     url: String,
-    driver: Option<ConnectionDriver>,
+    driver: Option<ResponseBodyDriver>,
     read_timeout: Option<Duration>,
     disposition: Option<ResponseDispositionState>,
 }
@@ -38,9 +38,9 @@ impl Response {
             head: response.head,
             body: Some(response.body),
             url: response.url,
-            driver: Some(response.driver),
+            driver: Some(ResponseBodyDriver::Network(response.lease)),
             read_timeout: response.read_timeout,
-            disposition: Some(ResponseDispositionState::without_native_lease()),
+            disposition: Some(ResponseDispositionState::default()),
         }
     }
 
@@ -63,7 +63,7 @@ impl Response {
                 .body
                 .take()
                 .map(|body| ResponseBodySource::Incoming(Box::pin(body))),
-            driver: self.driver.take().map(ResponseBodyDriver::Network),
+            driver: self.driver.take(),
             read_timeout: self.read_timeout.take(),
             read_deadline: None,
             chunked,
@@ -89,9 +89,11 @@ impl Response {
 
 impl Drop for Response {
     fn drop(&mut self) {
-        drop(self.driver.take());
         if let Some(disposition) = &mut self.disposition {
             disposition.apply(ResponseEvent::Drop);
+        }
+        if let Some(driver) = self.driver.take() {
+            driver.finish_now(false);
         }
     }
 }
@@ -112,7 +114,7 @@ enum ResponseBodySource {
 }
 
 enum ResponseBodyDriver {
-    Network(ConnectionDriver),
+    Network(TransportLease),
     #[cfg(test)]
     Controlled(ControlledDriver),
 }
@@ -120,18 +122,7 @@ enum ResponseBodyDriver {
 impl ResponseBodyDriver {
     fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<()>> {
         match self {
-            Self::Network(driver) => {
-                if !driver.is_running() {
-                    return Poll::Ready(Ok(()));
-                }
-                let Some(task) = driver.task_mut() else {
-                    return Poll::Ready(Ok(()));
-                };
-                match Pin::new(task).poll(context) {
-                    Poll::Ready(result) => Poll::Ready(driver.finish(result)),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
+            Self::Network(lease) => lease.poll_result(context),
             #[cfg(test)]
             Self::Controlled(driver) => driver.poll(context),
         }
@@ -139,15 +130,15 @@ impl ResponseBodyDriver {
 
     async fn abort_and_wait(self) -> Result<()> {
         match self {
-            Self::Network(mut driver) => driver.abort_and_wait().await,
+            Self::Network(driver) => driver.abort_and_wait().await,
             #[cfg(test)]
             Self::Controlled(_) => Ok(()),
         }
     }
 
-    fn shutdown_now(&mut self) {
+    fn finish_now(self, reusable: bool) {
         match self {
-            Self::Network(driver) => driver.shutdown_now(),
+            Self::Network(lease) => lease.finish_now(reusable),
             #[cfg(test)]
             Self::Controlled(_) => {}
         }
@@ -193,8 +184,8 @@ impl ResponseBody {
     }
 
     fn finish_now(&mut self, event: ResponseEvent) {
-        if let Some(mut driver) = self.begin_terminal(event) {
-            driver.shutdown_now();
+        if let Some(driver) = self.begin_terminal(event) {
+            driver.finish_now(self.disposition.decision() == Some(ResponseDecision::Reusable));
         }
     }
 
@@ -307,7 +298,6 @@ impl Stream for ResponseBody {
                     return self.finish_error(ResponseEvent::ReadError, error);
                 }
                 Poll::Ready(Ok(())) => {
-                    drop(self.driver.take());
                     context.waker().wake_by_ref();
                     return Poll::Pending;
                 }
@@ -516,6 +506,7 @@ impl Default for ResponseDispositionState {
 }
 
 impl ResponseDispositionState {
+    #[cfg(test)]
     pub(crate) const fn without_native_lease() -> Self {
         Self {
             state: ResponseDisposition::Open,

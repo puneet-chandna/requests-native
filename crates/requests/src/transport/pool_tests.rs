@@ -208,7 +208,7 @@ fn clear_keeps_old_active_readable_then_orphans_its_clean_return() {
     assert!(pool.generation(&active_key).is_none());
     let initial_generation = pool.generation_number(&active_key);
     let (idle, idle_closes) = controlled_connection(1, []);
-    let (active, active_closes) = controlled_connection(2, [b'x']);
+    let (active, active_closes) = controlled_connection(2, *b"x");
 
     let idle = fresh_lease(&pool, idle_key.clone(), idle).complete(LeaseTerminal::CleanEof);
     pool.release(idle);

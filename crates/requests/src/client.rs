@@ -13,7 +13,7 @@ pub struct Client {
 impl Client {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            transport: Arc::new(Transport),
+            transport: Arc::new(Transport::new()),
         })
     }
 

@@ -1,10 +1,13 @@
 mod connect;
+mod pool;
 #[cfg(test)]
 mod pool_tests;
 
+use std::fmt;
 use std::future::Future;
 use std::net::Shutdown;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -14,18 +17,33 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::task::JoinHandle;
 
+use self::pool::{ConnectionLease, IdleConnection, LeaseTerminal, Pool, PoolKey, TlsPoolKey};
 use crate::models::RequestParts;
 use crate::{BodySource, Error, Request, Result};
 
-#[derive(Debug)]
-pub(crate) struct Transport;
+const MAX_IDLE_PER_KEY: usize = 10;
+
+pub(crate) struct Transport {
+    pool: Arc<Mutex<Pool>>,
+}
+
+impl fmt::Debug for Transport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Transport")
+    }
+}
 
 pub(crate) struct TransportResponse {
     pub head: http::response::Parts,
     pub body: Incoming,
     pub url: String,
-    pub driver: ConnectionDriver,
+    pub lease: TransportLease,
     pub read_timeout: Option<std::time::Duration>,
+}
+
+pub(crate) struct TransportLease {
+    pool: Arc<Mutex<Pool>>,
+    lease: Option<ConnectionLease>,
 }
 
 pub(crate) struct ConnectionDriver {
@@ -46,6 +64,30 @@ impl ConnectionDriver {
 
     pub(crate) fn is_running(&self) -> bool {
         self.task.is_some()
+    }
+
+    pub(crate) fn is_reusable(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    pub(crate) fn peer_is_open(&self) -> bool {
+        let Some(stream) = &self.shutdown else {
+            return false;
+        };
+        let mut byte = [0_u8; 1];
+        match stream.peek(&mut byte) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     pub(crate) fn task_mut(&mut self) -> Option<&mut JoinHandle<Result<()>>> {
@@ -104,7 +146,104 @@ impl Drop for ConnectionDriver {
     }
 }
 
+impl TransportLease {
+    fn new(pool: Arc<Mutex<Pool>>, lease: ConnectionLease) -> Self {
+        Self {
+            pool,
+            lease: Some(lease),
+        }
+    }
+
+    pub(crate) fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<()>> {
+        let driver = self.driver_mut();
+        let Some(task) = driver.task_mut() else {
+            return Poll::Pending;
+        };
+        match Pin::new(task).poll(context) {
+            Poll::Ready(result) => Poll::Ready(driver.finish(result)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    pub(crate) async fn abort_and_wait(mut self) -> Result<()> {
+        let result = self.driver_mut().abort_and_wait().await;
+        self.release(false);
+        result
+    }
+
+    pub(crate) fn finish_now(mut self, reusable: bool) {
+        if !reusable {
+            self.driver_mut().shutdown_now();
+        }
+        self.release(reusable);
+    }
+
+    fn driver_mut(&mut self) -> &mut ConnectionDriver {
+        let (_, driver) = self
+            .lease
+            .as_mut()
+            .expect("transport lease owns one connection")
+            .connection_mut()
+            .network_parts_mut();
+        driver
+    }
+
+    fn release(&mut self, reusable: bool) {
+        let Some(mut lease) = self.lease.take() else {
+            return;
+        };
+        let reusable = reusable && lease.is_live() && lease.peer_is_open();
+        lease = lease.complete(if reusable {
+            LeaseTerminal::CleanEof
+        } else {
+            LeaseTerminal::Dirty
+        });
+        let rejected = {
+            self.pool
+                .lock()
+                .expect("transport pool lock poisoned")
+                .release(lease)
+        };
+        drop(rejected);
+    }
+}
+
+impl Drop for TransportLease {
+    fn drop(&mut self) {
+        let Some(mut lease) = self.lease.take() else {
+            return;
+        };
+        let (_, driver) = lease.connection_mut().network_parts_mut();
+        driver.shutdown_now();
+        let lease = lease.complete(LeaseTerminal::Dirty);
+        let rejected = {
+            self.pool
+                .lock()
+                .expect("transport pool lock poisoned")
+                .release(lease)
+        };
+        drop(rejected);
+    }
+}
+
 impl Transport {
+    pub(crate) fn new() -> Self {
+        Self {
+            pool: Arc::new(Mutex::new(Pool::new(MAX_IDLE_PER_KEY))),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn clear_pool(&self) {
+        let evicted = {
+            self.pool
+                .lock()
+                .expect("transport pool lock poisoned")
+                .clear()
+        };
+        drop(evicted);
+    }
+
     pub async fn send(&self, request: Request) -> Result<TransportResponse> {
         validate_request(&request)?;
         let host = request
@@ -113,50 +252,43 @@ impl Transport {
             .ok_or_else(|| Error::invalid_url(request.url()))?
             .to_owned();
         let port = request.uri().port_u16().unwrap_or(80);
-        let target = request
+        let scheme = request
+            .uri()
+            .scheme()
+            .cloned()
+            .ok_or_else(|| Error::invalid_url(request.url()))?;
+        let authority = request
             .uri()
             .authority()
             .ok_or_else(|| Error::invalid_url(request.url()))?
-            .as_str()
-            .to_owned();
+            .clone();
+        let target = authority.as_str().to_owned();
+        let key = PoolKey::new(scheme, authority, None, TlsPoolKey::plain(), None);
         let request = request.into_parts();
         let read_timeout = request.timeout.read;
         let (outgoing, url) = outgoing_request(request)?;
 
-        let stream = connect::connect(&host, port, &target).await?;
-        let stream = stream
-            .into_std()
-            .map_err(|error| Error::connect(&target, error))?;
-        let shutdown = stream
-            .try_clone()
-            .map_err(|error| Error::connect(&target, error))?;
-        let stream = tokio::net::TcpStream::from_std(stream)
-            .map_err(|error| Error::connect(&target, error))?;
-        let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(Error::handshake)?;
-        let mut driver = ConnectionDriver::spawn(
-            async move { connection.await.map_err(Error::connection) },
-            Some(shutdown),
-        );
+        let mut lease = self.acquire_connection(key, &host, port, &target).await?;
+        let response = {
+            let (sender, driver) = lease.connection_mut().network_parts_mut();
+            let sending = sender.send_request(outgoing);
+            tokio::pin!(sending);
+            loop {
+                if !driver.is_running() {
+                    break sending.as_mut().await.map_err(Error::send);
+                }
 
-        let sending = sender.send_request(outgoing);
-        tokio::pin!(sending);
-        let response = loop {
-            if !driver.is_running() {
-                break sending.as_mut().await.map_err(Error::send);
-            }
-
-            let Some(driver_task) = driver.task_mut() else {
-                continue;
-            };
-            tokio::select! {
-                biased;
-                result = &mut sending => break result.map_err(Error::send),
-                driver_result = driver_task => {
-                    match driver.finish(driver_result) {
-                        Ok(()) => continue,
-                        Err(error) => break Err(error),
+                let Some(driver_task) = driver.task_mut() else {
+                    continue;
+                };
+                tokio::select! {
+                    biased;
+                    result = &mut sending => break result.map_err(Error::send),
+                    driver_result = driver_task => {
+                        match driver.finish(driver_result) {
+                            Ok(()) => continue,
+                            Err(error) => break Err(error),
+                        }
                     }
                 }
             }
@@ -164,7 +296,10 @@ impl Transport {
         let response = match response {
             Ok(response) => response,
             Err(send_error) => {
-                return match driver.abort_and_wait().await {
+                let cleanup = TransportLease::new(Arc::clone(&self.pool), lease)
+                    .abort_and_wait()
+                    .await;
+                return match cleanup {
                     Ok(()) => Err(send_error),
                     Err(driver_error) => Err(Error::send_with_cleanup(send_error, driver_error)),
                 };
@@ -176,9 +311,79 @@ impl Transport {
             head,
             body,
             url,
-            driver,
+            lease: TransportLease::new(Arc::clone(&self.pool), lease),
             read_timeout,
         })
+    }
+
+    async fn acquire_connection(
+        &self,
+        key: PoolKey,
+        host: &str,
+        port: u16,
+        target: &str,
+    ) -> Result<ConnectionLease> {
+        loop {
+            let candidate = {
+                self.pool
+                    .lock()
+                    .expect("transport pool lock poisoned")
+                    .acquire(&key)
+            };
+            let Some(mut lease) = candidate else {
+                break;
+            };
+            if !lease.is_live() || !lease.peer_is_open() {
+                TransportLease::new(Arc::clone(&self.pool), lease).finish_now(false);
+                continue;
+            }
+            let ready = {
+                let (sender, _) = lease.connection_mut().network_parts_mut();
+                sender.ready().await
+            };
+            if ready.is_ok() && lease.is_live() && lease.peer_is_open() {
+                return Ok(lease);
+            }
+            TransportLease::new(Arc::clone(&self.pool), lease).finish_now(false);
+        }
+
+        self.connect_connection(key, host, port, target).await
+    }
+
+    async fn connect_connection(
+        &self,
+        key: PoolKey,
+        host: &str,
+        port: u16,
+        target: &str,
+    ) -> Result<ConnectionLease> {
+        let generation = {
+            self.pool
+                .lock()
+                .expect("transport pool lock poisoned")
+                .generation_number(&key)
+        };
+        let stream = connect::connect(host, port, target).await?;
+        let stream = stream
+            .into_std()
+            .map_err(|error| Error::connect(target, error))?;
+        let shutdown = stream
+            .try_clone()
+            .map_err(|error| Error::connect(target, error))?;
+        let stream = tokio::net::TcpStream::from_std(stream)
+            .map_err(|error| Error::connect(target, error))?;
+        let (sender, connection) = http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(Error::handshake)?;
+        let driver = ConnectionDriver::spawn(
+            async move { connection.await.map_err(Error::connection) },
+            Some(shutdown),
+        );
+        Ok(ConnectionLease::new(
+            key,
+            generation,
+            IdleConnection::network(sender, driver),
+        ))
     }
 }
 
@@ -305,6 +510,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use http::{HeaderName, HeaderValue, Method};
@@ -424,6 +630,32 @@ mod tests {
             }
 
             assert!(dropped.load(Ordering::Acquire));
+        });
+    }
+
+    #[test]
+    fn finished_connection_driver_is_not_reusable() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let driver = ConnectionDriver::spawn(async { Ok(()) }, None);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !driver
+                    .task
+                    .as_ref()
+                    .expect("driver task exists")
+                    .is_finished()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("connection driver did not finish");
+
+            assert!(driver.is_running());
+            assert!(!driver.is_reusable());
         });
     }
 }
