@@ -105,6 +105,27 @@ def capture(label, subject, operation):
     return outcome
 """
 
+_PREIMPORT_CAPTURE_HELPER = """
+def capture_preimport(subject, operation):
+    effect_start = len(side_effects)
+    try:
+        returned = operation()
+    except BaseException as error:
+        outcome = [
+            type(error).__module__,
+            type(error).__qualname__,
+            error.args,
+        ]
+    else:
+        outcome = ["returned", returned]
+    return {
+        "outcome": outcome,
+        "method": subject.method,
+        "url": subject.url,
+        "side_effects": side_effects[effect_start:],
+    }
+"""
+
 
 def _assert_matches_oracle(source: str) -> None:
     case = {"source": dedent(_TRIAL_HELPERS + source)}
@@ -342,6 +363,48 @@ try:
     }
 finally:
     PreparedRequest.prepare_method = original
+"""
+    )
+
+
+def test_prepare_method_builtin_isinstance_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import builtins
+from requests.models import PreparedRequest
+
+
+original_isinstance = builtins.isinstance
+original_str = builtins.str
+
+
+class ReplacedIsinstance:
+    def __call__(self, value, expected):
+        if original_isinstance(value, original_str) and value == "GET":
+            side_effects.append(["isinstance", value])
+            return False
+        return original_isinstance(value, expected)
+
+
+builtins.isinstance = ReplacedIsinstance()
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_method("get")
+            if _requests_rust is None
+            else _requests_rust._prepare_method_trial(subject, "get")
+        ),
+    )
+finally:
+    builtins.isinstance = original_isinstance
 """
     )
 
@@ -859,6 +922,102 @@ result = [rebound_isinstance, str_http, str_non_http, rebound_bytes]
     )
 
 
+def test_prepare_url_builtin_str_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import builtins
+from requests.models import PreparedRequest
+
+
+original_isinstance = builtins.isinstance
+original_str = builtins.str
+target = "http://example.com/path"
+
+
+class ReplacedStrMeta(type):
+    def __instancecheck__(cls, value):
+        return original_isinstance(value, original_str)
+
+
+class ReplacedStr(metaclass=ReplacedStrMeta):
+    def __new__(cls, value="", *args, **kwargs):
+        if original_isinstance(value, original_str) and value == target:
+            side_effects.append(["str", value])
+            return "http://rewritten.example/path"
+        return original_str(value, *args, **kwargs)
+
+
+builtins.str = ReplacedStr
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url(target, None)
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(subject, target, None)
+        ),
+    )
+finally:
+    builtins.str = original_str
+"""
+    )
+
+
+def test_prepare_url_builtin_bytes_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import builtins
+from requests.models import PreparedRequest
+
+
+original_bytes = builtins.bytes
+original_isinstance = builtins.isinstance
+target = b"http://example.com/path"
+
+
+class ReplacedBytesMeta(type):
+    def __instancecheck__(cls, value):
+        if original_isinstance(value, original_bytes) and value == target:
+            side_effects.append(["bytes-instancecheck", value])
+            return False
+        return original_isinstance(value, original_bytes)
+
+
+class ReplacedBytes(metaclass=ReplacedBytesMeta):
+    def __new__(cls, *args, **kwargs):
+        return original_bytes(*args, **kwargs)
+
+
+builtins.bytes = ReplacedBytes
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url(target, None)
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(subject, target, None)
+        ),
+    )
+finally:
+    builtins.bytes = original_bytes
+"""
+    )
+
+
 def test_prepare_url_parameter_builtin_and_transitive_shadows_delegate() -> None:
     _assert_matches_oracle(
         """
@@ -971,6 +1130,35 @@ try:
     )
 finally:
     globals_dict["_normalize_host"] = original
+"""
+    )
+
+
+def test_prepare_url_nested_nonfunction_global_mutation_delegates() -> None:
+    _assert_matches_oracle(
+        """
+import re
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+primer = PreparedRequest()
+prepare_method_call(primer, "get")
+original = url_utils._IPV4_RE
+url_utils._IPV4_RE = re.compile(".*")
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "rebound-ipv4-pattern",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://EXAMPLE.com/path",
+            None,
+        ),
+    )
+finally:
+    url_utils._IPV4_RE = original
 """
     )
 
@@ -1394,6 +1582,141 @@ try:
 finally:
     del CaseInsensitiveDict._store
     models.check_header_validity = original_check
+"""
+    )
+
+
+def test_prepare_headers_in_place_init_code_mutation_preserves_stage_order() -> None:
+    _assert_matches_oracle(
+        """
+import requests.models as models
+import requests.structures as structures
+from requests.models import PreparedRequest
+from requests.structures import CaseInsensitiveDict
+
+
+primer = PreparedRequest()
+prepare_method_call(primer, "get")
+original_code = CaseInsensitiveDict.__init__.__code__
+original_check = models.check_header_validity
+
+
+def accept(header):
+    side_effects.append(["accepted", header])
+
+
+def patched_init(self, data=None, **kwargs):
+    _task7_effects.append("patched-init")
+    self._store = OrderedDict()
+    _task7_models.check_header_validity = _task7_accept
+
+
+structures._task7_effects = side_effects
+structures._task7_models = models
+structures._task7_accept = accept
+CaseInsensitiveDict.__init__.__code__ = patched_init.__code__
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "in-place-init-code",
+        subject,
+        lambda: prepare_headers_call(subject, {"Bad": " leading"}),
+    )
+finally:
+    CaseInsensitiveDict.__init__.__code__ = original_code
+    models.check_header_validity = original_check
+    del structures._task7_effects
+    del structures._task7_models
+    del structures._task7_accept
+"""
+    )
+
+
+def test_prepare_headers_in_place_init_defaults_preserves_stage_order() -> None:
+    _assert_matches_oracle(
+        """
+import requests.models as models
+from requests.models import PreparedRequest
+from requests.structures import CaseInsensitiveDict
+
+
+primer = PreparedRequest()
+prepare_method_call(primer, "get")
+original_defaults = CaseInsensitiveDict.__init__.__defaults__
+original_check = models.check_header_validity
+
+
+def accept(header):
+    side_effects.append(["accepted", header])
+
+
+class MutatingDefault:
+    def keys(self):
+        side_effects.append("default-keys")
+        models.check_header_validity = accept
+        return ()
+
+
+CaseInsensitiveDict.__init__.__defaults__ = (MutatingDefault(),)
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "in-place-init-defaults",
+        subject,
+        lambda: prepare_headers_call(subject, {"Bad": " leading"}),
+    )
+finally:
+    CaseInsensitiveDict.__init__.__defaults__ = original_defaults
+    models.check_header_validity = original_check
+"""
+    )
+
+
+def test_prepare_headers_in_place_setitem_code_mutation_preserves_stage_order() -> None:
+    _assert_matches_oracle(
+        """
+import requests.models as models
+import requests.structures as structures
+from requests.models import PreparedRequest
+from requests.structures import CaseInsensitiveDict
+
+
+primer = PreparedRequest()
+prepare_method_call(primer, "get")
+original_code = CaseInsensitiveDict.__setitem__.__code__
+original_check = models.check_header_validity
+
+
+def accept(header):
+    side_effects.append(["accepted", header])
+
+
+def patched_setitem(self, key, value):
+    _task7_effects.append(["patched-setitem", key, value])
+    _task7_models.check_header_validity = _task7_accept
+    self._store[key.lower()] = (key, value)
+
+
+structures._task7_effects = side_effects
+structures._task7_models = models
+structures._task7_accept = accept
+CaseInsensitiveDict.__setitem__.__code__ = patched_setitem.__code__
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "in-place-setitem-code",
+        subject,
+        lambda: prepare_headers_call(
+            subject,
+            {"First": "one", "Bad": " leading"},
+        ),
+    )
+finally:
+    CaseInsensitiveDict.__setitem__.__code__ = original_code
+    models.check_header_validity = original_check
+    del structures._task7_effects
+    del structures._task7_models
+    del structures._task7_accept
 """
     )
 
