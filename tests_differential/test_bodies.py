@@ -24,6 +24,7 @@ _BODY_TRIAL_SYMBOLS = {
     "_prepare_content_length_trial",
     "_rewind_body_trial",
     "_body_stream_collect_trial",
+    "_body_stream_cancel_before_poll_trial",
     "_body_stream_cancel_trial",
     "_body_stream_poll_state_trial",
     "_body_stream_disconnect_trial",
@@ -104,6 +105,14 @@ def cancel_body_call(subject, error):
     if _requests_rust is not None:
         return _requests_rust._body_stream_cancel_trial(subject, error)
     next(iter(subject.body))
+    raise error
+
+
+def cancel_body_before_poll_call(subject, error):
+    if _requests_rust is not None:
+        return _requests_rust._body_stream_cancel_before_poll_trial(
+            subject, error
+        )
     raise error
 
 
@@ -957,3 +966,124 @@ result = {
     assert ["cancel-close", True] not in state["effects"]
     assert ["cancel-del", True] in state["effects"]
     assert all(event[-1] is True for event in state["effects"])
+
+
+def test_each_body_bridge_race_releases_its_owner_once_on_origin() -> None:
+    state = _run_matching(
+        """
+import gc
+
+
+class Cancelled(BaseException):
+    pass
+
+
+class TrackedBody:
+    def __init__(self, label):
+        self.label = label
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        side_effects.append([
+            "next",
+            self.label,
+            threading.get_ident() == ENTRY_THREAD,
+        ])
+        return b"chunk"
+
+    def close(self):
+        side_effects.append([
+            "close",
+            self.label,
+            threading.get_ident() == ENTRY_THREAD,
+        ])
+
+    def __del__(self):
+        side_effects.append([
+            "del",
+            self.label,
+            threading.get_ident() == ENTRY_THREAD,
+        ])
+
+
+def exercise(label, operation):
+    subject = new_subject()
+    subject.body = TrackedBody(label)
+    outcome = capture(lambda: operation(subject))
+    subject.body = None
+    del subject
+    gc.collect()
+    return outcome
+
+
+rows = []
+rows.append([
+    "failed-send",
+    exercise(
+        "failed-send",
+        lambda subject: disconnect_body_call(subject, "action-receiver"),
+    )["exception"],
+])
+rows.append([
+    "queued-action",
+    exercise("queued-action", poll_state_call)["exception"],
+])
+rows.append([
+    "reply-drop",
+    exercise(
+        "reply-drop",
+        lambda subject: disconnect_body_call(subject, "reply-receiver"),
+    )["exception"],
+])
+
+before = Cancelled("before first poll")
+before_outcome = exercise(
+    "cancel-before-poll",
+    lambda subject: cancel_body_before_poll_call(subject, before),
+)
+rows.append([
+    "cancel-before-poll",
+    before_outcome["exception"],
+    before_outcome["error"] is before,
+])
+
+after = Cancelled("after reply")
+after_outcome = exercise(
+    "cancel-after-reply",
+    lambda subject: cancel_body_call(subject, after),
+)
+rows.append([
+    "cancel-after-reply",
+    after_outcome["exception"],
+    after_outcome["error"] is after,
+])
+
+result = {
+    "rows": rows,
+    "effects": list(side_effects),
+}
+"""
+    )
+
+    assert state["rows"][0] == ["failed-send", None]
+    assert state["rows"][1] == ["queued-action", None]
+    assert state["rows"][2] == ["reply-drop", None]
+    assert state["rows"][3][2] is True
+    assert state["rows"][4][2] is True
+
+    finalizers = [
+        event for event in state["effects"] if event[0] == "del"
+    ]
+    assert finalizers == [
+        ["del", "failed-send", True],
+        ["del", "queued-action", True],
+        ["del", "reply-drop", True],
+        ["del", "cancel-before-poll", True],
+        ["del", "cancel-after-reply", True],
+    ]
+    assert [
+        event for event in state["effects"] if event[0] == "next"
+    ] == [["next", "cancel-after-reply", True]]
+    assert not [event for event in state["effects"] if event[0] == "close"]
