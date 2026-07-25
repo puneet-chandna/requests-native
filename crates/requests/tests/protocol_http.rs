@@ -11,13 +11,14 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const SCRIPTED_RESPONSE: &[u8] =
     b"HTTP/1.1 201 Created\r\nx-fixture: direct\r\nContent-Length: 7\r\n\r\ndirect\n";
 
 #[derive(Debug)]
 struct Observation {
     accepted_connections: usize,
-    request_head: Vec<u8>,
+    request_bytes: Vec<u8>,
 }
 
 struct ScriptedServer {
@@ -108,31 +109,38 @@ fn serve(listener: TcpListener, shutdown: &Receiver<()>) -> Result<Observation, 
         .set_write_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|error| format!("set fixture write timeout: {error}"))?;
 
-    let request_head = read_request_head(&mut stream)?;
+    let mut request_bytes = read_through_request_head(&mut stream)?;
     stream
         .write_all(SCRIPTED_RESPONSE)
         .map_err(|error| format!("write scripted response: {error}"))?;
     stream
         .flush()
         .map_err(|error| format!("flush scripted response: {error}"))?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| format!("make accepted stream nonblocking: {error}"))?;
 
     let mut accepted_connections = 1;
-    let mut retained_connections = vec![stream];
+    let mut retained_connections = Vec::new();
     let keep_alive_deadline = Instant::now() + EXCHANGE_TIMEOUT;
     loop {
-        loop {
-            match listener.accept() {
-                Ok((extra, _)) => {
-                    accepted_connections += 1;
-                    retained_connections.push(extra);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(format!("fixture retry accept failed: {error}")),
-            }
-        }
+        drain_request_bytes(&mut stream, &mut request_bytes)?;
+        accept_retries(
+            &listener,
+            &mut retained_connections,
+            &mut accepted_connections,
+        )?;
 
         match shutdown.try_recv() {
-            Ok(()) | Err(TryRecvError::Disconnected) => break,
+            Ok(()) | Err(TryRecvError::Disconnected) => {
+                drain_request_bytes(&mut stream, &mut request_bytes)?;
+                accept_retries(
+                    &listener,
+                    &mut retained_connections,
+                    &mut accepted_connections,
+                )?;
+                break;
+            }
             Err(TryRecvError::Empty) => {}
         }
         if Instant::now() >= keep_alive_deadline {
@@ -141,24 +149,37 @@ fn serve(listener: TcpListener, shutdown: &Receiver<()>) -> Result<Observation, 
         thread::sleep(SERVER_POLL_INTERVAL);
     }
 
+    drop(stream);
     drop(retained_connections);
     Ok(Observation {
         accepted_connections,
-        request_head,
+        request_bytes,
     })
 }
 
-fn read_request_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+fn accept_retries(
+    listener: &TcpListener,
+    retained_connections: &mut Vec<TcpStream>,
+    accepted_connections: &mut usize,
+) -> Result<(), String> {
+    loop {
+        match listener.accept() {
+            Ok((extra, _)) => {
+                *accepted_connections += 1;
+                retained_connections.push(extra);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(format!("fixture retry accept failed: {error}")),
+        }
+    }
+}
+
+fn read_through_request_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
 
     loop {
-        if let Some(end) = request
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .map(|index| index + 4)
-        {
-            request.truncate(end);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
             return Ok(request);
         }
         if request.len() >= MAX_REQUEST_HEAD_BYTES {
@@ -176,6 +197,27 @@ fn read_request_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
             return Err("client closed before completing request head".to_owned());
         }
         request.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn drain_request_bytes(stream: &mut TcpStream, request: &mut Vec<u8>) -> Result<(), String> {
+    let mut buffer = [0_u8; 1024];
+
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => {
+                if request.len() + read > MAX_REQUEST_BYTES {
+                    return Err(format!(
+                        "request exceeded {MAX_REQUEST_BYTES} bytes while checking for a GET body"
+                    ));
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("drain request bytes: {error}")),
+        }
     }
 }
 
@@ -222,7 +264,7 @@ fn get_over_new_plain_connection() {
     assert_eq!(body.as_ref(), b"direct\n");
     assert_eq!(observation.accepted_connections, 1);
     assert_eq!(
-        observation.request_head,
+        observation.request_bytes,
         format!("GET /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\n\r\n").into_bytes()
     );
 }
