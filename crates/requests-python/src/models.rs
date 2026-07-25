@@ -140,8 +140,12 @@ enum KnownCode {
         member: Py<PyCode>,
         protocol_hook: Option<Py<PyCode>>,
         protocol_init: Py<PyCode>,
+        protocol_meta_instancecheck: Py<PyCode>,
+        protocol_meta_subclasscheck: Option<Py<PyCode>>,
+        abc_meta_subclasscheck: Py<PyCode>,
         member_globals: Py<PyDict>,
         typing_globals: Py<PyDict>,
+        abc_globals: Py<PyDict>,
         abc_module: Py<PyModule>,
         abc_dump: Py<PyAny>,
     },
@@ -728,8 +732,12 @@ fn known_runtime_protocol_is(
     member_code: &Py<PyCode>,
     protocol_hook_code: &Py<PyCode>,
     protocol_init_code: &Py<PyCode>,
+    protocol_meta_instancecheck_code: &Py<PyCode>,
+    protocol_meta_subclasscheck_code: Option<&Py<PyCode>>,
+    abc_meta_subclasscheck_code: &Py<PyCode>,
     member_globals: &Py<PyDict>,
     typing_globals: &Py<PyDict>,
+    abc_globals: &Py<PyDict>,
     abc_module: &Py<PyModule>,
     abc_dump: &Py<PyAny>,
 ) -> PyResult<bool> {
@@ -743,7 +751,74 @@ fn known_runtime_protocol_is(
     let generic = typing_namespace
         .get_item("Generic")?
         .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("typing.Generic missing"))?;
-    if !class.get_type().is(protocol.get_type()) {
+    let protocol_meta = class.get_type();
+    if !protocol_meta.is(protocol.get_type())
+        || !protocol_meta.get_type().is(py.get_type::<PyType>())
+        || !exact_type_identity_is(protocol_meta.as_any(), "typing", "_ProtocolMeta")?
+    {
+        return Ok(false);
+    }
+    let protocol_meta_mro = protocol_meta.mro();
+    if protocol_meta_mro.len() != 4
+        || !protocol_meta_mro.get_item(0)?.is(&protocol_meta)
+        || !exact_type_identity_is(&protocol_meta_mro.get_item(1)?, "abc", "ABCMeta")?
+        || !protocol_meta_mro.get_item(2)?.is(py.get_type::<PyType>())
+        || !protocol_meta_mro.get_item(3)?.is(py.get_type::<PyAny>())
+    {
+        return Ok(false);
+    }
+    let protocol_meta_namespace = protocol_meta.getattr("__dict__")?;
+    if !exact_source_function_is(
+        py,
+        &protocol_meta_namespace.get_item("__instancecheck__")?,
+        "typing",
+        "_ProtocolMeta.__instancecheck__",
+        protocol_meta_instancecheck_code,
+        typing_namespace,
+        false,
+    )? {
+        return Ok(false);
+    }
+    match protocol_meta_subclasscheck_code {
+        Some(expected) => {
+            if !protocol_meta_namespace.contains("__subclasscheck__")?
+                || !exact_source_function_is(
+                    py,
+                    &protocol_meta_namespace.get_item("__subclasscheck__")?,
+                    "typing",
+                    "_ProtocolMeta.__subclasscheck__",
+                    expected,
+                    typing_namespace,
+                    false,
+                )?
+            {
+                return Ok(false);
+            }
+        }
+        None => {
+            if protocol_meta_namespace.contains("__subclasscheck__")? {
+                return Ok(false);
+            }
+            let Some(current) = raw_type_entry(&protocol_meta, "__subclasscheck__")? else {
+                return Ok(false);
+            };
+            if !exact_source_function_is(
+                py,
+                &current,
+                "abc",
+                "ABCMeta.__subclasscheck__",
+                abc_meta_subclasscheck_code,
+                abc_globals.bind(py),
+                false,
+            )? {
+                return Ok(false);
+            }
+        }
+    }
+    let type_getattribute = required_raw_type_entry(&py.get_type::<PyType>(), "__getattribute__")?;
+    if !raw_type_entry(&protocol_meta, "__getattribute__")?
+        .is_some_and(|current| current.is(&type_getattribute))
+    {
         return Ok(false);
     }
     let current_module = class.getattr("__module__")?;
@@ -1436,8 +1511,12 @@ fn known_value_is(
                 member: member_code,
                 protocol_hook,
                 protocol_init,
+                protocol_meta_instancecheck,
+                protocol_meta_subclasscheck,
+                abc_meta_subclasscheck,
                 member_globals,
                 typing_globals,
+                abc_globals,
                 abc_module,
                 abc_dump,
             }) = expected_code
@@ -1456,8 +1535,12 @@ fn known_value_is(
                 member_code,
                 protocol_hook,
                 protocol_init,
+                protocol_meta_instancecheck,
+                protocol_meta_subclasscheck.as_ref(),
+                abc_meta_subclasscheck,
                 member_globals,
                 typing_globals,
+                abc_globals,
                 abc_module,
                 abc_dump,
             ))
@@ -1783,6 +1866,9 @@ fn build_known_code(
             let Some(typing) = loaded_module(py, "typing")? else {
                 return Ok(None);
             };
+            let Some(abc_source) = loaded_module(py, "abc")? else {
+                return Ok(None);
+            };
             let Some(abc) = loaded_module(py, "_abc")? else {
                 return Ok(None);
             };
@@ -1801,8 +1887,28 @@ fn build_known_code(
                     "_no_init_or_replace_init",
                 )?
                 .unbind(),
+                protocol_meta_instancecheck: canonical_code_from_module(
+                    &typing,
+                    "typing",
+                    "_ProtocolMeta.__instancecheck__",
+                )?
+                .unbind(),
+                protocol_meta_subclasscheck: canonical_code_from_module(
+                    &typing,
+                    "typing",
+                    "_ProtocolMeta.__subclasscheck__",
+                )
+                .ok()
+                .map(Bound::unbind),
+                abc_meta_subclasscheck: canonical_code_from_module(
+                    &abc_source,
+                    "abc",
+                    "ABCMeta.__subclasscheck__",
+                )?
+                .unbind(),
                 member_globals: source.dict().unbind(),
                 typing_globals: typing.dict().unbind(),
+                abc_globals: abc_source.dict().unbind(),
                 abc_module: abc.clone().unbind(),
                 abc_dump: abc_dump.unbind(),
             }))
