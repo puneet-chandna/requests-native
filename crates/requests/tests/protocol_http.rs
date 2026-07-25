@@ -24,6 +24,7 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const POST_EXCHANGE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(3);
+const POOL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const SCRIPTED_RESPONSE: &[u8] =
@@ -71,6 +72,260 @@ struct PhasedServer {
     commands: Sender<PhaseCommand>,
     events: Receiver<PhaseEvent>,
     worker: Option<JoinHandle<Result<PhasedObservation, String>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PoolScript {
+    KeepAlive,
+    HoldFirstBody,
+    MalformedFirstBody,
+}
+
+#[derive(Debug)]
+struct PoolRequestObservation {
+    connection_id: usize,
+    request_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct PoolObservation {
+    accepted_connections: usize,
+    requests: Vec<PoolRequestObservation>,
+    peer_closed_connections: Vec<usize>,
+}
+
+impl PoolObservation {
+    fn connection_ids(&self) -> Vec<usize> {
+        self.requests
+            .iter()
+            .map(|request| request.connection_id)
+            .collect()
+    }
+}
+
+struct PoolConnection {
+    id: usize,
+    stream: TcpStream,
+    request_buffer: Vec<u8>,
+    requests_served: usize,
+    closed: bool,
+}
+
+struct PoolServer {
+    address: SocketAddr,
+    shutdown: Option<Sender<()>>,
+    worker: Option<JoinHandle<Result<PoolObservation, String>>>,
+}
+
+impl PoolServer {
+    fn spawn(script: PoolScript, expected_requests: usize, expected_peer_closes: usize) -> Self {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind pool loopback fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("make pool fixture listener nonblocking");
+        let address = listener.local_addr().expect("read pool fixture address");
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            serve_pool(
+                listener,
+                shutdown_rx,
+                script,
+                expected_requests,
+                expected_peer_closes,
+            )
+        });
+        Self {
+            address,
+            shutdown: Some(shutdown_tx),
+            worker: Some(worker),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{}", self.address, path)
+    }
+
+    fn finish(mut self) -> Result<PoolObservation, String> {
+        self.signal_shutdown();
+        join_pool_worker(self.worker.take())
+    }
+
+    fn signal_shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+impl Drop for PoolServer {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        let _ = join_pool_worker(self.worker.take());
+    }
+}
+
+fn join_pool_worker(
+    worker: Option<JoinHandle<Result<PoolObservation, String>>>,
+) -> Result<PoolObservation, String> {
+    let worker = worker.ok_or_else(|| "pool fixture worker already joined".to_owned())?;
+    worker
+        .join()
+        .map_err(|_| "pool fixture worker panicked".to_owned())?
+}
+
+fn serve_pool(
+    listener: TcpListener,
+    shutdown: Receiver<()>,
+    script: PoolScript,
+    expected_requests: usize,
+    expected_peer_closes: usize,
+) -> Result<PoolObservation, String> {
+    let deadline = Instant::now() + POOL_TIMEOUT;
+    let mut connections = Vec::new();
+    let mut accepted_connections = 0;
+    let mut requests = Vec::new();
+    let mut peer_closed_connections = Vec::new();
+    let mut shutting_down = false;
+
+    loop {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(true)
+                        .map_err(|error| format!("make pooled stream nonblocking: {error}"))?;
+                    stream
+                        .set_write_timeout(Some(SOCKET_TIMEOUT))
+                        .map_err(|error| format!("set pooled stream write timeout: {error}"))?;
+                    let id = accepted_connections;
+                    accepted_connections += 1;
+                    connections.push(PoolConnection {
+                        id,
+                        stream,
+                        request_buffer: Vec::new(),
+                        requests_served: 0,
+                        closed: false,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(format!("pool fixture accept failed: {error}")),
+            }
+        }
+
+        for connection in &mut connections {
+            read_pool_requests(
+                connection,
+                script,
+                &mut requests,
+                &mut peer_closed_connections,
+            )?;
+        }
+        connections.retain(|connection| !connection.closed);
+
+        match shutdown.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => shutting_down = true,
+            Err(TryRecvError::Empty) => {}
+        }
+        if shutting_down
+            && requests.len() >= expected_requests
+            && peer_closed_connections.len() >= expected_peer_closes
+        {
+            for connection in &connections {
+                let _ = connection.stream.shutdown(Shutdown::Both);
+            }
+            return Ok(PoolObservation {
+                accepted_connections,
+                requests,
+                peer_closed_connections,
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "pool fixture timed out: accepted={accepted_connections}, requests={}, peer_closes={}",
+                requests.len(),
+                peer_closed_connections.len()
+            ));
+        }
+        thread::sleep(SERVER_POLL_INTERVAL);
+    }
+}
+
+fn read_pool_requests(
+    connection: &mut PoolConnection,
+    script: PoolScript,
+    requests: &mut Vec<PoolRequestObservation>,
+    peer_closed_connections: &mut Vec<usize>,
+) -> Result<(), String> {
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match connection.stream.read(&mut buffer) {
+            Ok(0) => {
+                connection.closed = true;
+                if !peer_closed_connections.contains(&connection.id) {
+                    peer_closed_connections.push(connection.id);
+                }
+                break;
+            }
+            Ok(read) => {
+                if connection.request_buffer.len() + read > MAX_REQUEST_BYTES {
+                    return Err(format!(
+                        "pooled request on connection {} exceeded {MAX_REQUEST_BYTES} bytes",
+                        connection.id
+                    ));
+                }
+                connection.request_buffer.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(format!(
+                    "read pooled request on connection {}: {error}",
+                    connection.id
+                ));
+            }
+        }
+    }
+
+    while let Some(request_len) = complete_request_len(&connection.request_buffer)? {
+        let remainder = connection.request_buffer.split_off(request_len);
+        let request_bytes = std::mem::replace(&mut connection.request_buffer, remainder);
+        requests.push(PoolRequestObservation {
+            connection_id: connection.id,
+            request_bytes,
+        });
+        write_pool_response(connection, script)?;
+        connection.requests_served += 1;
+    }
+    Ok(())
+}
+
+fn write_pool_response(connection: &mut PoolConnection, script: PoolScript) -> Result<(), String> {
+    const COMPLETE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const PARTIAL: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\npartial\r\n";
+    const MALFORMED: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\n";
+
+    let response = match (script, connection.id, connection.requests_served) {
+        (PoolScript::HoldFirstBody, 0, 0) => PARTIAL,
+        (PoolScript::MalformedFirstBody, 0, 0) => MALFORMED,
+        _ => COMPLETE,
+    };
+    connection
+        .stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("make pooled stream blocking for response: {error}"))?;
+    connection
+        .stream
+        .write_all(response)
+        .map_err(|error| format!("write pooled response: {error}"))?;
+    connection
+        .stream
+        .flush()
+        .map_err(|error| format!("flush pooled response: {error}"))?;
+    connection
+        .stream
+        .set_nonblocking(true)
+        .map_err(|error| format!("restore pooled stream nonblocking mode: {error}"))
 }
 
 impl PhasedServer {
@@ -1142,6 +1397,172 @@ fn response_stream_read_timeout_resets_per_frame_and_is_not_total_duration() {
     server.wait_peer_eof();
     let observation = server.finish().expect("phased fixture completed");
     assert_eq!(observation.peer_eof_count, 1);
+}
+
+fn assert_pool_requests(
+    observation: &PoolObservation,
+    expected_connection_ids: &[usize],
+    expected_paths: &[&str],
+) {
+    assert_eq!(observation.connection_ids(), expected_connection_ids);
+    assert_eq!(observation.requests.len(), expected_paths.len());
+    for (request, path) in observation.requests.iter().zip(expected_paths) {
+        assert_eq!(
+            complete_request_len(&request.request_bytes).expect("parse pooled request"),
+            Some(request.request_bytes.len()),
+            "pooled request must be captured exactly once and without truncation"
+        );
+        assert!(
+            request
+                .request_bytes
+                .starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()),
+            "unexpected pooled request: {:?}",
+            String::from_utf8_lossy(&request.request_bytes)
+        );
+    }
+}
+
+#[test]
+fn pool_clean_eof_reuses_one_connection_for_two_requests() {
+    let runtime = runtime();
+    let server = PoolServer::spawn(PoolScript::KeepAlive, 2, 0);
+    let client = Client::new().expect("build pooled client");
+
+    let (_, _, first) = complete_exchange(&runtime, client.get(server.url("/pool/first")));
+    let (_, _, second) = complete_exchange(&runtime, client.get(server.url("/pool/second")));
+    assert_eq!(first, Bytes::from_static(b"ok"));
+    assert_eq!(second, Bytes::from_static(b"ok"));
+
+    let observation = server.finish().expect("pool fixture completed");
+    assert_eq!(observation.accepted_connections, 1);
+    assert_pool_requests(&observation, &[0, 0], &["/pool/first", "/pool/second"]);
+}
+
+#[test]
+fn pool_partial_body_drop_forces_a_second_connection() {
+    let runtime = runtime();
+    let server = PoolServer::spawn(PoolScript::HoldFirstBody, 2, 1);
+    let client = Client::new().expect("build pooled client");
+
+    let response = send_response(&runtime, client.get(server.url("/pool/drop")));
+    let mut body = response.into_body();
+    let partial = runtime
+        .block_on(async {
+            tokio::time::timeout(POOL_TIMEOUT, next_response_frame(&mut body)).await
+        })
+        .expect("timed out waiting for partial pooled frame")
+        .expect("partial pooled frame missing")
+        .expect("partial pooled frame failed");
+    assert_eq!(partial, Bytes::from_static(b"partial"));
+    drop(body);
+
+    let (_, _, second) = complete_exchange(&runtime, client.get(server.url("/pool/after-drop")));
+    assert_eq!(second, Bytes::from_static(b"ok"));
+
+    let observation = server.finish().expect("pool fixture completed");
+    assert_eq!(observation.accepted_connections, 2);
+    assert!(observation.peer_closed_connections.contains(&0));
+    assert_pool_requests(&observation, &[0, 1], &["/pool/drop", "/pool/after-drop"]);
+}
+
+#[test]
+fn pool_partial_body_close_forces_a_second_connection() {
+    let runtime = runtime();
+    let server = PoolServer::spawn(PoolScript::HoldFirstBody, 2, 1);
+    let client = Client::new().expect("build pooled client");
+
+    let response = send_response(&runtime, client.get(server.url("/pool/close")));
+    let mut body = response.into_body();
+    let partial = runtime
+        .block_on(async {
+            tokio::time::timeout(POOL_TIMEOUT, next_response_frame(&mut body)).await
+        })
+        .expect("timed out waiting for partial pooled frame")
+        .expect("partial pooled frame missing")
+        .expect("partial pooled frame failed");
+    assert_eq!(partial, Bytes::from_static(b"partial"));
+    runtime
+        .block_on(async { tokio::time::timeout(POOL_TIMEOUT, body.close()).await })
+        .expect("timed out closing partial pooled response")
+        .expect("close partial pooled response");
+
+    let (_, _, second) = complete_exchange(&runtime, client.get(server.url("/pool/after-close")));
+    assert_eq!(second, Bytes::from_static(b"ok"));
+
+    let observation = server.finish().expect("pool fixture completed");
+    assert_eq!(observation.accepted_connections, 2);
+    assert!(observation.peer_closed_connections.contains(&0));
+    assert_pool_requests(&observation, &[0, 1], &["/pool/close", "/pool/after-close"]);
+}
+
+#[test]
+fn pool_malformed_body_error_forces_a_second_connection() {
+    let runtime = runtime();
+    let server = PoolServer::spawn(PoolScript::MalformedFirstBody, 2, 1);
+    let client = Client::new().expect("build pooled client");
+
+    let response = send_response(&runtime, client.get(server.url("/pool/malformed")));
+    let mut body = response.into_body();
+    let error = runtime
+        .block_on(async {
+            tokio::time::timeout(POOL_TIMEOUT, next_response_frame(&mut body)).await
+        })
+        .expect("timed out waiting for malformed pooled body error")
+        .expect("malformed pooled body ended without an error")
+        .expect_err("malformed pooled body unexpectedly produced a frame");
+    assert_eq!(error.kind(), ErrorKind::ChunkedEncoding);
+    drop(body);
+
+    let (_, _, second) =
+        complete_exchange(&runtime, client.get(server.url("/pool/after-malformed")));
+    assert_eq!(second, Bytes::from_static(b"ok"));
+
+    let observation = server.finish().expect("pool fixture completed");
+    assert_eq!(observation.accepted_connections, 2);
+    assert!(observation.peer_closed_connections.contains(&0));
+    assert_pool_requests(
+        &observation,
+        &[0, 1],
+        &["/pool/malformed", "/pool/after-malformed"],
+    );
+}
+
+#[test]
+fn pool_instances_isolate_two_clients_for_the_same_authority() {
+    let runtime = runtime();
+    let server = PoolServer::spawn(PoolScript::KeepAlive, 4, 0);
+    let first_client = Client::new().expect("build first pooled client");
+    let second_client = Client::new().expect("build second pooled client");
+
+    complete_exchange(
+        &runtime,
+        first_client.get(server.url("/pool/client-a/first")),
+    );
+    complete_exchange(
+        &runtime,
+        second_client.get(server.url("/pool/client-b/first")),
+    );
+    complete_exchange(
+        &runtime,
+        first_client.get(server.url("/pool/client-a/second")),
+    );
+    complete_exchange(
+        &runtime,
+        second_client.get(server.url("/pool/client-b/second")),
+    );
+
+    let observation = server.finish().expect("pool fixture completed");
+    assert_eq!(observation.accepted_connections, 2);
+    assert_pool_requests(
+        &observation,
+        &[0, 1, 0, 1],
+        &[
+            "/pool/client-a/first",
+            "/pool/client-b/first",
+            "/pool/client-a/second",
+            "/pool/client-b/second",
+        ],
+    );
 }
 
 #[test]

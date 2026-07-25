@@ -1,4 +1,6 @@
 mod connect;
+#[cfg(test)]
+mod pool_tests;
 
 use std::future::Future;
 use std::net::Shutdown;
