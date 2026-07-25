@@ -2666,6 +2666,90 @@ finally:
     )
 
 
+def test_prepare_url_does_not_import_replaced_typing_module() -> None:
+    _assert_matches_oracle(
+        """
+import sys
+from requests.models import PreparedRequest
+
+
+prime = PreparedRequest()
+prepare_method_call(prime, "get")
+original = sys.modules["typing"]
+sys.modules["typing"] = object()
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "mutated-sys-modules-typing",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    sys.modules["typing"] = original
+"""
+    )
+
+
+def test_prepare_url_does_not_import_replaced_abc_module() -> None:
+    _assert_matches_oracle(
+        """
+import sys
+from requests.models import PreparedRequest
+
+
+prime = PreparedRequest()
+prepare_method_call(prime, "get")
+original = sys.modules["_abc"]
+sys.modules["_abc"] = object()
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "mutated-sys-modules-abc",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    sys.modules["_abc"] = original
+"""
+    )
+
+
+def test_prepare_url_does_not_import_replaced_urllib_parse_module() -> None:
+    _assert_matches_oracle(
+        """
+import sys
+from requests.models import PreparedRequest
+
+
+prime = PreparedRequest()
+prepare_method_call(prime, "get")
+original = sys.modules["urllib.parse"]
+sys.modules["urllib.parse"] = object()
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "mutated-sys-modules-urllib-parse",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/a path",
+            None,
+        ),
+    )
+finally:
+    sys.modules["urllib.parse"] = original
+"""
+    )
+
+
 def test_http_unix_preserves_lowercase_reserved_percent_escapes() -> None:
     _assert_matches_oracle(
         """
