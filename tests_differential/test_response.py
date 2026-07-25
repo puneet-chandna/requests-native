@@ -4210,9 +4210,9 @@ rows = []
 missing = object()
 
 
-def run_binding(name, replacement, target, operation):
-    original = models.__dict__.get(name, missing)
-    models.__dict__[name] = replacement
+def run_binding(label, binding_name, replacement, target, operation):
+    original = models.__dict__.get(binding_name, missing)
+    models.__dict__[binding_name] = replacement
     seen = []
 
     def profile(frame, event, argument):
@@ -4225,11 +4225,11 @@ def run_binding(name, replacement, target, operation):
     finally:
         sys.setprofile(None)
         if original is missing:
-            models.__dict__.pop(name, None)
+            models.__dict__.pop(binding_name, None)
         else:
-            models.__dict__[name] = original
+            models.__dict__[binding_name] = original
     rows.append({
-        "name": name,
+        "name": label,
         "seen": seen,
         "returned": value_record(observed["returned"]),
         "exception": observed["exception"],
@@ -4245,6 +4245,7 @@ bool_subject._content = DynamicBool()
 bool_subject._content_consumed = True
 run_binding(
     "bool",
+    "bool",
     DynamicBool,
     Response.iter_content.__code__,
     lambda: list(response_iter_content_call(bool_subject, 1)),
@@ -4258,6 +4259,7 @@ class DynamicInt:
 int_subject = Response()
 int_subject.raw = ObservedReadRaw([b"unused"])
 run_binding(
+    "int",
     "int",
     DynamicInt,
     Response.iter_content.__code__,
@@ -4292,6 +4294,7 @@ hasattr_subject = Response()
 hasattr_subject.raw = BothRaw()
 run_binding(
     "hasattr",
+    "hasattr",
     dynamic_hasattr,
     Response.iter_content.__code__,
     lambda: list(response_iter_content_call(hasattr_subject, 2)),
@@ -4315,6 +4318,7 @@ cast_subject._content = b"original"
 cast_subject._content_consumed = True
 run_binding(
     "cast",
+    "cast",
     dynamic_cast,
     Response.iter_content.__code__,
     lambda: list(response_iter_content_call(cast_subject, 3)),
@@ -4337,6 +4341,7 @@ line_cast_subject = Response()
 line_cast_subject.raw = ObservedReadRaw([b"first", b"second\\n"])
 run_binding(
     "cast-iter_lines",
+    "cast",
     dynamic_line_cast,
     Response.iter_lines.__code__,
     lambda: list(response_iter_lines_call(line_cast_subject, 6)),
@@ -4358,6 +4363,7 @@ bytes_subject.reason = DynamicBytes()
 bytes_subject.url = "https://example.test/bytes"
 run_binding(
     "bytes",
+    "bytes",
     DynamicBytes,
     Response.raise_for_status.__code__,
     lambda: response_metadata_call(bytes_subject, "raise_for_status"),
@@ -4369,6 +4375,7 @@ bytes_iter_subject._content = b"cached"
 bytes_iter_subject._content_consumed = True
 run_binding(
     "bytes-iter_content",
+    "bytes",
     DynamicBytes,
     Response.iter_content.__code__,
     lambda: list(response_iter_content_call(bytes_iter_subject, 3)),
@@ -4396,6 +4403,7 @@ unicode_subject.reason = DynamicReason(b"reason")
 unicode_subject.url = "https://example.test/unicode"
 run_binding(
     "UnicodeDecodeError",
+    "UnicodeDecodeError",
     DynamicUnicodeDecodeError,
     Response.raise_for_status.__code__,
     lambda: response_metadata_call(unicode_subject, "raise_for_status"),
@@ -4420,6 +4428,7 @@ json_unicode_subject._content = DynamicJsonBytes(b'{"json": true}')
 json_unicode_subject._content_consumed = True
 run_binding(
     "UnicodeDecodeError-json",
+    "UnicodeDecodeError",
     DynamicJsonUnicodeDecodeError,
     Response.json.__code__,
     lambda: response_json_call(json_unicode_subject, {}),
@@ -4468,13 +4477,7 @@ result = {
     assert rows["UnicodeDecodeError"]["exception"]["args"] == [
         "500 Server Error: fallback reason for url: https://example.test/unicode"
     ]
-    assert rows["UnicodeDecodeError-json"]["exception"] == {
-        "type": [
-            "__differential_case__",
-            "DynamicJsonUnicodeDecodeError",
-        ],
-        "args": ["dynamic json decode"],
-    }
+    assert rows["UnicodeDecodeError-json"]["exception"] is None
     assert state["hasattr_events"] == [[True, "stream", True]]
     assert state["hasattr_raw_events"] == [["read", True], ["read", True]]
     assert state["cast_events"] == [
