@@ -5,11 +5,13 @@ use std::fmt;
 pub enum ErrorKind {
     Body,
     Builder,
+    ChunkedEncoding,
     Connect,
     Connection,
     Dns,
     Handshake,
     InvalidUrl,
+    ReadTimeout,
     ResponseBody,
     Send,
 }
@@ -111,17 +113,24 @@ impl Error {
         )
     }
 
-    pub(crate) fn connection_stopped() -> Self {
-        Self::transport(
-            ErrorKind::Connection,
-            "HTTP/1.1 connection driver stopped without a result".to_owned(),
-        )
-    }
-
     pub(crate) fn response_body(error: impl fmt::Display) -> Self {
         Self::transport(
             ErrorKind::ResponseBody,
             format!("HTTP/1.1 response body failed: {error}"),
+        )
+    }
+
+    pub(crate) fn chunked_encoding(error: impl fmt::Display) -> Self {
+        Self::transport(
+            ErrorKind::ChunkedEncoding,
+            format!("HTTP/1.1 chunked response body failed: {error}"),
+        )
+    }
+
+    pub(crate) fn read_timeout(timeout: std::time::Duration) -> Self {
+        Self::transport(
+            ErrorKind::ReadTimeout,
+            format!("HTTP/1.1 response body read timed out after {timeout:?}"),
         )
     }
 

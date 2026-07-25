@@ -17,11 +17,11 @@ pub use error::{Error, ErrorKind, Result};
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 pub use models::{
     HeaderInput, HeaderPart, HeaderPreparationError, InvalidHeaderPart, PreparedHeader, Request,
-    RequestBuilder, UrlPreparationError, append_url_params, is_non_http_url, prepare_headers,
-    prepare_method, prepare_method_bytes, prepare_url, url_is_native_safe,
+    RequestBuilder, Timeout, UrlPreparationError, append_url_params, is_non_http_url,
+    prepare_headers, prepare_method, prepare_method_bytes, prepare_url, url_is_native_safe,
 };
 pub use response::{
-    Response, ResponseCache, ResponseContent, ResponseDecision, ResponseDisposition,
+    Response, ResponseBody, ResponseCache, ResponseContent, ResponseDecision, ResponseDisposition,
     ResponseDispositionState, ResponseEvent,
 };
 

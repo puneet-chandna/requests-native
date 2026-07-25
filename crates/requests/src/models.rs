@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::structures::CaseInsensitiveMap;
 use crate::transport::Transport;
@@ -329,6 +330,7 @@ pub struct Request {
     uri: Uri,
     headers: HeaderMap,
     body: BodySource,
+    timeout: Timeout,
 }
 
 impl Request {
@@ -359,6 +361,7 @@ impl Request {
             uri: self.uri,
             headers: self.headers,
             body: self.body,
+            timeout: self.timeout,
         }
     }
 }
@@ -369,6 +372,14 @@ pub(crate) struct RequestParts {
     pub uri: Uri,
     pub headers: HeaderMap,
     pub body: BodySource,
+    pub timeout: Timeout,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Timeout {
+    pub connect: Option<Duration>,
+    pub read: Option<Duration>,
+    pub total: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -387,6 +398,7 @@ impl RequestBuilder {
                 uri,
                 headers: HeaderMap::new(),
                 body: BodySource::Empty,
+                timeout: Timeout::default(),
             }),
             _ => Err(Error::invalid_url(&url)),
         };
@@ -425,6 +437,13 @@ impl RequestBuilder {
     pub fn body(mut self, body: impl Into<BodySource>) -> Self {
         if let Ok(request) = &mut self.request {
             request.body = body.into();
+        }
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Timeout) -> Self {
+        if let Ok(request) = &mut self.request {
+            request.timeout = timeout;
         }
         self
     }

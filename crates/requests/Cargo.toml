@@ -19,6 +19,7 @@ platform-smoke = [
 
 [dependencies]
 bytes = "1"
+futures-core = "0.3"
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }

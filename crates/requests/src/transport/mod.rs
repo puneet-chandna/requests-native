@@ -1,6 +1,7 @@
 mod connect;
 
 use std::future::Future;
+use std::net::Shutdown;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -22,16 +23,22 @@ pub(crate) struct TransportResponse {
     pub body: Incoming,
     pub url: String,
     pub driver: ConnectionDriver,
+    pub read_timeout: Option<std::time::Duration>,
 }
 
 pub(crate) struct ConnectionDriver {
     task: Option<JoinHandle<Result<()>>>,
+    shutdown: Option<std::net::TcpStream>,
 }
 
 impl ConnectionDriver {
-    fn spawn(task: impl Future<Output = Result<()>> + Send + 'static) -> Self {
+    fn spawn(
+        task: impl Future<Output = Result<()>> + Send + 'static,
+        shutdown: Option<std::net::TcpStream>,
+    ) -> Self {
         Self {
             task: Some(tokio::spawn(task)),
+            shutdown,
         }
     }
 
@@ -48,6 +55,7 @@ impl ConnectionDriver {
         result: std::result::Result<Result<()>, tokio::task::JoinError>,
     ) -> Result<()> {
         self.task.take();
+        self.shutdown.take();
         match result {
             Ok(result) => result,
             Err(error) => Err(Error::connection(error)),
@@ -55,25 +63,42 @@ impl ConnectionDriver {
     }
 
     pub(crate) async fn abort_and_wait(&mut self) -> Result<()> {
-        let Some(task) = self.task.as_mut() else {
+        self.shutdown_socket_once();
+        let Some(task) = self.take_and_abort_task_once() else {
             return Ok(());
         };
-        task.abort();
         let result = task.await;
-        self.task.take();
         match result {
             Ok(result) => result,
             Err(error) if error.is_cancelled() => Ok(()),
             Err(error) => Err(Error::connection(error)),
         }
     }
+
+    pub(crate) fn shutdown_now(&mut self) {
+        self.shutdown_socket_once();
+        drop(self.take_and_abort_task_once());
+    }
+
+    fn shutdown_socket_once(&mut self) {
+        if let Some(stream) = self.shutdown.take() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn take_and_abort_task_once(&mut self) -> Option<JoinHandle<Result<()>>> {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            Some(task)
+        } else {
+            None
+        }
+    }
 }
 
 impl Drop for ConnectionDriver {
     fn drop(&mut self) {
-        if let Some(task) = self.task.as_ref() {
-            task.abort();
-        }
+        self.shutdown_now();
     }
 }
 
@@ -92,14 +117,26 @@ impl Transport {
             .ok_or_else(|| Error::invalid_url(request.url()))?
             .as_str()
             .to_owned();
-        let (outgoing, url) = outgoing_request(request.into_parts())?;
+        let request = request.into_parts();
+        let read_timeout = request.timeout.read;
+        let (outgoing, url) = outgoing_request(request)?;
 
         let stream = connect::connect(&host, port, &target).await?;
+        let stream = stream
+            .into_std()
+            .map_err(|error| Error::connect(&target, error))?;
+        let shutdown = stream
+            .try_clone()
+            .map_err(|error| Error::connect(&target, error))?;
+        let stream = tokio::net::TcpStream::from_std(stream)
+            .map_err(|error| Error::connect(&target, error))?;
         let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
             .await
             .map_err(Error::handshake)?;
-        let mut driver =
-            ConnectionDriver::spawn(async move { connection.await.map_err(Error::connection) });
+        let mut driver = ConnectionDriver::spawn(
+            async move { connection.await.map_err(Error::connection) },
+            Some(shutdown),
+        );
 
         let sending = sender.send_request(outgoing);
         tokio::pin!(sending);
@@ -138,6 +175,7 @@ impl Transport {
             body,
             url,
             driver,
+            read_timeout,
         })
     }
 }
@@ -365,11 +403,14 @@ mod tests {
         runtime.block_on(async {
             let dropped = Arc::new(AtomicBool::new(false));
             let task_dropped = Arc::clone(&dropped);
-            let driver = ConnectionDriver::spawn(async move {
-                let _drop_flag = DropFlag(task_dropped);
-                future::pending::<()>().await;
-                Ok(())
-            });
+            let driver = ConnectionDriver::spawn(
+                async move {
+                    let _drop_flag = DropFlag(task_dropped);
+                    future::pending::<()>().await;
+                    Ok(())
+                },
+                None,
+            );
             tokio::task::yield_now().await;
 
             drop(driver);

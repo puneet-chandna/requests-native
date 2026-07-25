@@ -4,10 +4,21 @@
 //! A response can, for example, have an exhausted uncached body while the
 //! disposition has already become dirty.
 
-use bytes::Bytes;
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+
+use bytes::{Bytes, BytesMut};
+use futures_core::Stream;
+use http::header::TRANSFER_ENCODING;
 use http::{HeaderMap, StatusCode};
-use http_body_util::BodyExt;
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 
 use crate::transport::{ConnectionDriver, TransportResponse};
 use crate::{Error, Result};
@@ -17,7 +28,8 @@ pub struct Response {
     body: Option<Incoming>,
     url: String,
     driver: Option<ConnectionDriver>,
-    disposition: ResponseDispositionState,
+    read_timeout: Option<Duration>,
+    disposition: Option<ResponseDispositionState>,
 }
 
 impl Response {
@@ -27,7 +39,8 @@ impl Response {
             body: Some(response.body),
             url: response.url,
             driver: Some(response.driver),
-            disposition: ResponseDispositionState::without_native_lease(),
+            read_timeout: response.read_timeout,
+            disposition: Some(ResponseDispositionState::without_native_lease()),
         }
     }
 
@@ -43,69 +56,354 @@ impl Response {
         &self.url
     }
 
-    pub async fn bytes(mut self) -> Result<Bytes> {
-        let Some(body) = self.body.take() else {
-            self.disposition.apply(ResponseEvent::ReadError);
-            return Err(Error::response_body("response body was already consumed"));
-        };
-        let Some(mut driver) = self.driver.take() else {
-            self.disposition.apply(ResponseEvent::ReadError);
-            return Err(Error::connection_stopped());
-        };
-
-        let collection = body.collect();
-        tokio::pin!(collection);
-        let body_result = loop {
-            if !driver.is_running() {
-                break collection
-                    .as_mut()
-                    .await
-                    .map(|collected| collected.to_bytes())
-                    .map_err(Error::response_body);
-            }
-
-            let Some(driver_task) = driver.task_mut() else {
-                continue;
-            };
-            tokio::select! {
-                biased;
-                result = &mut collection => {
-                    break result
-                        .map(|collected| collected.to_bytes())
-                        .map_err(Error::response_body);
-                }
-                driver_result = driver_task => {
-                    match driver.finish(driver_result) {
-                        Ok(()) => continue,
-                        Err(error) => break Err(error),
-                    }
-                }
-            }
-        };
-
-        if driver.is_running() {
-            // Once Hyper has collected the complete framed body, this request
-            // succeeded. The body-first select reports driver failure only
-            // while the body is still pending; abort-and-wait here only closes
-            // the deliberately non-pooled connection and cannot override the
-            // completed response.
-            drop(driver.abort_and_wait().await);
+    pub fn into_body(mut self) -> ResponseBody {
+        let chunked = has_chunked_transfer_encoding(&self.head.headers);
+        ResponseBody {
+            source: self
+                .body
+                .take()
+                .map(|body| ResponseBodySource::Incoming(Box::pin(body))),
+            driver: self.driver.take().map(ResponseBodyDriver::Network),
+            read_timeout: self.read_timeout.take(),
+            read_deadline: None,
+            chunked,
+            terminal: false,
+            disposition: self
+                .disposition
+                .take()
+                .expect("response disposition transfers exactly once"),
+            #[cfg(test)]
+            probe: None,
         }
-        let result = body_result;
+    }
 
-        self.disposition.apply(if result.is_ok() {
-            ResponseEvent::CleanEof
-        } else {
-            ResponseEvent::ReadError
-        });
-        result
+    pub async fn bytes(self) -> Result<Bytes> {
+        let mut body = self.into_body();
+        let mut collected = BytesMut::new();
+        while let Some(chunk) = poll_fn(|context| Pin::new(&mut body).poll_next(context)).await {
+            collected.extend_from_slice(&chunk?);
+        }
+        Ok(collected.freeze())
     }
 }
 
 impl Drop for Response {
     fn drop(&mut self) {
         drop(self.driver.take());
-        self.disposition.apply(ResponseEvent::Drop);
+        if let Some(disposition) = &mut self.disposition {
+            disposition.apply(ResponseEvent::Drop);
+        }
+    }
+}
+
+fn has_chunked_transfer_encoding(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(TRANSFER_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+}
+
+enum ResponseBodySource {
+    Incoming(Pin<Box<Incoming>>),
+    #[cfg(test)]
+    Pending,
+}
+
+enum ResponseBodyDriver {
+    Network(ConnectionDriver),
+    #[cfg(test)]
+    Controlled(ControlledDriver),
+}
+
+impl ResponseBodyDriver {
+    fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<()>> {
+        match self {
+            Self::Network(driver) => {
+                if !driver.is_running() {
+                    return Poll::Ready(Ok(()));
+                }
+                let Some(task) = driver.task_mut() else {
+                    return Poll::Ready(Ok(()));
+                };
+                match Pin::new(task).poll(context) {
+                    Poll::Ready(result) => Poll::Ready(driver.finish(result)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            #[cfg(test)]
+            Self::Controlled(driver) => driver.poll(context),
+        }
+    }
+
+    async fn abort_and_wait(self) -> Result<()> {
+        match self {
+            Self::Network(mut driver) => driver.abort_and_wait().await,
+            #[cfg(test)]
+            Self::Controlled(_) => Ok(()),
+        }
+    }
+
+    fn shutdown_now(&mut self) {
+        match self {
+            Self::Network(driver) => driver.shutdown_now(),
+            #[cfg(test)]
+            Self::Controlled(_) => {}
+        }
+    }
+}
+
+pub struct ResponseBody {
+    source: Option<ResponseBodySource>,
+    driver: Option<ResponseBodyDriver>,
+    read_timeout: Option<Duration>,
+    read_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    chunked: bool,
+    terminal: bool,
+    disposition: ResponseDispositionState,
+    #[cfg(test)]
+    probe: Option<TestResponseBodyProbe>,
+}
+
+impl ResponseBody {
+    pub async fn close(mut self) -> Result<()> {
+        let Some(driver) = self.begin_terminal(ResponseEvent::Close) else {
+            return Ok(());
+        };
+        driver.abort_and_wait().await
+    }
+
+    fn begin_terminal(&mut self, event: ResponseEvent) -> Option<ResponseBodyDriver> {
+        if self.terminal {
+            return None;
+        }
+        self.terminal = true;
+        drop(self.source.take());
+        drop(self.read_deadline.take());
+        self.disposition.apply(event);
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.record_terminal(
+                self.disposition.state(),
+                usize::from(self.disposition.decision_count()),
+            );
+        }
+        self.driver.take()
+    }
+
+    fn finish_now(&mut self, event: ResponseEvent) {
+        if let Some(mut driver) = self.begin_terminal(event) {
+            driver.shutdown_now();
+        }
+    }
+
+    fn finish_error(&mut self, event: ResponseEvent, error: Error) -> Poll<Option<Result<Bytes>>> {
+        self.finish_now(event);
+        Poll::Ready(Some(Err(error)))
+    }
+
+    fn poll_source(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<Bytes>>> {
+        loop {
+            let result = match self.source.as_mut() {
+                Some(ResponseBodySource::Incoming(body)) => body.as_mut().poll_frame(context),
+                #[cfg(test)]
+                Some(ResponseBodySource::Pending) => return Poll::Pending,
+                None => {
+                    return Poll::Ready(Some(Err(Error::response_body(
+                        "response body was already consumed",
+                    ))));
+                }
+            };
+            match result {
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(bytes) => return Poll::Ready(Some(Ok(bytes))),
+                    Err(_) => continue,
+                },
+                Poll::Ready(Some(Err(error))) => {
+                    let error = if self.chunked {
+                        Error::chunked_encoding(error)
+                    } else {
+                        Error::response_body(error)
+                    };
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn test_pending_body_and_driver() -> (Self, TestDriverFailure, TestResponseBodyProbe) {
+        let shared = Arc::new(ControlledDriverShared {
+            failure: Mutex::new(None),
+            waker: Mutex::new(None),
+        });
+        let probe = TestResponseBodyProbe {
+            inner: Arc::new(TestResponseBodyProbeInner {
+                disposition: Mutex::new(ResponseDisposition::Open),
+                decision_count: AtomicUsize::new(0),
+                cleanup_count: AtomicUsize::new(0),
+            }),
+        };
+        (
+            Self {
+                source: Some(ResponseBodySource::Pending),
+                driver: Some(ResponseBodyDriver::Controlled(ControlledDriver {
+                    shared: Arc::clone(&shared),
+                })),
+                read_timeout: None,
+                read_deadline: None,
+                chunked: false,
+                terminal: false,
+                disposition: ResponseDispositionState::without_native_lease(),
+                probe: Some(probe.clone()),
+            },
+            TestDriverFailure { shared },
+            probe,
+        )
+    }
+}
+
+impl Stream for ResponseBody {
+    type Item = Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminal {
+            return Poll::Ready(None);
+        }
+
+        match self.poll_source(context) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                drop(self.read_deadline.take());
+                self.disposition.apply(ResponseEvent::Partial);
+                return Poll::Ready(Some(Ok(bytes)));
+            }
+            Poll::Ready(Some(Err(error))) => {
+                let event = if error.kind() == crate::ErrorKind::ChunkedEncoding {
+                    ResponseEvent::ProtocolError
+                } else {
+                    ResponseEvent::ReadError
+                };
+                return self.finish_error(event, error);
+            }
+            Poll::Ready(None) => {
+                self.finish_now(ResponseEvent::CleanEof);
+                return Poll::Ready(None);
+            }
+            Poll::Pending => {}
+        }
+
+        if self.read_deadline.is_none()
+            && let Some(timeout) = self.read_timeout
+        {
+            self.read_deadline = Some(Box::pin(tokio::time::sleep(timeout)));
+        }
+
+        if let Some(driver) = self.driver.as_mut() {
+            match driver.poll_result(context) {
+                Poll::Ready(Err(error)) => {
+                    return self.finish_error(ResponseEvent::ReadError, error);
+                }
+                Poll::Ready(Ok(())) => {
+                    drop(self.driver.take());
+                    context.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        if let Some(deadline) = self.read_deadline.as_mut()
+            && deadline.as_mut().poll(context).is_ready()
+        {
+            let timeout = self
+                .read_timeout
+                .expect("read deadline exists only when read timeout is configured");
+            return self.finish_error(ResponseEvent::ReadError, Error::read_timeout(timeout));
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for ResponseBody {
+    fn drop(&mut self) {
+        self.finish_now(ResponseEvent::Drop);
+    }
+}
+
+#[cfg(test)]
+struct ControlledDriverShared {
+    failure: Mutex<Option<String>>,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+#[cfg(test)]
+struct ControlledDriver {
+    shared: Arc<ControlledDriverShared>,
+}
+
+#[cfg(test)]
+impl ControlledDriver {
+    fn poll(&self, context: &mut Context<'_>) -> Poll<Result<()>> {
+        if let Some(message) = self.shared.failure.lock().expect("failure lock").take() {
+            Poll::Ready(Err(Error::connection(message)))
+        } else {
+            *self.shared.waker.lock().expect("waker lock") = Some(context.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+#[cfg(test)]
+struct TestDriverFailure {
+    shared: Arc<ControlledDriverShared>,
+}
+
+#[cfg(test)]
+impl TestDriverFailure {
+    fn fail(self, message: &str) {
+        *self.shared.failure.lock().expect("failure lock") = Some(message.to_owned());
+        if let Some(waker) = self.shared.waker.lock().expect("waker lock").take() {
+            waker.wake();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestResponseBodyProbe {
+    inner: Arc<TestResponseBodyProbeInner>,
+}
+
+#[cfg(test)]
+struct TestResponseBodyProbeInner {
+    disposition: Mutex<ResponseDisposition>,
+    decision_count: AtomicUsize,
+    cleanup_count: AtomicUsize,
+}
+
+#[cfg(test)]
+impl TestResponseBodyProbe {
+    fn record_terminal(&self, disposition: ResponseDisposition, decision_count: usize) {
+        self.inner
+            .decision_count
+            .store(decision_count, Ordering::Relaxed);
+        self.inner.cleanup_count.fetch_add(1, Ordering::Relaxed);
+        *self.inner.disposition.lock().expect("disposition lock") = disposition;
+    }
+
+    fn disposition(&self) -> ResponseDisposition {
+        *self.inner.disposition.lock().expect("disposition lock")
+    }
+
+    fn decision_count(&self) -> usize {
+        self.inner.decision_count.load(Ordering::Relaxed)
+    }
+
+    fn cleanup_count(&self) -> usize {
+        self.inner.cleanup_count.load(Ordering::Relaxed)
     }
 }
 
@@ -503,12 +801,12 @@ mod tests {
                 let mut pending_tx = Some(pending_tx);
                 let item = poll_fn(|context| {
                     let result = Pin::new(&mut body).poll_next(context);
-                    if result.is_pending() {
-                        if let Some(pending_tx) = pending_tx.take() {
-                            pending_tx
-                                .send(())
-                                .expect("report pending response body poll");
-                        }
+                    if result.is_pending()
+                        && let Some(pending_tx) = pending_tx.take()
+                    {
+                        pending_tx
+                            .send(())
+                            .expect("report pending response body poll");
                     }
                     result
                 })

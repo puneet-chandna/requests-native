@@ -739,10 +739,10 @@ async fn next_response_frame_after_pending(
     let mut pending = Some(pending);
     let item = poll_fn(|context| {
         let result = Pin::new(&mut body).poll_next(context);
-        if result.is_pending() {
-            if let Some(pending) = pending.take() {
-                pending.send(()).expect("report pending response body poll");
-            }
+        if result.is_pending()
+            && let Some(pending) = pending.take()
+        {
+            pending.send(()).expect("report pending response body poll");
         }
         result
     })
