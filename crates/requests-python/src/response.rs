@@ -1,20 +1,27 @@
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{
-    PyAssertionError, PyAttributeError, PyLookupError, PyNameError, PyStopIteration, PyTypeError,
-    PyUnicodeDecodeError,
+    PyAssertionError, PyAttributeError, PyLookupError, PyNameError, PyRuntimeError,
+    PyStopIteration, PyTypeError, PyUnicodeDecodeError,
 };
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
-    PyAny, PyAnyMethods, PyBool, PyBytes, PyDict, PyDictMethods, PyFunction, PyInt, PyList,
-    PyListMethods, PyModule, PyString, PyTuple, PyType, PyTypeMethods,
+    PyAny, PyAnyMethods, PyBool, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyFunction, PyInt,
+    PyList, PyListMethods, PyModule, PyString, PyTuple, PyType, PyTypeMethods,
 };
 use pyo3::wrap_pyfunction;
 use requests::{ResponseDispositionState, ResponseEvent};
 
+use crate::bridge::{BridgeClosed, WorkerPayload};
 use crate::models::canonical_code;
+use crate::runtime::run_with_actions_and_signal_checker;
 
 #[derive(Clone, Copy)]
 enum DescriptorKind {
@@ -1401,6 +1408,308 @@ fn _response_disposition_trial(py: Python<'_>, events: &Bound<'_, PyAny>) -> PyR
     Ok(result.into_any().unbind())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ResponseAction {
+    Read { size: usize },
+}
+
+#[derive(Debug)]
+enum ResponseReply {
+    Chunk(Vec<u8>),
+    End,
+    Failed,
+}
+
+impl WorkerPayload for ResponseAction {}
+impl WorkerPayload for ResponseReply {}
+
+struct OriginResponseOwner {
+    subject: Py<PyAny>,
+}
+
+#[derive(Clone, Copy)]
+enum LifecyclePhase {
+    BeforePoll,
+    QueuedBeforeDequeue,
+    ReplyObserved,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseWorkerFailure {
+    None = 0,
+    ActionReceiver = 1,
+    ReplySender = 2,
+    Handler = 3,
+}
+
+impl ResponseWorkerFailure {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::ActionReceiver,
+            2 => Self::ReplySender,
+            3 => Self::Handler,
+            _ => Self::None,
+        }
+    }
+}
+
+const RESPONSE_WORKER_STARTING: u8 = 0;
+const RESPONSE_WORKER_AWAITING_REPLY: u8 = 1;
+const RESPONSE_WORKER_REPLY_OBSERVED: u8 = 2;
+const RESPONSE_WORKER_DROPPED: u8 = 3;
+const RESPONSE_PHASE_WAIT: Duration = Duration::from_millis(500);
+
+struct ResponseWorkerDropGuard {
+    phase: Arc<AtomicU8>,
+}
+
+impl Drop for ResponseWorkerDropGuard {
+    fn drop(&mut self) {
+        self.phase.store(RESPONSE_WORKER_DROPPED, Ordering::Release);
+    }
+}
+
+fn wait_for_response_worker_phase(
+    py: Python<'_>,
+    phase: &AtomicU8,
+    expected: u8,
+    label: &str,
+) -> PyResult<()> {
+    let deadline = Instant::now() + RESPONSE_PHASE_WAIT;
+    while phase.load(Ordering::Acquire) != expected {
+        if Instant::now() >= deadline {
+            return Err(PyRuntimeError::new_err(format!(
+                "response worker did not reach {label}"
+            )));
+        }
+        py.detach(|| std::thread::sleep(Duration::from_millis(1)));
+    }
+    Ok(())
+}
+
+fn require_response_worker_dropped(phase: &AtomicU8) -> PyResult<()> {
+    if phase.load(Ordering::Acquire) == RESPONSE_WORKER_DROPPED {
+        Ok(())
+    } else {
+        Err(PyRuntimeError::new_err(
+            "response worker was not dropped before its origin owner",
+        ))
+    }
+}
+
+fn store_response_handler_error(slot: &mut Option<PyErr>, error: PyErr) -> ResponseReply {
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+    ResponseReply::Failed
+}
+
+fn response_read_action(
+    py: Python<'_>,
+    owner: &OriginResponseOwner,
+    size: usize,
+) -> PyResult<ResponseReply> {
+    let subject = owner.subject.bind(py);
+    let raw = subject.getattr("raw")?;
+    let chunk = if raw.hasattr("stream")? {
+        let stream = subject.getattr("raw")?.getattr("stream")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("decode_content", true)?;
+        let iterator = stream.call((size,), Some(&kwargs))?.try_iter()?;
+        match iterator.into_any().call_method0("__next__") {
+            Ok(chunk) => chunk,
+            Err(error) if error.is_instance_of::<PyStopIteration>(py) => {
+                return Ok(ResponseReply::End);
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        subject.getattr("raw")?.call_method1("read", (size,))?
+    };
+    if !chunk.is_truthy()? {
+        Ok(ResponseReply::End)
+    } else {
+        Ok(ResponseReply::Chunk(
+            chunk.cast::<PyBytes>()?.as_bytes().to_vec(),
+        ))
+    }
+}
+
+fn response_action(
+    py: Python<'_>,
+    action: ResponseAction,
+    owner: &OriginResponseOwner,
+    handler_error: &mut Option<PyErr>,
+    raw_actions: &Cell<u8>,
+) -> ResponseReply {
+    raw_actions.set(raw_actions.get().saturating_add(1));
+    let result = match action {
+        ResponseAction::Read { size } => response_read_action(py, owner, size),
+    };
+    match result {
+        Ok(reply) => reply,
+        Err(error) => store_response_handler_error(handler_error, error),
+    }
+}
+
+fn response_worker_failure(error: BridgeClosed) -> ResponseWorkerFailure {
+    match error {
+        BridgeClosed::ActionReceiver => ResponseWorkerFailure::ActionReceiver,
+        BridgeClosed::ReplySender => ResponseWorkerFailure::ReplySender,
+    }
+}
+
+fn response_lifecycle(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    error: Py<PyAny>,
+    phase: LifecyclePhase,
+    audit: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let owner = OriginResponseOwner {
+        subject: subject.clone().unbind(),
+    };
+    let worker_phase = Arc::new(AtomicU8::new(RESPONSE_WORKER_STARTING));
+    let worker_phase_guard = ResponseWorkerDropGuard {
+        phase: Arc::clone(&worker_phase),
+    };
+    let worker_poll_phase = Arc::clone(&worker_phase);
+    let worker_signal_phase = Arc::clone(&worker_phase);
+    let queued = Arc::new(AtomicU8::new(0));
+    let worker_queued = Arc::clone(&queued);
+    let replies_observed = Arc::new(AtomicU8::new(0));
+    let worker_replies_observed = Arc::clone(&replies_observed);
+    let failure = Arc::new(AtomicU8::new(ResponseWorkerFailure::None as u8));
+    let worker_failure = Arc::clone(&failure);
+    let execute = Cell::new(0_u8);
+    let raw_actions = Cell::new(0_u8);
+    let mut handler_error = None;
+
+    let result = run_with_actions_and_signal_checker(
+        py,
+        move |actions| async move {
+            let _worker_phase_guard = worker_phase_guard;
+            match phase {
+                LifecyclePhase::BeforePoll => future::pending::<()>().await,
+                LifecyclePhase::QueuedBeforeDequeue | LifecyclePhase::ReplyObserved => {
+                    let receive_reply = match actions.enqueue(ResponseAction::Read { size: 1 }) {
+                        Ok(receive_reply) => receive_reply,
+                        Err(error) => {
+                            worker_failure
+                                .store(response_worker_failure(error) as u8, Ordering::Release);
+                            return;
+                        }
+                    };
+                    worker_queued.fetch_add(1, Ordering::AcqRel);
+                    worker_poll_phase.store(RESPONSE_WORKER_AWAITING_REPLY, Ordering::Release);
+                    if matches!(phase, LifecyclePhase::QueuedBeforeDequeue) {
+                        future::pending::<()>().await;
+                    }
+                    match receive_reply.await {
+                        Ok(ResponseReply::Chunk(chunk)) => {
+                            let _chunk_length = chunk.len();
+                        }
+                        Ok(ResponseReply::End) => {}
+                        Ok(ResponseReply::Failed) => {
+                            worker_failure
+                                .store(ResponseWorkerFailure::Handler as u8, Ordering::Release);
+                        }
+                        Err(_) => {
+                            worker_failure
+                                .store(ResponseWorkerFailure::ReplySender as u8, Ordering::Release);
+                            return;
+                        }
+                    }
+                    worker_replies_observed.fetch_add(1, Ordering::AcqRel);
+                    worker_poll_phase.store(RESPONSE_WORKER_REPLY_OBSERVED, Ordering::Release);
+                    future::pending::<()>().await;
+                }
+            }
+        },
+        |py, action| {
+            execute.set(execute.get().saturating_add(1));
+            response_action(py, action, &owner, &mut handler_error, &raw_actions)
+        },
+        |py| match phase {
+            LifecyclePhase::BeforePoll => Err(PyErr::from_value(error.bind(py).clone())),
+            LifecyclePhase::QueuedBeforeDequeue => {
+                wait_for_response_worker_phase(
+                    py,
+                    &worker_signal_phase,
+                    RESPONSE_WORKER_AWAITING_REPLY,
+                    "queued-before-dequeue",
+                )?;
+                Err(PyErr::from_value(error.bind(py).clone()))
+            }
+            LifecyclePhase::ReplyObserved => {
+                if execute.get() == 0 {
+                    return Ok(());
+                }
+                wait_for_response_worker_phase(
+                    py,
+                    &worker_signal_phase,
+                    RESPONSE_WORKER_REPLY_OBSERVED,
+                    "reply-observed",
+                )?;
+                Err(PyErr::from_value(error.bind(py).clone()))
+            }
+        },
+    );
+
+    require_response_worker_dropped(&worker_phase)?;
+    if let Some(error) = handler_error {
+        return Err(error);
+    }
+    let queued = queued.load(Ordering::Acquire);
+    let replies_observed = replies_observed.load(Ordering::Acquire);
+    let expected = match phase {
+        LifecyclePhase::BeforePoll => (0, 0, 0, 0),
+        LifecyclePhase::QueuedBeforeDequeue => (1, 0, 0, 0),
+        LifecyclePhase::ReplyObserved => (1, 1, 1, 1),
+    };
+    if (queued, execute.get(), replies_observed, raw_actions.get()) != expected {
+        return Err(PyRuntimeError::new_err(format!(
+            "response lifecycle mismatch: queued={queued}, execute={}, replies={replies_observed}, raw_actions={}",
+            execute.get(),
+            raw_actions.get(),
+        )));
+    }
+    let failure = ResponseWorkerFailure::from_raw(failure.load(Ordering::Acquire));
+    if failure != ResponseWorkerFailure::None {
+        return Err(PyRuntimeError::new_err(format!(
+            "response worker failed: {failure:?}"
+        )));
+    }
+    audit.set_item("queued", queued)?;
+    audit.set_item("execute", execute.get())?;
+    audit.set_item("reply_observed", replies_observed != 0)?;
+    audit.set_item(
+        "worker_dropped",
+        worker_phase.load(Ordering::Acquire) == RESPONSE_WORKER_DROPPED,
+    )?;
+    audit.set_item("raw_actions", raw_actions.get())?;
+    drop(owner);
+    result
+}
+
+#[pyfunction]
+fn _response_lifecycle_trial(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    error: Py<PyAny>,
+    phase: &str,
+    audit: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let phase = match phase {
+        "before-poll" => LifecyclePhase::BeforePoll,
+        "queued-before-dequeue" => LifecyclePhase::QueuedBeforeDequeue,
+        "reply-observed" => LifecyclePhase::ReplyObserved,
+        _ => return Err(PyAssertionError::new_err(phase.to_owned())),
+    };
+    response_lifecycle(py, subject, error, phase, audit)
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = response_state(module.py())?;
     module.add_class::<NativeContentIterator>()?;
@@ -1417,5 +1726,44 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_response_drop_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_response_fields_snapshot, module)?)?;
     module.add_function(wrap_pyfunction!(_response_disposition_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_response_lifecycle_trial, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::PyAny;
+
+    use super::{
+        OriginResponseOwner, ResponseAction, ResponseReply, ResponseWorkerFailure, WorkerPayload,
+    };
+
+    fn assert_worker_payload<T: WorkerPayload>() {}
+
+    trait AmbiguousIfWorkerPayload<A> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfWorkerPayload<()> for T {}
+    impl<T: ?Sized + WorkerPayload> AmbiguousIfWorkerPayload<u8> for T {}
+
+    #[test]
+    fn response_payloads_and_origin_owner_are_explicit() {
+        assert_worker_payload::<ResponseAction>();
+        assert_worker_payload::<ResponseReply>();
+
+        let action = ResponseAction::Read { size: 7 };
+        assert!(matches!(action, ResponseAction::Read { size: 7 }));
+        let reply = ResponseReply::Chunk(vec![1, 2, 3]);
+        assert!(matches!(reply, ResponseReply::Chunk(chunk) if chunk == [1, 2, 3]));
+        assert_eq!(
+            ResponseWorkerFailure::from_raw(ResponseWorkerFailure::ReplySender as u8),
+            ResponseWorkerFailure::ReplySender
+        );
+
+        let _origin_owner_must_not_be_a_worker_payload =
+            <OriginResponseOwner as AmbiguousIfWorkerPayload<_>>::marker;
+        let _python_handle_must_not_be_a_worker_payload =
+            <pyo3::Py<PyAny> as AmbiguousIfWorkerPayload<_>>::marker;
+    }
 }
