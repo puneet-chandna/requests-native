@@ -1,10 +1,13 @@
+use std::sync::Arc;
+
 use crate::structures::CaseInsensitiveMap;
+use crate::transport::Transport;
 use crate::utils::{
     HeaderValidationError, normalize_percent_escape_hex, requote_uri, trim_python_whitespace_start,
     validate_header_name, validate_header_name_bytes, validate_header_value,
     validate_header_value_bytes,
 };
-use crate::{BodySource, Error, Result};
+use crate::{BodySource, Error, Response, Result};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use url::{ParseError, Url};
 
@@ -353,6 +356,7 @@ impl Request {
 #[derive(Debug)]
 pub struct RequestBuilder {
     request: Result<Request>,
+    transport: Option<Arc<Transport>>,
 }
 
 impl RequestBuilder {
@@ -369,7 +373,21 @@ impl RequestBuilder {
             _ => Err(Error::invalid_url(&url)),
         };
 
-        Self { request }
+        Self {
+            request,
+            transport: None,
+        }
+    }
+
+    pub(crate) fn for_client(
+        method: Method,
+        url: impl AsRef<str>,
+        transport: Arc<Transport>,
+    ) -> Self {
+        Self {
+            transport: Some(transport),
+            ..Self::new(method, url)
+        }
     }
 
     pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
@@ -395,6 +413,12 @@ impl RequestBuilder {
 
     pub fn build(self) -> Result<Request> {
         self.request
+    }
+
+    pub async fn send(self) -> Result<Response> {
+        let request = self.request?;
+        let transport = self.transport.ok_or_else(Error::unbound_builder)?;
+        transport.send(request).await.map(Response::from_transport)
     }
 }
 
@@ -522,5 +546,23 @@ mod tests {
         assert!(super::url_is_native_safe(
             "http+unix://%2Fvar%2Frun%2Fsocket/path%7E"
         ));
+    }
+
+    #[test]
+    fn standalone_request_builder_cannot_send_without_a_client() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let result = runtime
+            .block_on(super::RequestBuilder::new(http::Method::GET, "http://example.test/").send());
+        let Err(error) = result else {
+            panic!("standalone builder unexpectedly sent a request");
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::Builder);
+        assert_eq!(
+            error.to_string(),
+            "request builder is not bound to a Client"
+        );
     }
 }

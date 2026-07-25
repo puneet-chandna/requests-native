@@ -9,20 +9,22 @@ workspace = true
 
 [features]
 default = ["blocking"]
-blocking = ["dep:tokio"]
+blocking = ["tokio/rt-multi-thread"]
 platform-smoke = [
     "dep:hyper-rustls",
-    "dep:hyper-util",
+    "hyper-util/client-legacy",
+    "hyper-util/http1",
     "dep:rustls",
-    "dep:tokio",
 ]
 
 [dependencies]
 bytes = "1"
 http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
 indexmap = "2"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"], optional = true }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
-tokio = { version = "1", features = ["io-util", "rt-multi-thread", "sync", "time"], optional = true }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
 url = "2"

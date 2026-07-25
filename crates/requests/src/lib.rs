@@ -3,13 +3,16 @@
 #[cfg(feature = "blocking")]
 pub mod blocking;
 mod body;
+mod client;
 mod error;
 mod models;
 mod response;
 pub mod structures;
+mod transport;
 pub mod utils;
 
 pub use body::{AsyncBody, BodySource};
+pub use client::Client;
 pub use error::{Error, ErrorKind, Result};
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 pub use models::{
@@ -18,7 +21,7 @@ pub use models::{
     prepare_method, prepare_method_bytes, prepare_url, url_is_native_safe,
 };
 pub use response::{
-    ResponseCache, ResponseContent, ResponseDecision, ResponseDisposition,
+    Response, ResponseCache, ResponseContent, ResponseDecision, ResponseDisposition,
     ResponseDispositionState, ResponseEvent,
 };
 

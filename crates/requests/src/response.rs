@@ -4,6 +4,102 @@
 //! A response can, for example, have an exhausted uncached body while the
 //! disposition has already become dirty.
 
+use bytes::Bytes;
+use http::{HeaderMap, StatusCode};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+
+use crate::transport::{ConnectionDriver, TransportResponse};
+use crate::{Error, Result};
+
+pub struct Response {
+    head: http::response::Parts,
+    body: Option<Incoming>,
+    url: String,
+    driver: Option<ConnectionDriver>,
+    disposition: ResponseDispositionState,
+}
+
+impl Response {
+    pub(crate) fn from_transport(response: TransportResponse) -> Self {
+        Self {
+            head: response.head,
+            body: Some(response.body),
+            url: response.url,
+            driver: Some(response.driver),
+            disposition: ResponseDispositionState::without_native_lease(),
+        }
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.head.status
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.head.headers
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub async fn bytes(mut self) -> Result<Bytes> {
+        let Some(body) = self.body.take() else {
+            self.disposition.apply(ResponseEvent::ReadError);
+            return Err(Error::response_body("response body was already consumed"));
+        };
+        let Some(mut driver) = self.driver.take() else {
+            self.disposition.apply(ResponseEvent::ReadError);
+            return Err(Error::connection_stopped());
+        };
+
+        let collection = body.collect();
+        tokio::pin!(collection);
+        let mut driver_pending = true;
+        let body_result = loop {
+            tokio::select! {
+                biased;
+                driver_result = driver.task_mut(), if driver_pending => {
+                    driver_pending = false;
+                    match driver_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => break Err(error),
+                        Err(error) => break Err(Error::connection(error)),
+                    }
+                }
+                result = &mut collection => {
+                    break result
+                        .map(|collected| collected.to_bytes())
+                        .map_err(Error::response_body);
+                }
+            }
+        };
+
+        if driver_pending {
+            // Once Hyper has collected the complete framed body, this request
+            // succeeded. The biased select above reports any driver failure
+            // ready before body completion; abort-and-wait here only closes
+            // the deliberately non-pooled connection.
+            drop(driver.abort_and_wait().await);
+        }
+        let result = body_result;
+
+        self.disposition.apply(if result.is_ok() {
+            ResponseEvent::CleanEof
+        } else {
+            ResponseEvent::ReadError
+        });
+        result
+    }
+}
+
+impl Drop for Response {
+    fn drop(&mut self) {
+        drop(self.driver.take());
+        self.disposition.apply(ResponseEvent::Drop);
+    }
+}
+
 /// The observable shape of the response body cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResponseContent {
@@ -113,6 +209,15 @@ impl Default for ResponseDispositionState {
 }
 
 impl ResponseDispositionState {
+    pub(crate) const fn without_native_lease() -> Self {
+        Self {
+            state: ResponseDisposition::Open,
+            decision: None,
+            decision_count: 0,
+            native_lease: false,
+        }
+    }
+
     pub const fn state(self) -> ResponseDisposition {
         self.state
     }
@@ -266,5 +371,17 @@ mod tests {
         assert_eq!(python.decision(), None);
         assert_eq!(python.decision_count(), 0);
         assert!(!python.native_lease());
+    }
+
+    #[test]
+    fn unleased_native_response_never_claims_a_pool_lease() {
+        let mut response = ResponseDispositionState::without_native_lease();
+
+        assert!(!response.native_lease());
+        assert_eq!(
+            response.apply(ResponseEvent::CleanEof),
+            ResponseDisposition::Reusable
+        );
+        assert!(!response.native_lease());
     }
 }
