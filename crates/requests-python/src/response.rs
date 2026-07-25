@@ -20,7 +20,7 @@ use pyo3::wrap_pyfunction;
 use requests::{ResponseDispositionState, ResponseEvent};
 
 use crate::bridge::{BridgeClosed, WorkerPayload};
-use crate::models::canonical_code;
+use crate::models::{canonical_code, intrinsic_builtin_name_is};
 use crate::runtime::run_with_actions_and_signal_checker;
 
 #[derive(Clone, Copy)]
@@ -32,6 +32,7 @@ enum DescriptorKind {
 struct CanonicalDescriptor {
     kind: DescriptorKind,
     code: Py<PyAny>,
+    builtins: Py<PyDict>,
 }
 
 enum ExpectedGlobal {
@@ -195,7 +196,12 @@ fn descriptor_matches(
     let Ok(function) = descriptor_function(&current, expected.kind) else {
         return Ok(false);
     };
-    function_matches_code(&function, expected.code.bind(function.py()), globals)
+    Ok(
+        function_matches_code(&function, expected.code.bind(function.py()), globals)?
+            && function
+                .getattr("__builtins__")?
+                .is(expected.builtins.bind(function.py())),
+    )
 }
 
 fn known_module_attr_is(
@@ -302,13 +308,7 @@ fn global_has_canonical_provenance(
 
 fn initialize_response_state(py: Python<'_>) -> PyResult<ResponseState> {
     let models = PyModule::import(py, "requests.models")?;
-    let response_type = PyModule::import(py, "requests")?
-        .getattr("Response")?
-        .cast_into::<PyType>()?;
-    let adapter_response_type = PyModule::import(py, "requests.adapters")?
-        .getattr("Response")?
-        .cast_into::<PyType>()?;
-    let stable_aliases_agree = response_type.is(&adapter_response_type);
+    let response_type = models.getattr("Response")?.cast_into::<PyType>()?;
     let object = py.get_type::<PyAny>();
     let object_getattribute = object.getattr("__getattribute__")?.unbind();
     let object_setattr = object.getattr("__setattr__")?.unbind();
@@ -316,11 +316,18 @@ fn initialize_response_state(py: Python<'_>) -> PyResult<ResponseState> {
     let mut descriptors = HashMap::new();
     for &(name, kind) in DESCRIPTORS {
         let code = canonical_code(py, "requests.models", &format!("Response.{name}"))?;
+        let descriptor = raw_direct_type_entry(&response_type, name)?
+            .ok_or_else(|| PyRuntimeError::new_err(format!("missing Response.{name}")))?;
+        let function = descriptor_function(&descriptor, kind)?;
         descriptors.insert(
             name,
             CanonicalDescriptor {
                 kind,
                 code: code.into_any().unbind(),
+                builtins: function
+                    .getattr("__builtins__")?
+                    .cast_into::<PyDict>()?
+                    .unbind(),
             },
         );
     }
@@ -353,16 +360,14 @@ fn initialize_response_state(py: Python<'_>) -> PyResult<ResponseState> {
         globals,
         trusted_at_import: true,
     };
-    let trusted_at_import = stable_aliases_agree
-        && DESCRIPTORS.iter().all(|(name, _)| {
-            let expected = state
-                .descriptors
-                .get(name)
-                .expect("canonical descriptor is present");
-            descriptor_matches(&response_type, name, expected, &models.dict()).unwrap_or(false)
-        })
-        && raw_mro_type_entry(&response_type, "__getattribute__")?
-            .is_some_and(|value| value.is(state.object_getattribute.bind(py)))
+    let trusted_at_import = DESCRIPTORS.iter().all(|(name, _)| {
+        let expected = state
+            .descriptors
+            .get(name)
+            .expect("canonical descriptor is present");
+        descriptor_matches(&response_type, name, expected, &models.dict()).unwrap_or(false)
+    }) && raw_mro_type_entry(&response_type, "__getattribute__")?
+        .is_some_and(|value| value.is(state.object_getattribute.bind(py)))
         && raw_mro_type_entry(&response_type, "__setattr__")?
             .is_some_and(|value| value.is(state.object_setattr.bind(py)));
     Ok(ResponseState {
@@ -397,7 +402,12 @@ fn type_is_current(
             .is_some_and(|value| value.is(state.object_setattr.bind(py))))
 }
 
-fn globals_are_current(py: Python<'_>, state: &ResponseState, names: &[&str]) -> PyResult<bool> {
+fn globals_are_current(
+    py: Python<'_>,
+    state: &ResponseState,
+    descriptor: &CanonicalDescriptor,
+    names: &[&str],
+) -> PyResult<bool> {
     let models = state.models.bind(py);
     for name in names {
         let current = models.dict().get_item(*name)?;
@@ -405,7 +415,10 @@ fn globals_are_current(py: Python<'_>, state: &ResponseState, names: &[&str]) ->
             return Ok(false);
         };
         let matches = match expected {
-            ExpectedGlobal::Missing => current.is_none(),
+            ExpectedGlobal::Missing => {
+                current.is_none()
+                    && intrinsic_builtin_name_is(py, descriptor.builtins.bind(py), name)?
+            }
             ExpectedGlobal::Value(expected) => current
                 .as_ref()
                 .is_some_and(|current| current.is(expected.bind(py))),
@@ -453,7 +466,7 @@ fn exact_operation(
         operation,
         expected,
         &state.models.bind(py).dict(),
-    )? && globals_are_current(py, state, globals)?)
+    )? && globals_are_current(py, state, expected, globals)?)
 }
 
 fn fallback_iter_content(

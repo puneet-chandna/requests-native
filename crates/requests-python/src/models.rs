@@ -71,6 +71,9 @@ enum IntrinsicBuiltin {
     TypeError,
     ValueError,
     AttributeError,
+    RuntimeError,
+    LookupError,
+    UnicodeDecodeError,
     UnicodeEncodeError,
     ImportError,
     KeyError,
@@ -330,6 +333,15 @@ fn intrinsic_builtin_is(
         IntrinsicBuiltin::AttributeError => {
             Ok(current.is(py.get_type::<pyo3::exceptions::PyAttributeError>()))
         }
+        IntrinsicBuiltin::RuntimeError => {
+            Ok(current.is(py.get_type::<pyo3::exceptions::PyRuntimeError>()))
+        }
+        IntrinsicBuiltin::LookupError => {
+            Ok(current.is(py.get_type::<pyo3::exceptions::PyLookupError>()))
+        }
+        IntrinsicBuiltin::UnicodeDecodeError => {
+            Ok(current.is(py.get_type::<pyo3::exceptions::PyUnicodeDecodeError>()))
+        }
         IntrinsicBuiltin::UnicodeEncodeError => {
             Ok(current.is(py.get_type::<pyo3::exceptions::PyUnicodeEncodeError>()))
         }
@@ -360,8 +372,10 @@ fn intrinsic_builtin_is(
 
 fn intrinsic_builtin_for_name(name: &str) -> Option<IntrinsicBuiltin> {
     match name {
-        "isinstance" | "hasattr" | "len" | "ord" | "hex" | "chr" => {
+        "getattr" | "setattr" | "isinstance" | "hasattr" | "len" | "ord" | "hex" | "chr" => {
             Some(IntrinsicBuiltin::Function(match name {
+                "getattr" => "getattr",
+                "setattr" => "setattr",
                 "isinstance" => "isinstance",
                 "hasattr" => "hasattr",
                 "len" => "len",
@@ -384,11 +398,28 @@ fn intrinsic_builtin_for_name(name: &str) -> Option<IntrinsicBuiltin> {
         "TypeError" => Some(IntrinsicBuiltin::TypeError),
         "ValueError" => Some(IntrinsicBuiltin::ValueError),
         "AttributeError" => Some(IntrinsicBuiltin::AttributeError),
+        "RuntimeError" => Some(IntrinsicBuiltin::RuntimeError),
+        "LookupError" => Some(IntrinsicBuiltin::LookupError),
+        "UnicodeDecodeError" => Some(IntrinsicBuiltin::UnicodeDecodeError),
         "UnicodeEncodeError" => Some(IntrinsicBuiltin::UnicodeEncodeError),
         "ImportError" => Some(IntrinsicBuiltin::ImportError),
         "KeyError" => Some(IntrinsicBuiltin::KeyError),
         _ => None,
     }
+}
+
+pub(crate) fn intrinsic_builtin_name_is(
+    py: Python<'_>,
+    builtins: &Bound<'_, PyDict>,
+    name: &str,
+) -> PyResult<bool> {
+    let Some(intrinsic) = intrinsic_builtin_for_name(name) else {
+        return Ok(false);
+    };
+    let Some(current) = builtins.get_item(name)? else {
+        return Ok(false);
+    };
+    intrinsic_builtin_is(py, &PyModule::import(py, "builtins")?, &current, intrinsic)
 }
 
 fn urllib3_ipv6_pattern() -> String {

@@ -217,3 +217,11 @@ logging.getLogger(__name__).addHandler(NullHandler())
 
 # FileModeWarnings go off per the default.
 warnings.simplefilter("default", FileModeWarning, append=True)
+
+# Capture canonical Python objects before callers can replace their module aliases.
+from importlib.util import find_spec as _find_spec
+
+if _find_spec(f"{__name__}._requests_rust") is not None:
+    from . import _requests_rust as _requests_rust
+
+del _find_spec
