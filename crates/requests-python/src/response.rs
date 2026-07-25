@@ -94,6 +94,12 @@ const GLOBALS: &[&str] = &[
     "codes",
     "getattr",
     "setattr",
+    "bool",
+    "int",
+    "hasattr",
+    "cast",
+    "bytes",
+    "UnicodeDecodeError",
     "str",
     "isinstance",
     "type",
@@ -101,6 +107,33 @@ const GLOBALS: &[&str] = &[
     "RuntimeError",
     "LookupError",
     "TypeError",
+];
+
+const CANONICALLY_MISSING_GLOBALS: &[&str] = &[
+    "getattr",
+    "setattr",
+    "bool",
+    "int",
+    "hasattr",
+    "bytes",
+    "UnicodeDecodeError",
+    "str",
+    "isinstance",
+    "type",
+    "len",
+    "RuntimeError",
+    "LookupError",
+    "TypeError",
+];
+
+const INSTANCE_SHADOWABLE_METHODS: &[&str] = &[
+    "iter_content",
+    "iter_lines",
+    "json",
+    "raise_for_status",
+    "__getstate__",
+    "__setstate__",
+    "close",
 ];
 
 fn raw_direct_type_entry<'py>(
@@ -211,6 +244,11 @@ fn global_has_canonical_provenance(
             name,
             "getattr"
                 | "setattr"
+                | "bool"
+                | "int"
+                | "hasattr"
+                | "bytes"
+                | "UnicodeDecodeError"
                 | "str"
                 | "isinstance"
                 | "type"
@@ -227,6 +265,7 @@ fn global_has_canonical_provenance(
         "iter_slices" | "stream_decode_response_unicode" | "guess_json_utf" => {
             canonical_helper_is(py, current, "requests.utils", name)
         }
+        "cast" => known_module_attr_is(py, current, "typing", name),
         "ProtocolError" | "DecodeError" | "ReadTimeoutError" | "SSLError" => {
             known_module_attr_is(py, current, "urllib3.exceptions", name)
         }
@@ -263,7 +302,13 @@ fn global_has_canonical_provenance(
 
 fn initialize_response_state(py: Python<'_>) -> PyResult<ResponseState> {
     let models = PyModule::import(py, "requests.models")?;
-    let response_type = models.getattr("Response")?.cast_into::<PyType>()?;
+    let response_type = PyModule::import(py, "requests")?
+        .getattr("Response")?
+        .cast_into::<PyType>()?;
+    let adapter_response_type = PyModule::import(py, "requests.adapters")?
+        .getattr("Response")?
+        .cast_into::<PyType>()?;
+    let stable_aliases_agree = response_type.is(&adapter_response_type);
     let object = py.get_type::<PyAny>();
     let object_getattribute = object.getattr("__getattribute__")?.unbind();
     let object_setattr = object.getattr("__setattr__")?.unbind();
@@ -283,9 +328,13 @@ fn initialize_response_state(py: Python<'_>) -> PyResult<ResponseState> {
     let mut globals = HashMap::new();
     for &name in GLOBALS {
         let current = models.dict().get_item(name)?;
-        let admitted =
-            global_has_canonical_provenance(py, &models, name, current.as_ref()).unwrap_or(false);
-        let expected = if !admitted {
+        let expected = if CANONICALLY_MISSING_GLOBALS.contains(&name) {
+            ExpectedGlobal::Missing
+        } else if name == "cast" {
+            ExpectedGlobal::Value(PyModule::import(py, "typing")?.getattr("cast")?.unbind())
+        } else if !global_has_canonical_provenance(py, &models, name, current.as_ref())
+            .unwrap_or(false)
+        {
             ExpectedGlobal::Rejected
         } else if let Some(current) = current {
             ExpectedGlobal::Value(current.unbind())
@@ -304,14 +353,18 @@ fn initialize_response_state(py: Python<'_>) -> PyResult<ResponseState> {
         globals,
         trusted_at_import: true,
     };
-    let trusted_at_import = type_is_current(py, &state, &response_type)?
+    let trusted_at_import = stable_aliases_agree
         && DESCRIPTORS.iter().all(|(name, _)| {
             let expected = state
                 .descriptors
                 .get(name)
                 .expect("canonical descriptor is present");
             descriptor_matches(&response_type, name, expected, &models.dict()).unwrap_or(false)
-        });
+        })
+        && raw_mro_type_entry(&response_type, "__getattribute__")?
+            .is_some_and(|value| value.is(state.object_getattribute.bind(py)))
+        && raw_mro_type_entry(&response_type, "__setattr__")?
+            .is_some_and(|value| value.is(state.object_setattr.bind(py)));
     Ok(ResponseState {
         trusted_at_import,
         ..state
@@ -382,6 +435,14 @@ fn exact_operation(
 ) -> PyResult<bool> {
     let state = response_state(py)?;
     if !type_is_current(py, state, &subject.get_type())? {
+        return Ok(false);
+    }
+    if INSTANCE_SHADOWABLE_METHODS.contains(&operation)
+        && subject
+            .getattr("__dict__")?
+            .cast::<PyDict>()?
+            .contains(operation)?
+    {
         return Ok(false);
     }
     let Some(expected) = state.descriptors.get(operation) else {
@@ -640,6 +701,11 @@ fn iter_content_dispatch(
         "ConnectionError",
         "RequestsSSLError",
         "StreamConsumedError",
+        "bool",
+        "int",
+        "hasattr",
+        "cast",
+        "bytes",
         "type",
         "isinstance",
         "TypeError",
@@ -813,6 +879,7 @@ fn json_dispatch(
         "guess_json_utf",
         "JSONDecodeError",
         "RequestsJSONDecodeError",
+        "UnicodeDecodeError",
         "len",
     ];
     if !exact_operation(py, subject, "json", GLOBALS)?
@@ -885,7 +952,7 @@ fn raise_for_status_dispatch(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyRe
         py,
         subject,
         "raise_for_status",
-        &["HTTPError", "isinstance"],
+        &["HTTPError", "isinstance", "bytes", "UnicodeDecodeError"],
     )? {
         return Ok(subject.call_method0("raise_for_status")?.unbind());
     }
@@ -1015,7 +1082,7 @@ fn metadata_dispatch(
                 py,
                 subject,
                 "raise_for_status",
-                &["HTTPError", "isinstance"],
+                &["HTTPError", "isinstance", "bytes", "UnicodeDecodeError"],
             )? =>
         {
             raise_for_status_dispatch(py, subject)
@@ -1293,7 +1360,7 @@ fn _response_iter_lines_trial(
     decode_unicode: bool,
     delimiter: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    if !exact_operation(py, subject, "iter_lines", &[])? {
+    if !exact_operation(py, subject, "iter_lines", &["cast"])? {
         return fallback_iter_lines(py, subject, chunk_size, decode_unicode, delimiter);
     }
     Ok(Py::new(
