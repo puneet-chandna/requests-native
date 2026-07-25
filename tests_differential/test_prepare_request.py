@@ -416,7 +416,6 @@ def test_pristine_exact_candidates_execute_native_trials() -> None:
             + """
 import sys
 from requests.models import PreparedRequest, RequestEncodingMixin
-from requests.utils import to_key_val_list
 
 
 targets = {
@@ -424,7 +423,6 @@ targets = {
     PreparedRequest.prepare_url.__code__,
     PreparedRequest.prepare_headers.__code__,
     RequestEncodingMixin._encode_params.__code__,
-    to_key_val_list.__code__,
 }
 seen = []
 
@@ -443,7 +441,7 @@ try:
     prepare_url_call(
         url_subject,
         "http://example.com/a path",
-        {"x": "a b"},
+        "x=a+b",
     )
 
     headers_subject = PreparedRequest()

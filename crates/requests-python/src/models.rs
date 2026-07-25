@@ -34,15 +34,6 @@ enum CanonicalDefaults {
     ToNativeString,
     SingleNone,
     SingleEmptyTuple,
-    Quote {
-        safe: &'static str,
-    },
-    Urlencode {
-        quote_plus: Py<PyAny>,
-        quote_plus_trust: Box<CanonicalFunction>,
-        quote: Py<PyAny>,
-        quote_trust: Box<CanonicalFunction>,
-    },
 }
 
 struct CanonicalGlobal {
@@ -116,11 +107,6 @@ enum KnownValue {
     Bytes(&'static [u8]),
     EmptyDict,
     UrlType,
-    RuntimeProtocol {
-        module: &'static str,
-        name: &'static str,
-        member: &'static str,
-    },
     ByteQuoterFactory,
     QuoterType {
         name: &'static str,
@@ -135,19 +121,6 @@ enum KnownCode {
         new: Py<PyCode>,
         globals: Py<PyDict>,
         builtins: Py<PyDict>,
-    },
-    RuntimeProtocol {
-        member: Py<PyCode>,
-        protocol_hook: Option<Py<PyCode>>,
-        protocol_init: Py<PyCode>,
-        protocol_meta_instancecheck: Py<PyCode>,
-        protocol_meta_subclasscheck: Option<Py<PyCode>>,
-        abc_meta_subclasscheck: Py<PyCode>,
-        member_globals: Py<PyDict>,
-        typing_globals: Py<PyDict>,
-        abc_globals: Py<PyDict>,
-        abc_module: Py<PyModule>,
-        abc_dump: Py<PyAny>,
     },
     ByteQuoterFactory {
         factory: Py<PyCode>,
@@ -175,15 +148,12 @@ enum DefaultPolicy {
     ToNativeString,
     SingleNone,
     SingleEmptyTuple,
-    Quote(&'static str),
-    Urlencode,
 }
 
 struct ModelsState {
     internal_utils: Py<PyModule>,
     builtins: Py<PyModule>,
     models: Py<PyModule>,
-    model_types: Py<PyModule>,
     structures: Py<PyModule>,
     utils: Py<PyModule>,
     prepared_request: Py<PyType>,
@@ -209,11 +179,7 @@ struct ModelsState {
     missing_schema: Py<PyAny>,
     parse_url: Py<PyAny>,
     requote_uri: Py<PyAny>,
-    basestring: Py<PyAny>,
-    has_read: Py<PyAny>,
-    to_key_val_list: Py<PyAny>,
     unicode_is_ascii: Py<PyAny>,
-    urlencode: Py<PyAny>,
     urlunparse: Py<PyAny>,
     encode_params_descriptor: Py<PyAny>,
     builtin_str: Py<PyAny>,
@@ -232,9 +198,6 @@ struct ModelsState {
     requote_uri_trust: CanonicalFunction,
     unicode_is_ascii_trust: CanonicalFunction,
     urlunparse_trust: CanonicalFunction,
-    has_read_trust: CanonicalFunction,
-    to_key_val_list_trust: CanonicalFunction,
-    urlencode_trust: CanonicalFunction,
     check_header_validity_trust: CanonicalFunction,
     validate_header_part_trust: CanonicalFunction,
     case_insensitive_dict_init_trust: CanonicalFunction,
@@ -528,16 +491,6 @@ fn known_module_value(module: &str, name: &str) -> Option<KnownValue> {
             IntrinsicBuiltin::Str,
             IntrinsicBuiltin::Bytes,
         )),
-        ("requests._types", "SupportsRead") => Some(KnownValue::RuntimeProtocol {
-            module: "requests._types",
-            name: "SupportsRead",
-            member: "read",
-        }),
-        ("requests.utils", "_SupportsItems") => Some(KnownValue::RuntimeProtocol {
-            module: "requests._types",
-            name: "SupportsItems",
-            member: "items",
-        }),
         ("requests._internal_utils", "builtin_str") | ("requests.utils", "str") => {
             Some(KnownValue::Intrinsic(IntrinsicBuiltin::Str))
         }
@@ -676,243 +629,6 @@ fn exact_source_function_is(
         Some(_) => false,
     };
     Ok(defaults_match)
-}
-
-fn exact_text_set_is(current: &Bound<'_, PyAny>, expected: &str) -> PyResult<bool> {
-    if !current.is_exact_instance_of::<PySet>() {
-        return Ok(false);
-    }
-    let current = current.cast::<PySet>()?;
-    if current.len() != 1 {
-        return Ok(false);
-    }
-    let value = current.iter().next().expect("length checked");
-    Ok(value.is_exact_instance_of::<PyString>() && value.cast::<PyString>()?.to_str()? == expected)
-}
-
-fn abc_caches_are_pristine(
-    py: Python<'_>,
-    protocol: &Bound<'_, PyType>,
-    abc: &Bound<'_, PyModule>,
-    dump: &Bound<'_, PyAny>,
-) -> PyResult<bool> {
-    let Ok(dump_function) = dump.cast::<PyCFunction>() else {
-        return Ok(false);
-    };
-    if dump_function.getattr("__name__")?.extract::<String>()? != "_get_dump"
-        || dump_function.getattr("__module__")?.extract::<String>()? != "_abc"
-        || !c_function_self(py, dump_function).is_some_and(|owner| owner.is(abc))
-    {
-        return Ok(false);
-    }
-    let state = dump_function.call1((protocol,))?;
-    if !state.is_exact_instance_of::<PyTuple>() {
-        return Ok(false);
-    }
-    let state = state.cast::<PyTuple>()?;
-    if state.len() != 4 {
-        return Ok(false);
-    }
-    for index in 0..2 {
-        let entries = state.get_item(index)?;
-        if !entries.is_exact_instance_of::<PySet>() || !entries.cast::<PySet>()?.is_empty() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn known_runtime_protocol_is(
-    py: Python<'_>,
-    current: &Bound<'_, PyAny>,
-    module: &str,
-    name: &str,
-    member: &str,
-    member_code: &Py<PyCode>,
-    protocol_hook_code: &Py<PyCode>,
-    protocol_init_code: &Py<PyCode>,
-    protocol_meta_instancecheck_code: &Py<PyCode>,
-    protocol_meta_subclasscheck_code: Option<&Py<PyCode>>,
-    abc_meta_subclasscheck_code: &Py<PyCode>,
-    member_globals: &Py<PyDict>,
-    typing_globals: &Py<PyDict>,
-    abc_globals: &Py<PyDict>,
-    abc_module: &Py<PyModule>,
-    abc_dump: &Py<PyAny>,
-) -> PyResult<bool> {
-    let Ok(class) = current.cast::<PyType>() else {
-        return Ok(false);
-    };
-    let typing_namespace = typing_globals.bind(py);
-    let protocol = typing_namespace
-        .get_item("Protocol")?
-        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("typing.Protocol missing"))?;
-    let generic = typing_namespace
-        .get_item("Generic")?
-        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("typing.Generic missing"))?;
-    let protocol_meta = class.get_type();
-    if !protocol_meta.is(protocol.get_type())
-        || !protocol_meta.get_type().is(py.get_type::<PyType>())
-        || !exact_type_identity_is(protocol_meta.as_any(), "typing", "_ProtocolMeta")?
-    {
-        return Ok(false);
-    }
-    let protocol_meta_mro = protocol_meta.mro();
-    if protocol_meta_mro.len() != 4
-        || !protocol_meta_mro.get_item(0)?.is(&protocol_meta)
-        || !exact_type_identity_is(&protocol_meta_mro.get_item(1)?, "abc", "ABCMeta")?
-        || !protocol_meta_mro.get_item(2)?.is(py.get_type::<PyType>())
-        || !protocol_meta_mro.get_item(3)?.is(py.get_type::<PyAny>())
-    {
-        return Ok(false);
-    }
-    let protocol_meta_namespace = protocol_meta.getattr("__dict__")?;
-    if !exact_source_function_is(
-        py,
-        &protocol_meta_namespace.get_item("__instancecheck__")?,
-        "typing",
-        "_ProtocolMeta.__instancecheck__",
-        protocol_meta_instancecheck_code,
-        typing_namespace,
-        false,
-    )? {
-        return Ok(false);
-    }
-    match protocol_meta_subclasscheck_code {
-        Some(expected) => {
-            if !protocol_meta_namespace.contains("__subclasscheck__")?
-                || !exact_source_function_is(
-                    py,
-                    &protocol_meta_namespace.get_item("__subclasscheck__")?,
-                    "typing",
-                    "_ProtocolMeta.__subclasscheck__",
-                    expected,
-                    typing_namespace,
-                    false,
-                )?
-            {
-                return Ok(false);
-            }
-        }
-        None => {
-            if protocol_meta_namespace.contains("__subclasscheck__")? {
-                return Ok(false);
-            }
-            let Some(current) = raw_type_entry(&protocol_meta, "__subclasscheck__")? else {
-                return Ok(false);
-            };
-            if !exact_source_function_is(
-                py,
-                &current,
-                "abc",
-                "ABCMeta.__subclasscheck__",
-                abc_meta_subclasscheck_code,
-                abc_globals.bind(py),
-                false,
-            )? {
-                return Ok(false);
-            }
-        }
-    }
-    let type_getattribute = required_raw_type_entry(&py.get_type::<PyType>(), "__getattribute__")?;
-    if !raw_type_entry(&protocol_meta, "__getattribute__")?
-        .is_some_and(|current| current.is(&type_getattribute))
-    {
-        return Ok(false);
-    }
-    let current_module = class.getattr("__module__")?;
-    let current_name = class.getattr("__name__")?;
-    if !current_module.is_exact_instance_of::<PyString>()
-        || !current_name.is_exact_instance_of::<PyString>()
-        || current_module.cast::<PyString>()?.to_str()? != module
-        || current_name.cast::<PyString>()?.to_str()? != name
-    {
-        return Ok(false);
-    }
-    let mro = class.mro();
-    if mro.len() != 4
-        || !mro.get_item(0)?.is(class)
-        || !mro.get_item(1)?.is(&protocol)
-        || !mro.get_item(2)?.is(&generic)
-        || !mro.get_item(3)?.is(py.get_type::<PyAny>())
-    {
-        return Ok(false);
-    }
-
-    let namespace = class.getattr("__dict__")?;
-    for flag in ["_is_protocol", "_is_runtime_protocol"] {
-        let value = namespace.get_item(flag)?;
-        if !value.is_exact_instance_of::<PyBool>() || !value.is_truthy()? {
-            return Ok(false);
-        }
-    }
-    if !exact_text_set_is(&namespace.get_item("__protocol_attrs__")?, member)?
-        || !namespace
-            .get_item("__non_callable_proto_members__")?
-            .is_exact_instance_of::<PySet>()
-        || !namespace
-            .get_item("__non_callable_proto_members__")?
-            .cast::<PySet>()?
-            .is_empty()
-        || !namespace
-            .get_item("__abstractmethods__")?
-            .is_exact_instance_of::<PyFrozenSet>()
-        || !namespace
-            .get_item("__abstractmethods__")?
-            .cast::<PyFrozenSet>()?
-            .is_empty()
-    {
-        return Ok(false);
-    }
-
-    let protocol_hook = typing_namespace.get_item("_proto_hook")?.ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err("typing._proto_hook is missing")
-    })?;
-    let protocol_init = typing_namespace
-        .get_item("_no_init_or_replace_init")?
-        .ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("typing._no_init_or_replace_init is missing")
-        })?;
-    if !namespace.get_item("__subclasshook__")?.is(&protocol_hook)
-        || !namespace.get_item("__init__")?.is(&protocol_init)
-    {
-        return Ok(false);
-    }
-    let protocol_hook_function = protocol_hook.getattr("__func__")?;
-    if !exact_source_function_is(
-        py,
-        &protocol_hook_function,
-        "typing",
-        "_proto_hook",
-        protocol_hook_code,
-        typing_namespace,
-        false,
-    )? || !exact_source_function_is(
-        py,
-        &protocol_init,
-        "typing",
-        "_no_init_or_replace_init",
-        protocol_init_code,
-        typing_namespace,
-        false,
-    )? {
-        return Ok(false);
-    }
-
-    let member_function = namespace.get_item(member)?;
-    if !exact_source_function_is(
-        py,
-        &member_function,
-        module,
-        &format!("{name}.{member}"),
-        member_code,
-        member_globals.bind(py),
-        name == "SupportsRead",
-    )? {
-        return Ok(false);
-    }
-    abc_caches_are_pristine(py, class, abc_module.bind(py), abc_dump.bind(py))
 }
 
 fn static_type_is(current: &Bound<'_, PyType>, module: &str, name: &str) -> PyResult<bool> {
@@ -1502,49 +1218,6 @@ fn known_value_is(
             };
             conservative_structural_proof(known_url_type_is(py, current, new, globals, builtins))
         }
-        KnownValue::RuntimeProtocol {
-            module,
-            name,
-            member,
-        } => {
-            let Some(KnownCode::RuntimeProtocol {
-                member: member_code,
-                protocol_hook,
-                protocol_init,
-                protocol_meta_instancecheck,
-                protocol_meta_subclasscheck,
-                abc_meta_subclasscheck,
-                member_globals,
-                typing_globals,
-                abc_globals,
-                abc_module,
-                abc_dump,
-            }) = expected_code
-            else {
-                return Ok(false);
-            };
-            let Some(protocol_hook) = protocol_hook else {
-                return Ok(false);
-            };
-            conservative_structural_proof(known_runtime_protocol_is(
-                py,
-                current,
-                module,
-                name,
-                member,
-                member_code,
-                protocol_hook,
-                protocol_init,
-                protocol_meta_instancecheck,
-                protocol_meta_subclasscheck.as_ref(),
-                abc_meta_subclasscheck,
-                member_globals,
-                typing_globals,
-                abc_globals,
-                abc_module,
-                abc_dump,
-            ))
-        }
         KnownValue::ByteQuoterFactory => {
             let Some(KnownCode::ByteQuoterFactory {
                 factory,
@@ -1660,22 +1333,6 @@ fn find_code_by_scope<'py>(
     Ok(Some(scope))
 }
 
-#[allow(unsafe_code)]
-fn loaded_module<'py>(
-    py: Python<'py>,
-    module_name: &str,
-) -> PyResult<Option<Bound<'py, PyModule>>> {
-    // SAFETY: CPython owns and returns a borrowed reference to the interpreter
-    // module dictionary while `py` is attached.
-    let modules = unsafe {
-        Bound::from_borrowed_ptr(py, pyo3::ffi::PyImport_GetModuleDict()).cast_into::<PyDict>()?
-    };
-    let Some(module) = modules.get_item(module_name)? else {
-        return Ok(None);
-    };
-    Ok(module.cast_into::<PyModule>().ok())
-}
-
 fn canonical_module_code_from<'py>(
     module: &Bound<'py, PyModule>,
     module_name: &str,
@@ -1765,38 +1422,6 @@ fn build_canonical_function_inner(
         DefaultPolicy::ToNativeString => CanonicalDefaults::ToNativeString,
         DefaultPolicy::SingleNone => CanonicalDefaults::SingleNone,
         DefaultPolicy::SingleEmptyTuple => CanonicalDefaults::SingleEmptyTuple,
-        DefaultPolicy::Quote(safe) => CanonicalDefaults::Quote { safe },
-        DefaultPolicy::Urlencode => {
-            let urllib_parse = PyModule::import(py, "urllib.parse")?;
-            let quote_plus = required_module_entry(&urllib_parse, "quote_plus")?;
-            let quote = required_module_entry(&urllib_parse, "quote")?;
-            let quote_plus_trust = build_canonical_function_inner(
-                py,
-                &quote_plus,
-                "urllib.parse",
-                "quote_plus",
-                DefaultPolicy::Quote(""),
-                true,
-                &[],
-                &descendants,
-            )?;
-            let quote_trust = build_canonical_function_inner(
-                py,
-                &quote,
-                "urllib.parse",
-                "quote",
-                DefaultPolicy::Quote("/"),
-                true,
-                &["TypeError"],
-                &descendants,
-            )?;
-            CanonicalDefaults::Urlencode {
-                quote_plus: quote_plus.unbind(),
-                quote_plus_trust: Box::new(quote_plus_trust),
-                quote: quote.unbind(),
-                quote_trust: Box::new(quote_trust),
-            }
-        }
     };
     let dependencies = if include_globals {
         build_canonical_globals(
@@ -1843,7 +1468,6 @@ fn canonical_module_globals(py: Python<'_>, module_name: &str) -> PyResult<Vec<S
 }
 
 fn build_known_code(
-    py: Python<'_>,
     current_module: &Bound<'_, PyModule>,
     builtins: &Bound<'_, PyDict>,
     known: KnownValue,
@@ -1855,64 +1479,6 @@ fn build_known_code(
             globals: current_module.dict().unbind(),
             builtins: builtins.clone().unbind(),
         })),
-        KnownValue::RuntimeProtocol {
-            module,
-            name,
-            member,
-        } => {
-            let Some(source) = loaded_module(py, module)? else {
-                return Ok(None);
-            };
-            let Some(typing) = loaded_module(py, "typing")? else {
-                return Ok(None);
-            };
-            let Some(abc_source) = loaded_module(py, "abc")? else {
-                return Ok(None);
-            };
-            let Some(abc) = loaded_module(py, "_abc")? else {
-                return Ok(None);
-            };
-            let Some(abc_dump) = abc.dict().get_item("_get_dump")? else {
-                return Ok(None);
-            };
-            Ok(Some(KnownCode::RuntimeProtocol {
-                member: canonical_code_from_module(&source, module, &format!("{name}.{member}"))?
-                    .unbind(),
-                protocol_hook: canonical_code_from_module(&typing, "typing", "_proto_hook")
-                    .ok()
-                    .map(Bound::unbind),
-                protocol_init: canonical_code_from_module(
-                    &typing,
-                    "typing",
-                    "_no_init_or_replace_init",
-                )?
-                .unbind(),
-                protocol_meta_instancecheck: canonical_code_from_module(
-                    &typing,
-                    "typing",
-                    "_ProtocolMeta.__instancecheck__",
-                )?
-                .unbind(),
-                protocol_meta_subclasscheck: canonical_code_from_module(
-                    &typing,
-                    "typing",
-                    "_ProtocolMeta.__subclasscheck__",
-                )
-                .ok()
-                .map(Bound::unbind),
-                abc_meta_subclasscheck: canonical_code_from_module(
-                    &abc_source,
-                    "abc",
-                    "ABCMeta.__subclasscheck__",
-                )?
-                .unbind(),
-                member_globals: source.dict().unbind(),
-                typing_globals: typing.dict().unbind(),
-                abc_globals: abc_source.dict().unbind(),
-                abc_module: abc.clone().unbind(),
-                abc_dump: abc_dump.unbind(),
-            }))
-        }
         KnownValue::ByteQuoterFactory => Ok(Some(KnownCode::ByteQuoterFactory {
             factory: canonical_code_from_module(
                 current_module,
@@ -1982,7 +1548,7 @@ fn build_canonical_globals(
         }
         let resolution = if module_globals.contains(&name) {
             if let Some(known) = known_module_value(&module_name, &name) {
-                let code = build_known_code(py, module, builtins, known)?;
+                let code = build_known_code(module, builtins, known)?;
                 CanonicalGlobalResolution::KnownModule { value: known, code }
             } else if let Some(value) = module.dict().get_item(&name)? {
                 let Some((expected_module, expected_qualname)) =
@@ -2124,56 +1690,6 @@ fn canonical_defaults_are_current(
                     .cast::<PyTuple>()
                     .is_ok_and(PyTupleMethods::is_empty))
         }
-        CanonicalDefaults::Quote { safe } => {
-            if kwdefaults.is_some() {
-                return Ok(false);
-            }
-            let Some(defaults) = defaults else {
-                return Ok(false);
-            };
-            let Ok(defaults) = defaults.cast_into::<PyTuple>() else {
-                return Ok(false);
-            };
-            Ok(defaults.len() == 3
-                && defaults
-                    .get_item(0)?
-                    .cast::<PyString>()
-                    .is_ok_and(|value| value.to_str().is_ok_and(|value| value == *safe))
-                && defaults.get_item(1)?.is_none()
-                && defaults.get_item(2)?.is_none())
-        }
-        CanonicalDefaults::Urlencode {
-            quote_plus,
-            quote_plus_trust,
-            quote,
-            quote_trust,
-        } => {
-            if kwdefaults.is_some() {
-                return Ok(false);
-            }
-            let Some(defaults) = defaults else {
-                return Ok(false);
-            };
-            let Ok(defaults) = defaults.cast_into::<PyTuple>() else {
-                return Ok(false);
-            };
-            if defaults.len() != 5
-                || !defaults.get_item(0)?.is_exact_instance_of::<PyBool>()
-                || defaults.get_item(0)?.extract::<bool>()?
-                || !defaults
-                    .get_item(1)?
-                    .cast::<PyString>()
-                    .is_ok_and(|value| value.to_str().is_ok_and(str::is_empty))
-                || !defaults.get_item(2)?.is_none()
-                || !defaults.get_item(3)?.is_none()
-            {
-                return Ok(false);
-            }
-            let actual_quote_plus = defaults.get_item(4)?;
-            Ok(actual_quote_plus.is(quote_plus.bind(py))
-                && canonical_function_is(py, &actual_quote_plus, quote_plus_trust)?
-                && canonical_function_is(py, quote.bind(py), quote_trust)?)
-        }
     }
 }
 
@@ -2182,19 +1698,14 @@ fn canonical_function_is(
     current: &Bound<'_, PyAny>,
     expected: &CanonicalFunction,
 ) -> PyResult<bool> {
+    if !canonical_function_shape_is(py, current, expected)? {
+        return Ok(false);
+    }
     let Ok(function) = current.cast::<PyFunction>() else {
         return Ok(false);
     };
-    let code = function_code(py, function)?;
     let globals = function_globals(py, function)?;
-    let builtins = function.getattr("__builtins__")?.cast_into::<PyDict>()?;
-    if !code.eq(expected.code.bind(py))?
-        || !globals.is(expected.globals.bind(py))
-        || !builtins.is(expected.builtins.bind(py))
-        || !canonical_defaults_are_current(py, function, &expected.defaults)?
-    {
-        return Ok(false);
-    }
+    let builtins = expected.builtins.bind(py);
     for dependency in &expected.dependencies {
         let current_global = globals.get_item(&dependency.name)?;
         let (current, function) = match &dependency.resolution {
@@ -2256,11 +1767,27 @@ fn canonical_function_is(
     Ok(true)
 }
 
+fn canonical_function_shape_is(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    expected: &CanonicalFunction,
+) -> PyResult<bool> {
+    let Ok(function) = current.cast::<PyFunction>() else {
+        return Ok(false);
+    };
+    let code = function_code(py, function)?;
+    let globals = function_globals(py, function)?;
+    let builtins = function.getattr("__builtins__")?.cast_into::<PyDict>()?;
+    Ok(code.eq(expected.code.bind(py))?
+        && globals.is(expected.globals.bind(py))
+        && builtins.is(expected.builtins.bind(py))
+        && canonical_defaults_are_current(py, function, &expected.defaults)?)
+}
+
 fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
     let internal_utils = PyModule::import(py, "requests._internal_utils")?;
     let builtins = PyModule::import(py, "builtins")?;
     let models = PyModule::import(py, "requests.models")?;
-    let model_types = required_module_entry(&models, "_t")?.cast_into::<PyModule>()?;
     let structures = PyModule::import(py, "requests.structures")?;
     let utils = PyModule::import(py, "requests.utils")?;
     let method_type = PyModule::import(py, "types")?
@@ -2293,11 +1820,7 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
     let missing_schema = required_module_entry(&models, "MissingSchema")?;
     let parse_url = required_module_entry(&models, "parse_url")?;
     let requote_uri = required_module_entry(&models, "requote_uri")?;
-    let basestring = required_module_entry(&models, "basestring")?;
-    let has_read = required_module_entry(&model_types, "has_read")?;
-    let to_key_val_list = required_module_entry(&models, "to_key_val_list")?;
     let unicode_is_ascii = required_module_entry(&models, "unicode_is_ascii")?;
-    let urlencode = required_module_entry(&models, "urlencode")?;
     let urlunparse = required_module_entry(&models, "urlunparse")?;
     let request_encoding_mixin =
         required_module_entry(&models, "RequestEncodingMixin")?.cast_into::<PyType>()?;
@@ -2345,8 +1868,8 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         "requests.models",
         "RequestEncodingMixin._encode_params",
         DefaultPolicy::None,
-        true,
-        &["_t"],
+        false,
+        &[],
     )?;
     let to_native_string_trust = build_canonical_function(
         py,
@@ -2392,33 +1915,6 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         DefaultPolicy::None,
         true,
         &[],
-    )?;
-    let has_read_trust = build_canonical_function(
-        py,
-        &has_read,
-        "requests._types",
-        "has_read",
-        DefaultPolicy::None,
-        true,
-        &[],
-    )?;
-    let to_key_val_list_trust = build_canonical_function(
-        py,
-        &to_key_val_list,
-        "requests.utils",
-        "to_key_val_list",
-        DefaultPolicy::None,
-        true,
-        &["ValueError"],
-    )?;
-    let urlencode_trust = build_canonical_function(
-        py,
-        &urlencode,
-        "urllib.parse",
-        "urlencode",
-        DefaultPolicy::Urlencode,
-        true,
-        &["TypeError"],
     )?;
     let check_header_validity_trust = build_canonical_function(
         py,
@@ -2469,7 +1965,6 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         internal_utils: internal_utils.unbind(),
         builtins: builtins.unbind(),
         models: models.unbind(),
-        model_types: model_types.unbind(),
         structures: structures.unbind(),
         utils: utils.unbind(),
         prepared_request: prepared_request.unbind(),
@@ -2495,11 +1990,7 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         missing_schema: missing_schema.unbind(),
         parse_url: parse_url.unbind(),
         requote_uri: requote_uri.unbind(),
-        basestring: basestring.unbind(),
-        has_read: has_read.unbind(),
-        to_key_val_list: to_key_val_list.unbind(),
         unicode_is_ascii: unicode_is_ascii.unbind(),
-        urlencode: urlencode.unbind(),
         urlunparse: urlunparse.unbind(),
         encode_params_descriptor: encode_params_descriptor.unbind(),
         builtin_str: builtin_str.unbind(),
@@ -2518,9 +2009,6 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         requote_uri_trust,
         unicode_is_ascii_trust,
         urlunparse_trust,
-        has_read_trust,
-        to_key_val_list_trust,
-        urlencode_trust,
         check_header_validity_trust,
         validate_header_part_trust,
         case_insensitive_dict_init_trust,
@@ -2844,8 +2332,11 @@ fn trusted_url_parameter_dependencies(
     subject: &Bound<'_, PyAny>,
     params: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
+    if !params.is_exact_instance_of::<PyString>() && !params.is_exact_instance_of::<PyBytes>() {
+        return Ok(false);
+    }
     if !has_original_encode_params_descriptor(py, state, subject)?
-        || !canonical_function_is(
+        || !canonical_function_shape_is(
             py,
             state.encode_params_function.bind(py),
             &state.encode_params_trust,
@@ -2853,31 +2344,25 @@ fn trusted_url_parameter_dependencies(
     {
         return Ok(false);
     }
-    if params.is_exact_instance_of::<PyString>() || params.is_exact_instance_of::<PyBytes>() {
-        return trusted_native_string_dependencies(py, state);
-    }
-    if !params.is_exact_instance_of::<PyDict>() {
+    if !raw_intrinsic_builtin_fallback_is(
+        py,
+        state,
+        &state.models,
+        "isinstance",
+        IntrinsicBuiltin::Function("isinstance"),
+    )? {
         return Ok(false);
     }
-
-    let model_types_is_original = state
-        .models
-        .bind(py)
-        .dict()
-        .get_item("_t")?
-        .is_some_and(|value| value.is(state.model_types.bind(py)));
-    Ok(model_types_is_original
-        && raw_module_entry_is(py, &state.model_types, "has_read", &state.has_read)?
-        && raw_module_entry_is(py, &state.models, "basestring", &state.basestring)?
-        && raw_module_entry_is(py, &state.models, "to_key_val_list", &state.to_key_val_list)?
-        && raw_module_entry_is(py, &state.models, "urlencode", &state.urlencode)?
-        && canonical_function_is(py, state.has_read.bind(py), &state.has_read_trust)?
-        && canonical_function_is(
-            py,
-            state.to_key_val_list.bind(py),
-            &state.to_key_val_list_trust,
-        )?
-        && canonical_function_is(py, state.urlencode.bind(py), &state.urlencode_trust)?)
+    let Some(basestring) = state.models.bind(py).dict().get_item("basestring")? else {
+        return Ok(false);
+    };
+    known_value_is(
+        py,
+        state.builtins.bind(py),
+        &basestring,
+        KnownValue::IntrinsicPair(IntrinsicBuiltin::Str, IntrinsicBuiltin::Bytes),
+        None,
+    )
 }
 
 fn has_original_encode_params_descriptor(
