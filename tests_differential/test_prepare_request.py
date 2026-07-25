@@ -2669,6 +2669,49 @@ finally:
     )
 
 
+def test_prepare_url_protocol_proof_rejects_mutated_canonical_metaclass() -> None:
+    _assert_matches_oracle(
+        """
+import requests._types as model_types
+from requests.models import PreparedRequest
+
+
+prime = PreparedRequest()
+prepare_method_call(prime, "get")
+
+protocol_meta = type(model_types.SupportsRead)
+original = protocol_meta.__instancecheck__
+
+
+def observed(cls, value):
+    side_effects.append(
+        [
+            "canonical-protocol-meta-instancecheck",
+            cls.__name__,
+            type(value).__name__,
+        ]
+    )
+    return False
+
+
+protocol_meta.__instancecheck__ = observed
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "canonical-protocol-meta-instancecheck",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    protocol_meta.__instancecheck__ = original
+"""
+    )
+
+
 def test_prepare_url_items_protocol_replaced_before_extension_import() -> None:
     _assert_matches_oracle_before_extension_import(
         _PREIMPORT_CAPTURE_HELPER
