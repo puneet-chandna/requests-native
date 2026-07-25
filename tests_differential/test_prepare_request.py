@@ -1993,6 +1993,294 @@ finally:
     )
 
 
+def test_prepare_url_scheme_regex_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+class SchemePattern:
+    def search(self, value):
+        side_effects.append(["scheme-search", value])
+        raise RuntimeError("scheme callback")
+
+
+original = url_utils._SCHEME_RE
+url_utils._SCHEME_RE = SchemePattern()
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url("http://example.com/a path", None)
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/a path",
+                None,
+            )
+        ),
+    )
+finally:
+    url_utils._SCHEME_RE = original
+"""
+    )
+
+
+def test_prepare_url_scheme_tuple_subclass_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+class Schemes(tuple):
+    def __contains__(self, value):
+        side_effects.append(["scheme-contains", value])
+        return False
+
+
+original = url_utils._NORMALIZABLE_SCHEMES
+url_utils._NORMALIZABLE_SCHEMES = Schemes(original)
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url("http://EXAMPLE.com/path", None)
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://EXAMPLE.com/path",
+                None,
+            )
+        ),
+    )
+finally:
+    url_utils._NORMALIZABLE_SCHEMES = original
+"""
+    )
+
+
+def test_prepare_url_scheme_string_subclass_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+class Scheme(str):
+    def __eq__(self, other):
+        side_effects.append(["scheme-eq", str.__str__(self), other])
+        return False
+
+
+original = url_utils._NORMALIZABLE_SCHEMES
+url_utils._NORMALIZABLE_SCHEMES = (
+    Scheme("http"),
+    "https",
+    None,
+)
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url("http://EXAMPLE.com/path", None)
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://EXAMPLE.com/path",
+                None,
+            )
+        ),
+    )
+finally:
+    url_utils._NORMALIZABLE_SCHEMES = original
+"""
+    )
+
+
+def test_prepare_headers_validator_tuple_subclass_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+class Validators(tuple):
+    def __getitem__(self, index):
+        side_effects.append(["validator-getitem", index])
+        raise RuntimeError("validator callback")
+
+
+original = utils._HEADER_VALIDATORS_STR
+utils._HEADER_VALIDATORS_STR = Validators(original)
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_headers({"Name": "value"})
+            if _requests_rust is None
+            else _requests_rust._prepare_headers_trial(
+                subject,
+                {"Name": "value"},
+            )
+        ),
+    )
+finally:
+    utils._HEADER_VALIDATORS_STR = original
+"""
+    )
+
+
+def test_prepare_headers_byte_validator_tuple_subclass_before_extension_import() -> (
+    None
+):
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+class Validators(tuple):
+    def __getitem__(self, index):
+        side_effects.append(["byte-validator-getitem", index])
+        raise RuntimeError("byte validator callback")
+
+
+original = utils._HEADER_VALIDATORS_BYTE
+utils._HEADER_VALIDATORS_BYTE = Validators(original)
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_headers({b"Name": b"value"})
+            if _requests_rust is None
+            else _requests_rust._prepare_headers_trial(
+                subject,
+                {b"Name": b"value"},
+            )
+        ),
+    )
+finally:
+    utils._HEADER_VALIDATORS_BYTE = original
+"""
+    )
+
+
+def test_prepare_headers_redirected_pattern_type_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import re
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+class Pattern:
+    def __init__(self, pattern, flags):
+        self.pattern = pattern
+        self.flags = flags
+
+    def match(self, value):
+        side_effects.append(["fake-pattern-match", self.pattern, value])
+        return True
+
+
+original_pattern_type = re.Pattern
+original_text_validators = utils._HEADER_VALIDATORS_STR
+original_byte_validators = utils._HEADER_VALIDATORS_BYTE
+re.Pattern = Pattern
+utils._HEADER_VALIDATORS_STR = (
+    Pattern(r"^[^:\\s][^:\\r\\n]*\\Z", 32),
+    Pattern(r"^\\S[^\\r\\n]*\\Z|^\\Z", 32),
+)
+utils._HEADER_VALIDATORS_BYTE = (
+    Pattern(br"^[^:\\s][^:\\r\\n]*\\Z", 0),
+    Pattern(br"^\\S[^\\r\\n]*\\Z|^\\Z", 0),
+)
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_headers({"Bad": " leading"})
+            if _requests_rust is None
+            else _requests_rust._prepare_headers_trial(
+                subject,
+                {"Bad": " leading"},
+            )
+        ),
+    )
+finally:
+    utils._HEADER_VALIDATORS_STR = original_text_validators
+    utils._HEADER_VALIDATORS_BYTE = original_byte_validators
+    re.Pattern = original_pattern_type
+"""
+    )
+
+
+def test_prepare_headers_does_not_import_re_during_trial() -> None:
+    _assert_matches_oracle(
+        """
+import sys
+from requests.models import PreparedRequest
+
+
+original = sys.modules["re"]
+sys.modules["re"] = object()
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "mutated-sys-modules-re",
+        subject,
+        lambda: prepare_headers_call(subject, {"Name": "value"}),
+    )
+finally:
+    sys.modules["re"] = original
+"""
+    )
+
+
 def test_http_unix_preserves_lowercase_reserved_percent_escapes() -> None:
     _assert_matches_oracle(
         """
