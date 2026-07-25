@@ -4346,7 +4346,7 @@ run_binding(
 bytes_events = []
 
 
-class DynamicBytes:
+class DynamicBytes(bytes):
     def decode(self, encoding):
         bytes_events.append([encoding, same_thread()])
         return "dynamic reason"
