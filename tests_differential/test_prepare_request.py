@@ -2712,6 +2712,44 @@ finally:
     )
 
 
+def test_prepare_url_protocol_proof_rejects_mutated_metaclass_globals() -> None:
+    _assert_matches_oracle(
+        """
+import typing
+from requests.models import PreparedRequest
+
+
+prime = PreparedRequest()
+prepare_method_call(prime, "get")
+
+original = typing._abc_instancecheck
+
+
+def observed(cls, value):
+    side_effects.append(
+        ["typing-abc-instancecheck", cls.__name__, type(value).__name__]
+    )
+    return True
+
+
+typing._abc_instancecheck = observed
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "typing-abc-instancecheck",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    typing._abc_instancecheck = original
+"""
+    )
+
+
 def test_prepare_url_items_protocol_replaced_before_extension_import() -> None:
     _assert_matches_oracle_before_extension_import(
         _PREIMPORT_CAPTURE_HELPER
