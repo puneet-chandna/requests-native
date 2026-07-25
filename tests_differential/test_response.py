@@ -380,8 +380,21 @@ class ObservedReadRaw:
 """
 
 
-def _run_matching(source: str):
-    case = {"source": dedent(_TRIAL_HELPERS + source)}
+def _trial_source(source: str, before_extension: str = "") -> str:
+    helpers = _TRIAL_HELPERS
+    if before_extension:
+        marker = "\ntry:\n    from requests import _requests_rust"
+        helpers = helpers.replace(
+            marker,
+            f"\n{dedent(before_extension)}\n\n"
+            "try:\n    from requests import _requests_rust",
+            1,
+        )
+    return dedent(helpers + source)
+
+
+def _run_matching(source: str, *, before_extension: str = ""):
+    case = {"source": _trial_source(source, before_extension)}
     oracle = run_oracle_case(case)
     rewrite = run_rewrite_case(case)
 
@@ -392,8 +405,8 @@ def _run_matching(source: str):
     return _normalize_literal(ast.literal_eval(oracle.observations["result"]["repr"]))
 
 
-def _run_rewrite_only(source: str):
-    case = {"source": dedent(_TRIAL_HELPERS + source)}
+def _run_rewrite_only(source: str, *, before_extension: str = ""):
+    case = {"source": _trial_source(source, before_extension)}
     oracle = run_oracle_case(case)
     rewrite = run_rewrite_case(case)
 
@@ -4069,3 +4082,631 @@ result = {
         "suppress_context": False,
         "events": [["close", True]],
     }
+
+
+def test_preimport_descriptor_copy_is_rejected_then_restoration_is_readmitted() -> None:
+    state = _run_rewrite_only(
+        """
+if _requests_rust is None:
+    result = {"target": "oracle-control"}
+else:
+    import sys
+
+    targets = {
+        OriginalResponse.content.fget.__code__,
+        OriginalResponse.iter_content.__code__,
+        OriginalResponse.iter_lines.__code__,
+        OriginalResponse.text.fget.__code__,
+        OriginalResponse.apparent_encoding.fget.__code__,
+        OriginalResponse.json.__code__,
+        OriginalResponse.raise_for_status.__code__,
+        OriginalResponse.__getstate__.__code__,
+        OriginalResponse.__setstate__.__code__,
+        OriginalResponse.close.__code__,
+    }
+    seen = []
+
+    def profile(frame, event, argument):
+        if event == "call" and frame.f_code in targets:
+            seen.append(frame.f_code.co_name)
+
+    def exercise(response_type):
+        content_subject = response_type()
+        content_subject.status_code = 200
+        content_subject.raw = ObservedReadRaw([b"content"])
+        response_content_call(content_subject)
+
+        iter_subject = response_type()
+        iter_subject.raw = ObservedReadRaw([b"iter"])
+        list(response_iter_content_call(iter_subject, 2))
+
+        lines_subject = response_type()
+        lines_subject.raw = ObservedReadRaw([b"a\\nb\\n"])
+        list(response_iter_lines_call(lines_subject, 2))
+
+        text_subject = response_type()
+        text_subject._content = b"text"
+        text_subject._content_consumed = True
+        text_subject.encoding = "ascii"
+        response_text_call(text_subject)
+        response_apparent_encoding_call(text_subject)
+
+        json_subject = response_type()
+        json_subject._content = b'{"value": 1}'
+        json_subject._content_consumed = True
+        response_json_call(json_subject, {})
+
+        status_subject = response_type()
+        status_subject.status_code = 200
+        response_metadata_call(status_subject, "raise_for_status")
+
+        pickle_subject = response_type()
+        pickle_subject._content = b"pickle"
+        pickle_subject._content_consumed = True
+        pickle_state = response_pickle_call(pickle_subject, "get")
+        restored = response_type.__new__(response_type)
+        response_pickle_call(restored, "set", pickle_state)
+
+        close_subject = response_type()
+        close_subject._content_consumed = True
+        response_close_call(close_subject)
+
+    sys.setprofile(profile)
+    try:
+        exercise(CopiedResponse)
+        copied_seen = list(seen)
+        models.Response = OriginalResponse
+        exercise(OriginalResponse)
+        restored_seen = seen[len(copied_seen):]
+    finally:
+        sys.setprofile(None)
+        models.Response = OriginalResponse
+
+    result = {
+        "target": "rewrite",
+        "copied_seen": copied_seen,
+        "restored_seen": restored_seen,
+    }
+""",
+        before_extension="""
+import requests.models as models
+
+
+OriginalResponse = Response
+copied_namespace = {
+    name: value
+    for name, value in OriginalResponse.__dict__.items()
+    if name not in {"__dict__", "__weakref__"}
+}
+CopiedResponse = type("Response", (), copied_namespace)
+models.Response = CopiedResponse
+""",
+    )
+
+    assert state["target"] == "rewrite"
+    assert set(state["copied_seen"]) >= {
+        "content",
+        "iter_content",
+        "iter_lines",
+        "text",
+        "apparent_encoding",
+        "json",
+        "raise_for_status",
+        "__getstate__",
+        "__setstate__",
+        "close",
+    }
+    assert state["restored_seen"] == []
+
+
+def test_omitted_response_load_globals_force_authoritative_frames() -> None:
+    state = _run_matching(
+        """
+import sys
+import requests.models as models
+
+
+rows = []
+missing = object()
+
+
+def run_binding(name, replacement, target, operation):
+    original = models.__dict__.get(name, missing)
+    models.__dict__[name] = replacement
+    seen = []
+
+    def profile(frame, event, argument):
+        if event == "call" and frame.f_code is target:
+            seen.append(frame.f_code.co_name)
+
+    sys.setprofile(profile)
+    try:
+        observed = capture(operation)
+    finally:
+        sys.setprofile(None)
+        if original is missing:
+            models.__dict__.pop(name, None)
+        else:
+            models.__dict__[name] = original
+    rows.append({
+        "name": name,
+        "seen": seen,
+        "returned": value_record(observed["returned"]),
+        "exception": observed["exception"],
+    })
+
+
+class DynamicBool:
+    pass
+
+
+bool_subject = Response()
+bool_subject._content = DynamicBool()
+bool_subject._content_consumed = True
+run_binding(
+    "bool",
+    DynamicBool,
+    Response.iter_content.__code__,
+    lambda: list(response_iter_content_call(bool_subject, 1)),
+)
+
+
+class DynamicInt:
+    pass
+
+
+int_subject = Response()
+int_subject.raw = ObservedReadRaw([b"unused"])
+run_binding(
+    "int",
+    DynamicInt,
+    Response.iter_content.__code__,
+    lambda: list(response_iter_content_call(int_subject, 1)),
+)
+
+
+class BothRaw:
+    def __init__(self):
+        self.events = []
+        self.read_count = 0
+
+    def stream(self, chunk_size, decode_content=True):
+        self.events.append(["stream", same_thread()])
+        yield b"stream"
+
+    def read(self, chunk_size):
+        self.events.append(["read", same_thread()])
+        self.read_count += 1
+        return b"read" if self.read_count == 1 else b""
+
+
+hasattr_events = []
+
+
+def dynamic_hasattr(owner, name):
+    hasattr_events.append([owner is hasattr_subject.raw, name, same_thread()])
+    return False
+
+
+hasattr_subject = Response()
+hasattr_subject.raw = BothRaw()
+run_binding(
+    "hasattr",
+    dynamic_hasattr,
+    Response.iter_content.__code__,
+    lambda: list(response_iter_content_call(hasattr_subject, 2)),
+)
+
+
+cast_events = []
+
+
+def dynamic_cast(expected_type, value):
+    cast_events.append([
+        expected_type is bytes,
+        value_record(value),
+        same_thread(),
+    ])
+    return b"casted"
+
+
+cast_subject = Response()
+cast_subject._content = b"original"
+cast_subject._content_consumed = True
+run_binding(
+    "cast",
+    dynamic_cast,
+    Response.iter_content.__code__,
+    lambda: list(response_iter_content_call(cast_subject, 3)),
+)
+
+
+line_cast_events = []
+
+
+def dynamic_line_cast(expected_type, value):
+    line_cast_events.append([
+        expected_type,
+        value_record(value),
+        same_thread(),
+    ])
+    return value
+
+
+line_cast_subject = Response()
+line_cast_subject.raw = ObservedReadRaw([b"first", b"second\\n"])
+run_binding(
+    "cast-iter_lines",
+    dynamic_line_cast,
+    Response.iter_lines.__code__,
+    lambda: list(response_iter_lines_call(line_cast_subject, 6)),
+)
+
+
+bytes_events = []
+
+
+class DynamicBytes:
+    def decode(self, encoding):
+        bytes_events.append([encoding, same_thread()])
+        return "dynamic reason"
+
+
+bytes_subject = Response()
+bytes_subject.status_code = 400
+bytes_subject.reason = DynamicBytes()
+bytes_subject.url = "https://example.test/bytes"
+run_binding(
+    "bytes",
+    DynamicBytes,
+    Response.raise_for_status.__code__,
+    lambda: response_metadata_call(bytes_subject, "raise_for_status"),
+)
+
+
+bytes_iter_subject = Response()
+bytes_iter_subject._content = b"cached"
+bytes_iter_subject._content_consumed = True
+run_binding(
+    "bytes-iter_content",
+    DynamicBytes,
+    Response.iter_content.__code__,
+    lambda: list(response_iter_content_call(bytes_iter_subject, 3)),
+)
+
+
+unicode_events = []
+
+
+class DynamicUnicodeDecodeError(Exception):
+    pass
+
+
+class DynamicReason(bytes):
+    def decode(self, encoding):
+        unicode_events.append([encoding, same_thread()])
+        if encoding == "utf-8":
+            raise DynamicUnicodeDecodeError("dynamic decode")
+        return "fallback reason"
+
+
+unicode_subject = Response()
+unicode_subject.status_code = 500
+unicode_subject.reason = DynamicReason(b"reason")
+unicode_subject.url = "https://example.test/unicode"
+run_binding(
+    "UnicodeDecodeError",
+    DynamicUnicodeDecodeError,
+    Response.raise_for_status.__code__,
+    lambda: response_metadata_call(unicode_subject, "raise_for_status"),
+)
+
+
+json_unicode_events = []
+
+
+class DynamicJsonUnicodeDecodeError(Exception):
+    pass
+
+
+class DynamicJsonBytes(bytes):
+    def decode(self, encoding):
+        json_unicode_events.append([encoding, same_thread()])
+        raise DynamicJsonUnicodeDecodeError("dynamic json decode")
+
+
+json_unicode_subject = Response()
+json_unicode_subject._content = DynamicJsonBytes(b'{"json": true}')
+json_unicode_subject._content_consumed = True
+run_binding(
+    "UnicodeDecodeError-json",
+    DynamicJsonUnicodeDecodeError,
+    Response.json.__code__,
+    lambda: response_json_call(json_unicode_subject, {}),
+)
+
+
+result = {
+    "rows": rows,
+    "hasattr_events": hasattr_events,
+    "hasattr_raw_events": hasattr_subject.raw.events,
+    "cast_events": cast_events,
+    "line_cast_events": line_cast_events,
+    "bytes_events": bytes_events,
+    "unicode_events": unicode_events,
+    "json_unicode_events": json_unicode_events,
+}
+"""
+    )
+
+    rows = {row["name"]: row for row in state["rows"]}
+    assert list(rows) == [
+        "bool",
+        "int",
+        "hasattr",
+        "cast",
+        "cast-iter_lines",
+        "bytes",
+        "bytes-iter_content",
+        "UnicodeDecodeError",
+        "UnicodeDecodeError-json",
+    ]
+    assert all(row["seen"] for row in rows.values())
+    assert rows["bool"]["exception"]["type"] == [
+        "requests.exceptions",
+        "StreamConsumedError",
+    ]
+    assert rows["int"]["exception"]["type"] == ["builtins", "TypeError"]
+    assert rows["hasattr"]["exception"] is None
+    assert rows["hasattr"]["returned"]["payload"][0] == "opaque"
+    assert rows["cast"]["exception"] is None
+    assert rows["cast-iter_lines"]["exception"] is None
+    assert rows["bytes"]["exception"]["args"] == [
+        "400 Client Error: dynamic reason for url: https://example.test/bytes"
+    ]
+    assert rows["bytes-iter_content"]["exception"] is None
+    assert rows["UnicodeDecodeError"]["exception"]["args"] == [
+        "500 Server Error: fallback reason for url: https://example.test/unicode"
+    ]
+    assert rows["UnicodeDecodeError-json"]["exception"] == {
+        "type": [
+            "__differential_case__",
+            "DynamicJsonUnicodeDecodeError",
+        ],
+        "args": ["dynamic json decode"],
+    }
+    assert state["hasattr_events"] == [[True, "stream", True]]
+    assert state["hasattr_raw_events"] == [["read", True], ["read", True]]
+    assert state["cast_events"] == [
+        [
+            True,
+            {
+                "type": ["builtins", "bytes"],
+                "payload": ["bytes", b"original".hex()],
+            },
+            True,
+        ]
+    ]
+    assert state["line_cast_events"] == [
+        [
+            "str | bytes",
+            {
+                "type": ["builtins", "bytes"],
+                "payload": ["bytes", b"firstsecond\n".hex()],
+            },
+            True,
+        ]
+    ]
+    assert state["bytes_events"] == [["utf-8", True]]
+    assert state["unicode_events"] == [
+        ["utf-8", True],
+        ["iso-8859-1", True],
+    ]
+    assert state["json_unicode_events"] == [["utf-8", True]]
+
+
+def test_exact_response_instance_method_shadows_are_authoritative() -> None:
+    state = _run_matching(
+        """
+events = []
+
+
+direct_iter_marker = object()
+direct_iter = Response()
+
+
+def shadow_iter_content(chunk_size=1, decode_unicode=False):
+    events.append([
+        "iter_content",
+        chunk_size,
+        decode_unicode,
+        same_thread(),
+    ])
+    yield direct_iter_marker
+
+
+direct_iter.iter_content = shadow_iter_content
+direct_iter_values = list(response_iter_content_call(direct_iter, 7, True))
+
+
+direct_lines_marker = object()
+direct_lines = Response()
+
+
+def shadow_iter_lines(
+    chunk_size=512,
+    decode_unicode=False,
+    delimiter=None,
+):
+    events.append([
+        "iter_lines",
+        chunk_size,
+        decode_unicode,
+        value_record(delimiter),
+        same_thread(),
+    ])
+    yield direct_lines_marker
+
+
+direct_lines.iter_lines = shadow_iter_lines
+direct_lines_values = list(
+    response_iter_lines_call(direct_lines, 9, True, b"|")
+)
+
+
+json_marker = object()
+json_subject = Response()
+
+
+def shadow_json(**kwargs):
+    events.append(["json", sorted(kwargs.items()), same_thread()])
+    return json_marker
+
+
+json_subject.json = shadow_json
+json_value = response_json_call(json_subject, {"answer": 42})
+
+
+raise_marker = object()
+raise_subject = Response()
+
+
+def shadow_raise():
+    events.append(["raise_for_status", same_thread()])
+    return raise_marker
+
+
+raise_subject.raise_for_status = shadow_raise
+raise_value = response_metadata_call(raise_subject, "raise_for_status")
+
+
+get_marker = object()
+get_subject = Response()
+
+
+def shadow_getstate():
+    events.append(["__getstate__", same_thread()])
+    return {"marker": get_marker}
+
+
+get_subject.__getstate__ = shadow_getstate
+get_value = response_pickle_call(get_subject, "get")
+
+
+set_marker = object()
+set_state = {"value": object()}
+set_subject = Response()
+
+
+def shadow_setstate(state):
+    events.append([
+        "__setstate__",
+        state is set_state,
+        same_thread(),
+    ])
+    return set_marker
+
+
+set_subject.__setstate__ = shadow_setstate
+set_value = response_pickle_call(set_subject, "set", set_state)
+
+
+close_marker = object()
+close_subject = Response()
+
+
+def shadow_close():
+    events.append(["close", same_thread()])
+    return close_marker
+
+
+close_subject.close = shadow_close
+close_value = response_close_call(close_subject)
+
+
+content_subject = Response()
+content_subject.status_code = 200
+content_subject.raw = object()
+
+
+def nested_content_iter(chunk_size=1, decode_unicode=False):
+    events.append([
+        "content->iter_content",
+        chunk_size,
+        decode_unicode,
+        same_thread(),
+    ])
+    yield b"nested-content"
+
+
+content_subject.iter_content = nested_content_iter
+content_value = response_content_call(content_subject)
+
+
+line_subject = Response()
+
+
+def nested_lines_iter(chunk_size=1, decode_unicode=False):
+    events.append([
+        "iter_lines->iter_content",
+        chunk_size,
+        decode_unicode,
+        same_thread(),
+    ])
+    yield b"first\\nsecond\\n"
+
+
+line_subject.iter_content = nested_lines_iter
+line_values = list(response_iter_lines_call(line_subject, 11))
+
+
+result = {
+    "direct_iter_identity": direct_iter_values == [direct_iter_marker],
+    "direct_lines_identity": direct_lines_values == [direct_lines_marker],
+    "json_identity": json_value is json_marker,
+    "raise_identity": raise_value is raise_marker,
+    "get_identity": get_value["marker"] is get_marker,
+    "set_identity": set_value is set_marker,
+    "close_identity": close_value is close_marker,
+    "content": value_record(content_value),
+    "lines": [value_record(value) for value in line_values],
+    "events": events,
+}
+"""
+    )
+
+    assert state["direct_iter_identity"] is True
+    assert state["direct_lines_identity"] is True
+    assert state["json_identity"] is True
+    assert state["raise_identity"] is True
+    assert state["get_identity"] is True
+    assert state["set_identity"] is True
+    assert state["close_identity"] is True
+    assert state["content"]["payload"] == [
+        "bytes",
+        b"nested-content".hex(),
+    ]
+    assert [line["payload"][1] for line in state["lines"]] == [
+        b"first".hex(),
+        b"second".hex(),
+    ]
+    assert state["events"] == [
+        ["iter_content", 7, True, True],
+        [
+            "iter_lines",
+            9,
+            True,
+            {
+                "type": ["builtins", "bytes"],
+                "payload": ["bytes", b"|".hex()],
+            },
+            True,
+        ],
+        ["json", [["answer", 42]], True],
+        ["raise_for_status", True],
+        ["__getstate__", True],
+        ["__setstate__", True, True],
+        ["close", True],
+        ["content->iter_content", 10240, False, True],
+        ["iter_lines->iter_content", 11, False, True],
+    ]
