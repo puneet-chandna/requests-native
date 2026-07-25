@@ -2824,6 +2824,62 @@ finally:
     )
 
 
+def test_prepare_url_missing_protocol_hook_delegates() -> None:
+    _assert_matches_oracle(
+        """
+import typing
+from requests.models import PreparedRequest
+
+
+prime = PreparedRequest()
+prepare_method_call(prime, "get")
+original = typing._proto_hook
+del typing._proto_hook
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "missing-typing-proto-hook",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    typing._proto_hook = original
+"""
+    )
+
+
+def test_prepare_url_missing_protocol_alias_preserves_authoritative_error() -> None:
+    _assert_matches_oracle(
+        """
+import typing
+from requests.models import PreparedRequest
+
+
+prime = PreparedRequest()
+prepare_method_call(prime, "get")
+original = typing.Protocol
+del typing.Protocol
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "missing-typing-protocol",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    typing.Protocol = original
+"""
+    )
+
+
 def test_http_unix_preserves_lowercase_reserved_percent_escapes() -> None:
     _assert_matches_oracle(
         """
