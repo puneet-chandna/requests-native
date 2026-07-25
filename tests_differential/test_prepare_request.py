@@ -2510,6 +2510,140 @@ finally:
     )
 
 
+def test_prepare_url_read_protocol_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import requests._types as model_types
+from requests.models import PreparedRequest
+
+
+class ReadProtocolMeta(type):
+    def __instancecheck__(self, value):
+        side_effects.append(["read-instancecheck", type(value).__name__])
+        return True
+
+
+class ReadProtocol(metaclass=ReadProtocolMeta):
+    pass
+
+
+original = model_types.SupportsRead
+model_types.SupportsRead = ReadProtocol
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url("http://example.com/path", {"name": "value"})
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/path",
+                {"name": "value"},
+            )
+        ),
+    )
+finally:
+    model_types.SupportsRead = original
+"""
+    )
+
+
+def test_prepare_url_items_protocol_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+class ItemsProtocolMeta(type):
+    def __instancecheck__(self, value):
+        side_effects.append(["items-instancecheck", type(value).__name__])
+        return False
+
+
+class ItemsProtocol(metaclass=ItemsProtocolMeta):
+    pass
+
+
+original = utils._SupportsItems
+utils._SupportsItems = ItemsProtocol
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url("http://example.com/path", {"abc": "value"})
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/path",
+                {"abc": "value"},
+            )
+        ),
+    )
+finally:
+    utils._SupportsItems = original
+"""
+    )
+
+
+def test_prepare_url_byte_quoter_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import urllib.parse
+from requests.models import PreparedRequest
+
+
+class ByteQuoterFactory:
+    def __call__(self, safe):
+        side_effects.append(["byte-quoter-factory", safe])
+        raise RuntimeError("byte quoter callback")
+
+
+original = urllib.parse._byte_quoter_factory
+urllib.parse._byte_quoter_factory = ByteQuoterFactory()
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url(
+                "http://example.com/path",
+                {"name": "value/with/slashes"},
+            )
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/path",
+                {"name": "value/with/slashes"},
+            )
+        ),
+    )
+finally:
+    urllib.parse._byte_quoter_factory = original
+"""
+    )
+
+
 def test_prepare_headers_does_not_import_re_during_trial() -> None:
     _assert_matches_oracle(
         """
