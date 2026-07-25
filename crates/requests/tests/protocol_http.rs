@@ -9,6 +9,7 @@ use requests::{Client, HeaderName, HeaderValue, StatusCode};
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+const POST_EXCHANGE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -133,7 +134,7 @@ fn serve(listener: TcpListener, shutdown: &Receiver<()>) -> Result<Observation, 
 
         match shutdown.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => {
-                drain_request_bytes(&mut stream, &mut request_bytes)?;
+                drain_request_bytes_to_quiescence(&mut stream, &mut request_bytes)?;
                 accept_retries(
                     &listener,
                     &mut retained_connections,
@@ -200,25 +201,58 @@ fn read_through_request_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> 
     }
 }
 
+fn drain_request_bytes_to_quiescence(
+    stream: &mut TcpStream,
+    request: &mut Vec<u8>,
+) -> Result<(), String> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("restore accepted stream blocking mode: {error}"))?;
+    stream
+        .set_read_timeout(Some(POST_EXCHANGE_READ_TIMEOUT))
+        .map_err(|error| format!("set post-exchange read timeout: {error}"))?;
+
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => append_request_bytes(request, &buffer[..read])?,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("drain post-exchange request bytes: {error}")),
+        }
+    }
+}
+
 fn drain_request_bytes(stream: &mut TcpStream, request: &mut Vec<u8>) -> Result<(), String> {
     let mut buffer = [0_u8; 1024];
 
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => return Ok(()),
-            Ok(read) => {
-                if request.len() + read > MAX_REQUEST_BYTES {
-                    return Err(format!(
-                        "request exceeded {MAX_REQUEST_BYTES} bytes while checking for a GET body"
-                    ));
-                }
-                request.extend_from_slice(&buffer[..read]);
-            }
+            Ok(read) => append_request_bytes(request, &buffer[..read])?,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(format!("drain request bytes: {error}")),
         }
     }
+}
+
+fn append_request_bytes(request: &mut Vec<u8>, bytes: &[u8]) -> Result<(), String> {
+    if request.len() + bytes.len() > MAX_REQUEST_BYTES {
+        return Err(format!(
+            "request exceeded {MAX_REQUEST_BYTES} bytes while checking for a GET body"
+        ));
+    }
+    request.extend_from_slice(bytes);
+    Ok(())
 }
 
 #[test]
@@ -232,20 +266,23 @@ fn get_over_new_plain_connection() {
     let authority = server.authority();
     let host = HeaderValue::from_bytes(authority.as_bytes()).expect("valid loopback Host");
 
-    let exchange = runtime.block_on(tokio::time::timeout(EXCHANGE_TIMEOUT, async {
-        let client = Client::new()?;
-        let response = client
-            .get(&url)
-            .header(HeaderName::from_static("host"), host)
-            .send()
-            .await?;
-        let status = response.status();
-        let fixture_header = response.headers().get("x-fixture").cloned();
-        let response_url = response.url().to_owned();
-        let body = response.bytes().await?;
+    let exchange = runtime.block_on(async {
+        tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+            let client = Client::new()?;
+            let response = client
+                .get(&url)
+                .header(HeaderName::from_static("host"), host)
+                .send()
+                .await?;
+            let status = response.status();
+            let fixture_header = response.headers().get("x-fixture").cloned();
+            let response_url = response.url().to_owned();
+            let body = response.bytes().await?;
 
-        Ok::<_, requests::Error>((status, fixture_header, response_url, body))
-    }));
+            Ok::<_, requests::Error>((status, fixture_header, response_url, body))
+        })
+        .await
+    });
 
     let observation = server.finish();
     let (status, fixture_header, response_url, body) = match exchange {
