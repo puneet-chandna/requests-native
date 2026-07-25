@@ -47,8 +47,7 @@ impl From<Vec<u8>> for BodySource {
 mod tests {
     use std::collections::VecDeque;
     use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
 
     use bytes::Bytes;
 
@@ -72,12 +71,6 @@ mod tests {
         }
     }
 
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     #[test]
     fn body_stream_preserves_size_hint_and_poll_order_after_type_erasure() {
         let mut body = BodySource::Stream(Box::pin(ChunkBody {
@@ -92,8 +85,7 @@ mod tests {
         };
         assert_eq!(stream.size_hint(), Some(11));
 
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         let Poll::Ready(Some(Ok(first))) = stream.as_mut().poll_next(&mut context) else {
             panic!("expected first chunk");
         };
@@ -133,8 +125,7 @@ mod tests {
         let BodySource::Stream(stream) = &mut body else {
             panic!("expected stream body");
         };
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
 
         let Poll::Ready(Some(Ok(chunk))) = stream.as_mut().poll_next(&mut context) else {
             panic!("expected body chunk");

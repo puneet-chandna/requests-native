@@ -564,6 +564,17 @@ fn outcome_error(outcome: ProbeOutcome) -> PyErr {
     }
 }
 
+pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(_runtime_affinity_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_error_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_nested_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_signal_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_ready_error_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_cancel_ownership_probe, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_signal_was_cancelled, module)?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProbeAction, ProbeReply};
@@ -576,15 +587,4 @@ mod tests {
         assert_worker_payload::<ProbeAction>();
         assert_worker_payload::<ProbeReply>();
     }
-}
-
-pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(_runtime_affinity_probe, module)?)?;
-    module.add_function(wrap_pyfunction!(_runtime_error_probe, module)?)?;
-    module.add_function(wrap_pyfunction!(_runtime_nested_probe, module)?)?;
-    module.add_function(wrap_pyfunction!(_runtime_signal_probe, module)?)?;
-    module.add_function(wrap_pyfunction!(_runtime_ready_error_probe, module)?)?;
-    module.add_function(wrap_pyfunction!(_runtime_cancel_ownership_probe, module)?)?;
-    module.add_function(wrap_pyfunction!(_runtime_signal_was_cancelled, module)?)?;
-    Ok(())
 }

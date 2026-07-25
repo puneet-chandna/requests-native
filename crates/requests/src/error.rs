@@ -3,6 +3,7 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    Body,
     InvalidUrl,
 }
 
@@ -15,6 +16,14 @@ pub struct Error {
 impl Error {
     pub fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    #[doc(hidden)]
+    pub fn body_stream() -> Self {
+        Self {
+            kind: ErrorKind::Body,
+            message: "request body stream failed".to_owned(),
+        }
     }
 
     pub(crate) fn invalid_url(url: &str) -> Self {

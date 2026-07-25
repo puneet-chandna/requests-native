@@ -35,11 +35,16 @@ where
     A: WorkerPayload,
     R: WorkerPayload,
 {
-    pub(crate) async fn request(&self, action: A) -> Result<R, BridgeClosed> {
+    pub(crate) fn enqueue(&self, action: A) -> Result<oneshot::Receiver<R>, BridgeClosed> {
         let (reply, receive_reply) = oneshot::channel();
         self.sender
             .send(ActionRequest { action, reply })
             .map_err(|_| BridgeClosed::ActionReceiver)?;
+        Ok(receive_reply)
+    }
+
+    pub(crate) async fn request(&self, action: A) -> Result<R, BridgeClosed> {
+        let receive_reply = self.enqueue(action)?;
         receive_reply.await.map_err(|_| BridgeClosed::ReplySender)
     }
 }

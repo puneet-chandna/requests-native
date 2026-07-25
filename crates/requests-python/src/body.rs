@@ -4,16 +4,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use pyo3::exceptions::{
-    PyBaseException, PyNameError, PyRuntimeError, PyStopIteration, PyTypeError, PyValueError,
-};
+use pyo3::exceptions::{PyBaseException, PyNameError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyAny, PyAnyMethods, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyFunction, PyList,
-    PyListMethods, PyModule, PyString, PyStringMethods, PyTuple, PyTupleMethods, PyType,
+    PyAny, PyAnyMethods, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyFunction, PyIterator,
+    PyList, PyListMethods, PyModule, PyString, PyStringMethods, PyTuple, PyTupleMethods, PyType,
     PyTypeMethods,
 };
 use pyo3::wrap_pyfunction;
@@ -86,6 +84,8 @@ struct PythonBodyAdapter {
     state: AdapterState,
     size_hint: Option<u64>,
     failure: Arc<AtomicU8>,
+    queued_actions: Option<Arc<AtomicU8>>,
+    replies_observed: Option<Arc<AtomicU8>>,
 }
 
 impl PythonBodyAdapter {
@@ -101,6 +101,24 @@ impl PythonBodyAdapter {
             state: AdapterState::Idle,
             size_hint,
             failure,
+            queued_actions: None,
+            replies_observed: None,
+        }
+    }
+
+    fn with_lifecycle_counters(
+        mut self,
+        queued_actions: Arc<AtomicU8>,
+        replies_observed: Arc<AtomicU8>,
+    ) -> Self {
+        self.queued_actions = Some(queued_actions);
+        self.replies_observed = Some(replies_observed);
+        self
+    }
+
+    fn mark_reply_observed(&self) {
+        if let Some(replies_observed) = &self.replies_observed {
+            replies_observed.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -112,7 +130,14 @@ impl PythonBodyAdapter {
             AdapterMode::Next => BodyAction::Next,
         };
         let actions = self.actions.clone();
-        self.state = AdapterState::Waiting(Box::pin(async move { actions.request(action).await }));
+        let queued_actions = self.queued_actions.clone();
+        self.state = AdapterState::Waiting(Box::pin(async move {
+            let receive_reply = actions.enqueue(action)?;
+            if let Some(queued_actions) = queued_actions {
+                queued_actions.fetch_add(1, Ordering::AcqRel);
+            }
+            receive_reply.await.map_err(|_| BridgeClosed::ReplySender)
+        }));
     }
 
     fn fail(&mut self, failure: AdapterFailure) {
@@ -123,6 +148,11 @@ impl PythonBodyAdapter {
             Ordering::Acquire,
         );
         self.state = AdapterState::Done;
+    }
+
+    fn fail_item(&mut self, failure: AdapterFailure) -> Poll<Option<requests::Result<Bytes>>> {
+        self.fail(failure);
+        Poll::Ready(Some(Err(requests::Error::body_stream())))
     }
 }
 
@@ -138,28 +168,29 @@ impl AsyncBody for PythonBodyAdapter {
                 AdapterState::Waiting(reply) => match reply.as_mut().poll(context) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(BodyReply::Chunk(chunk))) => {
+                        this.mark_reply_observed();
                         this.state = AdapterState::Idle;
                         return Poll::Ready(Some(Ok(Bytes::from(chunk))));
                     }
                     Poll::Ready(Ok(BodyReply::Skip)) => {
+                        this.mark_reply_observed();
                         this.state = AdapterState::Idle;
                         return Poll::Ready(Some(Ok(Bytes::new())));
                     }
                     Poll::Ready(Ok(BodyReply::End)) => {
+                        this.mark_reply_observed();
                         this.state = AdapterState::Done;
                         return Poll::Ready(None);
                     }
                     Poll::Ready(Ok(BodyReply::Failed)) => {
-                        this.fail(AdapterFailure::Handler);
-                        return Poll::Ready(None);
+                        this.mark_reply_observed();
+                        return this.fail_item(AdapterFailure::Handler);
                     }
                     Poll::Ready(Err(BridgeClosed::ActionReceiver)) => {
-                        this.fail(AdapterFailure::ActionReceiver);
-                        return Poll::Ready(None);
+                        return this.fail_item(AdapterFailure::ActionReceiver);
                     }
                     Poll::Ready(Err(BridgeClosed::ReplySender)) => {
-                        this.fail(AdapterFailure::ReplySender);
-                        return Poll::Ready(None);
+                        return this.fail_item(AdapterFailure::ReplySender);
                     }
                 },
                 AdapterState::Done => return Poll::Ready(None),
@@ -174,8 +205,11 @@ impl AsyncBody for PythonBodyAdapter {
 
 enum OriginBodySource {
     Read,
-    Iterator(Py<PyAny>),
-    Once { pending: bool },
+    Iterator(Py<PyIterator>),
+    Once {
+        pending: bool,
+        cached_chunk: Option<Py<PyAny>>,
+    },
 }
 
 struct BodySelection {
@@ -293,10 +327,16 @@ fn body_action(
         (BodyAction::Next, OriginBodySource::Iterator(iterator)) => {
             next_body_chunk(py, iterator.bind(py))
         }
-        (BodyAction::Next, OriginBodySource::Once { pending }) => {
+        (
+            BodyAction::Next,
+            OriginBodySource::Once {
+                pending,
+                cached_chunk,
+            },
+        ) => {
             if *pending {
                 *pending = false;
-                once_body_chunk(py, owner.body.bind(py))
+                once_body_chunk(py, owner.body.bind(py), cached_chunk)
             } else {
                 Ok(BodyReply::End)
             }
@@ -320,11 +360,11 @@ fn read_body_chunk(py: Python<'_>, body: &Bound<'_, PyAny>, size: usize) -> PyRe
 }
 
 fn next_body_chunk(py: Python<'_>, iterator: &Bound<'_, PyAny>) -> PyResult<BodyReply> {
-    let builtins = PyModule::import(py, "builtins")?;
-    let chunk = match builtins.getattr("next")?.call1((iterator,)) {
-        Ok(chunk) => chunk,
-        Err(error) if error.is_instance_of::<PyStopIteration>(py) => return Ok(BodyReply::End),
-        Err(error) => return Err(error),
+    let mut iterator = iterator.cast::<PyIterator>()?.clone();
+    let chunk = match iterator.next() {
+        Some(Ok(chunk)) => chunk,
+        Some(Err(error)) => return Err(error),
+        None => return Ok(BodyReply::End),
     };
     if !chunk.is_truthy()? {
         return Ok(BodyReply::Skip);
@@ -332,7 +372,18 @@ fn next_body_chunk(py: Python<'_>, iterator: &Bound<'_, PyAny>) -> PyResult<Body
     Ok(BodyReply::Chunk(chunk_bytes(py, &chunk)?))
 }
 
-fn once_body_chunk(py: Python<'_>, body: &Bound<'_, PyAny>) -> PyResult<BodyReply> {
+fn once_body_chunk(
+    py: Python<'_>,
+    body: &Bound<'_, PyAny>,
+    cached_chunk: &mut Option<Py<PyAny>>,
+) -> PyResult<BodyReply> {
+    if let Some(chunk) = cached_chunk.take() {
+        let chunk = chunk.bind(py);
+        if !chunk.is_truthy()? {
+            return Ok(BodyReply::Skip);
+        }
+        return Ok(BodyReply::Chunk(chunk_bytes(py, chunk)?));
+    }
     if !body.is_truthy()? {
         return Ok(BodyReply::Skip);
     }
@@ -371,18 +422,25 @@ fn select_body_source(py: Python<'_>, body: &Bound<'_, PyAny>) -> PyResult<Optio
         return Ok(None);
     }
     if body.is_instance_of::<PyString>() {
-        let encoded = body.call_method1("encode", ("utf-8",))?;
+        let encoded = body.call_method0("encode")?;
+        let size_hint = encoded.len()? as u64;
         return Ok(Some(BodySelection {
             mode: AdapterMode::Next,
-            source: OriginBodySource::Once { pending: true },
-            size_hint: Some(encoded.cast::<PyBytes>()?.len()? as u64),
+            source: OriginBodySource::Once {
+                pending: true,
+                cached_chunk: Some(encoded.unbind()),
+            },
+            size_hint: Some(size_hint),
         }));
     }
     if body.is_instance_of::<PyBytes>() {
         return Ok(Some(BodySelection {
             mode: AdapterMode::Next,
-            source: OriginBodySource::Once { pending: true },
-            size_hint: Some(body.cast::<PyBytes>()?.len()? as u64),
+            source: OriginBodySource::Once {
+                pending: true,
+                cached_chunk: None,
+            },
+            size_hint: Some(body.len()? as u64),
         }));
     }
     if body.hasattr("read")? {
@@ -397,12 +455,15 @@ fn select_body_source(py: Python<'_>, body: &Bound<'_, PyAny>) -> PyResult<Optio
     match builtins.getattr("memoryview")?.call1((body,)) {
         Ok(view) => Ok(Some(BodySelection {
             mode: AdapterMode::Next,
-            source: OriginBodySource::Once { pending: true },
+            source: OriginBodySource::Once {
+                pending: true,
+                cached_chunk: None,
+            },
             size_hint: Some(view.getattr("nbytes")?.extract::<u64>()?),
         })),
         Err(error) if error.is_instance_of::<PyTypeError>(py) => {
             let iterator = match builtins.getattr("iter")?.call1((body,)) {
-                Ok(iterator) => iterator.unbind(),
+                Ok(iterator) => iterator.cast_into::<PyIterator>()?.unbind(),
                 Err(error) if error.is_instance_of::<PyTypeError>(py) => {
                     let representation = body.repr()?.to_str()?.to_owned();
                     return Err(PyTypeError::new_err(format!(
@@ -487,69 +548,7 @@ fn _body_stream_cancel_trial(
     subject: &Bound<'_, PyAny>,
     error: Py<PyAny>,
 ) -> PyResult<()> {
-    let body = subject.getattr("body")?;
-    let Some(mut selection) = select_body_source(py, &body)? else {
-        return Err(PyRuntimeError::new_err("cannot cancel an empty body"));
-    };
-    let owner = OriginBodyOwner {
-        body: body.unbind(),
-    };
-    let failure = Arc::new(AtomicU8::new(AdapterFailure::None as u8));
-    let worker_failure = Arc::clone(&failure);
-    let action_seen = Cell::new(false);
-    let mut handler_error = None;
-    let result = run_with_actions_and_signal_checker(
-        py,
-        move |actions| {
-            let mut adapter = Box::pin(PythonBodyAdapter::new(
-                actions,
-                selection.mode,
-                selection.size_hint,
-                worker_failure,
-            ));
-            async move {
-                if matches!(
-                    poll_fn(|context| adapter.as_mut().poll_next(context)).await,
-                    Some(Ok(_))
-                ) {
-                    future::pending::<()>().await;
-                }
-            }
-        },
-        |py, action| {
-            let reply = body_action(
-                py,
-                action,
-                &owner,
-                &mut selection.source,
-                &mut handler_error,
-            );
-            if !matches!(reply, BodyReply::Failed) {
-                action_seen.set(true);
-            }
-            reply
-        },
-        |py| {
-            if action_seen.get() {
-                Err(PyErr::from_value(error.bind(py).clone()))
-            } else {
-                Ok(())
-            }
-        },
-    );
-    match result {
-        Err(error) => Err(error),
-        Ok(()) => {
-            if let Some(error) = handler_error {
-                return Err(error);
-            }
-            let failure = body_failure(&failure);
-            if failure != AdapterFailure::None {
-                return Err(bridge_error(failure));
-            }
-            Ok(())
-        }
-    }
+    cancel_body_at_phase(py, subject, error, CancelPhase::ReplyObserved, None)
 }
 
 #[pyfunction]
@@ -558,29 +557,319 @@ fn _body_stream_cancel_before_poll_trial(
     subject: &Bound<'_, PyAny>,
     error: Py<PyAny>,
 ) -> PyResult<()> {
-    let body = subject.getattr("body")?;
-    let Some(selection) = select_body_source(py, &body)? else {
-        return Err(PyRuntimeError::new_err("cannot cancel an empty body"));
+    cancel_body_at_phase(py, subject, error, CancelPhase::BeforePoll, None)
+}
+
+#[pyfunction]
+fn _body_stream_cancel_phase_trial(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    error: Py<PyAny>,
+    phase: &str,
+    audit: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let phase = match phase {
+        "before-poll" => CancelPhase::BeforePoll,
+        "queued-before-dequeue" => CancelPhase::QueuedBeforeDequeue,
+        "reply-observed" => CancelPhase::ReplyObserved,
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "unknown body cancellation phase: {phase}"
+            )));
+        }
     };
-    let owner = OriginBodyOwner {
-        body: body.unbind(),
-    };
+    cancel_body_at_phase(py, subject, error, phase, Some(audit))
+}
+
+#[derive(Clone, Copy)]
+enum CancelPhase {
+    BeforePoll,
+    QueuedBeforeDequeue,
+    ReplyObserved,
+}
+
+const WORKER_STARTING: u8 = 0;
+const WORKER_AWAITING_REPLY: u8 = 1;
+const WORKER_REPLY_OBSERVED: u8 = 2;
+const WORKER_DROPPED: u8 = 3;
+const PHASE_WAIT: Duration = Duration::from_millis(500);
+
+struct WorkerDropGuard {
+    phase: Arc<AtomicU8>,
+}
+
+impl Drop for WorkerDropGuard {
+    fn drop(&mut self) {
+        self.phase.store(WORKER_DROPPED, Ordering::Release);
+    }
+}
+
+fn wait_for_worker_phase(
+    py: Python<'_>,
+    phase: &AtomicU8,
+    expected: u8,
+    label: &str,
+) -> PyResult<()> {
+    let deadline = Instant::now() + PHASE_WAIT;
+    while phase.load(Ordering::Acquire) != expected {
+        if Instant::now() >= deadline {
+            return Err(PyRuntimeError::new_err(format!(
+                "body worker did not reach {label}"
+            )));
+        }
+        py.detach(|| std::thread::sleep(Duration::from_millis(1)));
+    }
+    Ok(())
+}
+
+fn require_worker_dropped(phase: &AtomicU8) -> PyResult<()> {
+    if phase.load(Ordering::Acquire) == WORKER_DROPPED {
+        Ok(())
+    } else {
+        Err(PyRuntimeError::new_err(
+            "body worker was not dropped before its origin owner",
+        ))
+    }
+}
+
+fn cancel_body_at_phase(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    error: Py<PyAny>,
+    phase: CancelPhase,
+    audit: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
+    match phase {
+        CancelPhase::BeforePoll => cancel_before_poll(py, error, audit),
+        CancelPhase::QueuedBeforeDequeue => cancel_queued_before_dequeue(py, error, audit),
+        CancelPhase::ReplyObserved => {
+            let body = subject.getattr("body")?;
+            if body.is_none() {
+                return Err(PyRuntimeError::new_err("cannot cancel an empty body"));
+            }
+            let owner = OriginBodyOwner {
+                body: body.unbind(),
+            };
+            let result = cancel_after_reply(py, error, &owner, audit);
+            drop(owner);
+            result
+        }
+    }
+}
+
+fn cancel_before_poll(
+    py: Python<'_>,
+    error: Py<PyAny>,
+    audit: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
     let failure = Arc::new(AtomicU8::new(AdapterFailure::None as u8));
+    let worker_phase = Arc::new(AtomicU8::new(WORKER_STARTING));
+    let worker_phase_guard = WorkerDropGuard {
+        phase: Arc::clone(&worker_phase),
+    };
+    let queued_actions = Arc::new(AtomicU8::new(0));
+    let worker_queued_actions = Arc::clone(&queued_actions);
+    let replies_observed = Arc::new(AtomicU8::new(0));
+    let worker_replies_observed = Arc::clone(&replies_observed);
+    let action_count = Cell::new(0_u8);
     let result = run_with_actions_and_signal_checker(
         py,
         move |actions| {
-            let adapter =
-                PythonBodyAdapter::new(actions, selection.mode, selection.size_hint, failure);
+            let adapter = PythonBodyAdapter::new(actions, AdapterMode::Next, None, failure)
+                .with_lifecycle_counters(worker_queued_actions, worker_replies_observed);
             async move {
+                let _worker_phase_guard = worker_phase_guard;
                 let _adapter = adapter;
                 future::pending::<()>().await
             }
         },
-        |_py, _action| BodyReply::Failed,
+        |_py, _action| {
+            action_count.set(action_count.get().saturating_add(1));
+            BodyReply::Failed
+        },
         |py| Err(PyErr::from_value(error.bind(py).clone())),
     );
-    drop(selection.source);
-    drop(owner);
+    require_worker_dropped(&worker_phase)?;
+    let queued_actions = queued_actions.load(Ordering::Acquire);
+    let replies_observed = replies_observed.load(Ordering::Acquire);
+    if queued_actions != 0 || action_count.get() != 0 || replies_observed != 0 {
+        return Err(PyRuntimeError::new_err(
+            "body action ran before the adapter was polled",
+        ));
+    }
+    if let Some(audit) = audit {
+        audit.set_item("queued", queued_actions)?;
+        audit.set_item("execute", action_count.get())?;
+        audit.set_item("reply_observed", replies_observed != 0)?;
+        audit.set_item(
+            "worker_dropped",
+            worker_phase.load(Ordering::Acquire) == WORKER_DROPPED,
+        )?;
+    }
+    result
+}
+
+fn cancel_queued_before_dequeue(
+    py: Python<'_>,
+    error: Py<PyAny>,
+    audit: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
+    let failure = Arc::new(AtomicU8::new(AdapterFailure::None as u8));
+    let worker_phase = Arc::new(AtomicU8::new(WORKER_STARTING));
+    let worker_poll_phase = Arc::clone(&worker_phase);
+    let worker_signal_phase = Arc::clone(&worker_phase);
+    let worker_phase_guard = WorkerDropGuard {
+        phase: Arc::clone(&worker_phase),
+    };
+    let queued_actions = Arc::new(AtomicU8::new(0));
+    let worker_queued_actions = Arc::clone(&queued_actions);
+    let replies_observed = Arc::new(AtomicU8::new(0));
+    let worker_replies_observed = Arc::clone(&replies_observed);
+    let action_count = Cell::new(0_u8);
+    let result = run_with_actions_and_signal_checker(
+        py,
+        move |actions| {
+            let mut adapter = Box::pin(
+                PythonBodyAdapter::new(actions, AdapterMode::Next, None, failure)
+                    .with_lifecycle_counters(worker_queued_actions, worker_replies_observed),
+            );
+            async move {
+                let _worker_phase_guard = worker_phase_guard;
+                poll_fn(|context| match adapter.as_mut().poll_next(context) {
+                    Poll::Pending => {
+                        worker_poll_phase.store(WORKER_AWAITING_REPLY, Ordering::Release);
+                        Poll::Pending
+                    }
+                    Poll::Ready(_) => Poll::Ready(()),
+                })
+                .await;
+            }
+        },
+        |_py, _action| {
+            action_count.set(action_count.get().saturating_add(1));
+            BodyReply::Failed
+        },
+        |py| {
+            wait_for_worker_phase(
+                py,
+                &worker_signal_phase,
+                WORKER_AWAITING_REPLY,
+                "queued-before-dequeue",
+            )?;
+            Err(PyErr::from_value(error.bind(py).clone()))
+        },
+    );
+    require_worker_dropped(&worker_phase)?;
+    let queued_actions = queued_actions.load(Ordering::Acquire);
+    let replies_observed = replies_observed.load(Ordering::Acquire);
+    if queued_actions != 1 || action_count.get() != 0 || replies_observed != 0 {
+        return Err(PyRuntimeError::new_err(
+            "queued body action executed before cancellation",
+        ));
+    }
+    if let Some(audit) = audit {
+        audit.set_item("queued", queued_actions)?;
+        audit.set_item("execute", action_count.get())?;
+        audit.set_item("reply_observed", replies_observed != 0)?;
+        audit.set_item(
+            "worker_dropped",
+            worker_phase.load(Ordering::Acquire) == WORKER_DROPPED,
+        )?;
+    }
+    result
+}
+
+fn cancel_after_reply(
+    py: Python<'_>,
+    error: Py<PyAny>,
+    owner: &OriginBodyOwner,
+    audit: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
+    let Some(mut selection) = select_body_source(py, owner.body.bind(py))? else {
+        return Err(PyRuntimeError::new_err("cannot cancel an empty body"));
+    };
+    let failure = Arc::new(AtomicU8::new(AdapterFailure::None as u8));
+    let worker_failure = Arc::clone(&failure);
+    let worker_phase = Arc::new(AtomicU8::new(WORKER_STARTING));
+    let worker_poll_phase = Arc::clone(&worker_phase);
+    let worker_signal_phase = Arc::clone(&worker_phase);
+    let worker_phase_guard = WorkerDropGuard {
+        phase: Arc::clone(&worker_phase),
+    };
+    let queued_actions = Arc::new(AtomicU8::new(0));
+    let worker_queued_actions = Arc::clone(&queued_actions);
+    let replies_observed = Arc::new(AtomicU8::new(0));
+    let worker_replies_observed = Arc::clone(&replies_observed);
+    let action_count = Cell::new(0_u8);
+    let mut handler_error = None;
+    let result = run_with_actions_and_signal_checker(
+        py,
+        move |actions| {
+            let mut adapter = Box::pin(
+                PythonBodyAdapter::new(
+                    actions,
+                    selection.mode,
+                    selection.size_hint,
+                    worker_failure,
+                )
+                .with_lifecycle_counters(worker_queued_actions, worker_replies_observed),
+            );
+            async move {
+                let _worker_phase_guard = worker_phase_guard;
+                if matches!(
+                    poll_fn(|context| adapter.as_mut().poll_next(context)).await,
+                    Some(Ok(_))
+                ) {
+                    worker_poll_phase.store(WORKER_REPLY_OBSERVED, Ordering::Release);
+                    future::pending::<()>().await;
+                }
+            }
+        },
+        |py, action| {
+            let reply = body_action(py, action, owner, &mut selection.source, &mut handler_error);
+            if !matches!(reply, BodyReply::Failed) {
+                action_count.set(action_count.get().saturating_add(1));
+            }
+            reply
+        },
+        |py| {
+            if action_count.get() == 0 {
+                return Ok(());
+            }
+            wait_for_worker_phase(
+                py,
+                &worker_signal_phase,
+                WORKER_REPLY_OBSERVED,
+                "reply-observed",
+            )?;
+            Err(PyErr::from_value(error.bind(py).clone()))
+        },
+    );
+    require_worker_dropped(&worker_phase)?;
+    if let Some(error) = handler_error {
+        return Err(error);
+    }
+    let queued_actions = queued_actions.load(Ordering::Acquire);
+    let replies_observed = replies_observed.load(Ordering::Acquire);
+    if queued_actions != 1 || action_count.get() != 1 || replies_observed != 1 {
+        return Err(PyRuntimeError::new_err(format!(
+            "reply-observed cancellation mismatch: queued={queued_actions}, executed={}, replies={replies_observed}",
+            action_count.get(),
+        )));
+    }
+    let failure = body_failure(&failure);
+    if failure != AdapterFailure::None {
+        return Err(bridge_error(failure));
+    }
+    if let Some(audit) = audit {
+        audit.set_item("total_queued", queued_actions)?;
+        audit.set_item("execute", action_count.get())?;
+        audit.set_item("reply_observed", replies_observed != 0)?;
+        audit.set_item(
+            "worker_dropped",
+            worker_phase.load(Ordering::Acquire) == WORKER_DROPPED,
+        )?;
+    }
     result
 }
 
@@ -661,7 +950,7 @@ fn _body_stream_disconnect_trial(
             let _ = poll_adapter(&mut adapter);
             AdapterFailure::ActionReceiver
         }
-        "reply-receiver" => {
+        "reply-sender" => {
             if !poll_adapter(&mut adapter).is_pending() {
                 return Err(PyRuntimeError::new_err(
                     "reply disconnect did not begin a body action",
@@ -772,7 +1061,9 @@ fn prepare_body(
                         let wrapped = globals
                             .require("InvalidJSONError")?
                             .call((error.value(py),), Some(&kwargs))?;
-                        return Err(PyErr::from_value(wrapped));
+                        let wrapped = PyErr::from_value(wrapped);
+                        wrapped.set_context(py, Some(error));
+                        return Err(wrapped);
                     }
                     return Err(error);
                 }
@@ -982,11 +1273,11 @@ fn prepare_content_length(
     body: &Bound<'_, PyAny>,
     globals: &GlobalResolver<'_>,
 ) -> PyResult<()> {
-    let headers = subject.getattr("headers")?;
     if !body.is_none() {
         let length = globals.require("super_len")?.call1((body,))?;
         if length.is_truthy()? {
             let length = globals.require("builtin_str")?.call1((&length,))?;
+            let headers = subject.getattr("headers")?;
             headers.set_item("Content-Length", length)?;
         }
         return Ok(());
@@ -994,10 +1285,11 @@ fn prepare_content_length(
 
     let method = subject.getattr("method")?;
     let no_body_methods = PyTuple::new(py, ["GET", "HEAD"])?;
-    if !no_body_methods.contains(&method)?
-        && headers.call_method1("get", ("Content-Length",))?.is_none()
-    {
-        headers.set_item("Content-Length", "0")?;
+    if !no_body_methods.contains(&method)? {
+        let headers = subject.getattr("headers")?;
+        if headers.call_method1("get", ("Content-Length",))?.is_none() {
+            headers.set_item("Content-Length", "0")?;
+        }
     }
     Ok(())
 }
@@ -1032,13 +1324,16 @@ fn _rewind_body_trial(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py
             .call1((&position, globals.require("integer_types")?))?
             .is_truthy()?;
         if can_rewind {
-            match seek.call1((&position,)) {
+            let seek_position = subject.getattr("_body_position")?;
+            match seek.call1((&seek_position,)) {
                 Ok(_) => return Ok(py.None()),
                 Err(error) => {
                     if exception_matches(py, &error, &globals.require("OSError")?)? {
-                        return Err(unrewindable_error(
+                        return Err(unrewindable_error_with_context(
+                            py,
                             &globals,
                             "An error occurred when rewinding request body for redirect.",
+                            error,
                         )?);
                     }
                     return Err(error);
@@ -1058,6 +1353,21 @@ fn unrewindable_error(globals: &GlobalResolver<'_>, message: &str) -> PyResult<P
             .require("UnrewindableBodyError")?
             .call1((message,))?,
     ))
+}
+
+fn unrewindable_error_with_context(
+    py: Python<'_>,
+    globals: &GlobalResolver<'_>,
+    message: &str,
+    context: PyErr,
+) -> PyResult<PyErr> {
+    let error = PyErr::from_value(
+        globals
+            .require("UnrewindableBodyError")?
+            .call1((message,))?,
+    );
+    error.set_context(py, Some(context));
+    Ok(error)
 }
 
 fn value_record(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
@@ -1114,6 +1424,23 @@ fn _body_fields_snapshot(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult
     snapshot.set_item("body", value_record(py, &body)?)?;
     snapshot.set_item("position", value_record(py, &position)?)?;
     Ok(snapshot.into_any().unbind())
+}
+
+pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(_prepare_body_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_prepare_content_length_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_rewind_body_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_body_stream_collect_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        _body_stream_cancel_before_poll_trial,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(_body_stream_cancel_phase_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_body_stream_cancel_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_body_stream_poll_state_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_body_stream_disconnect_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_body_fields_snapshot, module)?)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1224,20 +1551,4 @@ mod tests {
             AdapterFailure::ReplySender
         );
     }
-}
-
-pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(_prepare_body_trial, module)?)?;
-    module.add_function(wrap_pyfunction!(_prepare_content_length_trial, module)?)?;
-    module.add_function(wrap_pyfunction!(_rewind_body_trial, module)?)?;
-    module.add_function(wrap_pyfunction!(_body_stream_collect_trial, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        _body_stream_cancel_before_poll_trial,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(_body_stream_cancel_trial, module)?)?;
-    module.add_function(wrap_pyfunction!(_body_stream_poll_state_trial, module)?)?;
-    module.add_function(wrap_pyfunction!(_body_stream_disconnect_trial, module)?)?;
-    module.add_function(wrap_pyfunction!(_body_fields_snapshot, module)?)?;
-    Ok(())
 }

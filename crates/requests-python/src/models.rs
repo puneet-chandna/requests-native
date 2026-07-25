@@ -2160,17 +2160,6 @@ fn raw_instance_dict<'py>(
         .cast_into::<PyDict>()?)
 }
 
-fn trusted_bound_method<'py>(
-    py: Python<'py>,
-    subject: &Bound<'py, PyAny>,
-    name: &str,
-    expected: &Py<PyAny>,
-    expected_trust: &CanonicalFunction,
-) -> PyResult<(Bound<'py, PyAny>, bool)> {
-    let callable = subject.getattr(name)?;
-    trusted_bound_method_with_callable(py, subject, name, callable, expected, expected_trust)
-}
-
 fn trusted_bound_method_with_callable<'py>(
     py: Python<'py>,
     subject: &Bound<'py, PyAny>,
@@ -2251,8 +2240,10 @@ pub(crate) fn trusted_prepared_body_method<'py>(
 }
 
 pub(crate) fn trusted_rewind_body(py: Python<'_>) -> PyResult<(Bound<'_, PyAny>, bool)> {
-    let models = models_state(py)?;
-    let callable = models.utils.bind(py).getattr("rewind_body")?;
+    let callable = PyModule::import(py, "requests.utils")?.getattr("rewind_body")?;
+    let Ok(models) = models_state(py) else {
+        return Ok((callable, false));
+    };
     let Ok(state) = rewind_body_state(py) else {
         return Ok((callable, false));
     };
@@ -2268,11 +2259,15 @@ fn _prepare_method_trial(
     subject: &Bound<'_, PyAny>,
     method: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let state = models_state(py)?;
-    let (callable, trusted) = trusted_bound_method(
+    let callable = subject.getattr("prepare_method")?;
+    let Ok(state) = models_state(py) else {
+        return Ok(callable.call1((method,))?.unbind());
+    };
+    let (callable, trusted) = trusted_bound_method_with_callable(
         py,
         subject,
         "prepare_method",
+        callable,
         &state.prepare_method,
         &state.prepare_method_trust,
     )?;
@@ -2334,11 +2329,15 @@ fn _prepare_url_trial(
     url: &Bound<'_, PyAny>,
     params: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let state = models_state(py)?;
-    let (callable, trusted) = trusted_bound_method(
+    let callable = subject.getattr("prepare_url")?;
+    let Ok(state) = models_state(py) else {
+        return Ok(callable.call1((url, params))?.unbind());
+    };
+    let (callable, trusted) = trusted_bound_method_with_callable(
         py,
         subject,
         "prepare_url",
+        callable,
         &state.prepare_url,
         &state.prepare_url_trust,
     )?;
@@ -2664,11 +2663,15 @@ fn _prepare_headers_trial(
     subject: &Bound<'_, PyAny>,
     headers: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let state = models_state(py)?;
-    let (callable, trusted) = trusted_bound_method(
+    let callable = subject.getattr("prepare_headers")?;
+    let Ok(state) = models_state(py) else {
+        return Ok(callable.call1((headers,))?.unbind());
+    };
+    let (callable, trusted) = trusted_bound_method_with_callable(
         py,
         subject,
         "prepare_headers",
+        callable,
         &state.prepare_headers,
         &state.prepare_headers_trust,
     )?;
@@ -3006,8 +3009,6 @@ fn _prepared_fields_snapshot(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyRe
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    let py = module.py();
-    let _ = models_state(py)?;
     module.add_function(wrap_pyfunction!(_prepare_method_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_prepare_url_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_prepare_headers_trial, module)?)?;
