@@ -1383,7 +1383,7 @@ fn canonical_code_from_module<'py>(
     })
 }
 
-fn canonical_code<'py>(
+pub(crate) fn canonical_code<'py>(
     py: Python<'py>,
     module_name: &str,
     qualname: &str,
