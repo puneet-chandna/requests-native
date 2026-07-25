@@ -2116,6 +2116,96 @@ finally:
     )
 
 
+def test_prepare_url_result_type_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+class ReplacementUrl:
+    def __call__(self, *args, **kwargs):
+        side_effects.append(["replacement-url", args, kwargs])
+        return (
+            "http",
+            None,
+            "rewritten.example",
+            None,
+            "/rewritten",
+            None,
+            None,
+        )
+
+
+original = url_utils.Url
+url_utils.Url = ReplacementUrl()
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url("http://example.com/a path", None)
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/a path",
+                None,
+            )
+        ),
+    )
+finally:
+    url_utils.Url = original
+"""
+    )
+
+
+def test_prepare_url_imported_helper_replaced_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+class ToString:
+    def __call__(self, *args, **kwargs):
+        side_effects.append(["to-str", args, kwargs])
+        raise RuntimeError("to_str callback")
+
+
+original = url_utils.to_str
+url_utils.to_str = ToString()
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_url("http://example.com/path", None)
+            if _requests_rust is None
+            else _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/path",
+                None,
+            )
+        ),
+    )
+finally:
+    url_utils.to_str = original
+"""
+    )
+
+
 def test_prepare_url_scheme_tuple_subclass_before_extension_import() -> None:
     _assert_matches_oracle_before_extension_import(
         _PREIMPORT_CAPTURE_HELPER
@@ -2337,6 +2427,85 @@ finally:
     utils._HEADER_VALIDATORS_STR = original_text_validators
     utils._HEADER_VALIDATORS_BYTE = original_byte_validators
     re.Pattern = original_pattern_type
+"""
+    )
+
+
+def test_prepare_headers_descriptor_lookalikes_before_extension_import() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+class method_descriptor:
+    def __init__(self, name):
+        self.__name__ = name
+        self.__objclass__ = None
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+
+        def invoke(value):
+            side_effects.append([self.__name__, value])
+            return True
+
+        return invoke
+
+
+class member_descriptor:
+    def __init__(self, name):
+        self.__name__ = name
+        self.__objclass__ = None
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        return instance._pattern if self.__name__ == "pattern" else instance._flags
+
+
+class Pattern:
+    __module__ = "re"
+    match = method_descriptor("match")
+    search = method_descriptor("search")
+    pattern = member_descriptor("pattern")
+    flags = member_descriptor("flags")
+
+    def __init__(self, pattern, flags):
+        self._pattern = pattern
+        self._flags = flags
+
+
+for name in ("match", "search", "pattern", "flags"):
+    Pattern.__dict__[name].__objclass__ = Pattern
+
+original = utils._HEADER_VALIDATORS_STR
+utils._HEADER_VALIDATORS_STR = (
+    Pattern(r"^[^:\\s][^:\\r\\n]*\\Z", 32),
+    Pattern(r"^\\S[^\\r\\n]*\\Z|^\\Z", 32),
+)
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_headers({"Name": " leading"})
+            if _requests_rust is None
+            else _requests_rust._prepare_headers_trial(
+                subject,
+                {"Name": " leading"},
+            )
+        ),
+    )
+finally:
+    utils._HEADER_VALIDATORS_STR = original
 """
     )
 
