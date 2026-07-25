@@ -465,6 +465,120 @@ result = seen
     assert rewrite.stderr == ""
 
 
+def test_pristine_trials_do_not_emit_sensitive_function_attribute_events() -> None:
+    _assert_matches_oracle(
+        """
+import sys
+from requests.models import PreparedRequest
+
+
+sensitive_names = {
+    "__builtins__",
+    "__code__",
+    "__defaults__",
+    "__globals__",
+    "__kwdefaults__",
+}
+
+
+def observe(event, arguments):
+    if (
+        event == "object.__getattr__"
+        and len(arguments) > 1
+        and arguments[1] in sensitive_names
+    ):
+        side_effects.append(["sensitive-function-read", arguments[1]])
+
+
+sys.addaudithook(observe)
+
+method_subject = PreparedRequest()
+method = capture(
+    "method",
+    method_subject,
+    lambda: prepare_method_call(method_subject, "get"),
+)
+
+url_subject = PreparedRequest()
+url = capture(
+    "url",
+    url_subject,
+    lambda: prepare_url_call(
+        url_subject,
+        "http://example.com/a path",
+        {"x": "a b"},
+    ),
+)
+
+headers_subject = PreparedRequest()
+headers = capture(
+    "headers",
+    headers_subject,
+    lambda: prepare_headers_call(headers_subject, {"Name": "value"}),
+)
+
+result = [method, url, headers]
+"""
+    )
+
+
+def test_sensitive_function_attribute_event_error_preserves_frozen_behavior() -> None:
+    _assert_matches_oracle(
+        """
+import sys
+from requests.models import PreparedRequest
+
+
+sensitive_names = {
+    "__builtins__",
+    "__code__",
+    "__defaults__",
+    "__globals__",
+    "__kwdefaults__",
+}
+
+
+def block(event, arguments):
+    if (
+        event == "object.__getattr__"
+        and len(arguments) > 1
+        and arguments[1] in sensitive_names
+    ):
+        raise RuntimeError("blocked sensitive function read")
+
+
+sys.addaudithook(block)
+
+method_subject = PreparedRequest()
+method = capture(
+    "method",
+    method_subject,
+    lambda: prepare_method_call(method_subject, "get"),
+)
+
+url_subject = PreparedRequest()
+url = capture(
+    "url",
+    url_subject,
+    lambda: prepare_url_call(
+        url_subject,
+        "http://example.com/a path",
+        {"x": "a b"},
+    ),
+)
+
+headers_subject = PreparedRequest()
+headers = capture(
+    "headers",
+    headers_subject,
+    lambda: prepare_headers_call(headers_subject, {"Name": "value"}),
+)
+
+result = [method, url, headers]
+"""
+    )
+
+
 def test_prepare_method_shadowed_descriptor_is_resolved_once() -> None:
     _assert_matches_oracle(
         """
