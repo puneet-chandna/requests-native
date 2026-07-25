@@ -736,15 +736,6 @@ fn known_runtime_protocol_is(
     let Ok(class) = current.cast::<PyType>() else {
         return Ok(false);
     };
-    let current_module = class.getattr("__module__")?;
-    let current_name = class.getattr("__name__")?;
-    if !current_module.is_exact_instance_of::<PyString>()
-        || !current_name.is_exact_instance_of::<PyString>()
-        || current_module.cast::<PyString>()?.to_str()? != module
-        || current_name.cast::<PyString>()?.to_str()? != name
-    {
-        return Ok(false);
-    }
     let typing_namespace = typing_globals.bind(py);
     let protocol = typing_namespace
         .get_item("Protocol")?
@@ -753,6 +744,15 @@ fn known_runtime_protocol_is(
         .get_item("Generic")?
         .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("typing.Generic missing"))?;
     if !class.get_type().is(protocol.get_type()) {
+        return Ok(false);
+    }
+    let current_module = class.getattr("__module__")?;
+    let current_name = class.getattr("__name__")?;
+    if !current_module.is_exact_instance_of::<PyString>()
+        || !current_name.is_exact_instance_of::<PyString>()
+        || current_module.cast::<PyString>()?.to_str()? != module
+        || current_name.cast::<PyString>()?.to_str()? != name
+    {
         return Ok(false);
     }
     let mro = class.mro();

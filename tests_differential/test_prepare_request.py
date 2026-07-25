@@ -2629,7 +2629,7 @@ finally:
     )
 
 
-def test_prepare_url_protocol_proof_rejects_custom_metaclass_without_callbacks() -> None:
+def test_prepare_url_protocol_proof_avoids_custom_metaclass() -> None:
     _assert_matches_oracle(
         """
 import requests._types as model_types
