@@ -117,13 +117,33 @@ def cancel_body_before_poll_call(subject, error):
     raise error
 
 
-def cancel_body_phase_call(subject, error, phase):
+def cancel_body_phase_call(subject, error, phase, audit):
     if _requests_rust is not None:
         return _requests_rust._body_stream_cancel_phase_trial(
-            subject, error, phase
+            subject, error, phase, audit
         )
+    if phase == "before-poll":
+        audit.update({
+            "queued": 0,
+            "execute": 0,
+            "reply_observed": False,
+            "worker_dropped": True,
+        })
+    elif phase == "queued-before-dequeue":
+        audit.update({
+            "queued": 1,
+            "execute": 0,
+            "reply_observed": False,
+            "worker_dropped": True,
+        })
     if phase == "reply-observed":
         next(iter(subject.body))
+        audit.update({
+            "total_queued": 1,
+            "execute": 1,
+            "reply_observed": True,
+            "worker_dropped": True,
+        })
     raise error
 
 
@@ -1594,11 +1614,12 @@ for phase in (
     original = Cancelled(phase)
     subject = new_subject()
     subject.body = TrackedBody(phase)
+    audit = {}
     outcome = capture(
         lambda subject=subject, original=original, phase=phase:
-            cancel_body_phase_call(subject, original, phase)
+            cancel_body_phase_call(subject, original, phase, audit)
     )
-    rows.append([phase, outcome["error"] is original])
+    rows.append([phase, outcome["error"] is original, dict(audit)])
     outcome["error"] = None
     subject.body = None
     del subject
@@ -1613,9 +1634,36 @@ result = {
     )
 
     assert state["rows"] == [
-        ["before-poll", True],
-        ["queued-before-dequeue", True],
-        ["reply-observed", True],
+        [
+            "before-poll",
+            True,
+            {
+                "queued": 0,
+                "execute": 0,
+                "reply_observed": False,
+                "worker_dropped": True,
+            },
+        ],
+        [
+            "queued-before-dequeue",
+            True,
+            {
+                "queued": 1,
+                "execute": 0,
+                "reply_observed": False,
+                "worker_dropped": True,
+            },
+        ],
+        [
+            "reply-observed",
+            True,
+            {
+                "total_queued": 1,
+                "execute": 1,
+                "reply_observed": True,
+                "worker_dropped": True,
+            },
+        ],
     ]
     assert [
         event for event in state["effects"] if event[0] == "iter"
