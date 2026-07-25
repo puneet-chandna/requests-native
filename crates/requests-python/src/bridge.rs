@@ -4,7 +4,16 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-pub(crate) fn action_channel<A, R>() -> (ActionSender<A, R>, ActionReceiver<A, R>) {
+/// Marker for payloads whose ownership may safely move to or be destroyed on
+/// a runtime worker. Implementations are an explicit crate-local inventory;
+/// Python handles and Python-controlled destructors must never implement it.
+pub(crate) trait WorkerPayload: Send + 'static {}
+
+pub(crate) fn action_channel<A, R>() -> (ActionSender<A, R>, ActionReceiver<A, R>)
+where
+    A: WorkerPayload,
+    R: WorkerPayload,
+{
     let (sender, receiver) = mpsc::channel();
     (ActionSender { sender }, ActionReceiver { receiver })
 }
@@ -21,17 +30,17 @@ impl<A, R> Clone for ActionSender<A, R> {
     }
 }
 
-impl<A, R> ActionSender<A, R> {
+impl<A, R> ActionSender<A, R>
+where
+    A: WorkerPayload,
+    R: WorkerPayload,
+{
     pub(crate) async fn request(&self, action: A) -> Result<R, BridgeClosed> {
         let (reply, receive_reply) = oneshot::channel();
         self.sender
             .send(ActionRequest { action, reply })
             .map_err(|_| BridgeClosed::ActionReceiver)?;
         receive_reply.await.map_err(|_| BridgeClosed::ReplySender)
-    }
-
-    pub(crate) async fn request_owned(self, action: A) -> Result<R, BridgeClosed> {
-        self.request(action).await
     }
 }
 

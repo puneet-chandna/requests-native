@@ -12,7 +12,7 @@ use requests::blocking::{
     BlockingDriverError, BlockingRuntimeDriver, BlockingSubmission, BlockingTaskError,
 };
 
-use crate::bridge::{ActionReceiver, ActionSender, BridgeClosed, action_channel};
+use crate::bridge::{ActionReceiver, ActionSender, BridgeClosed, WorkerPayload, action_channel};
 
 const WAKE_INTERVAL: Duration = Duration::from_millis(10);
 const CANCEL_WAIT: Duration = Duration::from_millis(500);
@@ -36,6 +36,9 @@ enum ProbeReply {
     Nested(NestedReport),
     HandlerFailed,
 }
+
+impl WorkerPayload for ProbeAction {}
+impl WorkerPayload for ProbeReply {}
 
 #[derive(Debug)]
 enum ProbeOutcome {
@@ -216,8 +219,8 @@ pub(crate) fn run_with_actions<T, A, R, Fut, Build, Execute>(
 ) -> PyResult<T>
 where
     T: Send + 'static,
-    A: Send + 'static,
-    R: Send + 'static,
+    A: WorkerPayload,
+    R: WorkerPayload,
     Fut: Future<Output = T> + Send + 'static,
     Build: FnOnce(ActionSender<A, R>) -> Fut,
     Execute: for<'py> FnMut(Python<'py>, A) -> R,
@@ -237,8 +240,8 @@ pub(crate) fn run_with_actions_and_signal_checker<T, A, R, Fut, Build, Execute, 
 ) -> PyResult<T>
 where
     T: Send + 'static,
-    A: Send + 'static,
-    R: Send + 'static,
+    A: WorkerPayload,
+    R: WorkerPayload,
     Fut: Future<Output = T> + Send + 'static,
     Build: FnOnce(ActionSender<A, R>) -> Fut,
     Execute: for<'py> FnMut(Python<'py>, A) -> R,
