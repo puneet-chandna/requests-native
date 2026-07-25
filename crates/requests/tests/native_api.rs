@@ -1,8 +1,30 @@
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use bytes::Bytes;
 use requests::{
-    BodySource, ErrorKind, HeaderMap, HeaderName, HeaderValue, Method, RequestBuilder, StatusCode,
-    Uri, Version,
+    AsyncBody, BodySource, ErrorKind, HeaderMap, HeaderName, HeaderValue, Method, RequestBuilder,
+    StatusCode, Uri, Version,
 };
+
+struct PublicStream {
+    chunks: VecDeque<Bytes>,
+    size_hint: Option<u64>,
+}
+
+impl AsyncBody for PublicStream {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<requests::Result<Bytes>>> {
+        Poll::Ready(self.chunks.pop_front().map(Ok))
+    }
+
+    fn size_hint(&self) -> Option<u64> {
+        self.size_hint
+    }
+}
 
 #[test]
 fn request_preserves_method_url_headers_and_an_empty_body() {
@@ -92,6 +114,22 @@ fn bytes_bodies_accept_shared_and_owned_bytes() {
         BodySource::Empty => panic!("expected bytes body"),
         _ => panic!("expected bytes body"),
     }
+}
+
+#[test]
+fn public_stream_body_survives_request_builder_type_erasure() {
+    let request = RequestBuilder::new(Method::POST, "https://example.test/stream")
+        .body(BodySource::Stream(Box::pin(PublicStream {
+            chunks: VecDeque::from([Bytes::from_static(b"stream")]),
+            size_hint: Some(6),
+        })))
+        .build()
+        .expect("valid stream request");
+
+    let BodySource::Stream(stream) = request.body() else {
+        panic!("expected stream body");
+    };
+    assert_eq!(stream.size_hint(), Some(6));
 }
 
 #[test]

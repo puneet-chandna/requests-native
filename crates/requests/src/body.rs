@@ -55,7 +55,7 @@ mod tests {
     use super::{AsyncBody, BodySource};
 
     struct ChunkBody {
-        chunks: VecDeque<Bytes>,
+        chunks: VecDeque<crate::Result<Bytes>>,
         size_hint: Option<u64>,
     }
 
@@ -64,7 +64,7 @@ mod tests {
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
         ) -> Poll<Option<crate::Result<Bytes>>> {
-            Poll::Ready(self.chunks.pop_front().map(Ok))
+            Poll::Ready(self.chunks.pop_front())
         }
 
         fn size_hint(&self) -> Option<u64> {
@@ -81,7 +81,10 @@ mod tests {
     #[test]
     fn body_stream_preserves_size_hint_and_poll_order_after_type_erasure() {
         let mut body = BodySource::Stream(Box::pin(ChunkBody {
-            chunks: VecDeque::from([Bytes::from_static(b"first"), Bytes::from_static(b"second")]),
+            chunks: VecDeque::from([
+                Ok(Bytes::from_static(b"first")),
+                Ok(Bytes::from_static(b"second")),
+            ]),
             size_hint: Some(11),
         }));
         let BodySource::Stream(stream) = &mut body else {
@@ -116,5 +119,34 @@ mod tests {
         };
 
         assert_eq!(stream.size_hint(), None);
+    }
+
+    #[test]
+    fn body_stream_preserves_chunk_error_and_end_order() {
+        let mut body = BodySource::Stream(Box::pin(ChunkBody {
+            chunks: VecDeque::from([
+                Ok(Bytes::from_static(b"chunk")),
+                Err(crate::Error::invalid_url("body-error.test")),
+            ]),
+            size_hint: None,
+        }));
+        let BodySource::Stream(stream) = &mut body else {
+            panic!("expected stream body");
+        };
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+
+        let Poll::Ready(Some(Ok(chunk))) = stream.as_mut().poll_next(&mut context) else {
+            panic!("expected body chunk");
+        };
+        assert_eq!(chunk, Bytes::from_static(b"chunk"));
+        let Poll::Ready(Some(Err(error))) = stream.as_mut().poll_next(&mut context) else {
+            panic!("expected body error");
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidUrl);
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut context),
+            Poll::Ready(None)
+        ));
     }
 }
