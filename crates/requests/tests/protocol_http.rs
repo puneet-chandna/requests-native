@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
+use std::future::poll_fn;
 use std::io::{Read, Write};
 use std::marker::PhantomPinned;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -10,9 +12,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_core::Stream;
 use requests::{
     AsyncBody, BodySource, Client, ErrorKind, HeaderName, HeaderValue, Method, RequestBuilder,
-    StatusCode,
+    ResponseBody, StatusCode, Timeout,
 };
 
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -20,6 +23,7 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const POST_EXCHANGE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const PHASE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const SCRIPTED_RESPONSE: &[u8] =
@@ -41,6 +45,229 @@ struct ScriptedServer {
     address: SocketAddr,
     shutdown: Option<Sender<()>>,
     worker: Option<JoinHandle<Result<Observation, String>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhaseCommand {
+    ReleaseNext,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhaseEvent {
+    FirstSent,
+    TailSent(usize),
+    PeerEof,
+}
+
+#[derive(Debug)]
+struct PhasedObservation {
+    request_bytes: Vec<u8>,
+    peer_eof_count: usize,
+}
+
+struct PhasedServer {
+    address: SocketAddr,
+    commands: Sender<PhaseCommand>,
+    events: Receiver<PhaseEvent>,
+    worker: Option<JoinHandle<Result<PhasedObservation, String>>>,
+}
+
+impl PhasedServer {
+    fn spawn(first: Vec<u8>, tails: Vec<Vec<u8>>) -> Self {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind phased loopback fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("make phased fixture listener nonblocking");
+        let address = listener.local_addr().expect("read phased fixture address");
+        let (command_tx, command_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let worker =
+            thread::spawn(move || serve_phases(listener, command_rx, event_tx, first, tails));
+        Self {
+            address,
+            commands: command_tx,
+            events: event_rx,
+            worker: Some(worker),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/phased", self.address)
+    }
+
+    fn wait_first(&self) {
+        assert_eq!(
+            self.events
+                .recv_timeout(PHASE_TIMEOUT)
+                .expect("wait for first response phase"),
+            PhaseEvent::FirstSent
+        );
+    }
+
+    fn release_next(&self, index: usize) {
+        self.commands
+            .send(PhaseCommand::ReleaseNext)
+            .expect("release next response phase");
+        assert_eq!(
+            self.events
+                .recv_timeout(PHASE_TIMEOUT)
+                .expect("wait for released response phase"),
+            PhaseEvent::TailSent(index)
+        );
+    }
+
+    fn release_after(&self, delay: Duration) -> JoinHandle<()> {
+        let commands = self.commands.clone();
+        thread::spawn(move || {
+            thread::sleep(delay);
+            commands
+                .send(PhaseCommand::ReleaseNext)
+                .expect("release delayed response phase");
+        })
+    }
+
+    fn wait_tail(&self, index: usize) {
+        assert_eq!(
+            self.events
+                .recv_timeout(PHASE_TIMEOUT)
+                .expect("wait for delayed response phase"),
+            PhaseEvent::TailSent(index)
+        );
+    }
+
+    fn wait_peer_eof(&self) {
+        assert_eq!(
+            self.events
+                .recv_timeout(PHASE_TIMEOUT)
+                .expect("wait for peer EOF"),
+            PhaseEvent::PeerEof
+        );
+    }
+
+    fn finish(mut self) -> Result<PhasedObservation, String> {
+        let _ = self.commands.send(PhaseCommand::Close);
+        join_phased_worker(self.worker.take())
+    }
+}
+
+impl Drop for PhasedServer {
+    fn drop(&mut self) {
+        let _ = self.commands.send(PhaseCommand::Close);
+        let _ = join_phased_worker(self.worker.take());
+    }
+}
+
+fn join_phased_worker(
+    worker: Option<JoinHandle<Result<PhasedObservation, String>>>,
+) -> Result<PhasedObservation, String> {
+    let worker = worker.ok_or_else(|| "phased fixture worker already joined".to_owned())?;
+    worker
+        .join()
+        .map_err(|_| "phased fixture worker panicked".to_owned())?
+}
+
+fn serve_phases(
+    listener: TcpListener,
+    commands: Receiver<PhaseCommand>,
+    events: Sender<PhaseEvent>,
+    first: Vec<u8>,
+    tails: Vec<Vec<u8>>,
+) -> Result<PhasedObservation, String> {
+    let deadline = Instant::now() + PHASE_TIMEOUT;
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(format!("phased fixture accept failed: {error}")),
+        }
+        if matches!(commands.try_recv(), Ok(PhaseCommand::Close)) {
+            return Ok(PhasedObservation {
+                request_bytes: Vec::new(),
+                peer_eof_count: 0,
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err("phased fixture timed out accepting a connection".to_owned());
+        }
+        thread::sleep(SERVER_POLL_INTERVAL);
+    };
+
+    stream
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|error| format!("set phased fixture read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|error| format!("set phased fixture write timeout: {error}"))?;
+    let request_bytes = read_complete_request(&mut stream)?;
+    write_phase(&mut stream, &first)?;
+    events
+        .send(PhaseEvent::FirstSent)
+        .map_err(|_| "phased fixture first-phase receiver closed".to_owned())?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| format!("make phased fixture stream nonblocking: {error}"))?;
+
+    let mut tails = tails.into_iter().enumerate();
+    let deadline = Instant::now() + PHASE_TIMEOUT;
+    loop {
+        match commands.try_recv() {
+            Ok(PhaseCommand::ReleaseNext) => {
+                let Some((index, phase)) = tails.next() else {
+                    return Err("phased fixture has no remaining response phase".to_owned());
+                };
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|error| format!("make phased fixture stream blocking: {error}"))?;
+                write_phase(&mut stream, &phase)?;
+                events
+                    .send(PhaseEvent::TailSent(index))
+                    .map_err(|_| "phased fixture tail receiver closed".to_owned())?;
+                stream.set_nonblocking(true).map_err(|error| {
+                    format!("restore phased fixture stream nonblocking mode: {error}")
+                })?;
+            }
+            Ok(PhaseCommand::Close) | Err(TryRecvError::Disconnected) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                return Ok(PhasedObservation {
+                    request_bytes,
+                    peer_eof_count: 0,
+                });
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+
+        let mut byte = [0_u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                events
+                    .send(PhaseEvent::PeerEof)
+                    .map_err(|_| "phased fixture peer-EOF receiver closed".to_owned())?;
+                return Ok(PhasedObservation {
+                    request_bytes,
+                    peer_eof_count: 1,
+                });
+            }
+            Ok(_) => return Err("phased fixture received bytes after request".to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("observe phased fixture peer: {error}")),
+        }
+        if Instant::now() >= deadline {
+            return Err("phased fixture timed out waiting for command or peer EOF".to_owned());
+        }
+        thread::sleep(SERVER_POLL_INTERVAL);
+    }
+}
+
+fn write_phase(stream: &mut TcpStream, phase: &[u8]) -> Result<(), String> {
+    stream
+        .write_all(phase)
+        .map_err(|error| format!("write phased response: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("flush phased response: {error}"))
 }
 
 impl ScriptedServer {
@@ -488,6 +715,433 @@ fn complete_exchange(
         Ok(Err(error)) => panic!("HTTP exchange failed: {error}"),
         Err(error) => panic!("HTTP exchange timed out: {error}"),
     }
+}
+
+fn send_response(runtime: &tokio::runtime::Runtime, request: RequestBuilder) -> requests::Response {
+    match runtime.block_on(async { tokio::time::timeout(EXCHANGE_TIMEOUT, request.send()).await }) {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => panic!("response-head exchange failed: {error}"),
+        Err(error) => panic!("response-head exchange timed out: {error}"),
+    }
+}
+
+async fn next_response_frame<S>(stream: &mut S) -> Option<S::Item>
+where
+    S: Stream + Unpin,
+{
+    poll_fn(|context| Pin::new(&mut *stream).poll_next(context)).await
+}
+
+async fn next_response_frame_after_pending(
+    mut body: ResponseBody,
+    pending: Sender<()>,
+) -> (ResponseBody, Option<requests::Result<Bytes>>) {
+    let mut pending = Some(pending);
+    let item = poll_fn(|context| {
+        let result = Pin::new(&mut body).poll_next(context);
+        if result.is_pending() {
+            if let Some(pending) = pending.take() {
+                pending.send(()).expect("report pending response body poll");
+            }
+        }
+        result
+    })
+    .await;
+    (body, item)
+}
+
+async fn wait_for_pending_poll(pending: &Receiver<()>) {
+    loop {
+        match pending.try_recv() {
+            Ok(()) => return,
+            Err(TryRecvError::Empty) => tokio::task::yield_now().await,
+            Err(TryRecvError::Disconnected) => {
+                panic!("response body task ended before reporting a pending poll")
+            }
+        }
+    }
+}
+
+#[test]
+fn response_body_is_unpin_for_by_value_close_after_polling() {
+    fn assert_unpin<T: Unpin>() {}
+    assert_unpin::<ResponseBody>();
+}
+
+#[test]
+fn response_stream_yields_first_frame_before_released_tail_then_clean_eof() {
+    let runtime = runtime();
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nfirst\r\n"
+            .to_vec(),
+        vec![b"4\r\ntail\r\n0\r\n\r\n".to_vec()],
+    );
+    let client = Client::new().expect("build client");
+
+    let response = send_response(&runtime, client.get(server.url()));
+    server.wait_first();
+    let mut body = response.into_body();
+    let first = runtime
+        .block_on(async {
+            tokio::time::timeout(PHASE_TIMEOUT, next_response_frame(&mut body)).await
+        })
+        .expect("first response frame timed out")
+        .expect("first response frame missing")
+        .expect("first response frame failed");
+    assert_eq!(first, Bytes::from_static(b"first"));
+
+    server.release_next(0);
+    let tail = runtime
+        .block_on(async {
+            tokio::time::timeout(PHASE_TIMEOUT, next_response_frame(&mut body)).await
+        })
+        .expect("tail response frame timed out")
+        .expect("tail response frame missing")
+        .expect("tail response frame failed");
+    assert_eq!(tail, Bytes::from_static(b"tail"));
+    assert!(
+        runtime
+            .block_on(async {
+                tokio::time::timeout(PHASE_TIMEOUT, next_response_frame(&mut body)).await
+            })
+            .expect("clean response EOF timed out")
+            .is_none()
+    );
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+    assert!(
+        observation
+            .request_bytes
+            .starts_with(b"GET /phased HTTP/1.1\r\n")
+    );
+}
+
+#[test]
+fn response_stream_malformed_chunk_is_typed_terminal_error_with_one_cleanup() {
+    let runtime = runtime();
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+        vec![b"not-hex\r\n".to_vec()],
+    );
+    let client = Client::new().expect("build client");
+
+    let response = send_response(&runtime, client.get(server.url()));
+    server.wait_first();
+    let mut body = response.into_body();
+    server.release_next(0);
+    let error = runtime
+        .block_on(async {
+            tokio::time::timeout(PHASE_TIMEOUT, next_response_frame(&mut body)).await
+        })
+        .expect("malformed response poll timed out")
+        .expect("malformed response did not yield an error")
+        .expect_err("malformed response unexpectedly yielded bytes");
+    assert_eq!(error.kind(), ErrorKind::ChunkedEncoding);
+    assert!(
+        runtime
+            .block_on(async {
+                tokio::time::timeout(PHASE_TIMEOUT, next_response_frame(&mut body)).await
+            })
+            .expect("terminal malformed response EOF timed out")
+            .is_none()
+    );
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+}
+
+#[test]
+fn response_bytes_uses_stream_path_for_malformed_chunk_and_cleanup() {
+    let runtime = runtime();
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+        vec![b"also-not-hex\r\n".to_vec()],
+    );
+    let client = Client::new().expect("build client");
+
+    let response = send_response(&runtime, client.get(server.url()));
+    server.wait_first();
+    server.release_next(0);
+    let error = runtime
+        .block_on(async { tokio::time::timeout(PHASE_TIMEOUT, response.bytes()).await })
+        .expect("malformed response bytes collection timed out")
+        .expect_err("malformed response bytes unexpectedly succeeded");
+    assert_eq!(error.kind(), ErrorKind::ChunkedEncoding);
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+}
+
+#[test]
+fn response_stream_close_before_read_closes_one_shot_connection_once() {
+    let runtime = runtime();
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+        Vec::new(),
+    );
+    let client = Client::new().expect("build client");
+
+    let response = send_response(&runtime, client.get(server.url()));
+    server.wait_first();
+    let body = response.into_body();
+    runtime
+        .block_on(async { tokio::time::timeout(PHASE_TIMEOUT, body.close()).await })
+        .expect("response close timed out")
+        .expect("response close failed");
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+}
+
+#[test]
+fn response_stream_close_after_partial_read_closes_one_shot_connection_once() {
+    let runtime = runtime();
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\npartial\r\n"
+            .to_vec(),
+        Vec::new(),
+    );
+    let client = Client::new().expect("build client");
+
+    let response = send_response(&runtime, client.get(server.url()));
+    server.wait_first();
+    let mut body = response.into_body();
+    let first = runtime
+        .block_on(async {
+            tokio::time::timeout(PHASE_TIMEOUT, next_response_frame(&mut body)).await
+        })
+        .expect("partial response frame timed out")
+        .expect("partial response frame missing")
+        .expect("partial response frame failed");
+    assert_eq!(first, Bytes::from_static(b"partial"));
+    runtime
+        .block_on(async { tokio::time::timeout(PHASE_TIMEOUT, body.close()).await })
+        .expect("partial response close timed out")
+        .expect("partial response close failed");
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+}
+
+#[test]
+fn response_stream_partial_drop_closes_promptly_once() {
+    let runtime = runtime();
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\npartial\r\n"
+            .to_vec(),
+        Vec::new(),
+    );
+    let client = Client::new().expect("build client");
+
+    let response = send_response(&runtime, client.get(server.url()));
+    server.wait_first();
+    let mut body = response.into_body();
+    let first = runtime
+        .block_on(async {
+            tokio::time::timeout(PHASE_TIMEOUT, next_response_frame(&mut body)).await
+        })
+        .expect("partial response frame timed out")
+        .expect("partial response frame missing")
+        .expect("partial response frame failed");
+    assert_eq!(first, Bytes::from_static(b"partial"));
+    drop(body);
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+}
+
+#[test]
+fn response_stream_pending_read_cancellation_closes_promptly_once() {
+    let runtime = runtime();
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+        Vec::new(),
+    );
+    let client = Client::new().expect("build client");
+
+    let response = send_response(&runtime, client.get(server.url()));
+    server.wait_first();
+    runtime.block_on(async {
+        let mut body = response.into_body();
+        let polled = Arc::new(AtomicBool::new(false));
+        let task_polled = Arc::clone(&polled);
+        let task = tokio::spawn(async move {
+            poll_fn(|context| {
+                let result = Pin::new(&mut body).poll_next(context);
+                if result.is_pending() {
+                    task_polled.store(true, Ordering::Release);
+                }
+                result
+            })
+            .await
+        });
+        tokio::time::timeout(PHASE_TIMEOUT, async {
+            while !polled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending body task was never polled");
+        task.abort();
+        let error = task.await.expect_err("cancelled body task completed");
+        assert!(error.is_cancelled());
+    });
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+}
+
+#[test]
+fn response_stream_read_timeout_is_typed_terminal_error() {
+    let runtime = runtime();
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+        Vec::new(),
+    );
+    let client = Client::new().expect("build client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(Duration::from_millis(100)),
+        total: None,
+    };
+
+    let response = send_response(&runtime, client.get(server.url()).timeout(timeout));
+    server.wait_first();
+    let mut body = response.into_body();
+    let error = runtime
+        .block_on(async {
+            tokio::time::timeout(PHASE_TIMEOUT, next_response_frame(&mut body)).await
+        })
+        .expect("read-timeout response poll hung")
+        .expect("read-timeout response did not yield an error")
+        .expect_err("read-timeout response unexpectedly yielded bytes");
+    assert_eq!(error.kind(), ErrorKind::ReadTimeout);
+    assert!(
+        runtime
+            .block_on(async {
+                tokio::time::timeout(PHASE_TIMEOUT, next_response_frame(&mut body)).await
+            })
+            .expect("terminal read-timeout EOF timed out")
+            .is_none()
+    );
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+}
+
+#[test]
+fn response_bytes_uses_stream_path_for_read_timeout_and_cleanup() {
+    let runtime = runtime();
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+        Vec::new(),
+    );
+    let client = Client::new().expect("build client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(Duration::from_millis(100)),
+        total: None,
+    };
+
+    let response = send_response(&runtime, client.get(server.url()).timeout(timeout));
+    server.wait_first();
+    let error = runtime
+        .block_on(async { tokio::time::timeout(PHASE_TIMEOUT, response.bytes()).await })
+        .expect("read-timeout response bytes collection hung")
+        .expect_err("read-timeout response bytes unexpectedly succeeded");
+    assert_eq!(error.kind(), ErrorKind::ReadTimeout);
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+}
+
+#[test]
+fn response_stream_read_timeout_resets_per_frame_and_is_not_total_duration() {
+    const READ_TIMEOUT: Duration = Duration::from_millis(600);
+    const RELEASE_DELAY: Duration = Duration::from_millis(400);
+
+    let runtime = runtime();
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\none\r\n"
+            .to_vec(),
+        vec![b"3\r\ntwo\r\n".to_vec(), b"0\r\n\r\n".to_vec()],
+    );
+    let client = Client::new().expect("build client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(READ_TIMEOUT),
+        total: None,
+    };
+
+    let response = send_response(&runtime, client.get(server.url()).timeout(timeout));
+    server.wait_first();
+    let mut body = response.into_body();
+    let first = runtime
+        .block_on(async {
+            tokio::time::timeout(PHASE_TIMEOUT, next_response_frame(&mut body)).await
+        })
+        .expect("first timed response frame timed out")
+        .expect("first timed response frame missing")
+        .expect("first timed response frame failed");
+    assert_eq!(first, Bytes::from_static(b"one"));
+
+    let started = Instant::now();
+    let (pending_tx, pending_rx) = mpsc::channel();
+    let second = runtime.spawn(next_response_frame_after_pending(body, pending_tx));
+    runtime
+        .block_on(async {
+            tokio::time::timeout(PHASE_TIMEOUT, wait_for_pending_poll(&pending_rx)).await
+        })
+        .expect("second response frame never reached a pending poll");
+    let release = server.release_after(RELEASE_DELAY);
+    let second = runtime
+        .block_on(async { tokio::time::timeout(PHASE_TIMEOUT, second).await })
+        .expect("second timed response frame task hung")
+        .expect("second timed response frame task failed");
+    release.join().expect("join first delayed release");
+    server.wait_tail(0);
+    let (returned_body, second) = second;
+    body = returned_body;
+    let second = second
+        .expect("second timed response frame missing")
+        .expect("second timed response frame failed");
+    assert_eq!(second, Bytes::from_static(b"two"));
+
+    let (pending_tx, pending_rx) = mpsc::channel();
+    let eof = runtime.spawn(next_response_frame_after_pending(body, pending_tx));
+    runtime
+        .block_on(async {
+            tokio::time::timeout(PHASE_TIMEOUT, wait_for_pending_poll(&pending_rx)).await
+        })
+        .expect("terminal response poll never reached Pending");
+    let release = server.release_after(RELEASE_DELAY);
+    let eof = runtime
+        .block_on(async { tokio::time::timeout(PHASE_TIMEOUT, eof).await })
+        .expect("timed response EOF task hung")
+        .expect("timed response EOF task failed");
+    release.join().expect("join second delayed release");
+    server.wait_tail(1);
+    let (body, eof) = eof;
+    assert!(eof.is_none(), "timed response did not reach clean EOF");
+    drop(body);
+    assert!(
+        started.elapsed() > READ_TIMEOUT,
+        "two successful pending reads must outlive one read deadline"
+    );
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
 }
 
 #[test]

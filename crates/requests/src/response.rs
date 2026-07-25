@@ -295,8 +295,15 @@ impl ResponseDispositionState {
 
 #[cfg(test)]
 mod tests {
+    use std::future::poll_fn;
+    use std::pin::Pin;
+    use std::sync::mpsc::{self, Receiver, TryRecvError};
+    use std::time::Duration;
+
+    use futures_core::Stream;
+
     use super::{
-        ResponseCache, ResponseContent, ResponseDecision, ResponseDisposition,
+        ResponseBody, ResponseCache, ResponseContent, ResponseDecision, ResponseDisposition,
         ResponseDispositionState, ResponseEvent,
     };
 
@@ -392,5 +399,152 @@ mod tests {
             ResponseDisposition::Reusable
         );
         assert!(!response.native_lease());
+    }
+
+    #[test]
+    fn response_stream_events_make_exactly_one_terminal_decision() {
+        let mut clean = ResponseDispositionState::without_native_lease();
+        assert_eq!(
+            clean.apply(ResponseEvent::Partial),
+            ResponseDisposition::Partial
+        );
+        assert_eq!(clean.decision_count(), 0);
+        assert_eq!(
+            clean.apply(ResponseEvent::CleanEof),
+            ResponseDisposition::Reusable
+        );
+        assert_eq!(clean.decision(), Some(ResponseDecision::Reusable));
+        assert_eq!(clean.decision_count(), 1);
+        assert_eq!(
+            clean.apply(ResponseEvent::Drop),
+            ResponseDisposition::Reusable
+        );
+        assert_eq!(clean.decision_count(), 1);
+        assert!(!clean.native_lease());
+
+        for partial in [false, true] {
+            for event in [
+                ResponseEvent::Close,
+                ResponseEvent::Drop,
+                ResponseEvent::ReadError,
+                ResponseEvent::ProtocolError,
+                ResponseEvent::Cancel,
+            ] {
+                let mut dirty = ResponseDispositionState::without_native_lease();
+                if partial {
+                    assert_eq!(
+                        dirty.apply(ResponseEvent::Partial),
+                        ResponseDisposition::Partial
+                    );
+                } else {
+                    assert_eq!(dirty.state(), ResponseDisposition::Open);
+                }
+                assert_eq!(dirty.decision_count(), 0);
+                assert_eq!(dirty.apply(event), ResponseDisposition::CloseDirty);
+                assert_eq!(dirty.decision(), Some(ResponseDecision::CloseDirty));
+                assert_eq!(dirty.decision_count(), 1);
+                assert_eq!(
+                    dirty.apply(ResponseEvent::CleanEof),
+                    ResponseDisposition::CloseDirty
+                );
+                assert_eq!(dirty.decision_count(), 1);
+                assert!(!dirty.native_lease());
+            }
+        }
+    }
+
+    #[test]
+    fn connection_driver_failure_maps_to_connection_error_and_one_dirty_read_decision() {
+        let error = crate::Error::connection("deterministic test driver failure");
+        assert_eq!(error.kind(), crate::ErrorKind::Connection);
+
+        let mut response = ResponseDispositionState::without_native_lease();
+        assert_eq!(
+            response.apply(ResponseEvent::Partial),
+            ResponseDisposition::Partial
+        );
+        assert_eq!(
+            response.apply(ResponseEvent::ReadError),
+            ResponseDisposition::CloseDirty
+        );
+        assert_eq!(response.decision(), Some(ResponseDecision::CloseDirty));
+        assert_eq!(response.decision_count(), 1);
+        assert_eq!(
+            response.apply(ResponseEvent::ReadError),
+            ResponseDisposition::CloseDirty
+        );
+        assert_eq!(response.decision_count(), 1);
+    }
+
+    async fn wait_for_pending_poll(pending: &Receiver<()>) {
+        loop {
+            match pending.try_recv() {
+                Ok(()) => return,
+                Err(TryRecvError::Empty) => tokio::task::yield_now().await,
+                Err(TryRecvError::Disconnected) => {
+                    panic!("response body task ended before reporting Pending")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_response_body_driver_failure_is_typed_terminal_and_cleaned_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build deterministic body-driver runtime");
+        let (body, driver_failure, probe) = ResponseBody::test_pending_body_and_driver();
+        let (pending_tx, pending_rx) = mpsc::channel();
+
+        let (mut body, item) = runtime.block_on(async {
+            let task = tokio::spawn(async move {
+                let mut body = body;
+                let mut pending_tx = Some(pending_tx);
+                let item = poll_fn(|context| {
+                    let result = Pin::new(&mut body).poll_next(context);
+                    if result.is_pending() {
+                        if let Some(pending_tx) = pending_tx.take() {
+                            pending_tx
+                                .send(())
+                                .expect("report pending response body poll");
+                        }
+                    }
+                    result
+                })
+                .await;
+                (body, item)
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), wait_for_pending_poll(&pending_rx))
+                .await
+                .expect("response body did not remain pending before driver failure");
+            driver_failure.fail("deterministic test driver failure");
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("driver failure did not wake response body")
+                .expect("response body task failed")
+        });
+
+        let error = item
+            .expect("driver failure did not yield an error")
+            .expect_err("driver failure unexpectedly yielded bytes");
+        assert_eq!(error.kind(), crate::ErrorKind::Connection);
+        assert_eq!(
+            error.to_string(),
+            "HTTP/1.1 connection driver failed: deterministic test driver failure"
+        );
+        assert!(
+            runtime
+                .block_on(poll_fn(|context| Pin::new(&mut body).poll_next(context)))
+                .is_none(),
+            "driver failure must be terminal"
+        );
+        assert_eq!(probe.disposition(), ResponseDisposition::CloseDirty);
+        assert_eq!(probe.decision_count(), 1);
+        assert_eq!(probe.cleanup_count(), 1);
+        drop(body);
+        assert_eq!(probe.decision_count(), 1);
+        assert_eq!(probe.cleanup_count(), 1);
     }
 }
