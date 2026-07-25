@@ -18,6 +18,10 @@ impl Client {
     }
 
     pub fn get(&self, url: impl AsRef<str>) -> RequestBuilder {
-        RequestBuilder::for_client(Method::GET, url, Arc::clone(&self.transport))
+        self.request(Method::GET, url)
+    }
+
+    pub fn request(&self, method: Method, url: impl AsRef<str>) -> RequestBuilder {
+        RequestBuilder::for_client(method, url, Arc::clone(&self.transport))
     }
 }

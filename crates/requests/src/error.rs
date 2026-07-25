@@ -55,10 +55,10 @@ impl Error {
         }
     }
 
-    pub(crate) fn unsupported_request_body() -> Self {
+    pub(crate) fn conflicting_content_length() -> Self {
         Self {
-            kind: ErrorKind::Body,
-            message: "direct HTTP GET currently requires an empty request body".to_owned(),
+            kind: ErrorKind::Builder,
+            message: "conflicting Content-Length headers".to_owned(),
         }
     }
 

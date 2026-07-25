@@ -1,14 +1,17 @@
 mod connect;
 
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http_body_util::Empty;
-use hyper::body::Incoming;
+use http::header::{CONTENT_LENGTH, HOST};
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::task::JoinHandle;
 
+use crate::models::RequestParts;
 use crate::{BodySource, Error, Request, Result};
 
 #[derive(Debug)]
@@ -89,8 +92,7 @@ impl Transport {
             .ok_or_else(|| Error::invalid_url(request.url()))?
             .as_str()
             .to_owned();
-        let outgoing = outgoing_request(&request)?;
-        let url = request.url().to_owned();
+        let (outgoing, url) = outgoing_request(request.into_parts())?;
 
         let stream = connect::connect(&host, port, &target).await?;
         let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
@@ -141,30 +143,119 @@ impl Transport {
 }
 
 fn validate_request(request: &Request) -> Result<()> {
-    if !matches!(request.body(), BodySource::Empty) {
-        return Err(Error::unsupported_request_body());
-    }
     if request.uri().scheme_str() != Some("http") {
         return Err(Error::unsupported_scheme(
             request.url(),
             request.uri().scheme_str(),
         ));
     }
+    validate_content_lengths(request.headers())?;
     Ok(())
 }
 
-fn outgoing_request(request: &Request) -> Result<http::Request<Empty<Bytes>>> {
+fn validate_content_lengths(headers: &http::HeaderMap) -> Result<()> {
+    let mut first = None;
+    for value in headers
+        .get_all(CONTENT_LENGTH)
+        .iter()
+        .filter_map(parsed_content_length)
+    {
+        if first.is_some_and(|first| value != first) {
+            return Err(Error::conflicting_content_length());
+        }
+        first = Some(value);
+    }
+    Ok(())
+}
+
+fn parsed_content_length(value: &http::HeaderValue) -> Option<u64> {
+    let value = value.to_str().ok()?.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn outgoing_request(mut request: RequestParts) -> Result<(http::Request<OutgoingBody>, String)> {
     let origin = request
-        .uri()
+        .uri
         .path_and_query()
         .map_or("/", http::uri::PathAndQuery::as_str)
         .parse::<http::Uri>()
-        .map_err(|_| Error::invalid_url(request.url()))?;
-    let mut outgoing = http::Request::new(Empty::new());
-    *outgoing.method_mut() = request.method().clone();
+        .map_err(|_| Error::invalid_url(&request.url))?;
+    if !request.headers.contains_key(HOST) {
+        let authority = request
+            .uri
+            .authority()
+            .ok_or_else(|| Error::invalid_url(&request.url))?;
+        let host = authority
+            .as_str()
+            .parse()
+            .map_err(|_| Error::invalid_url(&request.url))?;
+        request.headers.insert(HOST, host);
+    }
+
+    let mut outgoing = http::Request::new(OutgoingBody::new(request.body));
+    *outgoing.method_mut() = request.method;
     *outgoing.uri_mut() = origin;
-    *outgoing.headers_mut() = request.headers().clone();
-    Ok(outgoing)
+    *outgoing.headers_mut() = request.headers;
+    Ok((outgoing, request.url))
+}
+
+struct OutgoingBody {
+    source: BodySource,
+}
+
+impl OutgoingBody {
+    fn new(source: BodySource) -> Self {
+        Self { source }
+    }
+}
+
+impl Body for OutgoingBody {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>>>> {
+        let body = self.get_mut();
+        match std::mem::take(&mut body.source) {
+            BodySource::Empty => Poll::Ready(None),
+            BodySource::Bytes(bytes) if bytes.is_empty() => Poll::Ready(None),
+            BodySource::Bytes(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+            BodySource::Stream(mut stream) => match stream.as_mut().poll_next(context) {
+                Poll::Pending => {
+                    body.source = BodySource::Stream(stream);
+                    Poll::Pending
+                }
+                Poll::Ready(Some(chunk)) => {
+                    body.source = BodySource::Stream(stream);
+                    Poll::Ready(Some(chunk.map(Frame::data)))
+                }
+                Poll::Ready(None) => Poll::Ready(None),
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        matches!(self.source, BodySource::Empty)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = SizeHint::new();
+        match &self.source {
+            BodySource::Empty => hint.set_exact(0),
+            BodySource::Bytes(bytes) => hint.set_exact(bytes.len() as u64),
+            BodySource::Stream(stream) => {
+                if let Some(length) = stream.size_hint() {
+                    hint.set_exact(length);
+                }
+            }
+        }
+        hint
+    }
 }
 
 #[cfg(test)]
@@ -197,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn request_validation_rejects_nonempty_bodies_and_https_before_io() {
+    fn request_validation_allows_bodies_and_rejects_https_before_io() {
         let bytes = RequestBuilder::new(Method::GET, "http://example.test/")
             .body(Bytes::from_static(b"body"))
             .build()
@@ -210,18 +301,30 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(
-            validate_request(&bytes).unwrap_err().kind(),
-            ErrorKind::Body
-        );
-        assert_eq!(
-            validate_request(&stream).unwrap_err().kind(),
-            ErrorKind::Body
-        );
+        validate_request(&bytes).unwrap();
+        validate_request(&stream).unwrap();
         assert_eq!(
             validate_request(&https).unwrap_err().kind(),
             ErrorKind::InvalidUrl
         );
+    }
+
+    #[test]
+    fn request_validation_allows_equal_content_lengths() {
+        let request = RequestBuilder::new(Method::POST, "http://example.test/")
+            .header(
+                HeaderName::from_static("content-length"),
+                HeaderValue::from_static("3"),
+            )
+            .header(
+                HeaderName::from_static("content-length"),
+                HeaderValue::from_static("03"),
+            )
+            .body(Bytes::from_static(b"abc"))
+            .build()
+            .unwrap();
+
+        validate_request(&request).unwrap();
     }
 
     #[test]
@@ -235,7 +338,7 @@ mod tests {
                 .build()
                 .unwrap();
 
-        let outgoing = outgoing_request(&request).unwrap();
+        let (outgoing, url) = outgoing_request(request.into_parts()).unwrap();
 
         assert_eq!(outgoing.uri().to_string(), "/direct?source=unit");
         assert_eq!(outgoing.headers().len(), 1);
@@ -243,6 +346,7 @@ mod tests {
             outgoing.headers().get("host"),
             Some(&HeaderValue::from_static("example.test:8080"))
         );
+        assert_eq!(url, "http://example.test:8080/direct?source=unit");
     }
 
     #[test]

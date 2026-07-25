@@ -730,6 +730,41 @@ fn request_framing_conflicting_content_lengths_fail_before_connect() {
 }
 
 #[test]
+fn request_framing_equal_content_lengths_are_preserved() {
+    let runtime = runtime();
+    let server = ScriptedServer::spawn_with_response(FRAMING_RESPONSE);
+    let authority = server.authority();
+    let client = Client::new().expect("build client");
+
+    let (status, _, response_body) = complete_exchange(
+        &runtime,
+        client
+            .request(Method::POST, server.url())
+            .header(
+                HeaderName::from_static("content-length"),
+                HeaderValue::from_static("3"),
+            )
+            .header(
+                HeaderName::from_static("content-length"),
+                HeaderValue::from_static("03"),
+            )
+            .body(Bytes::from_static(b"abc")),
+    );
+    let observation = server.finish().expect("loopback fixture completed");
+    let request = CapturedRequest::parse(&observation);
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(response_body.is_empty());
+    assert_eq!(request.header_values("host"), vec![authority.as_bytes()]);
+    assert_eq!(
+        request.header_values("content-length"),
+        vec![&b"3"[..], &b"03"[..]]
+    );
+    assert!(request.header_values("transfer-encoding").is_empty());
+    assert_eq!(request.body, b"abc");
+}
+
+#[test]
 fn request_framing_strips_fragment_from_wire_but_retains_response_url() {
     let runtime = runtime();
     let server = ScriptedServer::spawn_with_response(FRAMING_RESPONSE);

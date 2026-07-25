@@ -351,6 +351,24 @@ impl Request {
     pub fn body(&self) -> &BodySource {
         &self.body
     }
+
+    pub(crate) fn into_parts(self) -> RequestParts {
+        RequestParts {
+            method: self.method,
+            url: self.url,
+            uri: self.uri,
+            headers: self.headers,
+            body: self.body,
+        }
+    }
+}
+
+pub(crate) struct RequestParts {
+    pub method: Method,
+    pub url: String,
+    pub uri: Uri,
+    pub headers: HeaderMap,
+    pub body: BodySource,
 }
 
 #[derive(Debug)]
