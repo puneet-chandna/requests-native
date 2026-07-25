@@ -2629,6 +2629,46 @@ finally:
     )
 
 
+def test_prepare_url_protocol_proof_rejects_custom_metaclass_without_callbacks() -> None:
+    _assert_matches_oracle(
+        """
+import requests._types as model_types
+from requests.models import PreparedRequest
+
+
+prime = PreparedRequest()
+prepare_method_call(prime, "get")
+
+
+class Meta(type):
+    def __getattribute__(cls, name):
+        side_effects.append(["protocol-meta-getattribute", name])
+        return type.__getattribute__(cls, name)
+
+
+class Replacement(metaclass=Meta):
+    pass
+
+
+original = model_types.SupportsRead
+model_types.SupportsRead = Replacement
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "protocol-meta-getattribute",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    model_types.SupportsRead = original
+"""
+    )
+
+
 def test_prepare_url_items_protocol_replaced_before_extension_import() -> None:
     _assert_matches_oracle_before_extension_import(
         _PREIMPORT_CAPTURE_HELPER
