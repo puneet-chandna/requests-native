@@ -13,20 +13,45 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_platform_smoke_dependencies_are_optional_and_explicit() -> None:
+def _core_manifest() -> dict:
     with (ROOT / "crates/requests/Cargo.toml").open("rb") as manifest:
-        core = tomllib.load(manifest)
+        return tomllib.load(manifest)
 
-    expected = {
+
+def test_direct_http_dependencies_are_required_and_explicit() -> None:
+    core = _core_manifest()
+    dependencies = core["dependencies"]
+
+    assert dependencies["http-body-util"] == "0.1"
+    assert dependencies["hyper"] == {
+        "version": "1",
+        "features": ["client", "http1"],
+    }
+    assert dependencies["hyper-util"] == {
+        "version": "0.1",
+        "default-features": False,
+        "features": ["tokio"],
+    }
+    assert dependencies["tokio"] == {
+        "version": "1",
+        "features": ["io-util", "macros", "net", "rt", "time"],
+    }
+    assert core["features"]["blocking"] == ["tokio/rt-multi-thread"]
+
+
+def test_platform_smoke_keeps_tls_optional_and_legacy_client_gated() -> None:
+    core = _core_manifest()
+    optional_tls = {
         "hyper-rustls": "0.27",
-        "hyper-util": "0.1",
         "rustls": "0.23",
-        "tokio": "1",
     }
     assert core["features"]["platform-smoke"] == [
-        f"dep:{dependency}" for dependency in expected
+        "dep:hyper-rustls",
+        "hyper-util/client-legacy",
+        "hyper-util/http1",
+        "dep:rustls",
     ]
-    for dependency, version in expected.items():
+    for dependency, version in optional_tls.items():
         declaration = core["dependencies"][dependency]
         assert declaration["version"] == version
         assert declaration["optional"] is True
@@ -63,9 +88,7 @@ def test_bootstrap_workflow_has_the_complete_supported_matrix() -> None:
         "pypy-3.11",
     ]
     assert matrix["os"] == ["ubuntu-22.04", "macos-latest", "windows-latest"]
-    assert matrix["exclude"] == [
-        {"python": "pypy-3.11", "os": "windows-latest"}
-    ]
+    assert matrix["exclude"] == [{"python": "pypy-3.11", "os": "windows-latest"}]
 
     steps = {step.get("name"): step for step in job["steps"]}
     assert steps["Compile every target and feature"]["run"] == (
@@ -74,8 +97,8 @@ def test_bootstrap_workflow_has_the_complete_supported_matrix() -> None:
     assert steps["Build version-specific wheel"]["run"] == (
         "python -m maturin build --interpreter python --out dist"
     )
-    install_script = steps[
-        "Install wheel into a fresh environment and import it"
-    ]["run"]
+    install_script = steps["Install wheel into a fresh environment and import it"][
+        "run"
+    ]
     assert "python -m venv wheel-smoke" in install_script
     assert "from requests import _requests_rust" in install_script
