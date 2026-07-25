@@ -55,10 +55,9 @@ enum CanonicalGlobalResolution {
         expected: Py<PyAny>,
         function: Option<Box<CanonicalFunction>>,
     },
-    KnownModule(KnownValue),
-    Builtin {
-        expected: Py<PyAny>,
-        function: Option<Box<CanonicalFunction>>,
+    KnownModule {
+        value: KnownValue,
+        code: Option<KnownCode>,
     },
     IntrinsicBuiltin(IntrinsicBuiltin),
     Missing,
@@ -67,9 +66,23 @@ enum CanonicalGlobalResolution {
 
 #[derive(Clone, Copy)]
 enum IntrinsicBuiltin {
-    IsInstance,
+    Function(&'static str),
     Str,
     Bytes,
+    Bool,
+    Int,
+    List,
+    Tuple,
+    ByteArray,
+    Range,
+    Map,
+    Type,
+    TypeError,
+    ValueError,
+    AttributeError,
+    UnicodeEncodeError,
+    ImportError,
+    KeyError,
 }
 
 #[derive(Clone, Copy)]
@@ -101,8 +114,46 @@ enum KnownValue {
     TextFrozenSet(&'static str),
     TextListContaining(&'static [&'static str]),
     Bytes(&'static [u8]),
+    EmptyDict,
+    UrlType,
+    RuntimeProtocol {
+        module: &'static str,
+        name: &'static str,
+        member: &'static str,
+    },
+    ByteQuoterFactory,
+    QuoterType {
+        name: &'static str,
+        default_dict_base: bool,
+    },
     Regex(KnownRegex),
     RegexPair(KnownRegex, KnownRegex),
+}
+
+enum KnownCode {
+    Url {
+        new: Py<PyCode>,
+    },
+    RuntimeProtocol {
+        member: Py<PyCode>,
+        protocol_hook: Option<Py<PyCode>>,
+        protocol_init: Py<PyCode>,
+    },
+    ByteQuoterFactory {
+        factory: Py<PyCode>,
+        quoter_init: Py<PyCode>,
+        quoter_missing: Py<PyCode>,
+    },
+    QuoterType {
+        init: Py<PyCode>,
+        missing: Py<PyCode>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum IntrinsicDescriptorType {
+    Method,
+    Member,
 }
 
 #[derive(Clone, Copy)]
@@ -236,6 +287,18 @@ fn function_kwdefaults<'py>(
 }
 
 #[allow(unsafe_code)]
+fn function_closure<'py>(
+    py: Python<'py>,
+    function: &Bound<'py, PyFunction>,
+) -> Option<Bound<'py, PyAny>> {
+    // SAFETY: PyFunction_GetClosure returns either null or a borrowed
+    // reference owned by the exact PyFunction while `py` is attached.
+    unsafe {
+        Bound::from_borrowed_ptr_or_opt(py, pyo3::ffi::PyFunction_GetClosure(function.as_ptr()))
+    }
+}
+
+#[allow(unsafe_code)]
 fn c_function_self<'py>(
     py: Python<'py>,
     function: &Bound<'py, PyCFunction>,
@@ -256,12 +319,42 @@ fn intrinsic_builtin_is(
     match intrinsic {
         IntrinsicBuiltin::Str => Ok(current.is(py.get_type::<PyString>())),
         IntrinsicBuiltin::Bytes => Ok(current.is(py.get_type::<PyBytes>())),
-        IntrinsicBuiltin::IsInstance => {
+        IntrinsicBuiltin::Bool => Ok(current.is(py.get_type::<PyBool>())),
+        IntrinsicBuiltin::Int => Ok(current.is(py.get_type::<pyo3::types::PyInt>())),
+        IntrinsicBuiltin::List => Ok(current.is(py.get_type::<PyList>())),
+        IntrinsicBuiltin::Tuple => Ok(current.is(py.get_type::<PyTuple>())),
+        IntrinsicBuiltin::ByteArray => Ok(current.is(py.get_type::<pyo3::types::PyByteArray>())),
+        IntrinsicBuiltin::Type => Ok(current.is(py.get_type::<PyType>())),
+        IntrinsicBuiltin::TypeError => {
+            Ok(current.is(py.get_type::<pyo3::exceptions::PyTypeError>()))
+        }
+        IntrinsicBuiltin::ValueError => {
+            Ok(current.is(py.get_type::<pyo3::exceptions::PyValueError>()))
+        }
+        IntrinsicBuiltin::AttributeError => {
+            Ok(current.is(py.get_type::<pyo3::exceptions::PyAttributeError>()))
+        }
+        IntrinsicBuiltin::UnicodeEncodeError => {
+            Ok(current.is(py.get_type::<pyo3::exceptions::PyUnicodeEncodeError>()))
+        }
+        IntrinsicBuiltin::ImportError => {
+            Ok(current.is(py.get_type::<pyo3::exceptions::PyImportError>()))
+        }
+        IntrinsicBuiltin::KeyError => Ok(current.is(py.get_type::<pyo3::exceptions::PyKeyError>())),
+        IntrinsicBuiltin::Range | IntrinsicBuiltin::Map => {
+            let expected = match intrinsic {
+                IntrinsicBuiltin::Range => std::ptr::addr_of_mut!(pyo3::ffi::PyRange_Type),
+                IntrinsicBuiltin::Map => std::ptr::addr_of_mut!(pyo3::ffi::PyMap_Type),
+                _ => unreachable!(),
+            };
+            Ok(current.as_ptr().cast() == expected)
+        }
+        IntrinsicBuiltin::Function(expected_name) => {
             let Ok(function) = current.cast::<PyCFunction>() else {
                 return Ok(false);
             };
             Ok(
-                function.getattr("__name__")?.extract::<String>()? == "isinstance"
+                function.getattr("__name__")?.extract::<String>()? == expected_name
                     && function.getattr("__module__")?.extract::<String>()? == "builtins"
                     && c_function_self(py, function).is_some_and(|owner| owner.is(state_builtins)),
             )
@@ -271,9 +364,33 @@ fn intrinsic_builtin_is(
 
 fn intrinsic_builtin_for_name(name: &str) -> Option<IntrinsicBuiltin> {
     match name {
-        "isinstance" => Some(IntrinsicBuiltin::IsInstance),
+        "isinstance" | "hasattr" | "len" | "ord" | "hex" | "chr" => {
+            Some(IntrinsicBuiltin::Function(match name {
+                "isinstance" => "isinstance",
+                "hasattr" => "hasattr",
+                "len" => "len",
+                "ord" => "ord",
+                "hex" => "hex",
+                "chr" => "chr",
+                _ => unreachable!(),
+            }))
+        }
         "str" => Some(IntrinsicBuiltin::Str),
         "bytes" => Some(IntrinsicBuiltin::Bytes),
+        "bool" => Some(IntrinsicBuiltin::Bool),
+        "int" => Some(IntrinsicBuiltin::Int),
+        "list" => Some(IntrinsicBuiltin::List),
+        "tuple" => Some(IntrinsicBuiltin::Tuple),
+        "bytearray" => Some(IntrinsicBuiltin::ByteArray),
+        "range" => Some(IntrinsicBuiltin::Range),
+        "map" => Some(IntrinsicBuiltin::Map),
+        "type" => Some(IntrinsicBuiltin::Type),
+        "TypeError" => Some(IntrinsicBuiltin::TypeError),
+        "ValueError" => Some(IntrinsicBuiltin::ValueError),
+        "AttributeError" => Some(IntrinsicBuiltin::AttributeError),
+        "UnicodeEncodeError" => Some(IntrinsicBuiltin::UnicodeEncodeError),
+        "ImportError" => Some(IntrinsicBuiltin::ImportError),
+        "KeyError" => Some(IntrinsicBuiltin::KeyError),
         _ => None,
     }
 }
@@ -399,6 +516,16 @@ fn known_module_value(module: &str, name: &str) -> Option<KnownValue> {
             IntrinsicBuiltin::Str,
             IntrinsicBuiltin::Bytes,
         )),
+        ("requests._types", "SupportsRead") => Some(KnownValue::RuntimeProtocol {
+            module: "requests._types",
+            name: "SupportsRead",
+            member: "read",
+        }),
+        ("requests.utils", "_SupportsItems") => Some(KnownValue::RuntimeProtocol {
+            module: "requests._types",
+            name: "SupportsItems",
+            member: "items",
+        }),
         ("requests._internal_utils", "builtin_str") | ("requests.utils", "str") => {
             Some(KnownValue::Intrinsic(IntrinsicBuiltin::Str))
         }
@@ -426,14 +553,532 @@ fn known_module_value(module: &str, name: &str) -> Option<KnownValue> {
         ("urllib3.util.url", "_NORMALIZABLE_SCHEMES") => {
             Some(KnownValue::TextPairAndNone("http", "https"))
         }
+        ("urllib3.util.url", "Url") => Some(KnownValue::UrlType),
         ("urllib.parse", "_ALWAYS_SAFE_BYTES") => Some(KnownValue::Bytes(
             b"-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~",
         )),
+        ("urllib.parse", "_byte_quoter_factory") => Some(KnownValue::ByteQuoterFactory),
+        ("urllib.parse", "_safe_quoters") => Some(KnownValue::EmptyDict),
+        ("urllib.parse", "Quoter") => Some(KnownValue::QuoterType {
+            name: "Quoter",
+            default_dict_base: true,
+        }),
         ("urllib.parse", "uses_netloc") => {
             Some(KnownValue::TextListContaining(NATIVE_NETLOC_SCHEMES))
         }
         _ => None,
     }
+}
+
+fn known_python_function(module: &str, name: &str) -> Option<(&'static str, &'static str)> {
+    match (module, name) {
+        ("requests.models", "to_key_val_list") => Some(("requests.utils", "to_key_val_list")),
+        ("requests.models", "urlencode") => Some(("urllib.parse", "urlencode")),
+        ("requests.utils", "_validate_header_part") => {
+            Some(("requests.utils", "_validate_header_part"))
+        }
+        ("requests.utils", "quote") => Some(("urllib.parse", "quote")),
+        ("requests.utils", "unquote_unreserved") => Some(("requests.utils", "unquote_unreserved")),
+        ("urllib.parse", "_coerce_args") => Some(("urllib.parse", "_coerce_args")),
+        ("urllib.parse", "_decode_args") => Some(("urllib.parse", "_decode_args")),
+        ("urllib.parse", "_encode_result") => Some(("urllib.parse", "_encode_result")),
+        ("urllib.parse", "_noop") => Some(("urllib.parse", "_noop")),
+        ("urllib.parse", "_urlunsplit") => Some(("urllib.parse", "_urlunsplit")),
+        ("urllib.parse", "urlunsplit") => Some(("urllib.parse", "urlunsplit")),
+        ("urllib.parse", "quote") => Some(("urllib.parse", "quote")),
+        ("urllib.parse", "quote_from_bytes") => Some(("urllib.parse", "quote_from_bytes")),
+        ("urllib3.util.url", "_encode_invalid_chars") => {
+            Some(("urllib3.util.url", "_encode_invalid_chars"))
+        }
+        ("urllib3.util.url", "_idna_encode") => Some(("urllib3.util.url", "_idna_encode")),
+        ("urllib3.util.url", "_normalize_host") => Some(("urllib3.util.url", "_normalize_host")),
+        ("urllib3.util.url", "_remove_path_dot_segments") => {
+            Some(("urllib3.util.url", "_remove_path_dot_segments"))
+        }
+        ("urllib3.util.url", "to_str") => Some(("urllib3.util.util", "to_str")),
+        _ => None,
+    }
+}
+
+#[allow(unsafe_code)]
+fn intrinsic_descriptor_type_is(
+    descriptor: &Bound<'_, PyAny>,
+    expected: IntrinsicDescriptorType,
+) -> bool {
+    let current = descriptor.get_type().as_type_ptr();
+    // SAFETY: these are interpreter-owned immortal descriptor type objects;
+    // only their stable addresses are compared while Python is attached.
+    let expected = match expected {
+        IntrinsicDescriptorType::Method => {
+            std::ptr::addr_of_mut!(pyo3::ffi::PyMethodDescr_Type)
+        }
+        IntrinsicDescriptorType::Member => {
+            std::ptr::addr_of_mut!(pyo3::ffi::PyMemberDescr_Type)
+        }
+    };
+    current == expected
+}
+
+fn exact_type_identity_is(current: &Bound<'_, PyAny>, module: &str, name: &str) -> PyResult<bool> {
+    if !current.is_exact_instance_of::<PyType>() {
+        return Ok(false);
+    }
+    let current = current.cast::<PyType>()?;
+    let current_module = current.getattr("__module__")?;
+    let current_name = current.getattr("__name__")?;
+    Ok(current_module.is_exact_instance_of::<PyString>()
+        && current_name.is_exact_instance_of::<PyString>()
+        && current_module.cast::<PyString>()?.to_str()? == module
+        && current_name.cast::<PyString>()?.to_str()? == name)
+}
+
+fn exact_source_function_is(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    module: &str,
+    qualname: &str,
+    code: &Py<PyCode>,
+    globals: &Bound<'_, PyDict>,
+    single_ellipsis_default: bool,
+) -> PyResult<bool> {
+    if !current.is_exact_instance_of::<PyFunction>() {
+        return Ok(false);
+    }
+    let current = current.cast::<PyFunction>()?;
+    if current.getattr("__module__")?.extract::<String>()? != module
+        || current.getattr("__qualname__")?.extract::<String>()? != qualname
+        || !function_code(py, current)?.eq(code.bind(py))?
+        || !function_globals(py, current)?.is(globals)
+        || function_kwdefaults(py, current).is_some()
+        || function_closure(py, current).is_some()
+    {
+        return Ok(false);
+    }
+    let defaults_match = match function_defaults(py, current) {
+        None => !single_ellipsis_default,
+        Some(defaults) if single_ellipsis_default => {
+            defaults.is_exact_instance_of::<PyTuple>()
+                && defaults.cast::<PyTuple>()?.len() == 1
+                && defaults.cast::<PyTuple>()?.get_item(0)?.is(py.Ellipsis())
+        }
+        Some(_) => false,
+    };
+    Ok(defaults_match)
+}
+
+fn exact_text_set_is(current: &Bound<'_, PyAny>, expected: &str) -> PyResult<bool> {
+    if !current.is_exact_instance_of::<PySet>() {
+        return Ok(false);
+    }
+    let current = current.cast::<PySet>()?;
+    if current.len() != 1 {
+        return Ok(false);
+    }
+    let value = current.iter().next().expect("length checked");
+    Ok(value.is_exact_instance_of::<PyString>() && value.cast::<PyString>()?.to_str()? == expected)
+}
+
+fn abc_caches_are_pristine(py: Python<'_>, protocol: &Bound<'_, PyType>) -> PyResult<bool> {
+    let abc = PyModule::import(py, "_abc")?;
+    let dump = required_module_entry(&abc, "_get_dump")?;
+    let Ok(dump_function) = dump.cast::<PyCFunction>() else {
+        return Ok(false);
+    };
+    if dump_function.getattr("__name__")?.extract::<String>()? != "_get_dump"
+        || dump_function.getattr("__module__")?.extract::<String>()? != "_abc"
+        || !c_function_self(py, dump_function).is_some_and(|owner| owner.is(&abc))
+    {
+        return Ok(false);
+    }
+    let state = dump_function.call1((protocol,))?;
+    if !state.is_exact_instance_of::<PyTuple>() {
+        return Ok(false);
+    }
+    let state = state.cast::<PyTuple>()?;
+    if state.len() != 4 {
+        return Ok(false);
+    }
+    for index in 0..2 {
+        let entries = state.get_item(index)?;
+        if !entries.is_exact_instance_of::<PySet>() || !entries.cast::<PySet>()?.is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn known_runtime_protocol_is(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    module: &str,
+    name: &str,
+    member: &str,
+    member_code: &Py<PyCode>,
+    protocol_hook_code: &Py<PyCode>,
+    protocol_init_code: &Py<PyCode>,
+) -> PyResult<bool> {
+    let Ok(class) = current.cast::<PyType>() else {
+        return Ok(false);
+    };
+    let current_module = class.getattr("__module__")?;
+    let current_name = class.getattr("__name__")?;
+    if !current_module.is_exact_instance_of::<PyString>()
+        || !current_name.is_exact_instance_of::<PyString>()
+        || current_module.cast::<PyString>()?.to_str()? != module
+        || current_name.cast::<PyString>()?.to_str()? != name
+    {
+        return Ok(false);
+    }
+    let typing = PyModule::import(py, "typing")?;
+    let protocol = required_module_entry(&typing, "Protocol")?;
+    let generic = required_module_entry(&typing, "Generic")?;
+    if !class.get_type().is(protocol.get_type()) {
+        return Ok(false);
+    }
+    let mro = class.mro();
+    if mro.len() != 4
+        || !mro.get_item(0)?.is(class)
+        || !mro.get_item(1)?.is(&protocol)
+        || !mro.get_item(2)?.is(&generic)
+        || !mro.get_item(3)?.is(py.get_type::<PyAny>())
+    {
+        return Ok(false);
+    }
+
+    let namespace = class.getattr("__dict__")?;
+    for flag in ["_is_protocol", "_is_runtime_protocol"] {
+        let value = namespace.get_item(flag)?;
+        if !value.is_exact_instance_of::<PyBool>() || !value.is_truthy()? {
+            return Ok(false);
+        }
+    }
+    if !exact_text_set_is(&namespace.get_item("__protocol_attrs__")?, member)?
+        || !namespace
+            .get_item("__non_callable_proto_members__")?
+            .is_exact_instance_of::<PySet>()
+        || !namespace
+            .get_item("__non_callable_proto_members__")?
+            .cast::<PySet>()?
+            .is_empty()
+        || !namespace
+            .get_item("__abstractmethods__")?
+            .is_exact_instance_of::<PyFrozenSet>()
+        || !namespace
+            .get_item("__abstractmethods__")?
+            .cast::<PyFrozenSet>()?
+            .is_empty()
+    {
+        return Ok(false);
+    }
+
+    let typing_namespace = typing.dict();
+    let protocol_hook = typing_namespace.get_item("_proto_hook")?.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("typing._proto_hook is missing")
+    })?;
+    let protocol_init = typing_namespace
+        .get_item("_no_init_or_replace_init")?
+        .ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("typing._no_init_or_replace_init is missing")
+        })?;
+    if !namespace.get_item("__subclasshook__")?.is(&protocol_hook)
+        || !namespace.get_item("__init__")?.is(&protocol_init)
+    {
+        return Ok(false);
+    }
+    let protocol_hook_function = protocol_hook.getattr("__func__")?;
+    if !exact_source_function_is(
+        py,
+        &protocol_hook_function,
+        "typing",
+        "_proto_hook",
+        protocol_hook_code,
+        &typing_namespace,
+        false,
+    )? || !exact_source_function_is(
+        py,
+        &protocol_init,
+        "typing",
+        "_no_init_or_replace_init",
+        protocol_init_code,
+        &typing_namespace,
+        false,
+    )? {
+        return Ok(false);
+    }
+
+    let member_function = namespace.get_item(member)?;
+    let source = PyModule::import(py, module)?;
+    if !exact_source_function_is(
+        py,
+        &member_function,
+        module,
+        &format!("{name}.{member}"),
+        member_code,
+        &source.dict(),
+        name == "SupportsRead",
+    )? {
+        return Ok(false);
+    }
+    abc_caches_are_pristine(py, class)
+}
+
+fn static_type_is(current: &Bound<'_, PyType>, module: &str, name: &str) -> PyResult<bool> {
+    const IMMUTABLE_TYPE: u64 = 1 << 8;
+    let flags = current.getattr("__flags__")?.extract::<u64>()?;
+    Ok(flags & IMMUTABLE_TYPE != 0
+        && current.module()?.to_str()? == module
+        && current.qualname()?.to_str()? == name
+        && current.mro().len() == 2
+        && current.mro().get_item(0)?.is(current)
+        && current
+            .mro()
+            .get_item(1)?
+            .is(current.py().get_type::<PyAny>()))
+}
+
+fn always_safe_frozenset_is(current: &Bound<'_, PyAny>) -> PyResult<bool> {
+    const ALWAYS_SAFE: &[u8] =
+        b"-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~";
+    if !current.is_exact_instance_of::<PyFrozenSet>() {
+        return Ok(false);
+    }
+    let current = current.cast::<PyFrozenSet>()?;
+    if current.len() != ALWAYS_SAFE.len() {
+        return Ok(false);
+    }
+    for value in current.iter() {
+        let Ok(value) = value.extract::<u8>() else {
+            return Ok(false);
+        };
+        if !ALWAYS_SAFE.contains(&value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn known_quoter_type_is(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    globals: &Bound<'_, PyDict>,
+    name: &str,
+    default_dict_base: bool,
+    init_code: &Py<PyCode>,
+    missing_code: &Py<PyCode>,
+) -> PyResult<bool> {
+    if !exact_type_identity_is(current, "urllib.parse", name)? {
+        return Ok(false);
+    }
+    let class = current.cast::<PyType>()?;
+    let mro = class.mro();
+    let mro_matches = if default_dict_base {
+        if mro.len() != 4
+            || !mro.get_item(0)?.is(class)
+            || !mro.get_item(2)?.is(py.get_type::<PyDict>())
+            || !mro.get_item(3)?.is(py.get_type::<PyAny>())
+        {
+            false
+        } else {
+            let base = mro.get_item(1)?.cast_into::<PyType>()?;
+            let flags = base.getattr("__flags__")?.extract::<u64>()?;
+            const IMMUTABLE_TYPE: u64 = 1 << 8;
+            flags & IMMUTABLE_TYPE != 0
+                && base.module()?.to_str()? == "collections"
+                && base.qualname()?.to_str()? == "defaultdict"
+                && base.mro().len() == 3
+                && base.mro().get_item(0)?.is(&base)
+                && base.mro().get_item(1)?.is(py.get_type::<PyDict>())
+                && base.mro().get_item(2)?.is(py.get_type::<PyAny>())
+        }
+    } else {
+        mro.len() == 3
+            && mro.get_item(0)?.is(class)
+            && mro.get_item(1)?.is(py.get_type::<PyDict>())
+            && mro.get_item(2)?.is(py.get_type::<PyAny>())
+    };
+    if !mro_matches {
+        return Ok(false);
+    }
+    let namespace = class.getattr("__dict__")?;
+    if ["__new__", "__getitem__", "__setitem__", "__getattribute__"]
+        .iter()
+        .any(|name| namespace.contains(*name).unwrap_or(true))
+    {
+        return Ok(false);
+    }
+    if !exact_source_function_is(
+        py,
+        &namespace.get_item("__init__")?,
+        "urllib.parse",
+        &format!("{name}.__init__"),
+        init_code,
+        globals,
+        false,
+    )? || !exact_source_function_is(
+        py,
+        &namespace.get_item("__missing__")?,
+        "urllib.parse",
+        &format!("{name}.__missing__"),
+        missing_code,
+        globals,
+        false,
+    )? {
+        return Ok(false);
+    }
+    always_safe_frozenset_is(&globals.get_item("_ALWAYS_SAFE")?.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("urllib.parse._ALWAYS_SAFE is missing")
+    })?)
+}
+
+fn known_byte_quoter_factory_is(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    factory_code: &Py<PyCode>,
+    quoter_init_code: &Py<PyCode>,
+    quoter_missing_code: &Py<PyCode>,
+) -> PyResult<bool> {
+    let wrapper_type = current.get_type();
+    if !static_type_is(&wrapper_type, "functools", "_lru_cache_wrapper")? {
+        return Ok(false);
+    }
+    let wrapper_namespace = wrapper_type.getattr("__dict__")?;
+    let cache_info_descriptor = wrapper_namespace.get_item("cache_info")?;
+    let cache_info = cache_info_descriptor
+        .call_method1("__get__", (current, &wrapper_type))?
+        .call0()?;
+    if !cache_info.is_instance_of::<PyTuple>() {
+        return Ok(false);
+    }
+    let cache_info = cache_info.cast::<PyTuple>()?;
+    if cache_info.len() != 4
+        || cache_info.get_item(0)?.extract::<usize>()? != 0
+        || cache_info.get_item(1)?.extract::<usize>()? != 0
+        || cache_info.get_item(2)?.extract::<usize>()? != 128
+        || cache_info.get_item(3)?.extract::<usize>()? != 0
+    {
+        return Ok(false);
+    }
+
+    let wrapper_dict = current.getattr("__dict__")?.cast_into::<PyDict>()?;
+    let wrapped = wrapper_dict
+        .get_item("__wrapped__")?
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("missing __wrapped__"))?;
+    let urllib_parse = PyModule::import(py, "urllib.parse")?;
+    let globals = urllib_parse.dict();
+    if !exact_source_function_is(
+        py,
+        &wrapped,
+        "urllib.parse",
+        "_byte_quoter_factory",
+        factory_code,
+        &globals,
+        false,
+    )? {
+        return Ok(false);
+    }
+    let quoter = globals
+        .get_item("_Quoter")?
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("urllib.parse._Quoter missing"))?;
+    known_quoter_type_is(
+        py,
+        &quoter,
+        &globals,
+        "_Quoter",
+        false,
+        quoter_init_code,
+        quoter_missing_code,
+    )
+}
+
+fn known_url_type_is(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    expected_code: &Py<PyCode>,
+) -> PyResult<bool> {
+    if !exact_type_identity_is(current, "urllib3.util.url", "Url")? {
+        return Ok(false);
+    }
+    let class = current.cast::<PyType>()?;
+    let mro = class.mro();
+    if mro.len() != 4
+        || !mro.get_item(0)?.is(class)
+        || !mro.get_item(2)?.is(py.get_type::<PyTuple>())
+        || !mro.get_item(3)?.is(py.get_type::<PyAny>())
+    {
+        return Ok(false);
+    }
+
+    let base = mro.get_item(1)?;
+    if base.is(class) || !exact_type_identity_is(&base, "urllib3.util.url", "Url")? {
+        return Ok(false);
+    }
+    let base = base.cast::<PyType>()?;
+    let fields = base.getattr("_fields")?;
+    if !fields.is_exact_instance_of::<PyTuple>() {
+        return Ok(false);
+    }
+    let fields = fields.cast::<PyTuple>()?;
+    const EXPECTED_FIELDS: [&str; 7] = [
+        "scheme", "auth", "host", "port", "path", "query", "fragment",
+    ];
+    if fields.len() != EXPECTED_FIELDS.len() {
+        return Ok(false);
+    }
+    for (field, expected) in fields.iter().zip(EXPECTED_FIELDS) {
+        if !field.is_exact_instance_of::<PyString>()
+            || field.cast::<PyString>()?.to_str()? != expected
+        {
+            return Ok(false);
+        }
+    }
+
+    let namespace = class.getattr("__dict__")?;
+    if EXPECTED_FIELDS
+        .iter()
+        .any(|field| namespace.contains(*field).unwrap_or(true))
+    {
+        return Ok(false);
+    }
+    let new_descriptor = namespace.get_item("__new__")?;
+    let string_namespace = py.get_type::<PyString>().getattr("__dict__")?;
+    let staticmethod_anchor = string_namespace.get_item("maketrans")?;
+    if !new_descriptor.get_type().is(staticmethod_anchor.get_type()) {
+        return Ok(false);
+    }
+    let new_function = new_descriptor.getattr("__func__")?;
+    if !new_function.is_exact_instance_of::<PyFunction>() {
+        return Ok(false);
+    }
+    let new_function = new_function.cast::<PyFunction>()?;
+    if !function_code(py, new_function)?.eq(expected_code.bind(py))? {
+        return Ok(false);
+    }
+    let Some(defaults) = function_defaults(py, new_function) else {
+        return Ok(false);
+    };
+    if !defaults.is_exact_instance_of::<PyTuple>() {
+        return Ok(false);
+    }
+    let defaults = defaults.cast::<PyTuple>()?;
+    if defaults.len() != EXPECTED_FIELDS.len() || defaults.iter().any(|value| !value.is_none()) {
+        return Ok(false);
+    }
+    let Some(closure) = function_closure(py, new_function) else {
+        return Ok(false);
+    };
+    if !closure.is_exact_instance_of::<PyTuple>() {
+        return Ok(false);
+    }
+    let closure = closure.cast::<PyTuple>()?;
+    if closure.len() != 1 || !closure.get_item(0)?.getattr("cell_contents")?.is(class) {
+        return Ok(false);
+    }
+
+    let tuple_getattribute =
+        required_raw_type_entry(&py.get_type::<PyTuple>(), "__getattribute__")?;
+    Ok(raw_type_entry(class, "__getattribute__")?
+        .is_some_and(|current| current.is(&tuple_getattribute)))
 }
 
 fn known_regex_is(
@@ -460,13 +1105,13 @@ fn known_regex_is(
 
     let namespace = pattern_type.getattr("__dict__")?;
     for (name, descriptor_type) in [
-        ("match", "method_descriptor"),
-        ("search", "method_descriptor"),
-        ("pattern", "member_descriptor"),
-        ("flags", "member_descriptor"),
+        ("match", IntrinsicDescriptorType::Method),
+        ("search", IntrinsicDescriptorType::Method),
+        ("pattern", IntrinsicDescriptorType::Member),
+        ("flags", IntrinsicDescriptorType::Member),
     ] {
         let descriptor = namespace.get_item(name)?;
-        if descriptor.get_type().name()?.to_str()? != descriptor_type
+        if !intrinsic_descriptor_type_is(&descriptor, descriptor_type)
             || !descriptor.getattr("__objclass__")?.is(&pattern_type)
             || descriptor.getattr("__name__")?.extract::<String>()? != name
         {
@@ -512,6 +1157,7 @@ fn known_value_is(
     builtins: &Bound<'_, PyModule>,
     current: &Bound<'_, PyAny>,
     expected: KnownValue,
+    expected_code: Option<&KnownCode>,
 ) -> PyResult<bool> {
     match expected {
         KnownValue::Intrinsic(expected) => intrinsic_builtin_is(py, builtins, current, expected),
@@ -593,6 +1239,71 @@ fn known_value_is(
         }
         KnownValue::Bytes(expected) => Ok(current.is_exact_instance_of::<PyBytes>()
             && current.cast::<PyBytes>()?.as_bytes() == expected),
+        KnownValue::EmptyDict => {
+            Ok(current.is_exact_instance_of::<PyDict>() && current.cast::<PyDict>()?.is_empty())
+        }
+        KnownValue::UrlType => {
+            let Some(KnownCode::Url { new }) = expected_code else {
+                return Ok(false);
+            };
+            known_url_type_is(py, current, new)
+        }
+        KnownValue::RuntimeProtocol {
+            module,
+            name,
+            member,
+        } => {
+            let Some(KnownCode::RuntimeProtocol {
+                member: member_code,
+                protocol_hook,
+                protocol_init,
+            }) = expected_code
+            else {
+                return Ok(false);
+            };
+            let Some(protocol_hook) = protocol_hook else {
+                return Ok(false);
+            };
+            known_runtime_protocol_is(
+                py,
+                current,
+                module,
+                name,
+                member,
+                member_code,
+                protocol_hook,
+                protocol_init,
+            )
+        }
+        KnownValue::ByteQuoterFactory => {
+            let Some(KnownCode::ByteQuoterFactory {
+                factory,
+                quoter_init,
+                quoter_missing,
+            }) = expected_code
+            else {
+                return Ok(false);
+            };
+            known_byte_quoter_factory_is(py, current, factory, quoter_init, quoter_missing)
+        }
+        KnownValue::QuoterType {
+            name,
+            default_dict_base,
+        } => {
+            let Some(KnownCode::QuoterType { init, missing }) = expected_code else {
+                return Ok(false);
+            };
+            let urllib_parse = PyModule::import(py, "urllib.parse")?;
+            known_quoter_type_is(
+                py,
+                current,
+                &urllib_parse.dict(),
+                name,
+                default_dict_base,
+                init,
+                missing,
+            )
+        }
         KnownValue::Regex(expected) => known_regex_is(py, current, expected),
         KnownValue::RegexPair(first, second) => {
             if !current.is_exact_instance_of::<PyTuple>() {
@@ -846,28 +1557,74 @@ fn build_canonical_globals(
         }
         let resolution = if module_globals.contains(&name) {
             if let Some(known) = known_module_value(&module_name, &name) {
-                CanonicalGlobalResolution::KnownModule(known)
+                let code = match known {
+                    KnownValue::UrlType => Some(KnownCode::Url {
+                        new: canonical_code(py, "urllib3.util.url", "Url.__new__")?.unbind(),
+                    }),
+                    KnownValue::RuntimeProtocol {
+                        module,
+                        name,
+                        member,
+                    } => Some(KnownCode::RuntimeProtocol {
+                        member: canonical_code(py, module, &format!("{name}.{member}"))?.unbind(),
+                        protocol_hook: canonical_code(py, "typing", "_proto_hook")
+                            .ok()
+                            .map(Bound::unbind),
+                        protocol_init: canonical_code(py, "typing", "_no_init_or_replace_init")?
+                            .unbind(),
+                    }),
+                    KnownValue::ByteQuoterFactory => Some(KnownCode::ByteQuoterFactory {
+                        factory: canonical_code(py, "urllib.parse", "_byte_quoter_factory")?
+                            .unbind(),
+                        quoter_init: canonical_code(py, "urllib.parse", "_Quoter.__init__")?
+                            .unbind(),
+                        quoter_missing: canonical_code(py, "urllib.parse", "_Quoter.__missing__")?
+                            .unbind(),
+                    }),
+                    KnownValue::QuoterType { name, .. } => Some(KnownCode::QuoterType {
+                        init: canonical_code(py, "urllib.parse", &format!("{name}.__init__"))?
+                            .unbind(),
+                        missing: canonical_code(
+                            py,
+                            "urllib.parse",
+                            &format!("{name}.__missing__"),
+                        )?
+                        .unbind(),
+                    }),
+                    _ => None,
+                };
+                CanonicalGlobalResolution::KnownModule { value: known, code }
             } else if let Some(value) = module.dict().get_item(&name)? {
-                match direct_function_trust(py, &value, ancestors) {
-                    Ok(function) => CanonicalGlobalResolution::Module {
-                        function,
-                        expected: value.unbind(),
-                    },
-                    Err(_) => CanonicalGlobalResolution::Unprovable,
+                let Some((expected_module, expected_qualname)) =
+                    known_python_function(&module_name, &name)
+                else {
+                    dependencies.push(CanonicalGlobal {
+                        name,
+                        resolution: CanonicalGlobalResolution::Unprovable,
+                    });
+                    continue;
+                };
+                if !value.is_exact_instance_of::<PyFunction>()
+                    || value.getattr("__module__")?.extract::<String>()? != expected_module
+                    || value.getattr("__qualname__")?.extract::<String>()? != expected_qualname
+                {
+                    CanonicalGlobalResolution::Unprovable
+                } else {
+                    match direct_function_trust(py, &value, ancestors) {
+                        Ok(function) => CanonicalGlobalResolution::Module {
+                            function,
+                            expected: value.unbind(),
+                        },
+                        Err(_) => CanonicalGlobalResolution::Unprovable,
+                    }
                 }
             } else {
                 CanonicalGlobalResolution::Unprovable
             }
         } else if let Some(intrinsic) = intrinsic_builtin_for_name(&name) {
             CanonicalGlobalResolution::IntrinsicBuiltin(intrinsic)
-        } else if let Some(value) = builtins.get_item(&name)? {
-            match direct_function_trust(py, &value, ancestors) {
-                Ok(function) => CanonicalGlobalResolution::Builtin {
-                    function,
-                    expected: value.unbind(),
-                },
-                Err(_) => CanonicalGlobalResolution::Unprovable,
-            }
+        } else if builtins.contains(&name)? {
+            CanonicalGlobalResolution::Unprovable
         } else {
             CanonicalGlobalResolution::Missing
         };
@@ -889,6 +1646,13 @@ fn direct_function_trust(
     if ancestors.contains(&(module_name.clone(), qualname.clone())) {
         return Ok(None);
     }
+    let ignored_globals: &[&str] = match (module_name.as_str(), qualname.as_str()) {
+        ("requests.utils", "_validate_header_part") => &["InvalidHeader"],
+        ("requests.utils", "unquote_unreserved") => &["InvalidURL"],
+        ("urllib.parse", "quote_from_bytes") => &["math"],
+        ("urllib3.util.url", "_idna_encode") => &["LocationParseError"],
+        _ => &[],
+    };
     Ok(Some(Box::new(build_canonical_function_inner(
         py,
         value,
@@ -896,7 +1660,7 @@ fn direct_function_trust(
         &qualname,
         DefaultPolicy::Captured,
         true,
-        &[],
+        ignored_globals,
         ancestors,
     )?)))
 }
@@ -1053,7 +1817,7 @@ fn canonical_function_is(
                 }
                 (current, function)
             }
-            CanonicalGlobalResolution::KnownModule(expected_value) => {
+            CanonicalGlobalResolution::KnownModule { value, code } => {
                 let Some(current) = current_global else {
                     return Ok(false);
                 };
@@ -1061,26 +1825,12 @@ fn canonical_function_is(
                     py,
                     expected.builtins_module.bind(py),
                     &current,
-                    *expected_value,
+                    *value,
+                    code.as_ref(),
                 )? {
                     return Ok(false);
                 }
                 continue;
-            }
-            CanonicalGlobalResolution::Builtin {
-                expected: expected_value,
-                function,
-            } => {
-                if current_global.is_some() {
-                    return Ok(false);
-                }
-                let Some(current) = builtins.get_item(&dependency.name)? else {
-                    return Ok(false);
-                };
-                if !current.is(expected_value.bind(py)) {
-                    return Ok(false);
-                }
-                (current, function)
             }
             CanonicalGlobalResolution::IntrinsicBuiltin(intrinsic) => {
                 if current_global.is_some() {
@@ -1206,7 +1956,7 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         "RequestEncodingMixin._encode_params",
         DefaultPolicy::None,
         true,
-        &[],
+        &["_t"],
     )?;
     let to_native_string_trust = build_canonical_function(
         py,
@@ -1305,7 +2055,7 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         "CaseInsensitiveDict.__init__",
         DefaultPolicy::SingleNone,
         true,
-        &[],
+        &["OrderedDict"],
     )?;
     let case_insensitive_dict_update_trust = build_canonical_function(
         py,
@@ -1314,7 +2064,7 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         "MutableMapping.update",
         DefaultPolicy::SingleEmptyTuple,
         true,
-        &[],
+        &["Mapping"],
     )?;
     let case_insensitive_dict_setitem_trust = build_canonical_function(
         py,
@@ -1582,6 +2332,9 @@ fn _prepare_url_trial(
         }
         return Ok(py.None());
     }
+    if raw_url.len() >= 200_000 {
+        return Ok(callable.call1((url, params))?.unbind());
+    }
     if !url_is_native_safe(&raw_url) {
         return Ok(callable.call1((url, params))?.unbind());
     }
@@ -1634,7 +2387,7 @@ fn trusted_url_input_dependencies(py: Python<'_>, state: &ModelsState) -> PyResu
         state,
         &state.models,
         "isinstance",
-        IntrinsicBuiltin::IsInstance,
+        IntrinsicBuiltin::Function("isinstance"),
     )? && raw_intrinsic_builtin_fallback_is(
         py,
         state,
@@ -1828,13 +2581,15 @@ fn exact_encoded_params(params: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
 
 fn exact_parameter_bytes(value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
     if value.is_exact_instance_of::<PyBytes>() {
-        return Ok(Some(value.cast::<PyBytes>()?.as_bytes().to_vec()));
+        let value = value.cast::<PyBytes>()?.as_bytes();
+        return Ok((value.len() < 200_000).then(|| value.to_vec()));
     }
     if value.is_exact_instance_of::<PyString>() {
         return Ok(value
             .cast::<PyString>()?
             .to_str()
             .ok()
+            .filter(|value| value.len() < 200_000)
             .map(|value| value.as_bytes().to_vec()));
     }
     Ok(None)
