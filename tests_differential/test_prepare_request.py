@@ -367,6 +367,73 @@ finally:
     )
 
 
+def test_missing_rewind_body_before_extension_import_is_branch_local() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+original = utils.rewind_body
+del utils.rewind_body
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_method("get")
+            if _requests_rust is None
+            else _requests_rust._prepare_method_trial(subject, "get")
+        ),
+    )
+finally:
+    utils.rewind_body = original
+"""
+    )
+
+
+def test_rebound_encode_files_is_not_inspected_for_prepare_method() -> None:
+    _assert_matches_oracle_before_extension_import(
+        _PREIMPORT_CAPTURE_HELPER
+        + """
+from requests.models import PreparedRequest, RequestEncodingMixin
+
+
+class Trap:
+    def __getattribute__(self, name):
+        side_effects.append(["trap", name])
+        raise RuntimeError("encode-files trap callback")
+
+
+original = RequestEncodingMixin._encode_files
+RequestEncodingMixin._encode_files = Trap()
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    result = capture_preimport(
+        subject,
+        lambda: (
+            subject.prepare_method("get")
+            if _requests_rust is None
+            else _requests_rust._prepare_method_trial(subject, "get")
+        ),
+    )
+finally:
+    RequestEncodingMixin._encode_files = original
+"""
+    )
+
+
 def test_prepare_method_builtin_isinstance_replaced_before_extension_import() -> None:
     _assert_matches_oracle_before_extension_import(
         _PREIMPORT_CAPTURE_HELPER
