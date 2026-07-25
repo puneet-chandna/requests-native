@@ -54,6 +54,7 @@ enum CanonicalGlobalResolution {
         expected: Py<PyAny>,
         function: Option<Box<CanonicalFunction>>,
     },
+    KnownModule(KnownValue),
     Builtin {
         expected: Py<PyAny>,
         function: Option<Box<CanonicalFunction>>,
@@ -68,6 +69,27 @@ enum IntrinsicBuiltin {
     IsInstance,
     Str,
     Bytes,
+}
+
+#[derive(Clone, Copy)]
+enum KnownRegexPattern {
+    Text(&'static str),
+    Bytes(&'static [u8]),
+}
+
+#[derive(Clone, Copy)]
+struct KnownRegex {
+    pattern: KnownRegexPattern,
+    flags: i64,
+}
+
+#[derive(Clone, Copy)]
+enum KnownValue {
+    Intrinsic(IntrinsicBuiltin),
+    IntrinsicPair(IntrinsicBuiltin, IntrinsicBuiltin),
+    TextPairAndNone(&'static str, &'static str),
+    Regex(KnownRegex),
+    RegexPair(KnownRegex, KnownRegex),
 }
 
 #[derive(Clone, Copy)]
@@ -240,6 +262,122 @@ fn intrinsic_builtin_for_name(name: &str) -> Option<IntrinsicBuiltin> {
         "str" => Some(IntrinsicBuiltin::Str),
         "bytes" => Some(IntrinsicBuiltin::Bytes),
         _ => None,
+    }
+}
+
+fn known_module_value(module: &str, name: &str) -> Option<KnownValue> {
+    const HEADER_NAME_TEXT: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Text(r"^[^:\s][^:\r\n]*\Z"),
+        flags: 32,
+    };
+    const HEADER_VALUE_TEXT: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Text(r"^\S[^\r\n]*\Z|^\Z"),
+        flags: 32,
+    };
+    const HEADER_NAME_BYTES: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Bytes(br"^[^:\s][^:\r\n]*\Z"),
+        flags: 0,
+    };
+    const HEADER_VALUE_BYTES: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Bytes(br"^\S[^\r\n]*\Z|^\Z"),
+        flags: 0,
+    };
+    const IPV4: KnownRegex = KnownRegex {
+        pattern: KnownRegexPattern::Text(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$"),
+        flags: 32,
+    };
+
+    match (module, name) {
+        ("requests.models", "basestring") => Some(KnownValue::IntrinsicPair(
+            IntrinsicBuiltin::Str,
+            IntrinsicBuiltin::Bytes,
+        )),
+        ("requests._internal_utils", "builtin_str") | ("requests.utils", "str") => {
+            Some(KnownValue::Intrinsic(IntrinsicBuiltin::Str))
+        }
+        ("requests.utils", "bytes") => Some(KnownValue::Intrinsic(IntrinsicBuiltin::Bytes)),
+        ("requests.utils", "_HEADER_VALIDATORS_STR") => {
+            Some(KnownValue::RegexPair(HEADER_NAME_TEXT, HEADER_VALUE_TEXT))
+        }
+        ("requests.utils", "_HEADER_VALIDATORS_BYTE") => {
+            Some(KnownValue::RegexPair(HEADER_NAME_BYTES, HEADER_VALUE_BYTES))
+        }
+        ("urllib3.util.url", "_IPV4_RE") => Some(KnownValue::Regex(IPV4)),
+        ("urllib3.util.url", "_NORMALIZABLE_SCHEMES") => {
+            Some(KnownValue::TextPairAndNone("http", "https"))
+        }
+        _ => None,
+    }
+}
+
+fn known_regex_is(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    expected: KnownRegex,
+) -> PyResult<bool> {
+    let re = PyModule::import(py, "re")?;
+    let Some(pattern_type) = re.dict().get_item("Pattern")? else {
+        return Ok(false);
+    };
+    let Ok(pattern_type) = pattern_type.cast_into::<PyType>() else {
+        return Ok(false);
+    };
+    if !current.get_type().is(&pattern_type) {
+        return Ok(false);
+    }
+
+    let pattern = current.getattr("pattern")?;
+    let pattern_matches = match expected.pattern {
+        KnownRegexPattern::Text(expected) => pattern
+            .cast::<PyString>()
+            .is_ok_and(|value| value.to_str().is_ok_and(|value| value == expected)),
+        KnownRegexPattern::Bytes(expected) => pattern
+            .cast::<PyBytes>()
+            .is_ok_and(|value| value.as_bytes() == expected),
+    };
+    Ok(pattern_matches && current.getattr("flags")?.extract::<i64>()? == expected.flags)
+}
+
+fn known_value_is(
+    py: Python<'_>,
+    builtins: &Bound<'_, PyModule>,
+    current: &Bound<'_, PyAny>,
+    expected: KnownValue,
+) -> PyResult<bool> {
+    match expected {
+        KnownValue::Intrinsic(expected) => intrinsic_builtin_is(py, builtins, current, expected),
+        KnownValue::IntrinsicPair(first, second) => {
+            let Ok(values) = current.cast::<PyTuple>() else {
+                return Ok(false);
+            };
+            Ok(values.len() == 2
+                && intrinsic_builtin_is(py, builtins, &values.get_item(0)?, first)?
+                && intrinsic_builtin_is(py, builtins, &values.get_item(1)?, second)?)
+        }
+        KnownValue::TextPairAndNone(first, second) => {
+            let Ok(values) = current.cast::<PyTuple>() else {
+                return Ok(false);
+            };
+            Ok(values.len() == 3
+                && values
+                    .get_item(0)?
+                    .cast::<PyString>()
+                    .is_ok_and(|value| value.to_str().is_ok_and(|value| value == first))
+                && values
+                    .get_item(1)?
+                    .cast::<PyString>()
+                    .is_ok_and(|value| value.to_str().is_ok_and(|value| value == second))
+                && values.get_item(2)?.is_none())
+        }
+        KnownValue::Regex(expected) => known_regex_is(py, current, expected),
+        KnownValue::RegexPair(first, second) => {
+            let Ok(values) = current.cast::<PyTuple>() else {
+                return Ok(false);
+            };
+            Ok(values.len() == 2
+                && known_regex_is(py, &values.get_item(0)?, first)?
+                && known_regex_is(py, &values.get_item(1)?, second)?)
+        }
     }
 }
 
@@ -466,6 +604,7 @@ fn build_canonical_globals(
     let instructions = PyModule::import(py, "dis")?
         .getattr("get_instructions")?
         .call1((code,))?;
+    let module_name = module.name()?.to_str()?.to_owned();
     let mut dependencies = Vec::new();
     for instruction in instructions.try_iter()? {
         let instruction = instruction?;
@@ -481,7 +620,9 @@ fn build_canonical_globals(
             continue;
         }
         let resolution = if module_globals.contains(&name) {
-            if let Some(value) = module.dict().get_item(&name)? {
+            if let Some(known) = known_module_value(&module_name, &name) {
+                CanonicalGlobalResolution::KnownModule(known)
+            } else if let Some(value) = module.dict().get_item(&name)? {
                 match direct_function_trust(py, &value, ancestors) {
                     Ok(function) => CanonicalGlobalResolution::Module {
                         function,
@@ -686,6 +827,20 @@ fn canonical_function_is(
                     return Ok(false);
                 }
                 (current, function)
+            }
+            CanonicalGlobalResolution::KnownModule(expected_value) => {
+                let Some(current) = current_global else {
+                    return Ok(false);
+                };
+                if !known_value_is(
+                    py,
+                    expected.builtins_module.bind(py),
+                    &current,
+                    *expected_value,
+                )? {
+                    return Ok(false);
+                }
+                continue;
             }
             CanonicalGlobalResolution::Builtin {
                 expected: expected_value,
