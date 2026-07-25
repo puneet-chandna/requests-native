@@ -1,8 +1,9 @@
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
-    PyAny, PyAnyMethods, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyList, PyListMethods,
-    PyModule, PyString, PyTuple, PyTupleMethods, PyType, PyTypeMethods,
+    PyAny, PyAnyMethods, PyBool, PyBytes, PyBytesMethods, PyCode, PyDict, PyDictMethods,
+    PyFunction, PyList, PyListMethods, PyModule, PyString, PyTuple, PyTupleMethods, PyType,
+    PyTypeMethods,
 };
 use pyo3::wrap_pyfunction;
 use requests::utils::{encode_query_pairs, trim_python_whitespace_start};
@@ -11,6 +12,59 @@ use requests::{
     UrlPreparationError, append_url_params, is_non_http_url, prepare_headers, prepare_method,
     prepare_method_bytes, prepare_url, url_is_native_safe,
 };
+
+struct CanonicalFunction {
+    code: Py<PyCode>,
+    globals: Py<PyDict>,
+    builtins: Py<PyDict>,
+    defaults: CanonicalDefaults,
+    dependencies: Vec<CanonicalGlobal>,
+}
+
+enum CanonicalDefaults {
+    None,
+    Captured {
+        defaults: Py<PyAny>,
+        kwdefaults: Py<PyAny>,
+    },
+    ToNativeString,
+    Quote {
+        safe: &'static str,
+    },
+    Urlencode {
+        quote_plus: Py<PyAny>,
+        quote_plus_trust: Box<CanonicalFunction>,
+        quote: Py<PyAny>,
+        quote_trust: Box<CanonicalFunction>,
+    },
+}
+
+struct CanonicalGlobal {
+    name: String,
+    resolution: CanonicalGlobalResolution,
+}
+
+enum CanonicalGlobalResolution {
+    Module {
+        expected: Py<PyAny>,
+        function: Option<Box<CanonicalFunction>>,
+    },
+    Builtin {
+        expected: Py<PyAny>,
+        function: Option<Box<CanonicalFunction>>,
+    },
+    Missing,
+    Unprovable,
+}
+
+#[derive(Clone, Copy)]
+enum DefaultPolicy {
+    None,
+    Captured,
+    ToNativeString,
+    Quote(&'static str),
+    Urlencode,
+}
 
 struct ModelsState {
     internal_utils: Py<PyModule>,
@@ -45,6 +99,7 @@ struct ModelsState {
     basestring: Py<PyAny>,
     python_str: Py<PyAny>,
     python_bytes: Py<PyAny>,
+    builtin_isinstance: Py<PyAny>,
     has_read: Py<PyAny>,
     to_key_val_list: Py<PyAny>,
     unicode_is_ascii: Py<PyAny>,
@@ -57,6 +112,21 @@ struct ModelsState {
     prepare_url: Py<PyAny>,
     object_getattribute: Py<PyAny>,
     object_setattr: Py<PyAny>,
+    prepare_method_trust: CanonicalFunction,
+    prepare_headers_trust: CanonicalFunction,
+    prepare_url_trust: CanonicalFunction,
+    encode_params_function: Py<PyAny>,
+    encode_params_trust: CanonicalFunction,
+    to_native_string_trust: CanonicalFunction,
+    parse_url_trust: CanonicalFunction,
+    requote_uri_trust: CanonicalFunction,
+    unicode_is_ascii_trust: CanonicalFunction,
+    urlunparse_trust: CanonicalFunction,
+    has_read_trust: CanonicalFunction,
+    to_key_val_list_trust: CanonicalFunction,
+    urlencode_trust: CanonicalFunction,
+    check_header_validity_trust: CanonicalFunction,
+    validate_header_part_trust: CanonicalFunction,
 }
 
 static MODELS_STATE: PyOnceLock<ModelsState> = PyOnceLock::new();
@@ -90,6 +160,360 @@ fn required_module_entry<'py>(
     module.dict().get_item(name)?.ok_or_else(|| {
         pyo3::exceptions::PyAttributeError::new_err(format!("module has no raw {name} entry"))
     })
+}
+
+fn find_code_by_qualname<'py>(
+    code: &Bound<'py, PyCode>,
+    qualname: &str,
+) -> PyResult<Option<Bound<'py, PyCode>>> {
+    let (code_name, qualified) = match code.getattr("co_qualname") {
+        Ok(name) => (name.extract::<String>()?, true),
+        Err(_) => (code.getattr("co_name")?.extract::<String>()?, false),
+    };
+    let expected_name = qualname.rsplit('.').next().unwrap_or(qualname);
+    let matches = if qualified {
+        code_name == qualname
+    } else {
+        code_name == expected_name
+    };
+    let mut found = matches.then(|| code.clone());
+    for constant in code.getattr("co_consts")?.cast_into::<PyTuple>()?.iter() {
+        let Ok(nested) = constant.cast_into::<PyCode>() else {
+            continue;
+        };
+        if let Some(nested) = find_code_by_qualname(&nested, qualname)? {
+            found = Some(nested);
+        }
+    }
+    Ok(found)
+}
+
+fn canonical_module_code<'py>(py: Python<'py>, module_name: &str) -> PyResult<Bound<'py, PyCode>> {
+    let module = PyModule::import(py, module_name)?;
+    let spec = required_module_entry(&module, "__spec__")?;
+    let loader = spec.getattr("loader")?;
+    Ok(loader
+        .call_method1("get_code", (module_name,))?
+        .cast_into::<PyCode>()?)
+}
+
+fn canonical_code<'py>(
+    py: Python<'py>,
+    module_name: &str,
+    qualname: &str,
+) -> PyResult<Bound<'py, PyCode>> {
+    let root = canonical_module_code(py, module_name)?;
+    find_code_by_qualname(&root, qualname)?.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "canonical code not found for {module_name}.{qualname}"
+        ))
+    })
+}
+
+fn build_canonical_function(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    module_name: &str,
+    qualname: &str,
+    policy: DefaultPolicy,
+    include_globals: bool,
+    ignored_globals: &[&str],
+) -> PyResult<CanonicalFunction> {
+    let module = PyModule::import(py, module_name)?;
+    let code = canonical_code(py, module_name, qualname)?;
+    let builtins = required_module_entry(&module, "__builtins__")?.cast_into::<PyDict>()?;
+    let module_globals = canonical_module_globals(py, module_name)?;
+    let defaults = match policy {
+        DefaultPolicy::None => CanonicalDefaults::None,
+        DefaultPolicy::Captured => {
+            let function = current.cast::<PyFunction>()?;
+            CanonicalDefaults::Captured {
+                defaults: function.getattr("__defaults__")?.unbind(),
+                kwdefaults: function.getattr("__kwdefaults__")?.unbind(),
+            }
+        }
+        DefaultPolicy::ToNativeString => CanonicalDefaults::ToNativeString,
+        DefaultPolicy::Quote(safe) => CanonicalDefaults::Quote { safe },
+        DefaultPolicy::Urlencode => {
+            let urllib_parse = PyModule::import(py, "urllib.parse")?;
+            let quote_plus = required_module_entry(&urllib_parse, "quote_plus")?;
+            let quote = required_module_entry(&urllib_parse, "quote")?;
+            let quote_plus_trust = build_canonical_function(
+                py,
+                &quote_plus,
+                "urllib.parse",
+                "quote_plus",
+                DefaultPolicy::Quote(""),
+                true,
+                &[],
+            )?;
+            let quote_trust = build_canonical_function(
+                py,
+                &quote,
+                "urllib.parse",
+                "quote",
+                DefaultPolicy::Quote("/"),
+                true,
+                &["TypeError"],
+            )?;
+            CanonicalDefaults::Urlencode {
+                quote_plus: quote_plus.unbind(),
+                quote_plus_trust: Box::new(quote_plus_trust),
+                quote: quote.unbind(),
+                quote_trust: Box::new(quote_trust),
+            }
+        }
+    };
+    let dependencies = if include_globals {
+        build_canonical_globals(
+            py,
+            &module,
+            &builtins,
+            &code,
+            &module_globals,
+            ignored_globals,
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok(CanonicalFunction {
+        code: code.unbind(),
+        globals: module.dict().unbind(),
+        builtins: builtins.unbind(),
+        defaults,
+        dependencies,
+    })
+}
+
+fn canonical_module_globals(py: Python<'_>, module_name: &str) -> PyResult<Vec<String>> {
+    let code = canonical_module_code(py, module_name)?;
+    let instructions = PyModule::import(py, "dis")?
+        .getattr("get_instructions")?
+        .call1((&code,))?;
+    let mut names = Vec::new();
+    for instruction in instructions.try_iter()? {
+        let instruction = instruction?;
+        let opname = instruction.getattr("opname")?.extract::<String>()?;
+        if opname != "STORE_NAME" && opname != "STORE_GLOBAL" {
+            continue;
+        }
+        let name = instruction.getattr("argval")?.extract::<String>()?;
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+fn build_canonical_globals(
+    py: Python<'_>,
+    module: &Bound<'_, PyModule>,
+    builtins: &Bound<'_, PyDict>,
+    code: &Bound<'_, PyCode>,
+    module_globals: &[String],
+    ignored: &[&str],
+) -> PyResult<Vec<CanonicalGlobal>> {
+    let instructions = PyModule::import(py, "dis")?
+        .getattr("get_instructions")?
+        .call1((code,))?;
+    let mut dependencies = Vec::new();
+    for instruction in instructions.try_iter()? {
+        let instruction = instruction?;
+        if instruction.getattr("opname")?.extract::<String>()? != "LOAD_GLOBAL" {
+            continue;
+        }
+        let name = instruction.getattr("argval")?.extract::<String>()?;
+        if ignored.contains(&name.as_str())
+            || dependencies
+                .iter()
+                .any(|dependency: &CanonicalGlobal| dependency.name == name)
+        {
+            continue;
+        }
+        let resolution = if module_globals.contains(&name) {
+            if let Some(value) = module.dict().get_item(&name)? {
+                match direct_function_trust(py, &value) {
+                    Ok(function) => CanonicalGlobalResolution::Module {
+                        function,
+                        expected: value.unbind(),
+                    },
+                    Err(_) => CanonicalGlobalResolution::Unprovable,
+                }
+            } else {
+                CanonicalGlobalResolution::Unprovable
+            }
+        } else if let Some(value) = builtins.get_item(&name)? {
+            match direct_function_trust(py, &value) {
+                Ok(function) => CanonicalGlobalResolution::Builtin {
+                    function,
+                    expected: value.unbind(),
+                },
+                Err(_) => CanonicalGlobalResolution::Unprovable,
+            }
+        } else {
+            CanonicalGlobalResolution::Missing
+        };
+        dependencies.push(CanonicalGlobal { name, resolution });
+    }
+    Ok(dependencies)
+}
+
+fn direct_function_trust(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Option<Box<CanonicalFunction>>> {
+    if !value.is_exact_instance_of::<PyFunction>() {
+        return Ok(None);
+    }
+    let module_name = value.getattr("__module__")?.extract::<String>()?;
+    let qualname = value.getattr("__qualname__")?.extract::<String>()?;
+    Ok(Some(Box::new(build_canonical_function(
+        py,
+        value,
+        &module_name,
+        &qualname,
+        DefaultPolicy::Captured,
+        false,
+        &[],
+    )?)))
+}
+
+fn canonical_defaults_are_current(
+    py: Python<'_>,
+    function: &Bound<'_, PyFunction>,
+    expected: &CanonicalDefaults,
+) -> PyResult<bool> {
+    let defaults = function.getattr("__defaults__")?;
+    let kwdefaults = function.getattr("__kwdefaults__")?;
+    match expected {
+        CanonicalDefaults::None => Ok(defaults.is_none() && kwdefaults.is_none()),
+        CanonicalDefaults::Captured {
+            defaults: expected_defaults,
+            kwdefaults: expected_kwdefaults,
+        } => {
+            Ok(defaults.is(expected_defaults.bind(py))
+                && kwdefaults.is(expected_kwdefaults.bind(py)))
+        }
+        CanonicalDefaults::ToNativeString => {
+            if !kwdefaults.is_none() {
+                return Ok(false);
+            }
+            let Ok(defaults) = defaults.cast_into::<PyTuple>() else {
+                return Ok(false);
+            };
+            Ok(defaults.len() == 1
+                && defaults
+                    .get_item(0)?
+                    .cast::<PyString>()
+                    .is_ok_and(|value| value.to_str().is_ok_and(|value| value == "ascii")))
+        }
+        CanonicalDefaults::Quote { safe } => {
+            if !kwdefaults.is_none() {
+                return Ok(false);
+            }
+            let Ok(defaults) = defaults.cast_into::<PyTuple>() else {
+                return Ok(false);
+            };
+            Ok(defaults.len() == 3
+                && defaults
+                    .get_item(0)?
+                    .cast::<PyString>()
+                    .is_ok_and(|value| value.to_str().is_ok_and(|value| value == *safe))
+                && defaults.get_item(1)?.is_none()
+                && defaults.get_item(2)?.is_none())
+        }
+        CanonicalDefaults::Urlencode {
+            quote_plus,
+            quote_plus_trust,
+            quote,
+            quote_trust,
+        } => {
+            if !kwdefaults.is_none() {
+                return Ok(false);
+            }
+            let Ok(defaults) = defaults.cast_into::<PyTuple>() else {
+                return Ok(false);
+            };
+            if defaults.len() != 5
+                || !defaults.get_item(0)?.is_exact_instance_of::<PyBool>()
+                || defaults.get_item(0)?.extract::<bool>()?
+                || !defaults
+                    .get_item(1)?
+                    .cast::<PyString>()
+                    .is_ok_and(|value| value.to_str().is_ok_and(str::is_empty))
+                || !defaults.get_item(2)?.is_none()
+                || !defaults.get_item(3)?.is_none()
+            {
+                return Ok(false);
+            }
+            let actual_quote_plus = defaults.get_item(4)?;
+            Ok(actual_quote_plus.is(quote_plus.bind(py))
+                && canonical_function_is(py, &actual_quote_plus, quote_plus_trust)?
+                && canonical_function_is(py, quote.bind(py), quote_trust)?)
+        }
+    }
+}
+
+fn canonical_function_is(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    expected: &CanonicalFunction,
+) -> PyResult<bool> {
+    let Ok(function) = current.cast::<PyFunction>() else {
+        return Ok(false);
+    };
+    let Ok(code) = function.getattr("__code__")?.cast_into::<PyCode>() else {
+        return Ok(false);
+    };
+    let globals = function.getattr("__globals__")?.cast_into::<PyDict>()?;
+    let builtins = function.getattr("__builtins__")?.cast_into::<PyDict>()?;
+    if !code.eq(expected.code.bind(py))?
+        || !globals.is(expected.globals.bind(py))
+        || !builtins.is(expected.builtins.bind(py))
+        || !canonical_defaults_are_current(py, function, &expected.defaults)?
+    {
+        return Ok(false);
+    }
+    for dependency in &expected.dependencies {
+        let current_global = globals.get_item(&dependency.name)?;
+        let (current, function) = match &dependency.resolution {
+            CanonicalGlobalResolution::Module { expected, function } => {
+                let Some(current) = current_global else {
+                    return Ok(false);
+                };
+                if !current.is(expected.bind(py)) {
+                    return Ok(false);
+                }
+                (current, function)
+            }
+            CanonicalGlobalResolution::Builtin { expected, function } => {
+                if current_global.is_some() {
+                    return Ok(false);
+                }
+                let Some(current) = builtins.get_item(&dependency.name)? else {
+                    return Ok(false);
+                };
+                if !current.is(expected.bind(py)) {
+                    return Ok(false);
+                }
+                (current, function)
+            }
+            CanonicalGlobalResolution::Missing => {
+                if current_global.is_some() || builtins.contains(&dependency.name)? {
+                    return Ok(false);
+                }
+                continue;
+            }
+            CanonicalGlobalResolution::Unprovable => return Ok(false),
+        };
+        if let Some(function) = function
+            && !canonical_function_is(py, &current, function)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
@@ -132,6 +556,7 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
     let basestring = required_module_entry(&models, "basestring")?;
     let python_str = required_module_entry(&builtins, "str")?;
     let python_bytes = required_module_entry(&builtins, "bytes")?;
+    let builtin_isinstance = required_module_entry(&builtins, "isinstance")?;
     let has_read = required_module_entry(&model_types, "has_read")?;
     let to_key_val_list = required_module_entry(&models, "to_key_val_list")?;
     let unicode_is_ascii = required_module_entry(&models, "unicode_is_ascii")?;
@@ -142,6 +567,7 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
     let encode_params_descriptor = request_encoding_mixin
         .getattr("__dict__")?
         .get_item("_encode_params")?;
+    let encode_params_function = encode_params_descriptor.getattr("__func__")?;
     let builtin_str = required_module_entry(&internal_utils, "builtin_str")?;
     let prepare_method = required_raw_type_entry(&prepared_request, "prepare_method")?;
     let prepare_headers = required_raw_type_entry(&prepared_request, "prepare_headers")?;
@@ -149,7 +575,132 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
     let object_type = py.get_type::<PyAny>();
     let object_getattribute = required_raw_type_entry(&object_type, "__getattribute__")?;
     let object_setattr = required_raw_type_entry(&object_type, "__setattr__")?;
-
+    let prepare_method_trust = build_canonical_function(
+        py,
+        &prepare_method,
+        "requests.models",
+        "PreparedRequest.prepare_method",
+        DefaultPolicy::None,
+        false,
+        &[],
+    )?;
+    let prepare_headers_trust = build_canonical_function(
+        py,
+        &prepare_headers,
+        "requests.models",
+        "PreparedRequest.prepare_headers",
+        DefaultPolicy::None,
+        false,
+        &[],
+    )?;
+    let prepare_url_trust = build_canonical_function(
+        py,
+        &prepare_url,
+        "requests.models",
+        "PreparedRequest.prepare_url",
+        DefaultPolicy::None,
+        false,
+        &[],
+    )?;
+    let encode_params_trust = build_canonical_function(
+        py,
+        &encode_params_function,
+        "requests.models",
+        "RequestEncodingMixin._encode_params",
+        DefaultPolicy::None,
+        true,
+        &[],
+    )?;
+    let to_native_string_trust = build_canonical_function(
+        py,
+        &to_native_string,
+        "requests._internal_utils",
+        "to_native_string",
+        DefaultPolicy::ToNativeString,
+        true,
+        &[],
+    )?;
+    let parse_url_trust = build_canonical_function(
+        py,
+        &parse_url,
+        "urllib3.util.url",
+        "parse_url",
+        DefaultPolicy::None,
+        true,
+        &["LocationParseError", "ValueError", "AttributeError"],
+    )?;
+    let requote_uri_trust = build_canonical_function(
+        py,
+        &requote_uri,
+        "requests.utils",
+        "requote_uri",
+        DefaultPolicy::None,
+        true,
+        &["InvalidURL"],
+    )?;
+    let unicode_is_ascii_trust = build_canonical_function(
+        py,
+        &unicode_is_ascii,
+        "requests._internal_utils",
+        "unicode_is_ascii",
+        DefaultPolicy::None,
+        true,
+        &["UnicodeEncodeError"],
+    )?;
+    let urlunparse_trust = build_canonical_function(
+        py,
+        &urlunparse,
+        "urllib.parse",
+        "urlunparse",
+        DefaultPolicy::None,
+        true,
+        &[],
+    )?;
+    let has_read_trust = build_canonical_function(
+        py,
+        &has_read,
+        "requests._types",
+        "has_read",
+        DefaultPolicy::None,
+        true,
+        &[],
+    )?;
+    let to_key_val_list_trust = build_canonical_function(
+        py,
+        &to_key_val_list,
+        "requests.utils",
+        "to_key_val_list",
+        DefaultPolicy::None,
+        true,
+        &["ValueError"],
+    )?;
+    let urlencode_trust = build_canonical_function(
+        py,
+        &urlencode,
+        "urllib.parse",
+        "urlencode",
+        DefaultPolicy::Urlencode,
+        true,
+        &["TypeError"],
+    )?;
+    let check_header_validity_trust = build_canonical_function(
+        py,
+        &check_header_validity,
+        "requests.utils",
+        "check_header_validity",
+        DefaultPolicy::None,
+        true,
+        &[],
+    )?;
+    let validate_header_part_trust = build_canonical_function(
+        py,
+        &validate_header_part,
+        "requests.utils",
+        "_validate_header_part",
+        DefaultPolicy::None,
+        true,
+        &["InvalidHeader", "type"],
+    )?;
     Ok(ModelsState {
         internal_utils: internal_utils.unbind(),
         builtins: builtins.unbind(),
@@ -183,6 +734,7 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         basestring: basestring.unbind(),
         python_str: python_str.unbind(),
         python_bytes: python_bytes.unbind(),
+        builtin_isinstance: builtin_isinstance.unbind(),
         has_read: has_read.unbind(),
         to_key_val_list: to_key_val_list.unbind(),
         unicode_is_ascii: unicode_is_ascii.unbind(),
@@ -195,6 +747,21 @@ fn initialize_models_state(py: Python<'_>) -> PyResult<ModelsState> {
         prepare_url: prepare_url.unbind(),
         object_getattribute: object_getattribute.unbind(),
         object_setattr: object_setattr.unbind(),
+        prepare_method_trust,
+        prepare_headers_trust,
+        prepare_url_trust,
+        encode_params_function: encode_params_function.unbind(),
+        encode_params_trust,
+        to_native_string_trust,
+        parse_url_trust,
+        requote_uri_trust,
+        unicode_is_ascii_trust,
+        urlunparse_trust,
+        has_read_trust,
+        to_key_val_list_trust,
+        urlencode_trust,
+        check_header_validity_trust,
+        validate_header_part_trust,
     })
 }
 
@@ -213,6 +780,17 @@ fn raw_module_entry_is(
         .dict()
         .get_item(name)?
         .is_some_and(|value| value.is(expected.bind(py))))
+}
+
+fn raw_builtin_fallback_is(
+    py: Python<'_>,
+    state: &ModelsState,
+    module: &Py<PyModule>,
+    name: &str,
+    expected: &Py<PyAny>,
+) -> PyResult<bool> {
+    Ok(!module.bind(py).dict().contains(name)?
+        && raw_module_entry_is(py, &state.builtins, name, expected)?)
 }
 
 fn raw_type_entry_is(
@@ -241,6 +819,7 @@ fn trusted_bound_method<'py>(
     subject: &Bound<'py, PyAny>,
     name: &str,
     expected: &Py<PyAny>,
+    expected_trust: &CanonicalFunction,
 ) -> PyResult<(Bound<'py, PyAny>, bool)> {
     let callable = subject.getattr(name)?;
     let state = models_state(py)?;
@@ -264,8 +843,10 @@ fn trusted_bound_method<'py>(
         return Ok((callable, false));
     }
 
+    let function = callable.getattr("__func__")?;
     let trusted = callable.getattr("__self__")?.is(subject)
-        && callable.getattr("__func__")?.is(expected.bind(py));
+        && function.is(expected.bind(py))
+        && canonical_function_is(py, &function, expected_trust)?;
     Ok((callable, trusted))
 }
 
@@ -276,8 +857,13 @@ fn _prepare_method_trial(
     method: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let state = models_state(py)?;
-    let (callable, trusted) =
-        trusted_bound_method(py, subject, "prepare_method", &state.prepare_method)?;
+    let (callable, trusted) = trusted_bound_method(
+        py,
+        subject,
+        "prepare_method",
+        &state.prepare_method,
+        &state.prepare_method_trust,
+    )?;
     if !trusted || !authoritative_field_is_none(py, state, subject, "method")? {
         return Ok(callable.call1((method,))?.unbind());
     }
@@ -337,8 +923,17 @@ fn _prepare_url_trial(
     params: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let state = models_state(py)?;
-    let (callable, trusted) = trusted_bound_method(py, subject, "prepare_url", &state.prepare_url)?;
+    let (callable, trusted) = trusted_bound_method(
+        py,
+        subject,
+        "prepare_url",
+        &state.prepare_url,
+        &state.prepare_url_trust,
+    )?;
     if !trusted {
+        return Ok(callable.call1((url, params))?.unbind());
+    }
+    if !trusted_url_input_dependencies(py, state)? {
         return Ok(callable.call1((url, params))?.unbind());
     }
 
@@ -396,7 +991,23 @@ fn trusted_native_string_dependencies(py: Python<'_>, state: &ModelsState) -> Py
         &state.models,
         "to_native_string",
         &state.to_native_string,
-    )? && raw_module_entry_is(py, &state.internal_utils, "builtin_str", &state.builtin_str)?)
+    )? && raw_module_entry_is(py, &state.internal_utils, "builtin_str", &state.builtin_str)?
+        && canonical_function_is(
+            py,
+            state.to_native_string.bind(py),
+            &state.to_native_string_trust,
+        )?)
+}
+
+fn trusted_url_input_dependencies(py: Python<'_>, state: &ModelsState) -> PyResult<bool> {
+    Ok(raw_builtin_fallback_is(
+        py,
+        state,
+        &state.models,
+        "isinstance",
+        &state.builtin_isinstance,
+    )? && raw_builtin_fallback_is(py, state, &state.models, "bytes", &state.python_bytes)?
+        && raw_builtin_fallback_is(py, state, &state.models, "str", &state.python_str)?)
 }
 
 fn trusted_url_parse_dependencies(py: Python<'_>, state: &ModelsState) -> PyResult<bool> {
@@ -409,7 +1020,15 @@ fn trusted_url_parse_dependencies(py: Python<'_>, state: &ModelsState) -> PyResu
                 "unicode_is_ascii",
                 &state.unicode_is_ascii,
             )?
-            && raw_module_entry_is(py, &state.models, "urlunparse", &state.urlunparse)?,
+            && raw_module_entry_is(py, &state.models, "urlunparse", &state.urlunparse)?
+            && canonical_function_is(py, state.parse_url.bind(py), &state.parse_url_trust)?
+            && canonical_function_is(py, state.requote_uri.bind(py), &state.requote_uri_trust)?
+            && canonical_function_is(
+                py,
+                state.unicode_is_ascii.bind(py),
+                &state.unicode_is_ascii_trust,
+            )?
+            && canonical_function_is(py, state.urlunparse.bind(py), &state.urlunparse_trust)?,
     )
 }
 
@@ -442,12 +1061,12 @@ fn trusted_url_parameter_dependencies(
     subject: &Bound<'_, PyAny>,
     params: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
-    let models_dict = state.models.bind(py).dict();
     if !has_original_encode_params_descriptor(py, state, subject)?
-        || models_dict.contains("str")?
-        || models_dict.contains("bytes")?
-        || !raw_module_entry_is(py, &state.builtins, "str", &state.python_str)?
-        || !raw_module_entry_is(py, &state.builtins, "bytes", &state.python_bytes)?
+        || !canonical_function_is(
+            py,
+            state.encode_params_function.bind(py),
+            &state.encode_params_trust,
+        )?
     {
         return Ok(false);
     }
@@ -468,7 +1087,14 @@ fn trusted_url_parameter_dependencies(
         && raw_module_entry_is(py, &state.model_types, "has_read", &state.has_read)?
         && raw_module_entry_is(py, &state.models, "basestring", &state.basestring)?
         && raw_module_entry_is(py, &state.models, "to_key_val_list", &state.to_key_val_list)?
-        && raw_module_entry_is(py, &state.models, "urlencode", &state.urlencode)?)
+        && raw_module_entry_is(py, &state.models, "urlencode", &state.urlencode)?
+        && canonical_function_is(py, state.has_read.bind(py), &state.has_read_trust)?
+        && canonical_function_is(
+            py,
+            state.to_key_val_list.bind(py),
+            &state.to_key_val_list_trust,
+        )?
+        && canonical_function_is(py, state.urlencode.bind(py), &state.urlencode_trust)?)
 }
 
 fn has_original_encode_params_descriptor(
@@ -614,8 +1240,13 @@ fn _prepare_headers_trial(
     headers: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let state = models_state(py)?;
-    let (callable, trusted) =
-        trusted_bound_method(py, subject, "prepare_headers", &state.prepare_headers)?;
+    let (callable, trusted) = trusted_bound_method(
+        py,
+        subject,
+        "prepare_headers",
+        &state.prepare_headers,
+        &state.prepare_headers_trust,
+    )?;
     if !trusted || !authoritative_field_is_none(py, state, subject, "headers")? {
         return Ok(callable.call1((headers,))?.unbind());
     }
@@ -684,7 +1315,17 @@ fn trusted_header_validation_dependencies(py: Python<'_>, state: &ModelsState) -
         "_HEADER_VALIDATORS_BYTE",
         &state.header_validators_byte,
     )? && raw_module_entry_is(py, &state.utils, "str", &state.utils_str)?
-        && raw_module_entry_is(py, &state.utils, "bytes", &state.utils_bytes)?)
+        && raw_module_entry_is(py, &state.utils, "bytes", &state.utils_bytes)?
+        && canonical_function_is(
+            py,
+            state.check_header_validity.bind(py),
+            &state.check_header_validity_trust,
+        )?
+        && canonical_function_is(
+            py,
+            state.validate_header_part.bind(py),
+            &state.validate_header_part_trust,
+        )?)
 }
 
 fn is_exact_header_candidate(py: Python<'_>, headers: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -706,6 +1347,7 @@ fn trusted_header_constructor_dependencies(py: Python<'_>, state: &ModelsState) 
         .dict()
         .get_item("CaseInsensitiveDict")?
         .is_some_and(|value| value.is(class))
+        && raw_type_entry(class, "_store")?.is_none()
         && raw_module_entry_is(py, &state.structures, "OrderedDict", &state.ordered_dict)?
         && raw_type_entry_is(py, class, "__init__", &state.case_insensitive_dict_init)?
         && raw_type_entry_is(py, class, "__new__", &state.case_insensitive_dict_new)?

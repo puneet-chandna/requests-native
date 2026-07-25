@@ -117,6 +117,17 @@ def _assert_matches_oracle(source: str) -> None:
     assert rewrite.stderr == ""
 
 
+def _assert_matches_oracle_before_extension_import(source: str) -> None:
+    case = {"source": dedent(source)}
+    oracle = run_oracle_case(case)
+    rewrite = run_rewrite_case(case)
+
+    assert oracle.observations["exception"] is None
+    assert oracle.stderr == ""
+    assert rewrite.observations == oracle.observations
+    assert rewrite.stderr == ""
+
+
 def test_prepare_method_normalization_errors_and_dynamic_upper() -> None:
     _assert_matches_oracle(
         """
@@ -192,6 +203,203 @@ bytes_result["is_canonical_text"] = bytes_subject.method is canonical_text
 result = [text, bytes_result]
 """
     )
+
+
+def test_prepare_method_rebound_internal_isinstance_preserves_partial_state() -> None:
+    _assert_matches_oracle(
+        """
+import requests._internal_utils as internal_utils
+from requests.models import PreparedRequest
+
+
+def rebound_isinstance(value, expected):
+    side_effects.append(["internal-isinstance", repr(value)])
+    return False
+
+
+internal_utils.isinstance = rebound_isinstance
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "rebound-internal-isinstance",
+        subject,
+        lambda: prepare_method_call(subject, "get"),
+    )
+finally:
+    del internal_utils.isinstance
+"""
+    )
+
+
+def test_prepare_method_same_function_replaced_code_delegates() -> None:
+    _assert_matches_oracle(
+        """
+from requests.models import PreparedRequest
+
+
+original_code = PreparedRequest.prepare_method.__code__
+
+
+def code_patched(subject, method):
+    subject.method = "CODE-PATCHED"
+
+
+PreparedRequest.prepare_method.__code__ = code_patched.__code__
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "same-function-code-replaced",
+        subject,
+        lambda: prepare_method_call(subject, "get"),
+    )
+finally:
+    PreparedRequest.prepare_method.__code__ = original_code
+"""
+    )
+
+
+def test_prepare_method_same_helper_replaced_code_delegates() -> None:
+    _assert_matches_oracle(
+        """
+import requests._internal_utils as internal_utils
+from requests.models import PreparedRequest
+
+
+original_code = internal_utils.to_native_string.__code__
+
+
+def code_patched(string, encoding="ascii"):
+    return "HELPER-CODE-PATCHED"
+
+
+internal_utils.to_native_string.__code__ = code_patched.__code__
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "same-helper-code-replaced",
+        subject,
+        lambda: prepare_method_call(subject, "get"),
+    )
+finally:
+    internal_utils.to_native_string.__code__ = original_code
+"""
+    )
+
+
+def test_prepare_method_helper_default_replacement_delegates() -> None:
+    _assert_matches_oracle(
+        """
+import requests._internal_utils as internal_utils
+from requests.models import PreparedRequest
+
+
+original_defaults = internal_utils.to_native_string.__defaults__
+internal_utils.to_native_string.__defaults__ = ("utf-16",)
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "helper-default-replaced",
+        subject,
+        lambda: prepare_method_call(subject, b"get"),
+    )
+finally:
+    internal_utils.to_native_string.__defaults__ = original_defaults
+"""
+    )
+
+
+def test_prepare_method_replaced_before_first_extension_import_delegates() -> None:
+    _assert_matches_oracle_before_extension_import(
+        """
+import requests.models as models
+from requests.models import PreparedRequest
+
+
+original = PreparedRequest.prepare_method
+
+
+def replacement(subject, method):
+    side_effects.append(["replacement-called", method])
+    subject.method = "CUSTOM"
+
+
+PreparedRequest.prepare_method = replacement
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    if _requests_rust is None:
+        returned = subject.prepare_method("get")
+    else:
+        returned = _requests_rust._prepare_method_trial(subject, "get")
+    result = {
+        "returned": returned,
+        "method": subject.method,
+        "side_effects": list(side_effects),
+    }
+finally:
+    PreparedRequest.prepare_method = original
+"""
+    )
+
+
+def test_pristine_exact_candidates_execute_native_trials() -> None:
+    case = {
+        "source": dedent(
+            _TRIAL_HELPERS
+            + """
+import sys
+from requests.models import PreparedRequest, RequestEncodingMixin
+from requests.utils import to_key_val_list
+
+
+targets = {
+    PreparedRequest.prepare_method.__code__,
+    PreparedRequest.prepare_url.__code__,
+    PreparedRequest.prepare_headers.__code__,
+    RequestEncodingMixin._encode_params.__code__,
+    to_key_val_list.__code__,
+}
+seen = []
+
+
+def profile(frame, event, argument):
+    if event == "call" and frame.f_code in targets:
+        seen.append(frame.f_code.co_qualname)
+
+
+sys.setprofile(profile)
+try:
+    method_subject = PreparedRequest()
+    prepare_method_call(method_subject, "get")
+
+    url_subject = PreparedRequest()
+    prepare_url_call(
+        url_subject,
+        "http://example.com/a path",
+        {"x": "a b"},
+    )
+
+    headers_subject = PreparedRequest()
+    prepare_headers_call(headers_subject, {"Name": "value"})
+finally:
+    sys.setprofile(None)
+
+assert seen == []
+assert method_subject.method == "GET"
+assert url_subject.url == "http://example.com/a%20path?x=a+b"
+assert list(headers_subject.headers.items()) == [("Name", "value")]
+result = seen
+"""
+        )
+    }
+    rewrite = run_rewrite_case(case)
+
+    assert rewrite.observations["exception"] is None
+    assert rewrite.stderr == ""
 
 
 def test_prepare_method_shadowed_descriptor_is_resolved_once() -> None:
@@ -569,6 +777,371 @@ finally:
     )
 
 
+def test_prepare_url_builtin_conversion_shadows_delegate_before_bypass() -> None:
+    _assert_matches_oracle(
+        """
+import builtins
+import requests.models as models
+from requests.models import PreparedRequest
+
+
+def observed_isinstance(value, expected):
+    side_effects.append(["models-isinstance", repr(value)])
+    return builtins.isinstance(value, expected)
+
+
+models.isinstance = observed_isinstance
+try:
+    isinstance_subject = PreparedRequest()
+    rebound_isinstance = capture(
+        "rebound-models-isinstance",
+        isinstance_subject,
+        lambda: prepare_url_call(
+            isinstance_subject,
+            "http://example.com/path",
+            None,
+        ),
+    )
+finally:
+    del models.isinstance
+
+
+def rewritten_str(value):
+    side_effects.append(["models-str", repr(value)])
+    if str(value).startswith("mailto:"):
+        return "mailto:rewritten@example.org"
+    return str(value)
+
+
+models.str = rewritten_str
+try:
+    str_http_subject = PreparedRequest()
+    str_http = capture(
+        "rebound-models-str-http",
+        str_http_subject,
+        lambda: prepare_url_call(
+            str_http_subject,
+            "http://example.com/path",
+            None,
+        ),
+    )
+    str_non_http_subject = PreparedRequest()
+    str_non_http = capture(
+        "rebound-models-str-non-http",
+        str_non_http_subject,
+        lambda: prepare_url_call(
+            str_non_http_subject,
+            "mailto:original@example.org",
+            None,
+        ),
+    )
+finally:
+    del models.str
+
+
+models.bytes = lambda value: value
+try:
+    bytes_subject = PreparedRequest()
+    rebound_bytes = capture(
+        "rebound-models-bytes",
+        bytes_subject,
+        lambda: prepare_url_call(
+            bytes_subject,
+            "http://example.com/path",
+            None,
+        ),
+    )
+finally:
+    del models.bytes
+
+result = [rebound_isinstance, str_http, str_non_http, rebound_bytes]
+"""
+    )
+
+
+def test_prepare_url_parameter_builtin_and_transitive_shadows_delegate() -> None:
+    _assert_matches_oracle(
+        """
+import requests.models as models
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+models.hasattr = lambda value, name: False
+try:
+    hasattr_subject = PreparedRequest()
+    rebound_hasattr = capture(
+        "rebound-models-hasattr",
+        hasattr_subject,
+        lambda: prepare_url_call(
+            hasattr_subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    del models.hasattr
+
+
+utils.isinstance = lambda value, expected: False
+try:
+    isinstance_subject = PreparedRequest()
+    transitive_isinstance = capture(
+        "rebound-utils-isinstance-params",
+        isinstance_subject,
+        lambda: prepare_url_call(
+            isinstance_subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    del utils.isinstance
+
+
+original_supports_items = utils._SupportsItems
+utils._SupportsItems = str
+try:
+    supports_items_subject = PreparedRequest()
+    rebound_supports_items = capture(
+        "rebound-supports-items",
+        supports_items_subject,
+        lambda: prepare_url_call(
+            supports_items_subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    utils._SupportsItems = original_supports_items
+
+
+utils.list = lambda value: [("rewritten", "value")]
+try:
+    list_subject = PreparedRequest()
+    rebound_list = capture(
+        "rebound-utils-list",
+        list_subject,
+        lambda: prepare_url_call(
+            list_subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    del utils.list
+
+result = [
+    rebound_hasattr,
+    transitive_isinstance,
+    rebound_supports_items,
+    rebound_list,
+]
+"""
+    )
+
+
+def test_prepare_url_parse_url_transitive_host_helper_delegates() -> None:
+    _assert_matches_oracle(
+        """
+import requests.models as models
+from requests.models import PreparedRequest
+
+
+globals_dict = models.parse_url.__globals__
+original = globals_dict["_normalize_host"]
+
+
+def rewritten_host(host, scheme):
+    side_effects.append(["normalize-host", host, scheme])
+    return "rewritten.example"
+
+
+globals_dict["_normalize_host"] = rewritten_host
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "rebound-normalize-host",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            None,
+        ),
+    )
+finally:
+    globals_dict["_normalize_host"] = original
+"""
+    )
+
+
+def test_prepare_url_internal_unicode_builtin_shadow_delegates() -> None:
+    _assert_matches_oracle(
+        """
+import requests._internal_utils as internal_utils
+from requests.models import PreparedRequest
+
+
+internal_utils.isinstance = lambda value, expected: False
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "rebound-unicode-is-ascii-isinstance",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            None,
+        ),
+    )
+finally:
+    del internal_utils.isinstance
+"""
+    )
+
+
+def test_prepare_url_requote_transitive_quote_delegates() -> None:
+    _assert_matches_oracle(
+        """
+import requests.models as models
+from requests.models import PreparedRequest
+
+
+globals_dict = models.requote_uri.__globals__
+original = globals_dict["quote"]
+
+
+def rewritten_quote(value, safe):
+    side_effects.append(["quote", value, safe])
+    return "mailto:quote-rewritten@example.org"
+
+
+globals_dict["quote"] = rewritten_quote
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "rebound-quote",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/a path",
+            None,
+        ),
+    )
+finally:
+    globals_dict["quote"] = original
+"""
+    )
+
+
+def test_prepare_url_urlencode_transitive_isinstance_delegates() -> None:
+    _assert_matches_oracle(
+        """
+import requests.models as models
+from requests.models import PreparedRequest
+
+
+globals_dict = models.urlencode.__globals__
+
+
+def rebound_isinstance(value, expected):
+    side_effects.append(["urlencode-isinstance", repr(value)])
+    return False
+
+
+globals_dict["isinstance"] = rebound_isinstance
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "rebound-urlencode-isinstance",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    del globals_dict["isinstance"]
+"""
+    )
+
+
+def test_prepare_url_unlisted_direct_global_shadow_delegates() -> None:
+    _assert_matches_oracle(
+        """
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+utils.bool = dict
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "rebound-utils-bool",
+        subject,
+        lambda: prepare_url_call(
+            subject,
+            "http://example.com/path",
+            {"x": "a b"},
+        ),
+    )
+finally:
+    del utils.bool
+"""
+    )
+
+
+def test_prepare_url_direct_global_shadow_before_extension_import_delegates() -> None:
+    _assert_matches_oracle_before_extension_import(
+        """
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+utils.bool = dict
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+    subject = PreparedRequest()
+    try:
+        if _requests_rust is None:
+            returned = subject.prepare_url(
+                "http://example.com/path",
+                {"x": "a b"},
+            )
+        else:
+            returned = _requests_rust._prepare_url_trial(
+                subject,
+                "http://example.com/path",
+                {"x": "a b"},
+            )
+    except BaseException as error:
+        outcome = {
+            "returned": None,
+            "exception": {
+                "type": [type(error).__module__, type(error).__qualname__],
+                "args": error.args,
+            },
+        }
+    else:
+        outcome = {
+            "returned": returned,
+            "exception": None,
+        }
+    result = {
+        "outcome": outcome,
+        "url": subject.url,
+    }
+finally:
+    del utils.bool
+"""
+    )
+
+
 def test_preparation_preserves_destructor_stage_order() -> None:
     _assert_matches_oracle(
         """
@@ -759,6 +1332,72 @@ result = [helper, validators]
     )
 
 
+def test_prepare_headers_rebound_utils_isinstance_preserves_empty_mapping() -> None:
+    _assert_matches_oracle(
+        """
+import requests.utils as utils
+from requests.models import PreparedRequest
+
+
+utils.isinstance = lambda value, expected: False
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "rebound-utils-isinstance-headers",
+        subject,
+        lambda: prepare_headers_call(subject, {"Name": "value"}),
+    )
+finally:
+    del utils.isinstance
+"""
+    )
+
+
+def test_prepare_headers_dynamic_store_delegates_before_validation() -> None:
+    _assert_matches_oracle(
+        """
+import requests.models as models
+from requests.models import PreparedRequest
+from requests.structures import CaseInsensitiveDict
+
+
+original_check = models.check_header_validity
+
+
+def rebound_check(header):
+    side_effects.append(["rebound-check", header])
+
+
+class DynamicStore:
+    def __set__(self, subject, value):
+        subject.__dict__["dynamic_store"] = value
+
+    def __get__(self, subject, owner):
+        if subject is None:
+            return self
+        side_effects.append("store-get")
+        models.check_header_validity = rebound_check
+        return subject.__dict__["dynamic_store"]
+
+
+CaseInsensitiveDict._store = DynamicStore()
+try:
+    subject = PreparedRequest()
+    result = capture(
+        "dynamic-store",
+        subject,
+        lambda: prepare_headers_call(
+            subject,
+            {"Good": "one", "Bad": " leading"},
+        ),
+    )
+finally:
+    del CaseInsensitiveDict._store
+    models.check_header_validity = original_check
+"""
+    )
+
+
 def test_http_unix_preserves_lowercase_reserved_percent_escapes() -> None:
     _assert_matches_oracle(
         """
@@ -793,6 +1432,60 @@ for label, url in cases:
     result.append(
         capture(
             label,
+            subject,
+            lambda subject=subject, url=url: prepare_url_call(
+                subject,
+                url,
+                None,
+            ),
+        )
+    )
+"""
+    )
+
+
+def test_prepare_url_numeric_final_hostname_labels_delegate() -> None:
+    _assert_matches_oracle(
+        """
+from requests.models import PreparedRequest
+
+
+result = []
+for host in ("example.1", "example.01", "example.0x1"):
+    subject = PreparedRequest()
+    result.append(
+        capture(
+            host,
+            subject,
+            lambda subject=subject, host=host: prepare_url_call(
+                subject,
+                f"http://{host}/path",
+                None,
+            ),
+        )
+    )
+"""
+    )
+
+
+def test_prepare_url_literal_final_dot_components_delegate() -> None:
+    _assert_matches_oracle(
+        """
+from requests.models import PreparedRequest
+
+
+urls = [
+    "http://example.com/a/.?q=1",
+    "http://example.com/a/..?q=1",
+    "http://example.com/a/.#f",
+    "http://example.com/a/..#f",
+]
+result = []
+for url in urls:
+    subject = PreparedRequest()
+    result.append(
+        capture(
+            url,
             subject,
             lambda subject=subject, url=url: prepare_url_call(
                 subject,

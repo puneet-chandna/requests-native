@@ -239,7 +239,22 @@ pub fn url_is_native_safe(raw_url: &str) -> bool {
         return false;
     }
 
-    !authority.starts_with(|ch: char| ch.is_ascii_digit()) && authority.is_ascii()
+    let path = remainder[authority.len()..]
+        .split_once(['?', '#'])
+        .map_or(&remainder[authority.len()..], |(path, _)| path);
+    if path
+        .split('/')
+        .any(|component| matches!(component, "." | ".."))
+    {
+        return false;
+    }
+
+    let numeric_final_label = scheme != "http+unix"
+        && authority
+            .rsplit('.')
+            .next()
+            .is_some_and(|label| label.starts_with(|ch: char| ch.is_ascii_digit()));
+    !numeric_final_label && authority.is_ascii()
 }
 
 fn has_incomplete_percent_escape(value: &[u8]) -> bool {
