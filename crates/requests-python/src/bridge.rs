@@ -84,3 +84,22 @@ impl fmt::Display for BridgeClosed {
 }
 
 impl std::error::Error for BridgeClosed {}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerPayload;
+
+    struct Unlisted;
+
+    trait AmbiguousIfPayload<A> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfPayload<()> for T {}
+    impl<T: ?Sized + WorkerPayload> AmbiguousIfPayload<u8> for T {}
+
+    #[test]
+    fn worker_payload_has_no_blanket_impl() {
+        let _ = <Unlisted as AmbiguousIfPayload<_>>::marker;
+    }
+}

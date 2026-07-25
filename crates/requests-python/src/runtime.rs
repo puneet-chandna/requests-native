@@ -564,6 +564,20 @@ fn outcome_error(outcome: ProbeOutcome) -> PyErr {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ProbeAction, ProbeReply};
+    use crate::bridge::WorkerPayload;
+
+    fn assert_worker_payload<T: WorkerPayload>() {}
+
+    #[test]
+    fn probe_payloads_are_explicit_worker_payloads() {
+        assert_worker_payload::<ProbeAction>();
+        assert_worker_payload::<ProbeReply>();
+    }
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_runtime_affinity_probe, module)?)?;
     module.add_function(wrap_pyfunction!(_runtime_error_probe, module)?)?;

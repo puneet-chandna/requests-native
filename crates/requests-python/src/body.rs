@@ -1116,6 +1116,116 @@ fn _body_fields_snapshot(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult
     Ok(snapshot.into_any().unbind())
 }
 
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use requests::{AsyncBody, ErrorKind};
+
+    use super::{
+        AdapterFailure, AdapterMode, BodyAction, BodyReply, PythonBodyAdapter, action_channel,
+    };
+    use crate::bridge::WorkerPayload;
+
+    fn assert_worker_payload<T: WorkerPayload>() {}
+
+    fn poll_adapter(
+        adapter: &mut Pin<Box<PythonBodyAdapter>>,
+    ) -> Poll<Option<requests::Result<Bytes>>> {
+        let mut context = Context::from_waker(Waker::noop());
+        adapter.as_mut().poll_next(&mut context)
+    }
+
+    fn assert_body_error_then_eof(adapter: &mut Pin<Box<PythonBodyAdapter>>) {
+        let Poll::Ready(Some(Err(error))) = poll_adapter(adapter) else {
+            panic!("expected one body error");
+        };
+        assert_eq!(error.kind(), ErrorKind::Body);
+        assert!(matches!(poll_adapter(adapter), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn body_payloads_are_explicit_worker_payloads() {
+        assert_worker_payload::<BodyAction>();
+        assert_worker_payload::<BodyReply>();
+    }
+
+    #[test]
+    fn adapter_handler_failure_yields_one_error_then_eof() {
+        let (actions, mut receiver) = action_channel();
+        let failure = Arc::new(AtomicU8::new(AdapterFailure::None as u8));
+        let mut adapter = Box::pin(PythonBodyAdapter::new(
+            actions,
+            AdapterMode::Next,
+            None,
+            Arc::clone(&failure),
+        ));
+
+        assert!(poll_adapter(&mut adapter).is_pending());
+        let request = receiver
+            .recv_timeout(Duration::ZERO)
+            .expect("body action should be queued");
+        let (_action, reply) = request.into_parts();
+        reply
+            .send(BodyReply::Failed)
+            .expect("adapter should still await the reply");
+
+        assert_body_error_then_eof(&mut adapter);
+        assert_eq!(
+            AdapterFailure::from_raw(failure.load(Ordering::Acquire)),
+            AdapterFailure::Handler
+        );
+    }
+
+    #[test]
+    fn adapter_action_receiver_close_yields_one_error_then_eof() {
+        let (actions, receiver) = action_channel();
+        let failure = Arc::new(AtomicU8::new(AdapterFailure::None as u8));
+        let mut adapter = Box::pin(PythonBodyAdapter::new(
+            actions,
+            AdapterMode::Next,
+            None,
+            Arc::clone(&failure),
+        ));
+        drop(receiver);
+
+        assert_body_error_then_eof(&mut adapter);
+        assert_eq!(
+            AdapterFailure::from_raw(failure.load(Ordering::Acquire)),
+            AdapterFailure::ActionReceiver
+        );
+    }
+
+    #[test]
+    fn adapter_reply_sender_close_yields_one_error_then_eof() {
+        let (actions, mut receiver) = action_channel();
+        let failure = Arc::new(AtomicU8::new(AdapterFailure::None as u8));
+        let mut adapter = Box::pin(PythonBodyAdapter::new(
+            actions,
+            AdapterMode::Next,
+            None,
+            Arc::clone(&failure),
+        ));
+
+        assert!(poll_adapter(&mut adapter).is_pending());
+        let request = receiver
+            .recv_timeout(Duration::ZERO)
+            .expect("body action should be queued");
+        drop(request);
+
+        assert_body_error_then_eof(&mut adapter);
+        assert_eq!(
+            AdapterFailure::from_raw(failure.load(Ordering::Acquire)),
+            AdapterFailure::ReplySender
+        );
+    }
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_prepare_body_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_prepare_content_length_trial, module)?)?;

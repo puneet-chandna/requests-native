@@ -34,3 +34,19 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, ErrorKind};
+
+    fn assert_send_static<T: Send + 'static>() {}
+
+    #[test]
+    fn body_stream_error_is_fixed_and_python_independent() {
+        let error = Error::body_stream();
+
+        assert_eq!(error.kind(), ErrorKind::Body);
+        assert_eq!(error.to_string(), "request body stream failed");
+        assert_send_static::<Error>();
+    }
+}

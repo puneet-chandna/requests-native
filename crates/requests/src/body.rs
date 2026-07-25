@@ -126,7 +126,7 @@ mod tests {
         let mut body = BodySource::Stream(Box::pin(ChunkBody {
             chunks: VecDeque::from([
                 Ok(Bytes::from_static(b"chunk")),
-                Err(crate::Error::invalid_url("body-error.test")),
+                Err(crate::Error::body_stream()),
             ]),
             size_hint: None,
         }));
@@ -143,7 +143,7 @@ mod tests {
         let Poll::Ready(Some(Err(error))) = stream.as_mut().poll_next(&mut context) else {
             panic!("expected body error");
         };
-        assert_eq!(error.kind(), crate::ErrorKind::InvalidUrl);
+        assert_eq!(error.kind(), crate::ErrorKind::Body);
         assert!(matches!(
             stream.as_mut().poll_next(&mut context),
             Poll::Ready(None)

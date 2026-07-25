@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from textwrap import dedent
+from textwrap import dedent, indent
 
 from tests_differential.runner import run_oracle_case, run_rewrite_case
 
@@ -208,6 +208,17 @@ def _run_matching(source: str):
     return _normalize_literal(
         ast.literal_eval(oracle.observations["result"]["repr"])
     )
+
+
+def _assert_preimport_matches(source: str) -> None:
+    case = {"source": dedent(source)}
+    oracle = run_oracle_case(case)
+    rewrite = run_rewrite_case(case)
+
+    assert oracle.observations["exception"] is None
+    assert oracle.stderr == ""
+    assert rewrite.observations == oracle.observations
+    assert rewrite.stderr == ""
 
 
 def _normalize_literal(value):
@@ -932,7 +943,7 @@ poll_subject.body = tracked
 poll_state = poll_state_call(poll_subject)
 
 disconnects = []
-for mode in ("action-receiver", "reply-receiver"):
+for mode in ("action-receiver", "reply-sender"):
     disconnect_subject = new_subject()
     disconnect_subject.body = tracked
     disconnects.append(disconnect_body_call(disconnect_subject, mode))
@@ -962,7 +973,7 @@ result = {
         "second_poll_pending": True,
         "queued_actions": 1,
     }
-    assert state["disconnects"] == ["action-receiver", "reply-receiver"]
+    assert state["disconnects"] == ["action-receiver", "reply-sender"]
     assert ["cancel-close", True] not in state["effects"]
     assert ["cancel-del", True] in state["effects"]
     assert all(event[-1] is True for event in state["effects"])
@@ -1034,7 +1045,7 @@ rows.append([
     "reply-drop",
     exercise(
         "reply-drop",
-        lambda subject: disconnect_body_call(subject, "reply-receiver"),
+        lambda subject: disconnect_body_call(subject, "reply-sender"),
     )["exception"],
 ])
 
@@ -1087,3 +1098,432 @@ result = {
         event for event in state["effects"] if event[0] == "next"
     ] == [["next", "cancel-after-reply", True]]
     assert not [event for event in state["effects"] if event[0] == "close"]
+
+
+def test_task8_capabilities_are_branch_local_before_extension_import() -> None:
+    mutations = [
+        (
+            """
+original = PreparedRequest.prepare_method
+del PreparedRequest.prepare_method
+""",
+            "PreparedRequest.prepare_method = original",
+        ),
+        (
+            """
+original = RequestEncodingMixin._encode_params
+
+def replacement(value):
+    side_effects.append(["replacement", value])
+    return "replacement"
+
+RequestEncodingMixin._encode_params = replacement
+""",
+            "RequestEncodingMixin._encode_params = original",
+        ),
+    ]
+    operations = [
+        """
+subject = PreparedRequest()
+subject.method = "POST"
+subject.headers = CaseInsensitiveDict()
+if _requests_rust is None:
+    returned = subject.prepare_content_length(None)
+else:
+    returned = _requests_rust._prepare_content_length_trial(subject, None)
+result = {
+    "returned": returned,
+    "headers": list(subject.headers.items()),
+}
+""",
+        """
+subject = PreparedRequest()
+subject.method = "POST"
+subject.headers = CaseInsensitiveDict()
+if _requests_rust is None:
+    returned = subject.prepare_body(None, None, {"x": 1})
+else:
+    returned = _requests_rust._prepare_body_trial(
+        subject, None, None, {"x": 1}
+    )
+result = {
+    "returned": returned,
+    "body": subject.body.hex(),
+    "headers": list(subject.headers.items()),
+}
+""",
+        """
+class Body:
+    def seek(self, position):
+        side_effects.append(["seek", position])
+
+subject = PreparedRequest()
+subject.method = "POST"
+subject.headers = CaseInsensitiveDict()
+subject.body = Body()
+subject._body_position = 0
+if _requests_rust is None:
+    from requests.utils import rewind_body
+
+    returned = rewind_body(subject)
+else:
+    returned = _requests_rust._rewind_body_trial(subject)
+result = {
+    "returned": returned,
+    "effects": list(side_effects),
+}
+""",
+    ]
+
+    for mutation, restore in mutations:
+        for operation in operations:
+            _assert_preimport_matches(
+                f"""
+from requests.models import PreparedRequest, RequestEncodingMixin
+from requests.structures import CaseInsensitiveDict
+
+{mutation}
+try:
+    try:
+        from requests import _requests_rust
+    except ImportError:
+        _requests_rust = None
+
+{indent(dedent(operation), "    ")}
+finally:
+    {restore}
+"""
+            )
+
+
+def test_rewind_reads_dynamic_body_position_twice() -> None:
+    state = _run_matching(
+        """
+class Body:
+    def seek(self, position):
+        side_effects.append(["seek", position])
+
+
+class Subject:
+    def __init__(self):
+        self.body = Body()
+        self.reads = 0
+
+    def __getattribute__(self, name):
+        if name == "_body_position":
+            reads = object.__getattribute__(self, "reads") + 1
+            object.__setattr__(self, "reads", reads)
+            side_effects.append(["position-read", reads])
+            return reads
+        return object.__getattribute__(self, name)
+
+
+subject = Subject()
+returned = rewind_body_call(subject)
+result = {
+    "returned": returned,
+    "reads": subject.reads,
+    "effects": list(side_effects),
+}
+"""
+    )
+
+    assert state == {
+        "returned": None,
+        "reads": 2,
+        "effects": [
+            ["position-read", 1],
+            ["position-read", 2],
+            ["seek", 2],
+        ],
+    }
+
+
+def test_iterator_advancement_ignores_rebound_builtin_next() -> None:
+    state = _run_matching(
+        """
+import builtins
+
+
+class Body:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        side_effects.append("intrinsic-next")
+        return b"real"
+
+
+subject = new_subject()
+subject.body = Body()
+original_next = builtins.next
+
+
+def replacement_next(iterator):
+    side_effects.append("rebound-next")
+    return b"patched"
+
+
+builtins.next = replacement_next
+try:
+    chunks = collect_body_call(subject, 1)
+finally:
+    builtins.next = original_next
+
+result = {
+    "chunks": [chunk.hex() for chunk in chunks],
+    "effects": list(side_effects),
+}
+"""
+    )
+
+    assert state == {
+        "chunks": [b"real".hex()],
+        "effects": ["intrinsic-next"],
+    }
+
+
+def test_top_level_text_body_is_encoded_once_without_arguments() -> None:
+    state = _run_matching(
+        """
+class DynamicText(str):
+    def encode(self, *args, **kwargs):
+        side_effects.append(["encode", list(args), kwargs])
+        if len(side_effects) == 1:
+            return b"first"
+        return b"second"
+
+
+subject = new_subject()
+subject.body = DynamicText("value")
+chunks = collect_body_call(subject, 1)
+result = {
+    "chunks": [chunk.hex() for chunk in chunks],
+    "effects": list(side_effects),
+}
+"""
+    )
+
+    assert state == {
+        "chunks": [b"first".hex()],
+        "effects": [["encode", [], {}]],
+    }
+
+
+def test_cancel_before_first_poll_does_not_touch_body_protocol() -> None:
+    state = _run_matching(
+        """
+cancelled = RuntimeError("cancelled")
+iteration_error = ValueError("iterated-too-early")
+
+
+class Body:
+    def __iter__(self):
+        side_effects.append("iter")
+        raise iteration_error
+
+
+subject = new_subject()
+subject.body = Body()
+try:
+    cancel_body_before_poll_call(subject, cancelled)
+except BaseException as error:
+    result = {
+        "cancel_is_original": error is cancelled,
+        "iteration_is_original": error is iteration_error,
+        "effects": list(side_effects),
+    }
+else:
+    result = "no-error"
+"""
+    )
+
+    assert state == {
+        "cancel_is_original": True,
+        "iteration_is_original": False,
+        "effects": [],
+    }
+
+
+def test_content_length_short_circuits_header_access() -> None:
+    state = _run_matching(
+        """
+def run_case(label, method, body):
+    subject = new_subject(method)
+    del subject.headers
+    outcome = capture(
+        lambda: prepare_content_length_call(subject, body)
+    )
+    return [
+        label,
+        outcome["exception"],
+        outcome["returned"],
+    ]
+
+
+result = [
+    run_case("empty-body", "POST", b""),
+    run_case("get-none", "GET", None),
+]
+"""
+    )
+
+    assert [row[:2] for row in state] == [
+        ["empty-body", None],
+        ["get-none", None],
+    ]
+
+
+def test_wrapped_json_and_rewind_errors_retain_context_identity() -> None:
+    state = _run_matching(
+        """
+import requests.models as models
+
+
+json_original = ValueError("bad-json")
+
+
+class SelectedJson:
+    def dumps(self, *args, **kwargs):
+        raise json_original
+
+
+saved_json = models.complexjson
+models.complexjson = SelectedJson()
+try:
+    json_subject = new_subject()
+    json_outcome = capture(
+        lambda: prepare_body_call(
+            json_subject, None, None, {"x": 1}
+        )
+    )
+    json_error = json_outcome["error"]
+    json_result = {
+        "context_is_original": json_error.__context__ is json_original,
+        "context_type": (
+            None
+            if json_error.__context__ is None
+            else type(json_error.__context__).__qualname__
+        ),
+        "cause": json_error.__cause__,
+        "suppress": json_error.__suppress_context__,
+    }
+finally:
+    models.complexjson = saved_json
+
+
+seek_original = OSError("seek-failed")
+
+
+class Body:
+    def seek(self, position):
+        raise seek_original
+
+
+rewind_subject = new_subject()
+rewind_subject.body = Body()
+rewind_subject._body_position = 0
+rewind_outcome = capture(lambda: rewind_body_call(rewind_subject))
+rewind_error = rewind_outcome["error"]
+rewind_result = {
+    "context_is_original": rewind_error.__context__ is seek_original,
+    "context_type": (
+        None
+        if rewind_error.__context__ is None
+        else type(rewind_error.__context__).__qualname__
+    ),
+    "cause": rewind_error.__cause__,
+    "suppress": rewind_error.__suppress_context__,
+}
+
+result = {
+    "json": json_result,
+    "rewind": rewind_result,
+}
+"""
+    )
+
+    assert state == {
+        "json": {
+            "context_is_original": True,
+            "context_type": "ValueError",
+            "cause": None,
+            "suppress": False,
+        },
+        "rewind": {
+            "context_is_original": True,
+            "context_type": "OSError",
+            "cause": None,
+            "suppress": False,
+        },
+    }
+
+
+def test_handler_error_identity_and_finalizer_stay_on_origin() -> None:
+    state = _run_matching(
+        """
+import gc
+
+
+class BodyFailure(BaseException):
+    def __del__(self):
+        side_effects.append([
+            "error-del",
+            threading.get_ident() == ENTRY_THREAD,
+        ])
+
+
+original = BodyFailure("body failed")
+
+
+class FailingBody:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        side_effects.append([
+            "next",
+            threading.get_ident() == ENTRY_THREAD,
+        ])
+        raise original
+
+    def close(self):
+        side_effects.append([
+            "close",
+            threading.get_ident() == ENTRY_THREAD,
+        ])
+
+
+subject = new_subject()
+subject.body = FailingBody()
+try:
+    collect_body_call(subject, 1)
+except BaseException as error:
+    identity = error is original
+else:
+    identity = False
+
+subject.body = None
+original = None
+gc.collect()
+result = {
+    "identity": identity,
+    "error_finalizers": [
+        event for event in side_effects if event[0] == "error-del"
+    ],
+    "close_events": [
+        event for event in side_effects if event[0] == "close"
+    ],
+    "next_events": [
+        event for event in side_effects if event[0] == "next"
+    ],
+}
+"""
+    )
+
+    assert state == {
+        "identity": True,
+        "error_finalizers": [["error-del", True]],
+        "close_events": [],
+        "next_events": [["next", True]],
+    }
