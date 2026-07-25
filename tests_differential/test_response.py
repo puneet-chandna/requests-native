@@ -997,6 +997,91 @@ result = {
     assert state["side_effects"] == [["dynamic-content", True]]
 
 
+def test_content_uses_live_chunk_size_global_and_preserves_lookup_errors() -> None:
+    state = _run_matching(
+        """
+import requests.models as models
+
+
+original_chunk_size = models.CONTENT_CHUNK_SIZE
+try:
+    models.CONTENT_CHUNK_SIZE = 7
+    rebound_raw = ObservedStreamRaw([b"rebound"])
+    rebound = Response()
+    rebound.status_code = 200
+    rebound.raw = rebound_raw
+    rebound_content = response_content_call(rebound)
+
+    models.CONTENT_CHUNK_SIZE = object()
+    invalid_raw = ObservedStreamRaw([b"must-not-read"])
+    invalid = Response()
+    invalid.status_code = 200
+    invalid.raw = invalid_raw
+    invalid_result = capture(
+        lambda: response_content_call(invalid)
+    )
+
+    del models.CONTENT_CHUNK_SIZE
+    missing_raw = ObservedStreamRaw([b"must-not-read"])
+    missing = Response()
+    missing.status_code = 200
+    missing.raw = missing_raw
+    missing_result = capture(
+        lambda: response_content_call(missing)
+    )
+finally:
+    models.CONTENT_CHUNK_SIZE = original_chunk_size
+
+
+result = {
+    "rebound": {
+        "content": value_record(rebound_content),
+        "events": rebound_raw.events,
+        "state": response_fields_snapshot(rebound),
+    },
+    "invalid": {
+        "record": invalid_result["exception"],
+        "events": invalid_raw.events,
+        "state": response_fields_snapshot(invalid),
+    },
+    "missing": {
+        "record": missing_result["exception"],
+        "events": missing_raw.events,
+        "state": response_fields_snapshot(missing),
+    },
+}
+"""
+    )
+
+    assert state["rebound"]["content"]["payload"] == [
+        "bytes",
+        b"rebound".hex(),
+    ]
+    assert [event for event in state["rebound"]["events"] if event[0] == "stream"] == [
+        [
+            "stream",
+            {"type": ["builtins", "int"], "payload": 7},
+            True,
+            True,
+        ]
+    ]
+    assert state["rebound"]["state"]["content_consumed"] is True
+    assert state["invalid"]["record"] == {
+        "type": ["builtins", "TypeError"],
+        "args": ["chunk_size must be an int, it is instead a <class 'object'>."],
+    }
+    assert state["invalid"]["events"] == []
+    assert state["invalid"]["state"]["content_is_false"] is True
+    assert state["invalid"]["state"]["content_consumed"] is False
+    assert state["missing"]["record"] == {
+        "type": ["builtins", "NameError"],
+        "args": ["name 'CONTENT_CHUNK_SIZE' is not defined"],
+    }
+    assert state["missing"]["events"] == []
+    assert state["missing"]["state"]["content_is_false"] is True
+    assert state["missing"]["state"]["content_consumed"] is False
+
+
 def test_iter_content_partial_exhausted_cached_reuse_and_consumed_error() -> None:
     state = _run_matching(
         """
@@ -3910,15 +3995,42 @@ result = {
     "unconsumed": {
         "record": unconsumed_failure["exception"],
         "identity": unconsumed_failure["error"] is unconsumed_error,
+        "context_is_none": (
+            unconsumed_failure["error"].__context__ is None
+        ),
+        "cause_is_none": (
+            unconsumed_failure["error"].__cause__ is None
+        ),
+        "suppress_context": (
+            unconsumed_failure["error"].__suppress_context__
+        ),
         "events": unconsumed_raw.events,
     },
     "consumed": {
         "record": consumed_failure["exception"],
         "identity": consumed_failure["error"] is consumed_error,
+        "context_is_none": (
+            consumed_failure["error"].__context__ is None
+        ),
+        "cause_is_none": (
+            consumed_failure["error"].__cause__ is None
+        ),
+        "suppress_context": (
+            consumed_failure["error"].__suppress_context__
+        ),
         "events": consumed_raw.events,
     },
     "noncallable": {
         "record": noncallable_failure["exception"],
+        "context_is_none": (
+            noncallable_failure["error"].__context__ is None
+        ),
+        "cause_is_none": (
+            noncallable_failure["error"].__cause__ is None
+        ),
+        "suppress_context": (
+            noncallable_failure["error"].__suppress_context__
+        ),
         "events": noncallable_raw.events,
     },
 }
@@ -3931,6 +4043,9 @@ result = {
             "args": ["unconsumed release failed"],
         },
         "identity": True,
+        "context_is_none": True,
+        "cause_is_none": True,
+        "suppress_context": False,
         "events": [["close", True], ["release", True]],
     }
     assert state["consumed"] == {
@@ -3939,6 +4054,9 @@ result = {
             "args": ["consumed release failed"],
         },
         "identity": True,
+        "context_is_none": True,
+        "cause_is_none": True,
+        "suppress_context": False,
         "events": [["release", True]],
     }
     assert state["noncallable"] == {
@@ -3946,5 +4064,8 @@ result = {
             "type": ["builtins", "TypeError"],
             "args": ["'object' object is not callable"],
         },
+        "context_is_none": True,
+        "cause_is_none": True,
+        "suppress_context": False,
         "events": [["close", True]],
     }
