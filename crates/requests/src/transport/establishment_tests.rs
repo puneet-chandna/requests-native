@@ -681,6 +681,7 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
     let exact_load = blocking_body.is_some_and(|body| {
         body.matches("tls::load(").count() == 1
             && body.contains("tls::load(&tls,native_root_loader)")
+            && body.matches("native_root_loader").count() == 1
             && !body.contains("letnative_root_loader=")
     });
     if !matches!(
@@ -694,8 +695,8 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
     {
         violations.push(
             "cfg(test) must select native_root_loader from EstablishmentControl, cfg(not(test)) \
-             must select None, and that exact variable must be the sole loader value passed to \
-             the sole tls::load call inside the awaited spawn_blocking closure",
+             must select None, and the exact tls::load argument must be the only occurrence of \
+             that variable inside the awaited spawn_blocking closure",
         );
     }
     for required in [
