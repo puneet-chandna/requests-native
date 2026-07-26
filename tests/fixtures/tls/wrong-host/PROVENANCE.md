@@ -4,6 +4,14 @@ Purpose: a valid server-authentication leaf signed by the frozen Requests test
 CA whose only SAN is `wrong.test`. It must fail hostname verification when a
 test client connects to `localhost`.
 
+This dedicated leaf is necessary because the frozen valid server leaf's SAN
+covers all loopback names used by the suite: `localhost`, `127.0.0.1`, and
+`::1`. The other frozen CA-signed server leaf expired on
+2025-02-17 00:38:22 UTC, so it cannot isolate hostname verification from
+validity failure. No pre-existing frozen leaf is simultaneously valid,
+server-authentication-capable, signed by this CA, and mismatched for those
+loopback names.
+
 This fixture was generated once offline. Builds and tests must never run
 OpenSSL or regenerate it.
 

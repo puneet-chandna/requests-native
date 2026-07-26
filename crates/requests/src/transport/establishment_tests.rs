@@ -1,10 +1,12 @@
 use std::future::{Future, pending, ready};
 use std::io::Cursor;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http::Method;
 use tokio::io::AsyncReadExt;
@@ -22,6 +24,7 @@ use crate::{
 const SHORT_DEADLINE: Duration = Duration::from_millis(200);
 const LONG_DEADLINE: Duration = Duration::from_millis(800);
 const OUTER_BOUND: Duration = Duration::from_secs(2);
+static NEXT_TLS_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ObservedStage {
@@ -47,6 +50,48 @@ struct TestEstablishmentControl {
     load_release: Condvar,
     load_finished: AtomicBool,
     raw_shutdowns: AtomicUsize,
+}
+
+struct TestTlsDirectory {
+    path: PathBuf,
+}
+
+impl TestTlsDirectory {
+    fn new() -> Self {
+        let sequence = NEXT_TLS_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "requests-tls-load-contract-{}-{timestamp}-{sequence}",
+            std::process::id(),
+        ));
+        std::fs::create_dir(&path).expect("create TLS load contract directory");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn write(&self, filename: &str, contents: &[u8]) -> PathBuf {
+        let path = self.path.join(filename);
+        std::fs::write(&path, contents).expect("write TLS load contract fixture");
+        path
+    }
+
+    fn directory(&self, filename: &str) -> PathBuf {
+        let path = self.path.join(filename);
+        std::fs::create_dir(&path).expect("create portable TLS read-failure fixture");
+        path
+    }
+}
+
+impl Drop for TestTlsDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 impl TestEstablishmentControl {
@@ -181,6 +226,48 @@ struct PendingConnector {
     drops: Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
+struct LoopbackFailingConnector {
+    address: SocketAddr,
+    calls: Arc<AtomicUsize>,
+}
+
+impl LoopbackFailingConnector {
+    fn new(address: SocketAddr) -> Self {
+        Self {
+            address,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
+}
+
+impl Connector for LoopbackFailingConnector {
+    fn connect(
+        &self,
+        _host: &str,
+        _port: u16,
+        target: &str,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<tokio::net::TcpStream>> + Send>> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let address = self.address;
+        let target = target.to_owned();
+        Box::pin(async move {
+            let stream = tokio::net::TcpStream::connect(address)
+                .await
+                .map_err(|error| Error::connect(&target, error))?;
+            drop(stream);
+            Err(Error::connect(
+                &target,
+                "controlled post-accept connector failure",
+            ))
+        })
+    }
+}
+
 struct PendingConnectFuture {
     drops: Arc<AtomicUsize>,
 }
@@ -224,6 +311,12 @@ fn frozen_ca_bundle() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/certs/expired/ca/ca.crt")
 }
 
+fn frozen_mtls_client(filename: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tls/mtls-client")
+        .join(filename)
+}
+
 fn request(url: &str, timeout: Timeout) -> crate::Request {
     RequestBuilder::new(Method::GET, url)
         .timeout(timeout)
@@ -260,6 +353,100 @@ fn assert_no_pool_entry(transport: &Transport) {
     assert!(
         pool.generation(&keys[0]).is_none(),
         "failed establishment must not create a pool generation",
+    );
+}
+
+#[derive(Debug)]
+struct InvalidMaterialObservation {
+    name: &'static str,
+    kind: String,
+    stages: Vec<ObservedStage>,
+    connector_calls: usize,
+    accepts: usize,
+    raw_shutdowns: usize,
+    derived_keys: usize,
+    pool_generations: usize,
+}
+
+async fn observe_invalid_material(
+    name: &'static str,
+    tls: TlsConfig,
+) -> InvalidMaterialObservation {
+    let control = TestEstablishmentControl::new(None);
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind invalid-material accept sentinel");
+    listener
+        .set_nonblocking(true)
+        .expect("make invalid-material accept sentinel nonblocking");
+    let connector = LoopbackFailingConnector::new(
+        listener
+            .local_addr()
+            .expect("read invalid-material sentinel address"),
+    );
+    let transport = transport(Arc::new(connector.clone()), tls, Arc::clone(&control));
+    let result = tokio::time::timeout(
+        OUTER_BOUND,
+        transport.send(request(
+            &format!("https://invalid-material.test/{name}"),
+            Timeout::default(),
+        )),
+    )
+    .await
+    .expect("invalid TLS material exceeded outer bound");
+    let kind = match result {
+        Ok(_) => "Success".to_owned(),
+        Err(error) => format!("{:?}", error.kind()),
+    };
+    let derived_keys = transport.drain_derived_pool_keys().len();
+    let pool_generations = transport
+        .pool
+        .lock()
+        .expect("transport pool lock poisoned")
+        .generation_count();
+    let accepts = match listener.accept() {
+        Ok((stream, _)) => {
+            drop(stream);
+            1
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+        Err(error) => panic!("inspect invalid-material accept sentinel: {error}"),
+    };
+
+    InvalidMaterialObservation {
+        name,
+        kind,
+        stages: control.stages(),
+        connector_calls: connector.calls(),
+        accepts,
+        raw_shutdowns: control.raw_shutdowns.load(Ordering::Acquire),
+        derived_keys,
+        pool_generations,
+    }
+}
+
+fn assert_invalid_material_observations(observations: &[InvalidMaterialObservation]) {
+    let failures = observations
+        .iter()
+        .filter_map(|observation| {
+            let expected_stages = [
+                ObservedStage::LoadStarted,
+                ObservedStage::LoadFinished(false),
+            ];
+            (observation.kind != "Tls"
+                || observation.stages != expected_stages
+                || observation.connector_calls != 0
+                || observation.accepts != 0
+                || observation.raw_shutdowns != 0
+                || observation.derived_keys != 1
+                || observation.pool_generations != 0)
+                .then(|| format!("{}: {observation:?}", observation.name))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "every invalid material case must derive one key, execute exactly one failed awaited load, \
+         and produce zero connector/accept/shutdown/pool events:\n{}",
+        failures.join("\n"),
     );
 }
 
@@ -333,6 +520,10 @@ async fn run_blocked_load(
 fn production_https_establishment_inventory_is_ordered_and_typed() {
     let transport = include_str!("mod.rs");
     let error = include_str!("../error.rs");
+    let tls = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/transport/tls.rs"),
+    )
+    .unwrap_or_default();
     let (production, _) = transport
         .split_once("#[cfg(test)]\nmod tests {")
         .expect("transport source keeps one final cfg(test) module");
@@ -390,6 +581,13 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
 
     if production.matches("tokio::task::spawn_blocking").count() != 1 {
         violations.push("HTTPS establishment needs exactly one blocking load/parse task");
+    }
+    if tls
+        .matches("rustls_native_certs::load_native_certs")
+        .count()
+        != 1
+    {
+        violations.push("Platform roots need exactly one native-root loader invocation");
     }
     if !compact.contains("spawn_blocking") || !compact.contains(".await") {
         violations.push("the one blocking loader must be awaited inside establishment");
@@ -538,6 +736,203 @@ fn native_load_failure_is_pre_socket_tls_and_never_enters_pool() {
         assert_eq!(control.raw_shutdowns.load(Ordering::Acquire), 0);
         assert_no_pool_entry(&transport);
     });
+}
+
+#[test]
+fn default_platform_roots_use_awaited_native_loader_before_connector() {
+    runtime().block_on(async {
+        let tls = TlsConfig::default();
+        assert_eq!(
+            tls.roots,
+            CertificateSource::Platform,
+            "default certificate source must remain Platform",
+        );
+        let control = TestEstablishmentControl::new(None);
+        let connector = FailingConnector::default();
+        let transport = transport(Arc::new(connector.clone()), tls, Arc::clone(&control));
+        let error = expect_error(
+            tokio::time::timeout(
+                OUTER_BOUND,
+                transport.send(request(
+                    "https://platform-loader.test/path",
+                    Timeout::default(),
+                )),
+            )
+            .await
+            .expect("Platform TLS load exceeded outer bound"),
+            "controlled connector unexpectedly returned a response",
+        );
+
+        assert_eq!(error.kind(), ErrorKind::Connect);
+        assert_eq!(connector.calls(), 1);
+        assert_eq!(
+            control.stages(),
+            [
+                ObservedStage::LoadStarted,
+                ObservedStage::LoadFinished(true),
+                ObservedStage::Connect,
+            ],
+            "default Platform roots must execute the awaited loader before connect",
+        );
+        assert_eq!(control.raw_shutdowns.load(Ordering::Acquire), 0);
+        assert_no_pool_entry(&transport);
+    });
+}
+
+#[test]
+fn every_invalid_root_bundle_uses_one_failed_load_before_downstream_work() {
+    let directory = TestTlsDirectory::new();
+    let missing = directory.path().join("missing-root.pem");
+    let read_failure = directory.directory("unreadable-root.pem");
+    let empty = directory.write("empty-root.pem", b"");
+    let malformed = directory.write("malformed-root.pem", b"not a PEM certificate");
+    let cases = [
+        ("bundle-missing", missing),
+        ("bundle-read-failure", read_failure),
+        ("bundle-empty", empty),
+        ("bundle-malformed", malformed),
+    ];
+
+    let observations = runtime().block_on(async {
+        let mut observations = Vec::with_capacity(cases.len());
+        for (name, path) in cases {
+            observations.push(
+                observe_invalid_material(
+                    name,
+                    TlsConfig {
+                        roots: CertificateSource::PemBundle(path),
+                        identity: None,
+                    },
+                )
+                .await,
+            );
+        }
+        observations
+    });
+    assert_invalid_material_observations(&observations);
+}
+
+#[test]
+fn every_invalid_capath_uses_one_failed_load_before_downstream_work() {
+    let directory = TestTlsDirectory::new();
+    let missing = directory.path().join("missing-capath");
+    let empty = directory.directory("empty-capath");
+    let read_failure = directory.directory("read-failure-capath");
+    std::fs::create_dir(read_failure.join("117adfc4.0"))
+        .expect("create eligible directory-as-file read failure");
+    let empty_entry = directory.directory("empty-entry-capath");
+    std::fs::write(empty_entry.join("117adfc4.0"), b"").expect("write empty eligible capath entry");
+    let malformed_entry = directory.directory("malformed-entry-capath");
+    std::fs::write(malformed_entry.join("117adfc4.0"), b"not a PEM certificate")
+        .expect("write malformed eligible capath entry");
+    let cases = [
+        ("capath-missing", missing),
+        ("capath-empty", empty),
+        ("capath-entry-read-failure", read_failure),
+        ("capath-entry-empty", empty_entry),
+        ("capath-entry-malformed", malformed_entry),
+    ];
+
+    let observations = runtime().block_on(async {
+        let mut observations = Vec::with_capacity(cases.len());
+        for (name, path) in cases {
+            observations.push(
+                observe_invalid_material(
+                    name,
+                    TlsConfig {
+                        roots: CertificateSource::PemDirectory(path),
+                        identity: None,
+                    },
+                )
+                .await,
+            );
+        }
+        observations
+    });
+    assert_invalid_material_observations(&observations);
+}
+
+#[test]
+fn every_invalid_client_chain_uses_one_failed_load_before_downstream_work() {
+    let directory = TestTlsDirectory::new();
+    let missing = directory.path().join("missing-client-chain.pem");
+    let read_failure = directory.directory("unreadable-client-chain.pem");
+    let empty = directory.write("empty-client-chain.pem", b"");
+    let malformed = directory.write("malformed-client-chain.pem", b"not a PEM certificate");
+    let certificate_only = frozen_mtls_client("client-chain.pem");
+    let valid_key = frozen_mtls_client("client.key");
+    let cases = [
+        ("client-chain-missing", missing, Some(valid_key.clone())),
+        (
+            "client-chain-read-failure",
+            read_failure,
+            Some(valid_key.clone()),
+        ),
+        ("client-chain-empty", empty, Some(valid_key.clone())),
+        ("client-chain-malformed", malformed, Some(valid_key)),
+        ("client-combined-without-key", certificate_only, None),
+    ];
+
+    let observations = runtime().block_on(async {
+        let mut observations = Vec::with_capacity(cases.len());
+        for (name, certificate_chain, private_key) in cases {
+            observations.push(
+                observe_invalid_material(
+                    name,
+                    TlsConfig {
+                        roots: CertificateSource::PemBundle(frozen_ca_bundle()),
+                        identity: Some(crate::Identity {
+                            certificate_chain,
+                            private_key,
+                        }),
+                    },
+                )
+                .await,
+            );
+        }
+        observations
+    });
+    assert_invalid_material_observations(&observations);
+}
+
+#[test]
+fn every_invalid_client_key_uses_one_failed_load_before_downstream_work() {
+    let directory = TestTlsDirectory::new();
+    let missing = directory.path().join("missing-client.key");
+    let read_failure = directory.directory("unreadable-client.key");
+    let empty = directory.write("empty-client.key", b"");
+    let malformed = directory.write("malformed-client.key", b"not a PEM private key");
+    let mismatched =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/certs/valid/server/server.key");
+    let certificate_chain = frozen_mtls_client("client-chain.pem");
+    let cases = [
+        ("client-key-missing", missing),
+        ("client-key-read-failure", read_failure),
+        ("client-key-empty", empty),
+        ("client-key-malformed", malformed),
+        ("client-key-mismatched", mismatched),
+    ];
+
+    let observations = runtime().block_on(async {
+        let mut observations = Vec::with_capacity(cases.len());
+        for (name, private_key) in cases {
+            observations.push(
+                observe_invalid_material(
+                    name,
+                    TlsConfig {
+                        roots: CertificateSource::PemBundle(frozen_ca_bundle()),
+                        identity: Some(crate::Identity {
+                            certificate_chain: certificate_chain.clone(),
+                            private_key: Some(private_key),
+                        }),
+                    },
+                )
+                .await,
+            );
+        }
+        observations
+    });
+    assert_invalid_material_observations(&observations);
 }
 
 #[test]

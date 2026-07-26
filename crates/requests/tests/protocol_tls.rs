@@ -109,6 +109,17 @@ impl CapathDirectory {
         std::fs::write(&path, contents).expect("write capath fixture entry");
         path
     }
+
+    fn directory(&self, basename: &str) -> PathBuf {
+        assert_eq!(
+            Path::new(basename).components().count(),
+            1,
+            "capath fixture creates only direct entries"
+        );
+        let path = self.path.join(basename);
+        std::fs::create_dir(&path).expect("create portable directory-as-file read failure");
+        path
+    }
 }
 
 impl Drop for CapathDirectory {
@@ -409,6 +420,13 @@ fn pre_socket_garbage_ca_bundle_is_tls_error() {
     assert_pre_socket_bundle_failure(repository_fixture("fixtures/tls/garbage-ca.pem"));
 }
 
+#[test]
+fn pre_socket_root_bundle_read_failure_is_tls_error() {
+    let directory = CapathDirectory::new();
+    let bundle = directory.directory("unreadable-root.pem");
+    assert_pre_socket_bundle_failure(bundle);
+}
+
 fn assert_mtls_pre_socket_identity_failure(identity: Identity, filename_tokens: &[&str]) {
     let client = Client::builder()
         .tls(TlsConfig {
@@ -489,6 +507,19 @@ fn mtls_pre_socket_malformed_certificate_chain_is_tls_error() {
 }
 
 #[test]
+fn mtls_pre_socket_certificate_chain_read_failure_is_tls_error() {
+    let directory = CapathDirectory::new();
+    let certificate_chain = directory.directory("unreadable-client-chain.pem");
+    assert_mtls_pre_socket_identity_failure(
+        Identity {
+            certificate_chain,
+            private_key: Some(mtls_client_fixture("client.key")),
+        },
+        &["unreadable-client-chain.pem"],
+    );
+}
+
+#[test]
 fn mtls_pre_socket_certificate_only_combined_file_is_tls_error() {
     assert_mtls_pre_socket_identity_failure(
         Identity {
@@ -539,6 +570,19 @@ fn mtls_pre_socket_malformed_separate_key_is_tls_error() {
             private_key: Some(private_key),
         },
         &["malformed-client.key"],
+    );
+}
+
+#[test]
+fn mtls_pre_socket_separate_key_read_failure_is_tls_error() {
+    let directory = CapathDirectory::new();
+    let private_key = directory.directory("unreadable-client.key");
+    assert_mtls_pre_socket_identity_failure(
+        Identity {
+            certificate_chain: mtls_client_fixture("client-chain.pem"),
+            private_key: Some(private_key),
+        },
+        &["unreadable-client.key"],
     );
 }
 
@@ -609,6 +653,13 @@ fn capath_accepts_multi_digit_nonnegative_suffix() {
     assert_capath_accepted(&directory);
 }
 
+#[test]
+fn capath_accepts_mixed_case_hex_and_leading_zero_multi_digit_suffix() {
+    let directory = CapathDirectory::new();
+    directory.write("0aBcDeF1.007", FROZEN_CA_CERTIFICATE);
+    assert_capath_accepted(&directory);
+}
+
 #[cfg(unix)]
 #[test]
 fn capath_accepts_file_symlink_to_valid_root() {
@@ -664,6 +715,13 @@ fn capath_rejects_malformed_eligible_entry() {
     assert_capath_rejected(&directory);
 }
 
+#[test]
+fn capath_rejects_eligible_entry_read_failure() {
+    let directory = CapathDirectory::new();
+    directory.directory("117adfc4.0");
+    assert_capath_rejected(&directory);
+}
+
 #[cfg(unix)]
 #[test]
 fn capath_rejects_broken_eligible_symlink() {
@@ -691,6 +749,14 @@ fn capath_ignores_invalid_basenames() {
     ] {
         directory.write(basename, FROZEN_CA_CERTIFICATE);
     }
+    assert_capath_rejected(&directory);
+}
+
+#[test]
+fn capath_ignores_non_ascii_decimal_suffixes_even_with_valid_pem() {
+    let directory = CapathDirectory::new();
+    directory.write("117adfc4.١", FROZEN_CA_CERTIFICATE);
+    directory.write("117adfc4.１２", FROZEN_CA_CERTIFICATE);
     assert_capath_rejected(&directory);
 }
 
