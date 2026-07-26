@@ -269,12 +269,9 @@ fn capath_request_failure(directory: &CapathDirectory) -> (String, String) {
         .build()
         .expect("client construction remains path-blind");
     let error = runtime().block_on(async {
-        match tokio::time::timeout(
-            IO_TIMEOUT,
-            client.get("https://no-socket.invalid/check").send(),
-        )
-        .await
-        .expect("capath policy request timed out")
+        match tokio::time::timeout(IO_TIMEOUT, client.get("https://127.0.0.1:0/check").send())
+            .await
+            .expect("capath policy request timed out")
         {
             Ok(_) => panic!("capath policy request unexpectedly returned HTTP"),
             Err(error) => error,
@@ -286,14 +283,13 @@ fn capath_request_failure(directory: &CapathDirectory) -> (String, String) {
 fn assert_capath_accepted(directory: &CapathDirectory) {
     let (kind, error) = capath_request_failure(directory);
     assert_eq!(
-        kind, "Dns",
-        "accepted capath must defer path loading and reach DNS: {error}"
+        kind, "Connect",
+        "accepted capath must finish loading and reach the local connector: {error}"
     );
 }
 
 fn assert_capath_rejected(directory: &CapathDirectory) -> String {
     let (kind, error) = capath_request_failure(directory);
-    assert_ne!(kind, "Dns", "rejected capath must fail before DNS");
     assert_ne!(kind, "Connect", "rejected capath must fail before connect");
     assert_eq!(kind, "Tls", "rejected capath must be a TLS error: {error}");
     error
@@ -395,11 +391,31 @@ fn capath_ignores_invalid_basenames() {
         "117adfc40.0",
         "117adfcg.0",
         "117adfc4.-1",
+        "117adfc4.+1",
+        "117adfc4.",
+        "117adfc4.1x",
         "117adfc4.nope",
     ] {
         directory.write(basename, FROZEN_CA_CERTIFICATE);
     }
     assert_capath_rejected(&directory);
+}
+
+#[test]
+fn capath_eagerly_rejects_malformed_entry_after_valid_root() {
+    let directory = CapathDirectory::new();
+    directory.write("00000000.0", FROZEN_CA_CERTIFICATE);
+    directory.write("ffffffff.0", b"malformed later entry");
+
+    let error = assert_capath_rejected(&directory);
+    assert!(
+        error.contains("ffffffff.0"),
+        "TLS error must name the later malformed eligible entry: {error}"
+    );
+    assert!(
+        !error.contains("00000000.0"),
+        "valid first entry must not mask or cause the TLS error: {error}"
+    );
 }
 
 #[test]
