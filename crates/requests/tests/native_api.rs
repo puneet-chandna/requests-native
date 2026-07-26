@@ -359,16 +359,10 @@ fn execute_and_top_level_async_helpers_have_the_approved_signatures() {
     let _response_surface: fn(requests::Response) = assert_response_surface;
 
     assert_top_level_url_generics("http://example.test/generic".to_owned());
-    assert_top_level_post_generics(
-        "http://example.test/post".to_owned(),
-        Vec::from(&b"post"[..]),
-    );
+    assert_top_level_post_generics("http://example.test/post", Vec::from(&b"post"[..]));
     assert_top_level_put_generics(
-        "http://example.test/put".to_owned(),
+        "http://example.test/put",
         BodySource::Bytes(Bytes::from_static(b"put")),
     );
-    assert_top_level_patch_generics(
-        "http://example.test/patch".to_owned(),
-        Vec::from(&b"patch"[..]),
-    );
+    assert_top_level_patch_generics("http://example.test/patch", Vec::from(&b"patch"[..]));
 }

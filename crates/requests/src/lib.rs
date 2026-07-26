@@ -12,7 +12,7 @@ mod transport;
 pub mod utils;
 
 pub use body::{AsyncBody, BodySource};
-pub use client::Client;
+pub use client::{CertificateSource, Client, ClientBuilder, Identity, Proxy, TlsConfig};
 pub use error::{Error, ErrorKind, Result};
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 pub use models::{
@@ -24,6 +24,30 @@ pub use response::{
     Response, ResponseBody, ResponseCache, ResponseContent, ResponseDecision, ResponseDisposition,
     ResponseDispositionState, ResponseEvent,
 };
+
+pub async fn get(url: impl AsRef<str>) -> Result<Response> {
+    Client::new()?.get(url).send().await
+}
+
+pub async fn head(url: impl AsRef<str>) -> Result<Response> {
+    Client::new()?.head(url).send().await
+}
+
+pub async fn post(url: impl AsRef<str>, body: impl Into<BodySource>) -> Result<Response> {
+    Client::new()?.post(url).body(body).send().await
+}
+
+pub async fn put(url: impl AsRef<str>, body: impl Into<BodySource>) -> Result<Response> {
+    Client::new()?.put(url).body(body).send().await
+}
+
+pub async fn patch(url: impl AsRef<str>, body: impl Into<BodySource>) -> Result<Response> {
+    Client::new()?.patch(url).body(body).send().await
+}
+
+pub async fn delete(url: impl AsRef<str>) -> Result<Response> {
+    Client::new()?.delete(url).send().await
+}
 
 #[cfg(feature = "platform-smoke")]
 #[allow(dead_code)] // These probes are compiled by the matrix before transport implementation.

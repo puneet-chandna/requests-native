@@ -22,13 +22,17 @@ use tokio::task::JoinHandle;
 
 use self::pool::{ConnectionLease, IdleConnection, LeaseTerminal, Pool, PoolKey, TlsPoolKey};
 use crate::models::RequestParts;
-use crate::{BodySource, Error, Request, Result};
+use crate::{BodySource, Error, Proxy, Request, Result, Timeout, TlsConfig};
 
-const MAX_IDLE_PER_KEY: usize = 10;
+pub(crate) const DEFAULT_MAX_IDLE_PER_HOST: usize = 10;
 
 pub(crate) struct Transport {
     pool: Arc<Mutex<Pool>>,
     connector: Arc<dyn Connector>,
+    proxy: Option<Proxy>,
+    #[allow(dead_code)]
+    tls: TlsConfig,
+    default_timeout: Timeout,
 }
 
 pub(super) trait Connector: Send + Sync {
@@ -320,14 +324,45 @@ impl Drop for TransportLease {
 }
 
 impl Transport {
-    pub(crate) fn new() -> Self {
-        Self::with_connector(Arc::new(DirectConnector))
+    pub(crate) fn configured(
+        proxy: Option<Proxy>,
+        tls: TlsConfig,
+        default_timeout: Timeout,
+        pool_max_idle_per_host: usize,
+    ) -> Self {
+        Self::with_configuration(
+            Arc::new(DirectConnector),
+            proxy,
+            tls,
+            default_timeout,
+            pool_max_idle_per_host,
+        )
     }
 
+    #[cfg(test)]
     fn with_connector(connector: Arc<dyn Connector>) -> Self {
-        Self {
-            pool: Arc::new(Mutex::new(Pool::new(MAX_IDLE_PER_KEY))),
+        Self::with_configuration(
             connector,
+            None,
+            TlsConfig::default(),
+            Timeout::default(),
+            DEFAULT_MAX_IDLE_PER_HOST,
+        )
+    }
+
+    fn with_configuration(
+        connector: Arc<dyn Connector>,
+        proxy: Option<Proxy>,
+        tls: TlsConfig,
+        default_timeout: Timeout,
+        pool_max_idle_per_host: usize,
+    ) -> Self {
+        Self {
+            pool: Arc::new(Mutex::new(Pool::new(pool_max_idle_per_host))),
+            connector,
+            proxy,
+            tls,
+            default_timeout,
         }
     }
 
@@ -343,6 +378,10 @@ impl Transport {
     }
 
     pub async fn send(&self, request: Request) -> Result<TransportResponse> {
+        if self.proxy.is_some() {
+            return Err(Error::proxy_not_implemented());
+        }
+        let timeout = request.timeout().unwrap_or(self.default_timeout);
         let started = Instant::now();
         validate_request(&request)?;
         let host = request
@@ -364,9 +403,9 @@ impl Transport {
         let target = authority.as_str().to_owned();
         let key = PoolKey::new(scheme, authority, None, TlsPoolKey::plain(), None);
         let request = request.into_parts();
-        let connect_timeout = request.timeout.connect;
-        let read_timeout = request.timeout.read;
-        let total_timeout = request.timeout.total;
+        let connect_timeout = timeout.connect;
+        let read_timeout = timeout.read;
+        let total_timeout = timeout.total;
         let connect_deadline = connect_timeout.and_then(|timeout| started.checked_add(timeout));
         let total_deadline = total_timeout.and_then(|timeout| started.checked_add(timeout));
         let establishment_deadlines = EstablishmentDeadlines {

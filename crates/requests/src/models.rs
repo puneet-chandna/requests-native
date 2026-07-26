@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::client::execute_request;
 use crate::structures::CaseInsensitiveMap;
 use crate::transport::Transport;
 use crate::utils::{
@@ -330,7 +331,7 @@ pub struct Request {
     uri: Uri,
     headers: HeaderMap,
     body: BodySource,
-    timeout: Timeout,
+    timeout: Option<Timeout>,
 }
 
 impl Request {
@@ -354,6 +355,10 @@ impl Request {
         &self.body
     }
 
+    pub(crate) fn timeout(&self) -> Option<Timeout> {
+        self.timeout
+    }
+
     pub(crate) fn into_parts(self) -> RequestParts {
         RequestParts {
             method: self.method,
@@ -361,7 +366,6 @@ impl Request {
             uri: self.uri,
             headers: self.headers,
             body: self.body,
-            timeout: self.timeout,
         }
     }
 }
@@ -372,7 +376,6 @@ pub(crate) struct RequestParts {
     pub uri: Uri,
     pub headers: HeaderMap,
     pub body: BodySource,
-    pub timeout: Timeout,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -398,7 +401,7 @@ impl RequestBuilder {
                 uri,
                 headers: HeaderMap::new(),
                 body: BodySource::Empty,
-                timeout: Timeout::default(),
+                timeout: None,
             }),
             _ => Err(Error::invalid_url(&url)),
         };
@@ -443,7 +446,7 @@ impl RequestBuilder {
 
     pub fn timeout(mut self, timeout: Timeout) -> Self {
         if let Ok(request) = &mut self.request {
-            request.timeout = timeout;
+            request.timeout = Some(timeout);
         }
         self
     }
@@ -455,7 +458,7 @@ impl RequestBuilder {
     pub async fn send(self) -> Result<Response> {
         let request = self.request?;
         let transport = self.transport.ok_or_else(Error::unbound_builder)?;
-        transport.send(request).await.map(Response::from_transport)
+        execute_request(&transport, request).await
     }
 }
 

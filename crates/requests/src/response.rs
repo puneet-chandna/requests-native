@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
-use http::header::TRANSFER_ENCODING;
-use http::{HeaderMap, StatusCode};
+use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::{HeaderMap, StatusCode, Version};
 use hyper::body::{Body, Incoming};
 
 use crate::transport::{DeadlineSource, TransportLease, TransportResponse, select_deadline_source};
@@ -50,6 +50,24 @@ impl Response {
 
     pub fn status(&self) -> StatusCode {
         self.head.status
+    }
+
+    pub fn version(&self) -> Version {
+        self.head.version
+    }
+
+    pub fn content_length(&self) -> Option<u64> {
+        if has_chunked_transfer_encoding(&self.head.headers) {
+            return None;
+        }
+        self.head
+            .headers
+            .get(CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     pub fn headers(&self) -> &HeaderMap {
@@ -90,6 +108,10 @@ impl Response {
             collected.extend_from_slice(&chunk?);
         }
         Ok(collected.freeze())
+    }
+
+    pub async fn text(self) -> Result<String> {
+        Ok(String::from_utf8_lossy(&self.bytes().await?).into_owned())
     }
 }
 

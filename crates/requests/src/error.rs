@@ -12,6 +12,7 @@ pub enum ErrorKind {
     Dns,
     Handshake,
     InvalidUrl,
+    Proxy,
     ReadTimeout,
     ResponseBody,
     Send,
@@ -63,6 +64,20 @@ impl Error {
             kind: ErrorKind::Builder,
             message: "conflicting Content-Length headers".to_owned(),
         }
+    }
+
+    pub(crate) fn invalid_proxy(message: impl fmt::Display) -> Self {
+        Self::transport(
+            ErrorKind::Proxy,
+            format!("invalid proxy configuration: {message}"),
+        )
+    }
+
+    pub(crate) fn proxy_not_implemented() -> Self {
+        Self::transport(
+            ErrorKind::Proxy,
+            "configured proxy transport is not implemented".to_owned(),
+        )
     }
 
     pub(crate) fn dns(target: &str, error: impl fmt::Display) -> Self {
