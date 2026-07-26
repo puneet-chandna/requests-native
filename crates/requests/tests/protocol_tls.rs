@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use requests::{CertificateSource, Client, StatusCode, TlsConfig};
+use requests::{CertificateSource, Client, Identity, StatusCode, TlsConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -13,6 +13,10 @@ use tokio_rustls::TlsAcceptor;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_REQUEST_HEAD: usize = 16 * 1024;
 const FROZEN_CA_CERTIFICATE: &[u8] = include_bytes!("../../../tests/certs/expired/ca/ca.crt");
+const MTLS_CLIENT_CERTIFICATE: &[u8] =
+    include_bytes!("../../../tests/fixtures/tls/mtls-client/client.pem");
+const MTLS_CLIENT_CHAIN: &[u8] =
+    include_bytes!("../../../tests/fixtures/tls/mtls-client/client-chain.pem");
 const VALID_SERVER: ServerIdentity = ServerIdentity {
     certificate_chain: include_bytes!("../../../tests/certs/valid/server/server.pem"),
     private_key: include_bytes!("../../../tests/certs/valid/server/server.key"),
@@ -44,6 +48,8 @@ enum ServerEvent {
 struct TlsObservation {
     tls_completed: bool,
     alpn: Option<Vec<u8>>,
+    protocol_version: Option<rustls::ProtocolVersion>,
+    peer_certificates: Vec<Vec<u8>>,
     request_bytes: Vec<u8>,
     handshake_error: Option<String>,
     events: Vec<ServerEvent>,
@@ -53,6 +59,12 @@ struct TlsObservation {
 enum ExpectedClientResult {
     Success,
     TlsFailure,
+}
+
+#[derive(Clone, Copy)]
+enum ClientAuthentication {
+    None,
+    Required,
 }
 
 struct CapathDirectory {
@@ -113,7 +125,40 @@ fn frozen_ca_bundle() -> PathBuf {
     repository_fixture("certs/expired/ca/ca.crt")
 }
 
-fn tls_acceptor(identity: ServerIdentity) -> TlsAcceptor {
+fn mtls_client_fixture(filename: &str) -> PathBuf {
+    repository_fixture(&format!("fixtures/tls/mtls-client/{filename}"))
+}
+
+fn separate_mtls_identity() -> Identity {
+    Identity {
+        certificate_chain: mtls_client_fixture("client-chain.pem"),
+        private_key: Some(mtls_client_fixture("client.key")),
+    }
+}
+
+fn combined_mtls_identity() -> Identity {
+    Identity {
+        certificate_chain: mtls_client_fixture("client-combined.pem"),
+        private_key: None,
+    }
+}
+
+fn pem_certificate_der(bytes: &[u8], label: &str) -> Vec<Vec<u8>> {
+    let mut cursor = Cursor::new(bytes);
+    rustls_pemfile::certs(&mut cursor)
+        .map(|certificate| {
+            certificate
+                .unwrap_or_else(|error| panic!("parse {label} certificate: {error}"))
+                .as_ref()
+                .to_vec()
+        })
+        .collect()
+}
+
+fn tls_acceptor(
+    identity: ServerIdentity,
+    client_authentication: ClientAuthentication,
+) -> TlsAcceptor {
     let mut certificates = Cursor::new(identity.certificate_chain);
     let certificates = rustls_pemfile::certs(&mut certificates)
         .collect::<Result<Vec<_>, _>>()
@@ -122,8 +167,24 @@ fn tls_acceptor(identity: ServerIdentity) -> TlsAcceptor {
     let private_key = rustls_pemfile::private_key(&mut private_key)
         .expect("parse frozen server private key")
         .expect("frozen server private key exists");
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+    let builder = rustls::ServerConfig::builder();
+    let builder = match client_authentication {
+        ClientAuthentication::None => builder.with_no_client_auth(),
+        ClientAuthentication::Required => {
+            let mut roots = rustls::RootCertStore::empty();
+            let mut root = Cursor::new(FROZEN_CA_CERTIFICATE);
+            for certificate in rustls_pemfile::certs(&mut root) {
+                roots
+                    .add(certificate.expect("parse frozen client-authentication root"))
+                    .expect("add frozen client-authentication root");
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .expect("build required client-certificate verifier");
+            builder.with_client_cert_verifier(verifier)
+        }
+    };
+    let mut config = builder
         .with_single_cert(certificates, private_key)
         .expect("frozen server certificate matches private key");
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -155,20 +216,26 @@ where
 async fn serve_one_tls(
     listener: TcpListener,
     identity: ServerIdentity,
+    client_authentication: ClientAuthentication,
 ) -> Result<TlsObservation, String> {
     let (stream, _) = tokio::time::timeout(IO_TIMEOUT, listener.accept())
         .await
         .map_err(|_| "TLS fixture accept timed out".to_owned())?
         .map_err(|error| format!("accept TLS fixture connection: {error}"))?;
-    let accepted = tokio::time::timeout(IO_TIMEOUT, tls_acceptor(identity).accept(stream))
-        .await
-        .map_err(|_| "TLS fixture handshake timed out".to_owned())?;
+    let accepted = tokio::time::timeout(
+        IO_TIMEOUT,
+        tls_acceptor(identity, client_authentication).accept(stream),
+    )
+    .await
+    .map_err(|_| "TLS fixture handshake timed out".to_owned())?;
     let mut stream = match accepted {
         Ok(stream) => stream,
         Err(error) => {
             return Ok(TlsObservation {
                 tls_completed: false,
                 alpn: None,
+                protocol_version: None,
+                peer_certificates: Vec::new(),
                 request_bytes: Vec::new(),
                 handshake_error: Some(error.to_string()),
                 events: Vec::new(),
@@ -178,6 +245,15 @@ async fn serve_one_tls(
 
     let mut events = vec![ServerEvent::TlsCompleted];
     let alpn = stream.get_ref().1.alpn_protocol().map(ToOwned::to_owned);
+    let protocol_version = stream.get_ref().1.protocol_version();
+    let peer_certificates = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .unwrap_or_default()
+        .iter()
+        .map(|certificate| certificate.as_ref().to_vec())
+        .collect();
     let request_bytes = tokio::time::timeout(IO_TIMEOUT, read_request_head(&mut stream))
         .await
         .map_err(|_| "TLS fixture request read timed out".to_owned())??;
@@ -193,6 +269,8 @@ async fn serve_one_tls(
     Ok(TlsObservation {
         tls_completed: true,
         alpn,
+        protocol_version,
+        peer_certificates,
         request_bytes,
         handshake_error: None,
         events,
@@ -258,6 +336,150 @@ fn pre_socket_empty_ca_bundle_is_tls_error() {
 #[test]
 fn pre_socket_garbage_ca_bundle_is_tls_error() {
     assert_pre_socket_bundle_failure(repository_fixture("fixtures/tls/garbage-ca.pem"));
+}
+
+fn assert_mtls_pre_socket_identity_failure(identity: Identity, filename_tokens: &[&str]) {
+    let client = Client::builder()
+        .tls(TlsConfig {
+            roots: CertificateSource::PemBundle(frozen_ca_bundle()),
+            identity: Some(identity),
+        })
+        .build()
+        .expect("client construction remains identity-path-blind");
+    let error = runtime().block_on(async {
+        match tokio::time::timeout(
+            IO_TIMEOUT,
+            client.get("https://no-socket.invalid/check").send(),
+        )
+        .await
+        .expect("pre-socket mTLS identity failure timed out")
+        {
+            Ok(_) => panic!("invalid mTLS identity unexpectedly returned HTTP"),
+            Err(error) => error,
+        }
+    });
+    let kind = format!("{:?}", error.kind());
+    assert_ne!(kind, "Dns", "invalid identity must not fall through to DNS");
+    assert_ne!(
+        kind, "Connect",
+        "invalid identity must not fall through to connect"
+    );
+    assert_eq!(kind, "Tls", "invalid identity must be a TLS error: {error}");
+    let message = error.to_string();
+    for token in filename_tokens {
+        assert!(
+            message.contains(token),
+            "TLS identity error must name {token}: {message}"
+        );
+    }
+}
+
+#[test]
+fn mtls_pre_socket_missing_certificate_chain_is_tls_error() {
+    let directory = CapathDirectory::new();
+    let certificate_chain = directory.path().join("missing-client-chain.pem");
+    assert!(
+        !certificate_chain.exists(),
+        "missing client certificate fixture must stay absent"
+    );
+    assert_mtls_pre_socket_identity_failure(
+        Identity {
+            certificate_chain,
+            private_key: Some(mtls_client_fixture("client.key")),
+        },
+        &["missing-client-chain.pem"],
+    );
+}
+
+#[test]
+fn mtls_pre_socket_empty_certificate_chain_is_tls_error() {
+    let directory = CapathDirectory::new();
+    let certificate_chain = directory.write("empty-client-chain.pem", b"");
+    assert_mtls_pre_socket_identity_failure(
+        Identity {
+            certificate_chain,
+            private_key: Some(mtls_client_fixture("client.key")),
+        },
+        &["empty-client-chain.pem"],
+    );
+}
+
+#[test]
+fn mtls_pre_socket_malformed_certificate_chain_is_tls_error() {
+    let directory = CapathDirectory::new();
+    let certificate_chain = directory.write("malformed-client-chain.pem", b"not a PEM certificate");
+    assert_mtls_pre_socket_identity_failure(
+        Identity {
+            certificate_chain,
+            private_key: Some(mtls_client_fixture("client.key")),
+        },
+        &["malformed-client-chain.pem"],
+    );
+}
+
+#[test]
+fn mtls_pre_socket_certificate_only_combined_file_is_tls_error() {
+    assert_mtls_pre_socket_identity_failure(
+        Identity {
+            certificate_chain: mtls_client_fixture("client-chain.pem"),
+            private_key: None,
+        },
+        &["client-chain.pem"],
+    );
+}
+
+#[test]
+fn mtls_pre_socket_missing_separate_key_is_tls_error() {
+    let directory = CapathDirectory::new();
+    let private_key = directory.path().join("missing-client.key");
+    assert!(
+        !private_key.exists(),
+        "missing client-key fixture must stay absent"
+    );
+    assert_mtls_pre_socket_identity_failure(
+        Identity {
+            certificate_chain: mtls_client_fixture("client-chain.pem"),
+            private_key: Some(private_key),
+        },
+        &["missing-client.key"],
+    );
+}
+
+#[test]
+fn mtls_pre_socket_empty_separate_key_is_tls_error() {
+    let directory = CapathDirectory::new();
+    let private_key = directory.write("empty-client.key", b"");
+    assert_mtls_pre_socket_identity_failure(
+        Identity {
+            certificate_chain: mtls_client_fixture("client-chain.pem"),
+            private_key: Some(private_key),
+        },
+        &["empty-client.key"],
+    );
+}
+
+#[test]
+fn mtls_pre_socket_malformed_separate_key_is_tls_error() {
+    let directory = CapathDirectory::new();
+    let private_key = directory.write("malformed-client.key", b"not a PEM private key");
+    assert_mtls_pre_socket_identity_failure(
+        Identity {
+            certificate_chain: mtls_client_fixture("client-chain.pem"),
+            private_key: Some(private_key),
+        },
+        &["malformed-client.key"],
+    );
+}
+
+#[test]
+fn mtls_pre_socket_mismatched_certificate_and_key_is_tls_error() {
+    assert_mtls_pre_socket_identity_failure(
+        Identity {
+            certificate_chain: mtls_client_fixture("client-chain.pem"),
+            private_key: Some(repository_fixture("certs/valid/server/server.key")),
+        },
+        &[],
+    );
 }
 
 fn capath_request_failure(directory: &CapathDirectory) -> (String, String) {
@@ -436,20 +658,64 @@ fn capath_reports_lexically_first_malformed_eligible_entry() {
 }
 
 fn run_tls_case(
-    identity: ServerIdentity,
+    server_identity: ServerIdentity,
     roots: CertificateSource,
     expected: ExpectedClientResult,
+) {
+    run_tls_case_with_client_authentication(
+        server_identity,
+        ClientAuthentication::None,
+        roots,
+        None,
+        expected,
+        None,
+    );
+}
+
+fn run_mtls_case(
+    roots: CertificateSource,
+    client_identity: Option<Identity>,
+    expected: ExpectedClientResult,
+) {
+    let expected_peer_certificates = match expected {
+        ExpectedClientResult::Success => Some(pem_certificate_der(
+            MTLS_CLIENT_CHAIN,
+            "ordered mTLS client chain",
+        )),
+        ExpectedClientResult::TlsFailure => None,
+    };
+    run_tls_case_with_client_authentication(
+        VALID_SERVER,
+        ClientAuthentication::Required,
+        roots,
+        client_identity,
+        expected,
+        expected_peer_certificates,
+    );
+}
+
+fn run_tls_case_with_client_authentication(
+    server_identity: ServerIdentity,
+    client_authentication: ClientAuthentication,
+    roots: CertificateSource,
+    client_identity: Option<Identity>,
+    expected: ExpectedClientResult,
+    expected_peer_certificates: Option<Vec<Vec<u8>>>,
 ) {
     runtime().block_on(async {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind TLS loopback fixture");
         let address = listener.local_addr().expect("read TLS fixture address");
-        let server = tokio::spawn(serve_one_tls(listener, identity));
+        let server = tokio::spawn(serve_one_tls(
+            listener,
+            server_identity,
+            client_authentication,
+        ));
         let client = Client::builder()
             .tls(TlsConfig {
                 roots,
-                identity: None,
+                identity: client_identity,
             })
             .build()
             .expect("build TLS client without I/O");
@@ -489,6 +755,31 @@ fn run_tls_case(
                     [ServerEvent::TlsCompleted, ServerEvent::HttpRequestRead]
                 );
                 assert_eq!(observation.alpn.as_deref(), Some(b"http/1.1".as_slice()));
+                match expected_peer_certificates {
+                    Some(expected_peer_certificates) => {
+                        let expected_leaf =
+                            pem_certificate_der(MTLS_CLIENT_CERTIFICATE, "mTLS client leaf");
+                        assert_eq!(expected_leaf.len(), 1);
+                        assert_eq!(
+                            observation.peer_certificates.first(),
+                            expected_leaf.first(),
+                            "peer leaf DER must equal the checked-in CN=requests certificate"
+                        );
+                        assert_eq!(
+                            observation.peer_certificates, expected_peer_certificates,
+                            "peer certificate DER sequence must preserve configured chain order"
+                        );
+                        assert_eq!(
+                            observation.protocol_version,
+                            Some(rustls::ProtocolVersion::TLSv1_3),
+                            "mTLS success must keep TLS 1.3 enabled"
+                        );
+                    }
+                    None => assert!(
+                        observation.peer_certificates.is_empty(),
+                        "server without client authentication must not record a peer identity"
+                    ),
+                }
                 assert!(
                     observation
                         .request_bytes
@@ -531,6 +822,8 @@ fn run_tls_case(
                 let observation = await_server(server).await;
                 assert!(!observation.tls_completed);
                 assert_eq!(observation.alpn, None);
+                assert_eq!(observation.protocol_version, None);
+                assert!(observation.peer_certificates.is_empty());
                 assert!(observation.request_bytes.is_empty());
                 assert!(observation.events.is_empty());
                 assert!(
@@ -622,6 +915,42 @@ fn disabled_verification_accepts_wrong_hostname_encrypted() {
     run_tls_case(
         WRONG_HOST_SERVER,
         CertificateSource::Disabled,
+        ExpectedClientResult::Success,
+    );
+}
+
+#[test]
+fn mtls_loopback_requires_client_identity_before_http() {
+    run_mtls_case(
+        CertificateSource::PemBundle(frozen_ca_bundle()),
+        None,
+        ExpectedClientResult::TlsFailure,
+    );
+}
+
+#[test]
+fn mtls_loopback_separate_chain_and_key_succeeds() {
+    run_mtls_case(
+        CertificateSource::PemBundle(frozen_ca_bundle()),
+        Some(separate_mtls_identity()),
+        ExpectedClientResult::Success,
+    );
+}
+
+#[test]
+fn mtls_loopback_combined_chain_and_key_succeeds() {
+    run_mtls_case(
+        CertificateSource::PemBundle(frozen_ca_bundle()),
+        Some(combined_mtls_identity()),
+        ExpectedClientResult::Success,
+    );
+}
+
+#[test]
+fn mtls_loopback_disabled_server_verification_still_sends_identity() {
+    run_mtls_case(
+        CertificateSource::Disabled,
+        Some(separate_mtls_identity()),
         ExpectedClientResult::Success,
     );
 }

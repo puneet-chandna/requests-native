@@ -1,0 +1,19 @@
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+encrypt_key = no
+distinguished_name = dn
+req_extensions = v3_req
+
+[dn]
+C = US
+ST = DE
+O = Python Software Foundation
+OU = python-requests
+CN = requests
+
+[v3_req]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = critical, clientAuth
