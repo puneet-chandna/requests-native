@@ -1,12 +1,22 @@
 use std::fmt;
-use std::future::Future;
-use std::io;
+use std::future::{Future, poll_fn};
+use std::io::{self, Read};
 use std::mem;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
-use tokio::runtime::{Handle, Runtime};
+use bytes::Bytes;
+use futures_core::Stream;
+use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 use tokio::task::AbortHandle;
+
+use crate::{
+    BodySource, Client as AsyncClient, ClientBuilder as AsyncClientBuilder, Error, HeaderMap,
+    HeaderName, HeaderValue, Method, Proxy, Request, RequestBuilder as AsyncRequestBuilder,
+    Response as AsyncResponse, ResponseBody as AsyncResponseBody, Result as RequestResult,
+    StatusCode, Timeout, TlsConfig, Version,
+};
 
 static PROCESS_RUNTIME: OnceLock<DriverRegistry> = OnceLock::new();
 
@@ -171,7 +181,13 @@ impl<T> BlockingSubmission<T> {
             .receiver
             .take()
             .ok_or(BlockingTaskError::AlreadyCompleted)?;
-        receiver.recv().map_err(|_| self.stopped_error())
+        let result = match Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| receiver.recv())
+            }
+            _ => receiver.recv(),
+        };
+        result.map_err(|_| self.stopped_error())
     }
 
     pub fn cancel(&self) -> Result<(), BlockingTaskError> {
@@ -283,6 +299,7 @@ impl DriverRegistry {
         }
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
             .enable_time()
             .thread_name("requests-runtime")
             .build()?;
@@ -299,6 +316,317 @@ impl DriverRegistry {
         *current = Some(Arc::clone(&driver));
         Ok(BlockingRuntimeDriver { inner: driver })
     }
+}
+
+pub struct Client {
+    inner: AsyncClient,
+    driver: BlockingRuntimeDriver,
+}
+
+pub struct ClientBuilder {
+    inner: AsyncClientBuilder,
+}
+
+pub struct RequestBuilder {
+    inner: AsyncRequestBuilder,
+    driver: BlockingRuntimeDriver,
+}
+
+pub struct Response {
+    inner: AsyncResponse,
+    driver: BlockingRuntimeDriver,
+}
+
+pub struct ResponseBody {
+    inner: Option<AsyncResponseBody>,
+    driver: BlockingRuntimeDriver,
+    remainder: Option<Bytes>,
+    terminal: bool,
+}
+
+impl Client {
+    pub fn new() -> RequestResult<Self> {
+        Self::builder().build()
+    }
+
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder {
+            inner: AsyncClient::builder(),
+        }
+    }
+
+    pub fn request(&self, method: Method, url: impl AsRef<str>) -> RequestBuilder {
+        RequestBuilder {
+            inner: self.inner.request(method, url),
+            driver: self.driver.clone(),
+        }
+    }
+
+    pub fn get(&self, url: impl AsRef<str>) -> RequestBuilder {
+        RequestBuilder {
+            inner: self.inner.get(url),
+            driver: self.driver.clone(),
+        }
+    }
+
+    pub fn head(&self, url: impl AsRef<str>) -> RequestBuilder {
+        RequestBuilder {
+            inner: self.inner.head(url),
+            driver: self.driver.clone(),
+        }
+    }
+
+    pub fn post(&self, url: impl AsRef<str>) -> RequestBuilder {
+        RequestBuilder {
+            inner: self.inner.post(url),
+            driver: self.driver.clone(),
+        }
+    }
+
+    pub fn put(&self, url: impl AsRef<str>) -> RequestBuilder {
+        RequestBuilder {
+            inner: self.inner.put(url),
+            driver: self.driver.clone(),
+        }
+    }
+
+    pub fn patch(&self, url: impl AsRef<str>) -> RequestBuilder {
+        RequestBuilder {
+            inner: self.inner.patch(url),
+            driver: self.driver.clone(),
+        }
+    }
+
+    pub fn delete(&self, url: impl AsRef<str>) -> RequestBuilder {
+        RequestBuilder {
+            inner: self.inner.delete(url),
+            driver: self.driver.clone(),
+        }
+    }
+
+    pub fn execute(&self, request: Request) -> RequestResult<Response> {
+        let client = self.inner.clone();
+        let inner = submit_and_wait(&self.driver, async move { client.execute(request).await })?;
+        Ok(Response {
+            inner,
+            driver: self.driver.clone(),
+        })
+    }
+}
+
+impl ClientBuilder {
+    pub fn proxy(self, proxy: Proxy) -> Self {
+        Self {
+            inner: self.inner.proxy(proxy),
+        }
+    }
+
+    pub fn tls(self, tls: TlsConfig) -> Self {
+        Self {
+            inner: self.inner.tls(tls),
+        }
+    }
+
+    pub fn timeout(self, timeout: Timeout) -> Self {
+        Self {
+            inner: self.inner.timeout(timeout),
+        }
+    }
+
+    pub fn pool_max_idle_per_host(self, maximum: usize) -> Self {
+        Self {
+            inner: self.inner.pool_max_idle_per_host(maximum),
+        }
+    }
+
+    pub fn build(self) -> RequestResult<Client> {
+        let inner = self.inner.build()?;
+        let driver = BlockingRuntimeDriver::process_local().map_err(Error::blocking)?;
+        Ok(Client { inner, driver })
+    }
+}
+
+impl RequestBuilder {
+    pub fn header(self, name: HeaderName, value: HeaderValue) -> Self {
+        Self {
+            inner: self.inner.header(name, value),
+            driver: self.driver,
+        }
+    }
+
+    pub fn headers(self, headers: HeaderMap) -> Self {
+        Self {
+            inner: self.inner.headers(headers),
+            driver: self.driver,
+        }
+    }
+
+    pub fn body(self, body: impl Into<BodySource>) -> Self {
+        Self {
+            inner: self.inner.body(body),
+            driver: self.driver,
+        }
+    }
+
+    pub fn timeout(self, timeout: Timeout) -> Self {
+        Self {
+            inner: self.inner.timeout(timeout),
+            driver: self.driver,
+        }
+    }
+
+    pub fn build(self) -> RequestResult<Request> {
+        self.inner.build()
+    }
+
+    pub fn send(self) -> RequestResult<Response> {
+        let Self { inner, driver } = self;
+        let response = submit_and_wait(&driver, async move { inner.send().await })?;
+        Ok(Response {
+            inner: response,
+            driver,
+        })
+    }
+}
+
+impl Response {
+    pub fn status(&self) -> StatusCode {
+        self.inner.status()
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        self.inner.headers()
+    }
+
+    pub fn url(&self) -> &str {
+        self.inner.url()
+    }
+
+    pub fn version(&self) -> Version {
+        self.inner.version()
+    }
+
+    pub fn content_length(&self) -> Option<u64> {
+        self.inner.content_length()
+    }
+
+    pub fn into_body(self) -> ResponseBody {
+        let Self { inner, driver } = self;
+        ResponseBody {
+            inner: Some(inner.into_body()),
+            driver,
+            remainder: None,
+            terminal: false,
+        }
+    }
+
+    pub fn bytes(self) -> RequestResult<Bytes> {
+        let Self { inner, driver } = self;
+        submit_and_wait(&driver, async move { inner.bytes().await })
+    }
+
+    pub fn text(self) -> RequestResult<String> {
+        let Self { inner, driver } = self;
+        submit_and_wait(&driver, async move { inner.text().await })
+    }
+}
+
+impl Read for ResponseBody {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if let Some(remainder) = self.remainder.take() {
+            return Ok(copy_frame(buffer, remainder, &mut self.remainder));
+        }
+        if self.terminal {
+            return Ok(0);
+        }
+        let Some(mut body) = self.inner.take() else {
+            self.terminal = true;
+            return Ok(0);
+        };
+
+        let polled = submit_and_wait(&self.driver, async move {
+            let frame = loop {
+                match poll_fn(|context| Pin::new(&mut body).poll_next(context)).await {
+                    Some(Ok(frame)) if frame.is_empty() => {}
+                    frame => break frame,
+                }
+            };
+            Ok((body, frame))
+        });
+        let (body, frame) = match polled {
+            Ok(polled) => polled,
+            Err(error) => {
+                self.terminal = true;
+                return Err(io::Error::other(error));
+            }
+        };
+        self.inner = Some(body);
+        match frame {
+            Some(Ok(frame)) => Ok(copy_frame(buffer, frame, &mut self.remainder)),
+            Some(Err(error)) => {
+                self.terminal = true;
+                Err(io::Error::other(error))
+            }
+            None => {
+                self.terminal = true;
+                Ok(0)
+            }
+        }
+    }
+}
+
+impl ResponseBody {
+    pub fn close(mut self) -> RequestResult<()> {
+        let Some(body) = self.inner.take() else {
+            return Ok(());
+        };
+        submit_and_wait(&self.driver, async move { body.close().await })
+    }
+}
+
+pub fn get(url: impl AsRef<str>) -> RequestResult<Response> {
+    Client::new()?.get(url).send()
+}
+
+pub fn head(url: impl AsRef<str>) -> RequestResult<Response> {
+    Client::new()?.head(url).send()
+}
+
+pub fn post(url: impl AsRef<str>, body: impl Into<BodySource>) -> RequestResult<Response> {
+    Client::new()?.post(url).body(body).send()
+}
+
+pub fn put(url: impl AsRef<str>, body: impl Into<BodySource>) -> RequestResult<Response> {
+    Client::new()?.put(url).body(body).send()
+}
+
+pub fn patch(url: impl AsRef<str>, body: impl Into<BodySource>) -> RequestResult<Response> {
+    Client::new()?.patch(url).body(body).send()
+}
+
+pub fn delete(url: impl AsRef<str>) -> RequestResult<Response> {
+    Client::new()?.delete(url).send()
+}
+
+fn submit_and_wait<T, F>(driver: &BlockingRuntimeDriver, future: F) -> RequestResult<T>
+where
+    T: Send + 'static,
+    F: Future<Output = RequestResult<T>> + Send + 'static,
+{
+    let submission = driver.submit(future).map_err(Error::blocking)?;
+    submission.wait().map_err(Error::blocking)?
+}
+
+fn copy_frame(buffer: &mut [u8], frame: Bytes, remainder: &mut Option<Bytes>) -> usize {
+    let read = buffer.len().min(frame.len());
+    buffer[..read].copy_from_slice(&frame[..read]);
+    if read < frame.len() {
+        *remainder = Some(frame.slice(read..));
+    }
+    read
 }
 
 #[cfg(test)]

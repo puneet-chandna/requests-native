@@ -4,6 +4,7 @@ use std::fmt;
 #[non_exhaustive]
 pub enum ErrorKind {
     Body,
+    Blocking,
     Builder,
     ChunkedEncoding,
     Connect,
@@ -41,6 +42,14 @@ impl Error {
         Self {
             kind: ErrorKind::InvalidUrl,
             message: format!("invalid URL: {url}"),
+        }
+    }
+
+    #[cfg(feature = "blocking")]
+    pub(crate) fn blocking(error: impl fmt::Display) -> Self {
+        Self {
+            kind: ErrorKind::Blocking,
+            message: format!("blocking runtime failed: {error}"),
         }
     }
 
