@@ -12,6 +12,7 @@ use tokio_rustls::TlsConnector;
 use super::NativeRootLoader;
 use crate::{CertificateSource, Error, Identity, Result, TlsConfig};
 
+#[derive(Clone)]
 pub(super) struct LoadedTls {
     config: Arc<ClientConfig>,
 }
@@ -206,11 +207,14 @@ fn root_store(certificates: Vec<CertificateDer<'static>>, source: &str) -> Resul
     Ok(roots)
 }
 
-pub(super) async fn handshake(
+pub(super) async fn handshake<S>(
     loaded: LoadedTls,
     host: &str,
-    stream: tokio::net::TcpStream,
-) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    stream: S,
+) -> Result<tokio_rustls::client::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let server_name =
         ServerName::try_from(host.to_owned()).map_err(|error| Error::tls(error.to_string()))?;
     TlsConnector::from(loaded.config)

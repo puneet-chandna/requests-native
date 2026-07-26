@@ -5,6 +5,7 @@ mod establishment_tests;
 mod pool;
 #[cfg(test)]
 mod pool_tests;
+mod proxy;
 #[cfg(test)]
 mod timeout_tests;
 mod tls;
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::HeaderValue;
-use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, HOST};
+use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, HOST, PROXY_AUTHORIZATION};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -27,7 +28,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinHandle;
 
 use self::pool::{
-    ConnectionLease, IdentityKey, IdleConnection, LeaseTerminal, Pool, PoolKey, TlsPoolKey,
+    ConnectionLease, IdentityKey, IdleConnection, LeaseTerminal, Pool, PoolKey, ProxyKey,
+    TlsPoolKey,
 };
 use crate::models::RequestParts;
 use crate::{BodySource, ContentCodecs, Error, Proxy, Request, Result, Timeout, TlsConfig};
@@ -477,9 +479,6 @@ impl Transport {
     }
 
     pub async fn send(&self, request: Request) -> Result<TransportResponse> {
-        if self.proxy.is_some() {
-            return Err(Error::proxy_not_implemented());
-        }
         let timeout = request.timeout().unwrap_or(self.default_timeout);
         let started = Instant::now();
         validate_request(&request)?;
@@ -515,13 +514,22 @@ impl Transport {
         } else {
             (TlsPoolKey::plain(), None)
         };
-        let key = PoolKey::new(scheme, authority, None, tls, identity);
+        let proxy_key = self.proxy.as_ref().map(ProxyKey::from_proxy);
+        let target_is_https = scheme == http::uri::Scheme::HTTPS;
+        let absolute_form = proxy::uses_absolute_form(self.proxy.as_ref(), target_is_https);
+        let key = PoolKey::new(scheme, authority, proxy_key, tls, identity);
         #[cfg(test)]
         self.derived_pool_keys
             .lock()
             .expect("derived pool-key observation lock poisoned")
             .push(key.clone());
         let mut request = request.into_parts();
+        if absolute_form
+            && let Some(proxy) = &self.proxy
+            && let Some(authorization) = proxy::authorization(proxy)?
+        {
+            request.headers.insert(PROXY_AUTHORIZATION, authorization);
+        }
         if !request.headers.contains_key(ACCEPT_ENCODING) {
             request.headers.insert(
                 ACCEPT_ENCODING,
@@ -541,7 +549,7 @@ impl Transport {
         };
         let track_body_completion = read_timeout.is_some() || total_timeout.is_some();
         let (outgoing, url, mut body_completion) =
-            outgoing_request(request, track_body_completion)?;
+            outgoing_request(request, track_body_completion, absolute_form)?;
 
         let mut lease = self
             .acquire_connection(key, &host, port, &target, establishment_deadlines)
@@ -730,6 +738,7 @@ impl Transport {
         };
         let establishing = async {
             let tls = self.tls.clone();
+            let proxy = self.proxy.clone();
             #[cfg(test)]
             let establishment_control = self.establishment_control.as_ref().map(Arc::clone);
             #[cfg(test)]
@@ -739,30 +748,54 @@ impl Transport {
                 .and_then(|control| control.native_root_loader());
             #[cfg(not(test))]
             let native_root_loader = None;
-            let loaded_tls = if key.scheme == http::uri::Scheme::HTTPS {
-                Some(
-                    tokio::task::spawn_blocking(move || {
-                        #[cfg(test)]
-                        if let Some(control) = &establishment_control {
-                            control.blocking_load_started();
-                        }
-                        let result = tls::load(&tls, native_root_loader);
-                        #[cfg(test)]
-                        if let Some(control) = &establishment_control {
-                            control.blocking_load_finished(result.is_ok());
-                        }
-                        result
-                    })
-                    .await
-                    .map_err(Error::tls)??,
-                )
+            let target_is_https = key.scheme == http::uri::Scheme::HTTPS;
+            let proxy_needs_tls = proxy.as_ref().is_some_and(proxy::needs_tls);
+            let (loaded_tls, proxy_tls) = if target_is_https || proxy_needs_tls {
+                tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(control) = &establishment_control {
+                        control.blocking_load_started();
+                    }
+                    let target = target_is_https
+                        .then(|| tls::load(&tls, native_root_loader.clone()))
+                        .transpose();
+                    let proxy = proxy_needs_tls
+                        .then(|| {
+                            tls::load(
+                                &TlsConfig {
+                                    roots: tls.roots.clone(),
+                                    identity: None,
+                                },
+                                native_root_loader,
+                            )
+                        })
+                        .transpose();
+                    let result = target.and_then(|target| proxy.map(|proxy| (target, proxy)));
+                    #[cfg(test)]
+                    if let Some(control) = &establishment_control {
+                        control.blocking_load_finished(result.is_ok());
+                    }
+                    result
+                })
+                .await
+                .map_err(Error::tls)??
             } else {
-                None
+                (None, None)
             };
             #[cfg(test)]
             self.establishment_checkpoint(EstablishmentStage::Connect)
                 .await;
-            let stream = self.connector.connect(host, port, target).await?;
+            let endpoint = match &proxy {
+                Some(proxy) => proxy::endpoint(proxy)?,
+                None => proxy::Endpoint {
+                    host: host.to_owned(),
+                    port,
+                },
+            };
+            let stream = self
+                .connector
+                .connect(&endpoint.host, endpoint.port, target)
+                .await?;
             let stream = stream
                 .into_std()
                 .map_err(|error| Error::connect(target, error))?;
@@ -775,6 +808,12 @@ impl Transport {
             #[cfg(test)]
             let driver =
                 driver.with_shutdown_observer(self.establishment_control.as_ref().map(Arc::clone));
+            let stream = match &proxy {
+                Some(proxy) => {
+                    proxy::establish(proxy, stream, proxy_tls, host, port, target_is_https).await?
+                }
+                None => proxy::ProxyStream::Plain(stream),
+            };
             let connection = match loaded_tls {
                 Some(loaded_tls) => {
                     #[cfg(test)]
@@ -880,13 +919,27 @@ fn parsed_content_length(value: &http::HeaderValue) -> Option<u64> {
 fn outgoing_request(
     mut request: RequestParts,
     track_body_completion: bool,
+    absolute_form: bool,
 ) -> Result<(http::Request<OutgoingBody>, String, Option<BodyCompletion>)> {
-    let origin = request
-        .uri
-        .path_and_query()
-        .map_or("/", http::uri::PathAndQuery::as_str)
-        .parse::<http::Uri>()
-        .map_err(|_| Error::invalid_url(&request.url))?;
+    let request_target = if absolute_form {
+        let mut url =
+            url::Url::parse(&request.url).map_err(|_| Error::invalid_url(&request.url))?;
+        url.set_fragment(None);
+        url.set_username("")
+            .map_err(|_| Error::invalid_url(&request.url))?;
+        url.set_password(None)
+            .map_err(|_| Error::invalid_url(&request.url))?;
+        url.as_str()
+            .parse::<http::Uri>()
+            .map_err(|_| Error::invalid_url(&request.url))?
+    } else {
+        request
+            .uri
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str)
+            .parse::<http::Uri>()
+            .map_err(|_| Error::invalid_url(&request.url))?
+    };
     if !request.headers.contains_key(HOST) {
         let authority = request
             .uri
@@ -902,7 +955,7 @@ fn outgoing_request(
     let (body, completion) = OutgoingBody::new(request.body, track_body_completion);
     let mut outgoing = http::Request::new(body);
     *outgoing.method_mut() = request.method;
-    *outgoing.uri_mut() = origin;
+    *outgoing.uri_mut() = request_target;
     *outgoing.headers_mut() = request.headers;
     Ok((outgoing, request.url, completion))
 }
@@ -1217,7 +1270,8 @@ mod tests {
                 .build()
                 .unwrap();
 
-        let (outgoing, url, completion) = outgoing_request(request.into_parts(), false).unwrap();
+        let (outgoing, url, completion) =
+            outgoing_request(request.into_parts(), false, false).unwrap();
 
         assert_eq!(outgoing.uri().to_string(), "/direct?source=unit");
         assert!(completion.is_none());

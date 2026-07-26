@@ -44,12 +44,10 @@ pub enum Proxy {
 }
 
 impl Proxy {
-    fn uri_and_scheme(&self) -> (&Uri, &'static str) {
+    pub(crate) fn uri(&self) -> &Uri {
         match self {
-            Self::Http(uri) => (uri, "http"),
-            Self::Https(uri) => (uri, "https"),
-            Self::Socks4(uri) => (uri, "socks4"),
-            Self::Socks5 { uri, .. } => (uri, "socks5"),
+            Self::Http(uri) | Self::Https(uri) | Self::Socks4(uri) => uri,
+            Self::Socks5 { uri, .. } => uri,
         }
     }
 }
@@ -139,13 +137,22 @@ impl ClientBuilder {
 }
 
 fn validate_proxy(proxy: &Proxy) -> Result<()> {
-    let (uri, expected_scheme) = proxy.uri_and_scheme();
+    let uri = proxy.uri();
     let scheme = uri
         .scheme_str()
         .ok_or_else(|| Error::invalid_proxy("URI must be absolute and include a scheme"))?;
-    if !scheme.eq_ignore_ascii_case(expected_scheme) {
+    let valid_scheme = match proxy {
+        Proxy::Http(_) => scheme.eq_ignore_ascii_case("http"),
+        Proxy::Https(_) => scheme.eq_ignore_ascii_case("https"),
+        Proxy::Socks4(_) => matches!(scheme, "socks4" | "socks4a"),
+        Proxy::Socks5 { remote_dns, .. } => {
+            scheme.eq_ignore_ascii_case("socks5")
+                || (*remote_dns && scheme.eq_ignore_ascii_case("socks5h"))
+        }
+    };
+    if !valid_scheme {
         return Err(Error::invalid_proxy(format!(
-            "{expected_scheme} proxy requires the {expected_scheme:?} URI scheme, got {scheme:?}"
+            "proxy variant does not accept URI scheme {scheme:?}"
         )));
     }
     if uri.authority().is_none() || uri.host().is_none_or(str::is_empty) {

@@ -698,15 +698,17 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
         .split_once("spawn_blocking(move||{")
         .and_then(|(_, after)| after.split_once("}).await").map(|(body, _)| body));
     let exact_load = blocking_body.is_some_and(|body| {
-        body.matches("tls::load(").count() == 1
-            && body.contains("tls::load(&tls,native_root_loader)")
-            && body.matches("native_root_loader").count() == 1
+        body.matches("tls::load(").count() == 2
+            && body.contains("tls::load(&tls,native_root_loader.clone())")
+            && body.contains(
+                "tls::load(&TlsConfig{roots:tls.roots.clone(),identity:None,},native_root_loader,)",
+            )
             && !body.contains("letnative_root_loader=")
     });
     let exact_loader_flow = matches!(
         (test_override, blocking_end),
         (Some(start), Some(end))
-            if compact[start..end].matches("native_root_loader").count() == 4
+            if compact[start..end].matches("native_root_loader").count() == 5
     );
     if !matches!(
         (test_override, production_default, blocking_load),
@@ -714,14 +716,14 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
             if test < default && default < blocking
     ) || !exact_load
         || !exact_loader_flow
-        || compact.matches("tls::load(").count() != 1
+        || compact.matches("tls::load(").count() != 2
         || compact.matches("letnative_root_loader=").count() != 2
         || compact.matches(".native_root_loader()").count() != 1
     {
         violations.push(
             "cfg(test) must select native_root_loader from EstablishmentControl, cfg(not(test)) \
-             must select None, and the bounded post-selection flow must contain only those two \
-             bindings, the control getter, and the sole exact tls::load argument",
+             must select None, and the sole awaited blocking stage must load target TLS plus \
+             optional HTTPS-proxy TLS before connector work without client identity on the proxy",
         );
     }
     for required in [

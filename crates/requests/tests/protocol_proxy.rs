@@ -348,6 +348,54 @@ fn spawn_connect_proxy(
     (address, task)
 }
 
+fn spawn_tls_connect_proxy(
+    origin: std::net::SocketAddr,
+) -> (std::net::SocketAddr, thread::JoinHandle<Vec<u8>>) {
+    let (address_sender, address_receiver) = mpsc::channel();
+    let task = thread::spawn(move || {
+        runtime().block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind TLS CONNECT proxy");
+            address_sender
+                .send(listener.local_addr().expect("TLS CONNECT proxy address"))
+                .expect("publish TLS CONNECT proxy address");
+            let (stream, _) = listener.accept().await.expect("accept TLS proxy client");
+            let mut client = tls_acceptor()
+                .accept(stream)
+                .await
+                .expect("accept outer proxy TLS");
+            let mut connect_head = Vec::new();
+            while !connect_head.ends_with(b"\r\n\r\n") {
+                assert!(connect_head.len() < MAX_HEAD);
+                let mut byte = [0_u8; 1];
+                client
+                    .read_exact(&mut byte)
+                    .await
+                    .expect("read CONNECT over proxy TLS");
+                connect_head.push(byte[0]);
+            }
+            let mut upstream = tokio::net::TcpStream::connect(origin)
+                .await
+                .expect("connect tunneled TLS origin");
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("write CONNECT over proxy TLS");
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .expect("forward nested TLS tunnel");
+            connect_head
+        })
+    });
+    (
+        address_receiver
+            .recv()
+            .expect("receive TLS CONNECT proxy address"),
+        task,
+    )
+}
+
 fn frozen_ca_bundle() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/certs/expired/ca/ca.crt")
 }
@@ -398,6 +446,60 @@ fn https_uses_authenticated_connect_then_tls_and_origin_form() {
         tunneled.starts_with("GET /secure?q=one HTTP/1.1\r\n"),
         "{tunneled:?}"
     );
+    assert!(
+        !tunneled
+            .to_ascii_lowercase()
+            .contains("proxy-authorization")
+    );
+}
+
+#[test]
+fn https_proxy_layers_outer_tls_connect_then_inner_origin_tls() {
+    let (origin_address, origin_task) = spawn_tls_origin();
+    let (proxy_address, proxy_task) = spawn_tls_connect_proxy(origin_address);
+    let proxy_uri = format!(
+        "https://outer-user:outer-pass@localhost:{}",
+        proxy_address.port()
+    )
+    .parse::<Uri>()
+    .expect("valid HTTPS proxy URI");
+    let client = Client::builder()
+        .proxy(Proxy::Https(proxy_uri))
+        .tls(TlsConfig {
+            roots: CertificateSource::PemBundle(frozen_ca_bundle()),
+            identity: None,
+        })
+        .build()
+        .expect("build HTTPS proxy client");
+    let url = format!("https://localhost:{}/nested", origin_address.port());
+
+    let response = runtime()
+        .block_on(client.get(url).send())
+        .expect("HTTPS through HTTPS proxy");
+    assert_eq!(
+        runtime()
+            .block_on(response.bytes())
+            .expect("nested TLS body"),
+        "proxy-ok"
+    );
+
+    let connect = String::from_utf8(proxy_task.join().expect("join HTTPS proxy"))
+        .expect("CONNECT request is ASCII");
+    assert!(
+        connect.starts_with(&format!(
+            "CONNECT localhost:{} HTTP/1.1\r\n",
+            origin_address.port()
+        )),
+        "{connect:?}"
+    );
+    assert!(
+        connect.contains("Basic b3V0ZXItdXNlcjpvdXRlci1wYXNz"),
+        "{connect:?}"
+    );
+
+    let tunneled = String::from_utf8(origin_task.join().expect("join nested TLS origin"))
+        .expect("origin request is ASCII");
+    assert!(tunneled.starts_with("GET /nested HTTP/1.1\r\n"));
     assert!(
         !tunneled
             .to_ascii_lowercase()

@@ -13,12 +13,26 @@ use http::uri::{Authority, Scheme};
 use hyper::client::conn::http1::SendRequest;
 
 use super::{ConnectionDriver, OutgoingBody};
-use crate::{CertificateSource, Identity, TlsConfig};
+use crate::{CertificateSource, Identity, Proxy, TlsConfig};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct ProxyKey(String);
 
 impl ProxyKey {
+    pub(super) fn from_proxy(proxy: &Proxy) -> Self {
+        let dns = match proxy {
+            Proxy::Socks5 { remote_dns, .. } => {
+                if *remote_dns {
+                    "#remote-dns"
+                } else {
+                    "#local-dns"
+                }
+            }
+            _ => "",
+        };
+        Self(format!("{}{dns}", proxy.uri()))
+    }
+
     #[cfg(test)]
     pub(super) fn new(value: &str) -> Self {
         Self(value.to_owned())

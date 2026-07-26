@@ -3692,7 +3692,7 @@ fn zero_pool_idle_limit_disables_reuse_and_last_setter_wins() {
 }
 
 #[test]
-fn configured_proxy_fails_closed_after_the_client_is_dropped() {
+fn configured_proxy_request_survives_the_client_handle_and_never_connects_directly() {
     let runtime = runtime();
     let origin = ScriptedServer::spawn();
     let proxy = ScriptedServer::spawn();
@@ -3710,32 +3710,35 @@ fn configured_proxy_fails_closed_after_the_client_is_dropped() {
     let request = client.request(Method::POST, origin.url()).body(body);
     drop(client);
 
-    let result = runtime
+    let response = runtime
         .block_on(async { tokio::time::timeout(EXCHANGE_TIMEOUT, request.send()).await })
-        .expect("configured proxy request exceeded outer bound");
-    let error = match result {
-        Err(error) => error,
-        Ok(response) => {
-            drop(response);
-            panic!("configured proxy silently used the direct transport")
-        }
-    };
-    assert_eq!(error.kind(), ErrorKind::Proxy);
+        .expect("configured proxy request exceeded outer bound")
+        .expect("configured proxy request failed");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        runtime
+            .block_on(response.bytes())
+            .expect("collect configured proxy response"),
+        Bytes::from_static(b"direct\n")
+    );
     assert!(
-        probe
+        !probe
             .polls
             .lock()
             .expect("proxy body poll log lock")
             .is_empty(),
-        "configured proxy must fail before polling the request body"
+        "configured proxy must poll the request body"
     );
 
-    let proxy_observation = proxy.finish().expect("proxy fail-closed fixture completed");
-    assert_eq!(proxy_observation.accepted_connections, 0);
-    assert!(proxy_observation.request_bytes.is_empty());
-    let origin_observation = origin
-        .finish()
-        .expect("origin fail-closed fixture completed");
+    let proxy_observation = proxy.finish().expect("proxy fixture completed");
+    assert_eq!(proxy_observation.accepted_connections, 1);
+    assert!(
+        proxy_observation
+            .request_bytes
+            .starts_with(format!("POST {} HTTP/1.1\r\n", origin.url()).as_bytes())
+    );
+    assert!(proxy_observation.request_bytes.ends_with(b"proxy-body"));
+    let origin_observation = origin.finish().expect("unreached origin fixture completed");
     assert_eq!(origin_observation.accepted_connections, 0);
     assert!(origin_observation.request_bytes.is_empty());
 }

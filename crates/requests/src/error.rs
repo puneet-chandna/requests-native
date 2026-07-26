@@ -84,11 +84,8 @@ impl Error {
         )
     }
 
-    pub(crate) fn proxy_not_implemented() -> Self {
-        Self::transport(
-            ErrorKind::Proxy,
-            "configured proxy transport is not implemented".to_owned(),
-        )
+    pub(crate) fn proxy(error: impl fmt::Display) -> Self {
+        Self::transport(ErrorKind::Proxy, format!("proxy transport failed: {error}"))
     }
 
     pub(crate) fn dns(target: &str, error: impl fmt::Display) -> Self {
