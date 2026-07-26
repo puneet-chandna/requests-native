@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_core::Stream;
+#[cfg(feature = "blocking")]
+use requests::blocking;
 use requests::{
     AsyncBody, BodySource, Client, ErrorKind, HeaderName, HeaderValue, Method, Proxy,
     RequestBuilder, ResponseBody, StatusCode, Timeout, Uri, Version,
@@ -1597,6 +1599,56 @@ fn runtime() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .expect("build caller-owned Tokio runtime")
+}
+
+#[cfg(feature = "blocking")]
+fn bounded_blocking<T, F, C>(work: F, cancel: C) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    C: FnOnce(),
+{
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    match receiver.recv_timeout(EXCHANGE_TIMEOUT) {
+        Ok(result) => {
+            worker.join().expect("bounded blocking worker panicked");
+            result
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+            Ok(()) => panic!("bounded blocking worker stopped without a result"),
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            cancel();
+            let _ = worker.join();
+            panic!("blocking operation exceeded {EXCHANGE_TIMEOUT:?}")
+        }
+    }
+}
+
+#[cfg(feature = "blocking")]
+fn bounded_body_read<C>(
+    mut body: blocking::ResponseBody,
+    capacity: usize,
+    cancel: C,
+) -> (blocking::ResponseBody, std::io::Result<Vec<u8>>)
+where
+    C: FnOnce(),
+{
+    bounded_blocking(
+        move || {
+            let mut buffer = vec![0; capacity];
+            let result = body.read(&mut buffer).map(|read| {
+                buffer.truncate(read);
+                buffer
+            });
+            (body, result)
+        },
+        cancel,
+    )
 }
 
 fn complete_exchange(
@@ -3742,4 +3794,396 @@ fn top_level_streamed_post_is_polled_on_the_callers_tokio_runtime_and_moved_once
     assert!(polls.load(Ordering::Acquire) >= 1);
     assert!(all_polls_on_caller_runtime_thread.load(Ordering::Acquire));
     assert_eq!(drops.load(Ordering::Acquire), 1);
+}
+
+#[cfg(feature = "blocking")]
+#[test]
+fn blocking_request_runs_inside_a_current_thread_tokio_runtime() {
+    let mut server = ScriptedServer::spawn();
+    let url = server.url();
+    let result = bounded_blocking(
+        move || {
+            runtime().block_on(async move {
+                let response = blocking::get(url)?;
+                response.bytes()
+            })
+        },
+        || server.signal_shutdown(),
+    );
+    let body = result.expect("blocking request inside Tokio runtime failed");
+
+    let observation = server.finish().expect("blocking runtime fixture completed");
+    let request = CapturedRequest::parse(&observation);
+    assert_eq!(request.request_line, "GET /direct?source=task10 HTTP/1.1");
+    assert_eq!(body, Bytes::from_static(b"direct\n"));
+}
+
+#[cfg(feature = "blocking")]
+#[test]
+fn blocking_send_returns_after_head_and_response_body_read_streams() {
+    let server = PhasedServer::spawn(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+        vec![
+            Vec::new(),
+            b"6\r\nabcdef\r\n".to_vec(),
+            b"4\r\nghij\r\n0\r\n\r\n".to_vec(),
+        ],
+    );
+    let url = server.url();
+    let response = bounded_blocking(
+        move || {
+            let client = blocking::Client::new()?;
+            client.get(url).send()
+        },
+        || {
+            let _ = server.commands.send(PhaseCommand::Close);
+        },
+    )
+    .expect("blocking send failed before response body release");
+    server.wait_first();
+
+    let body = response.into_body();
+    let (body, empty) = bounded_body_read(body, 0, || {
+        let _ = server.commands.send(PhaseCommand::Close);
+    });
+    assert!(empty.expect("empty blocking read failed").is_empty());
+
+    server.release_next(0);
+    server.release_next(1);
+    let (body, first) = bounded_body_read(body, 2, || {
+        let _ = server.commands.send(PhaseCommand::Close);
+    });
+    assert_eq!(first.expect("first blocking read failed"), b"ab");
+    let (body, middle) = bounded_body_read(body, 3, || {
+        let _ = server.commands.send(PhaseCommand::Close);
+    });
+    assert_eq!(middle.expect("middle blocking read failed"), b"cde");
+    let (body, remainder) = bounded_body_read(body, 4, || {
+        let _ = server.commands.send(PhaseCommand::Close);
+    });
+    assert_eq!(remainder.expect("remainder blocking read failed"), b"f");
+
+    server.release_next(2);
+    let (body, tail) = bounded_body_read(body, 3, || {
+        let _ = server.commands.send(PhaseCommand::Close);
+    });
+    assert_eq!(tail.expect("tail blocking read failed"), b"ghi");
+    let (body, tail_remainder) = bounded_body_read(body, 3, || {
+        let _ = server.commands.send(PhaseCommand::Close);
+    });
+    assert_eq!(
+        tail_remainder.expect("tail remainder blocking read failed"),
+        b"j"
+    );
+    let (body, eof) = bounded_body_read(body, 8, || {
+        let _ = server.commands.send(PhaseCommand::Close);
+    });
+    assert!(eof.expect("blocking EOF read failed").is_empty());
+    let (body, repeated_eof) = bounded_body_read(body, 8, || {
+        let _ = server.commands.send(PhaseCommand::Close);
+    });
+    assert!(
+        repeated_eof
+            .expect("repeated blocking EOF read failed")
+            .is_empty()
+    );
+    drop(body);
+
+    server.wait_peer_eof();
+    let observation = server.finish().expect("blocking phased fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+    assert!(
+        observation
+            .request_bytes
+            .starts_with(b"GET /phased HTTP/1.1\r\n")
+    );
+}
+
+#[cfg(feature = "blocking")]
+#[test]
+fn blocking_response_metadata_bytes_and_text_match_wire() {
+    const METADATA_RESPONSE: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+        x-blocking: metadata\r\nContent-Length: 5\r\nConnection: close\r\n\r\nbytes";
+    const TEXT_RESPONSE: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ntext \xFF";
+
+    let mut metadata_server = ScriptedServer::spawn_with_response(METADATA_RESPONSE);
+    let mut text_server = ScriptedServer::spawn_with_response(TEXT_RESPONSE);
+    let metadata_url = metadata_server.url();
+    let expected_url = metadata_url.clone();
+    let text_url = text_server.url();
+    let result = bounded_blocking(
+        move || {
+            let response = blocking::get(metadata_url)?;
+            let status = response.status();
+            let header = response.headers().get("x-blocking").cloned();
+            let url = response.url().to_owned();
+            let version = response.version();
+            let content_length = response.content_length();
+            let bytes = response.bytes()?;
+            let text = blocking::get(text_url)?.text()?;
+            Ok::<_, requests::Error>((status, header, url, version, content_length, bytes, text))
+        },
+        || {
+            metadata_server.signal_shutdown();
+            text_server.signal_shutdown();
+        },
+    )
+    .expect("blocking response collection failed");
+
+    metadata_server
+        .finish()
+        .expect("blocking metadata fixture completed");
+    text_server
+        .finish()
+        .expect("blocking text fixture completed");
+    let (status, header, url, version, content_length, bytes, text) = result;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header.as_ref().map(HeaderValue::as_bytes),
+        Some(&b"metadata"[..])
+    );
+    assert_eq!(url, expected_url);
+    assert_eq!(version, Version::HTTP_11);
+    assert_eq!(content_length, Some(5));
+    assert_eq!(bytes, Bytes::from_static(b"bytes"));
+    assert_eq!(text, "text \u{fffd}");
+}
+
+#[cfg(feature = "blocking")]
+#[test]
+fn blocking_full_body_read_reuses_one_connection() {
+    let mut server = PoolServer::spawn(PoolScript::KeepAlive, 2, 0);
+    let first_url = server.url("/blocking-pool/full");
+    let second_url = server.url("/blocking-pool/after-full");
+    let result = bounded_blocking(
+        move || {
+            let client = blocking::Client::new()?;
+            let mut body = client.get(first_url).send()?.into_body();
+            let mut first = Vec::new();
+            body.read_to_end(&mut first)
+                .expect("read complete blocking response body");
+            let second = client.get(second_url).send()?.bytes()?;
+            Ok::<_, requests::Error>((first, second))
+        },
+        || server.signal_shutdown(),
+    )
+    .expect("blocking pooled exchange failed");
+
+    let observation = server
+        .finish()
+        .expect("blocking clean pool fixture completed");
+    assert_eq!(result.0, b"ok");
+    assert_eq!(result.1, Bytes::from_static(b"ok"));
+    assert_eq!(observation.accepted_connections, 1);
+    assert_pool_requests(
+        &observation,
+        &[0, 0],
+        &["/blocking-pool/full", "/blocking-pool/after-full"],
+    );
+}
+
+#[cfg(feature = "blocking")]
+#[test]
+fn blocking_partial_body_drop_forces_a_second_connection() {
+    let mut server = PoolServer::spawn(PoolScript::HoldFirstBody, 2, 1);
+    let first_url = server.url("/blocking-pool/drop");
+    let second_url = server.url("/blocking-pool/after-drop");
+    let result = bounded_blocking(
+        move || {
+            let client = blocking::Client::new()?;
+            let mut body = client.get(first_url).send()?.into_body();
+            let mut prefix = [0; 3];
+            body.read_exact(&mut prefix)
+                .expect("read partial blocking response body");
+            drop(body);
+            let second = client.get(second_url).send()?.bytes()?;
+            Ok::<_, requests::Error>((prefix, second))
+        },
+        || server.signal_shutdown(),
+    )
+    .expect("blocking partial-drop exchange failed");
+
+    let observation = server
+        .finish()
+        .expect("blocking partial-drop pool fixture completed");
+    assert_eq!(result.0, *b"par");
+    assert_eq!(result.1, Bytes::from_static(b"ok"));
+    assert_eq!(observation.accepted_connections, 2);
+    assert!(observation.peer_closed_connections.contains(&0));
+    assert_pool_requests(
+        &observation,
+        &[0, 1],
+        &["/blocking-pool/drop", "/blocking-pool/after-drop"],
+    );
+}
+
+#[cfg(feature = "blocking")]
+#[test]
+fn blocking_partial_body_close_forces_a_second_connection() {
+    let mut server = PoolServer::spawn(PoolScript::HoldFirstBody, 2, 1);
+    let first_url = server.url("/blocking-pool/close");
+    let second_url = server.url("/blocking-pool/after-close");
+    let result = bounded_blocking(
+        move || {
+            let client = blocking::Client::new()?;
+            let mut body = client.get(first_url).send()?.into_body();
+            let mut prefix = [0; 3];
+            body.read_exact(&mut prefix)
+                .expect("read partial blocking response body");
+            body.close()?;
+            let second = client.get(second_url).send()?.bytes()?;
+            Ok::<_, requests::Error>((prefix, second))
+        },
+        || server.signal_shutdown(),
+    )
+    .expect("blocking partial-close exchange failed");
+
+    let observation = server
+        .finish()
+        .expect("blocking partial-close pool fixture completed");
+    assert_eq!(result.0, *b"par");
+    assert_eq!(result.1, Bytes::from_static(b"ok"));
+    assert_eq!(observation.accepted_connections, 2);
+    assert!(observation.peer_closed_connections.contains(&0));
+    assert_pool_requests(
+        &observation,
+        &[0, 1],
+        &["/blocking-pool/close", "/blocking-pool/after-close"],
+    );
+}
+
+#[cfg(feature = "blocking")]
+#[test]
+fn blocking_execute_client_and_top_level_helpers_preserve_wire_contracts() {
+    let mut server = PoolServer::spawn(PoolScript::KeepAlive, 13, 0);
+    let address = server.address;
+    let result = bounded_blocking(
+        move || {
+            let url = |path: &str| format!("http://{address}{path}");
+            let collect = |response: requests::Result<blocking::Response>| {
+                response.and_then(blocking::Response::bytes)
+            };
+            let client = blocking::Client::new()?;
+            let execute_request = RequestBuilder::new(Method::POST, url("/blocking/execute"))
+                .body(Vec::from(&b"execute"[..]))
+                .build()?;
+            let bodies = vec![
+                client.execute(execute_request)?.bytes()?,
+                collect(client.get(url("/blocking/client/get")).send())?,
+                collect(client.head(url("/blocking/client/head")).send())?,
+                collect(
+                    client
+                        .post(url("/blocking/client/post"))
+                        .body(Vec::from(&b"client-post"[..]))
+                        .send(),
+                )?,
+                collect(
+                    client
+                        .put(url("/blocking/client/put"))
+                        .body(BodySource::Bytes(Bytes::from_static(b"client-put")))
+                        .send(),
+                )?,
+                collect(
+                    client
+                        .patch(url("/blocking/client/patch"))
+                        .body(Vec::from(&b"client-patch"[..]))
+                        .send(),
+                )?,
+                collect(client.delete(url("/blocking/client/delete")).send())?,
+                blocking::get(url("/blocking/top/get"))?.bytes()?,
+                blocking::head(url("/blocking/top/head"))?.bytes()?,
+                blocking::post(url("/blocking/top/post"), Vec::from(&b"top-post"[..]))?.bytes()?,
+                blocking::put(
+                    url("/blocking/top/put"),
+                    BodySource::Bytes(Bytes::from_static(b"top-put")),
+                )?
+                .bytes()?,
+                blocking::patch(url("/blocking/top/patch"), Vec::from(&b"top-patch"[..]))?
+                    .bytes()?,
+                blocking::delete(url("/blocking/top/delete"))?.bytes()?,
+            ];
+
+            let client_error = match client.get("/relative-client").send() {
+                Err(error) => error,
+                Ok(response) => {
+                    drop(response);
+                    panic!("blocking client accepted a relative URL")
+                }
+            };
+            let top_level_error = match blocking::get("/relative-top-level") {
+                Err(error) => error,
+                Ok(response) => {
+                    drop(response);
+                    panic!("blocking top-level helper accepted a relative URL")
+                }
+            };
+            Ok::<_, requests::Error>((bodies, client_error.kind(), top_level_error.kind()))
+        },
+        || server.signal_shutdown(),
+    )
+    .expect("blocking convenience exchanges failed");
+
+    let observation = server
+        .finish()
+        .expect("blocking convenience pool fixture completed");
+    assert_eq!(result.1, ErrorKind::InvalidUrl);
+    assert_eq!(result.2, ErrorKind::InvalidUrl);
+    let expected_response_bodies = [
+        b"ok".as_slice(),
+        b"ok".as_slice(),
+        b"".as_slice(),
+        b"ok".as_slice(),
+        b"ok".as_slice(),
+        b"ok".as_slice(),
+        b"ok".as_slice(),
+        b"ok".as_slice(),
+        b"".as_slice(),
+        b"ok".as_slice(),
+        b"ok".as_slice(),
+        b"ok".as_slice(),
+        b"ok".as_slice(),
+    ];
+    for (body, expected) in result.0.iter().zip(expected_response_bodies) {
+        assert_eq!(body.as_ref(), expected);
+    }
+
+    assert_eq!(observation.accepted_connections, 7);
+    assert_eq!(
+        observation.connection_ids(),
+        [0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6]
+    );
+    let expected_requests = [
+        ("POST /blocking/execute HTTP/1.1", b"execute".as_slice()),
+        ("GET /blocking/client/get HTTP/1.1", b"".as_slice()),
+        ("HEAD /blocking/client/head HTTP/1.1", b"".as_slice()),
+        (
+            "POST /blocking/client/post HTTP/1.1",
+            b"client-post".as_slice(),
+        ),
+        (
+            "PUT /blocking/client/put HTTP/1.1",
+            b"client-put".as_slice(),
+        ),
+        (
+            "PATCH /blocking/client/patch HTTP/1.1",
+            b"client-patch".as_slice(),
+        ),
+        ("DELETE /blocking/client/delete HTTP/1.1", b"".as_slice()),
+        ("GET /blocking/top/get HTTP/1.1", b"".as_slice()),
+        ("HEAD /blocking/top/head HTTP/1.1", b"".as_slice()),
+        ("POST /blocking/top/post HTTP/1.1", b"top-post".as_slice()),
+        ("PUT /blocking/top/put HTTP/1.1", b"top-put".as_slice()),
+        (
+            "PATCH /blocking/top/patch HTTP/1.1",
+            b"top-patch".as_slice(),
+        ),
+        ("DELETE /blocking/top/delete HTTP/1.1", b"".as_slice()),
+    ];
+    assert_eq!(observation.requests.len(), expected_requests.len());
+    for (observed, (request_line, body)) in observation.requests.iter().zip(expected_requests) {
+        let request = CapturedRequest::parse_bytes(&observed.request_bytes);
+        assert_eq!(request.request_line, request_line);
+        assert_eq!(request.body, body);
+    }
 }

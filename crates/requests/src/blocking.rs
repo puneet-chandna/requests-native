@@ -304,9 +304,13 @@ impl DriverRegistry {
 #[cfg(test)]
 mod tests {
     use std::future;
-    use std::sync::Arc;
+    use std::io::{self, Read};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    use tokio::io::AsyncWriteExt;
 
     use super::{
         BlockingDriverError, BlockingRuntimeDriver, BlockingSubmission, BlockingTaskError,
@@ -342,6 +346,83 @@ mod tests {
 
         assert_eq!(output.value, "complete");
         assert_ne!(output.worker, caller);
+    }
+
+    #[test]
+    fn process_local_runtime_drives_tokio_tcp_io() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> io::Result<[u8; 4]> {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "timed out accepting loopback connection",
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+            let mut request = [0; 4];
+            stream.read_exact(&mut request)?;
+            Ok(request)
+        });
+
+        let client_result = BlockingRuntimeDriver::process_local()
+            .unwrap()
+            .submit(async move {
+                let mut stream = tokio::net::TcpStream::connect(address).await?;
+                stream.write_all(b"ping").await
+            })
+            .unwrap()
+            .wait();
+        let server_result = server.join().expect("loopback server thread panicked");
+
+        client_result
+            .expect("process runtime worker stopped")
+            .expect("Tokio TCP client failed");
+        assert_eq!(server_result.expect("loopback server failed"), *b"ping");
+    }
+
+    #[test]
+    fn submission_wait_yields_a_multi_thread_runtime_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let watchdog_sender = sender.clone();
+        let watchdog = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(1));
+            let _ = watchdog_sender.send("watchdog");
+        });
+
+        let result = runtime.block_on(async move {
+            tokio::spawn(async move {
+                let _runtime_task = tokio::spawn(async move {
+                    let _ = sender.send("runtime");
+                });
+                BlockingRuntimeDriver::process_local()
+                    .unwrap()
+                    .submit(async move { receiver.recv().unwrap() })
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+            })
+            .await
+            .unwrap()
+        });
+        watchdog.join().unwrap();
+
+        assert_eq!(result, "runtime");
     }
 
     #[test]
