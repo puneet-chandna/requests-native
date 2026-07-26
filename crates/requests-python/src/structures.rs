@@ -1,11 +1,357 @@
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyTypeError, PyUnicodeEncodeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{
-    PyAny, PyAnyMethods, PyDict, PyDictMethods, PyInt, PyModule, PyString, PyTuple, PyTupleMethods,
-    PyType, PyTypeMethods,
+    PyAny, PyAnyMethods, PyBytes, PyDict, PyDictMethods, PyInt, PyModule, PyString, PyTuple,
+    PyTupleMethods, PyType, PyTypeMethods,
 };
 use pyo3::wrap_pyfunction;
 use requests::structures::CaseInsensitiveMap;
+
+struct CallableProof {
+    function: Py<PyAny>,
+    code: Py<PyAny>,
+    defaults: Py<PyAny>,
+    kwdefaults: Py<PyAny>,
+    closure: Py<PyAny>,
+    globals: Py<PyAny>,
+    builtins: Py<PyAny>,
+}
+
+struct InternalUtilsState {
+    module: Py<PyModule>,
+    module_dictionary: Py<PyDict>,
+    to_native_string: CallableProof,
+    unicode_is_ascii: CallableProof,
+    builtin_str: Py<PyAny>,
+    builtin_isinstance: Py<PyAny>,
+    builtin_unicode_encode_error: Py<PyAny>,
+}
+
+struct ClassEntryProof {
+    key: Py<PyAny>,
+    value: Py<PyAny>,
+    callable: Option<CallableProof>,
+}
+
+struct StatusCodesState {
+    structures: Py<PyModule>,
+    lookup_dict: Py<PyType>,
+    lookup_dictionary: Vec<ClassEntryProof>,
+    bases: Py<PyAny>,
+    base_items: Vec<Py<PyAny>>,
+    codes: Py<PyAny>,
+}
+
+static INTERNAL_UTILS_STATE: PyOnceLock<InternalUtilsState> = PyOnceLock::new();
+static STATUS_CODES_STATE: PyOnceLock<StatusCodesState> = PyOnceLock::new();
+
+fn callable_proof(value: &Bound<'_, PyAny>) -> PyResult<CallableProof> {
+    Ok(CallableProof {
+        function: value.clone().unbind(),
+        code: value.getattr("__code__")?.unbind(),
+        defaults: value.getattr("__defaults__")?.unbind(),
+        kwdefaults: value.getattr("__kwdefaults__")?.unbind(),
+        closure: value.getattr("__closure__")?.unbind(),
+        globals: value.getattr("__globals__")?.unbind(),
+        builtins: value.getattr("__builtins__")?.unbind(),
+    })
+}
+
+fn callable_is_pristine(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    proof: &CallableProof,
+) -> PyResult<bool> {
+    Ok(current.is(proof.function.bind(py))
+        && current.getattr("__code__")?.is(proof.code.bind(py))
+        && current.getattr("__defaults__")?.is(proof.defaults.bind(py))
+        && current
+            .getattr("__kwdefaults__")?
+            .is(proof.kwdefaults.bind(py))
+        && current.getattr("__closure__")?.is(proof.closure.bind(py))
+        && current.getattr("__globals__")?.is(proof.globals.bind(py))
+        && current.getattr("__builtins__")?.is(proof.builtins.bind(py)))
+}
+
+fn initialize_internal_utils_state(py: Python<'_>) -> PyResult<InternalUtilsState> {
+    let module = PyModule::import(py, "requests._internal_utils")?;
+    let module_dictionary = module.dict();
+    let builtins = PyModule::import(py, "builtins")?;
+    Ok(InternalUtilsState {
+        to_native_string: callable_proof(&module.getattr("to_native_string")?)?,
+        unicode_is_ascii: callable_proof(&module.getattr("unicode_is_ascii")?)?,
+        builtin_str: py.get_type::<PyString>().into_any().unbind(),
+        builtin_isinstance: builtins.getattr("isinstance")?.unbind(),
+        builtin_unicode_encode_error: builtins.getattr("UnicodeEncodeError")?.unbind(),
+        module: module.unbind(),
+        module_dictionary: module_dictionary.unbind(),
+    })
+}
+
+fn internal_utils_state(py: Python<'_>) -> PyResult<&InternalUtilsState> {
+    INTERNAL_UTILS_STATE.get_or_try_init(py, || initialize_internal_utils_state(py))
+}
+
+fn internal_callable_is_pristine(
+    py: Python<'_>,
+    state: &InternalUtilsState,
+    name: &str,
+    proof: &CallableProof,
+) -> PyResult<bool> {
+    let module = state.module.bind(py);
+    let dictionary = module.dict();
+    let builtins = proof.builtins.bind(py).cast::<PyDict>()?;
+    Ok(dictionary.is(state.module_dictionary.bind(py))
+        && callable_is_pristine(py, &module.getattr(name)?, proof)?
+        && !dictionary.contains("isinstance")?
+        && builtins
+            .get_item("isinstance")?
+            .is_some_and(|value| value.is(state.builtin_isinstance.bind(py))))
+}
+
+fn internal_utils_fallback(
+    py: Python<'_>,
+    state: &InternalUtilsState,
+    operation: &str,
+    arguments: &Bound<'_, PyTuple>,
+) -> PyResult<Py<PyAny>> {
+    Ok(state
+        .module
+        .bind(py)
+        .getattr(operation)?
+        .call1(arguments.clone())?
+        .unbind())
+}
+
+#[pyfunction]
+fn _internal_utils_trial(
+    py: Python<'_>,
+    operation: &str,
+    arguments: &Bound<'_, PyTuple>,
+) -> PyResult<Py<PyAny>> {
+    let state = internal_utils_state(py)?;
+    match operation {
+        "to_native_string"
+            if (arguments.len() == 1 || arguments.len() == 2)
+                && internal_callable_is_pristine(
+                    py,
+                    state,
+                    operation,
+                    &state.to_native_string,
+                )?
+                && state
+                    .module
+                    .bind(py)
+                    .getattr("builtin_str")?
+                    .is(state.builtin_str.bind(py)) =>
+        {
+            let value = arguments.get_item(0)?;
+            if value.is_exact_instance_of::<PyString>() {
+                return Ok(value.unbind());
+            }
+            if value.is_exact_instance_of::<PyBytes>() {
+                let encoding = if arguments.len() == 2 {
+                    arguments.get_item(1)?
+                } else {
+                    PyString::new(py, "ascii").into_any()
+                };
+                if encoding.is_exact_instance_of::<PyString>() {
+                    return Ok(value.call_method1("decode", (encoding,))?.unbind());
+                }
+            }
+            internal_utils_fallback(py, state, operation, arguments)
+        }
+        "unicode_is_ascii"
+            if arguments.len() == 1
+                && internal_callable_is_pristine(
+                    py,
+                    state,
+                    operation,
+                    &state.unicode_is_ascii,
+                )?
+                && !state
+                    .module_dictionary
+                    .bind(py)
+                    .contains("UnicodeEncodeError")?
+                && state
+                    .unicode_is_ascii
+                    .builtins
+                    .bind(py)
+                    .cast::<PyDict>()?
+                    .get_item("UnicodeEncodeError")?
+                    .is_some_and(|value| value.is(state.builtin_unicode_encode_error.bind(py))) =>
+        {
+            let value = arguments.get_item(0)?;
+            if value.is_exact_instance_of::<PyString>() {
+                return match value.cast::<PyString>()?.to_str() {
+                    Ok(value) => Ok(requests::utils::unicode_is_ascii(value)
+                        .into_pyobject(py)?
+                        .to_owned()
+                        .into_any()
+                        .unbind()),
+                    Err(error) if error.is_instance_of::<PyUnicodeEncodeError>(py) => {
+                        Ok(false.into_pyobject(py)?.to_owned().into_any().unbind())
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+            internal_utils_fallback(py, state, operation, arguments)
+        }
+        "to_native_string" | "unicode_is_ascii" => {
+            internal_utils_fallback(py, state, operation, arguments)
+        }
+        _ => Err(PyValueError::new_err(format!(
+            "unknown internal utils trial operation: {operation}"
+        ))),
+    }
+}
+
+fn initialize_status_codes_state(py: Python<'_>) -> PyResult<StatusCodesState> {
+    let status_codes = PyModule::import(py, "requests.status_codes")?;
+    let structures = PyModule::import(py, "requests.structures")?;
+    let lookup_dict = structures.getattr("LookupDict")?.cast_into::<PyType>()?;
+    let dictionary = lookup_dict.getattr("__dict__")?;
+    let mut lookup_dictionary = Vec::new();
+    for key in dictionary.try_iter()? {
+        let key = key?;
+        let value = dictionary.get_item(&key)?;
+        let callable = value
+            .hasattr("__code__")?
+            .then(|| callable_proof(&value))
+            .transpose()?;
+        lookup_dictionary.push(ClassEntryProof {
+            key: key.unbind(),
+            value: value.unbind(),
+            callable,
+        });
+    }
+    let bases = lookup_dict.getattr("__bases__")?;
+    let base_items = bases
+        .try_iter()?
+        .map(|item| item.map(Bound::unbind))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(StatusCodesState {
+        structures: structures.unbind(),
+        lookup_dict: lookup_dict.unbind(),
+        lookup_dictionary,
+        bases: bases.unbind(),
+        base_items,
+        codes: status_codes.getattr("codes")?.unbind(),
+    })
+}
+
+fn status_codes_state(py: Python<'_>) -> PyResult<&StatusCodesState> {
+    STATUS_CODES_STATE.get_or_try_init(py, || initialize_status_codes_state(py))
+}
+
+fn lookup_class_is_pristine(py: Python<'_>, state: &StatusCodesState) -> PyResult<bool> {
+    let current = state.structures.bind(py).getattr("LookupDict")?;
+    if !current.is(state.lookup_dict.bind(py)) {
+        return Ok(false);
+    }
+    let dictionary = current.getattr("__dict__")?;
+    let keys = dictionary.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+    if keys.len() != state.lookup_dictionary.len() {
+        return Ok(false);
+    }
+    for (key, proof) in keys.iter().zip(&state.lookup_dictionary) {
+        if !key.is(proof.key.bind(py)) {
+            return Ok(false);
+        }
+        let value = dictionary.get_item(key)?;
+        if !value.is(proof.value.bind(py)) {
+            return Ok(false);
+        }
+        if let Some(callable) = &proof.callable
+            && !callable_is_pristine(py, &value, callable)?
+        {
+            return Ok(false);
+        }
+    }
+    let bases = current.getattr("__bases__")?;
+    let base_items = bases.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+    Ok(bases.is(state.bases.bind(py))
+        && base_items.len() == state.base_items.len()
+        && base_items
+            .iter()
+            .zip(&state.base_items)
+            .all(|(current, expected)| current.is(expected.bind(py))))
+}
+
+fn status_codes_fallback(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    operation: &str,
+    arguments: &Bound<'_, PyTuple>,
+) -> PyResult<Py<PyAny>> {
+    lookup_fallback(py, subject, operation, arguments)
+}
+
+#[pyfunction]
+fn _status_codes_trial(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    operation: &str,
+    arguments: &Bound<'_, PyTuple>,
+) -> PyResult<Py<PyAny>> {
+    let state = status_codes_state(py)?;
+    if !subject.is(state.codes.bind(py))
+        || !subject.get_type().is(state.lookup_dict.bind(py))
+        || !lookup_class_is_pristine(py, state)?
+    {
+        return status_codes_fallback(py, subject, operation, arguments);
+    }
+    match operation {
+        "getitem" if arguments.len() == 1 => {
+            let key = arguments.get_item(0)?;
+            if !key.is_exact_instance_of::<PyString>() {
+                return status_codes_fallback(py, subject, operation, arguments);
+            }
+            Ok(subject
+                .getattr("__dict__")?
+                .cast::<PyDict>()?
+                .get_item(key)?
+                .map_or_else(|| py.None(), Bound::unbind))
+        }
+        "get" if arguments.len() == 1 || arguments.len() == 2 => {
+            let key = arguments.get_item(0)?;
+            if !key.is_exact_instance_of::<PyString>() {
+                return status_codes_fallback(py, subject, operation, arguments);
+            }
+            let default = if arguments.len() == 2 {
+                arguments.get_item(1)?.unbind()
+            } else {
+                py.None()
+            };
+            Ok(subject
+                .getattr("__dict__")?
+                .cast::<PyDict>()?
+                .get_item(key)?
+                .map_or(default, Bound::unbind))
+        }
+        "getattr" if arguments.len() == 1 => {
+            let key = arguments.get_item(0)?;
+            if !key.is_exact_instance_of::<PyString>() {
+                return status_codes_fallback(py, subject, operation, arguments);
+            }
+            if let Some(value) = subject
+                .getattr("__dict__")?
+                .cast::<PyDict>()?
+                .get_item(&key)?
+            {
+                Ok(value.unbind())
+            } else {
+                status_codes_fallback(py, subject, operation, arguments)
+            }
+        }
+        "repr" => status_codes_fallback(py, subject, operation, arguments),
+        "getitem" | "get" | "getattr" => status_codes_fallback(py, subject, operation, arguments),
+        _ => Err(PyValueError::new_err(format!(
+            "unknown status codes trial operation: {operation}"
+        ))),
+    }
+}
 
 #[pyfunction]
 fn _case_insensitive_dict_trial(
@@ -234,6 +580,11 @@ fn argument_count_error(operation: &str, expected: &str, actual: usize) -> PyErr
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = module.py();
+    internal_utils_state(py)?;
+    status_codes_state(py)?;
+    module.add_function(wrap_pyfunction!(_internal_utils_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_status_codes_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_case_insensitive_dict_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_lookup_dict_trial, module)?)?;
     Ok(())

@@ -46,6 +46,10 @@ pub fn trim_python_whitespace_start(value: &str) -> &str {
     value.trim_start_matches(is_python_whitespace)
 }
 
+pub fn unicode_is_ascii(value: &str) -> bool {
+    value.is_ascii()
+}
+
 fn is_python_whitespace(value: char) -> bool {
     value.is_whitespace() || matches!(value, '\u{1c}'..='\u{1f}')
 }
@@ -198,7 +202,7 @@ fn quote_bytes(value: &[u8], safe: &[u8], plus_for_space: bool) -> String {
 mod tests {
     use super::{
         HeaderValidationError, encode_query_pairs, normalize_percent_escape_hex, requote_uri,
-        trim_python_whitespace_start, validate_header, validate_header_bytes,
+        trim_python_whitespace_start, unicode_is_ascii, validate_header, validate_header_bytes,
     };
 
     #[test]
@@ -268,5 +272,11 @@ mod tests {
             trim_python_whitespace_start("\u{1c}\u{1f} mailto:user@example.org"),
             "mailto:user@example.org"
         );
+    }
+
+    #[test]
+    fn unicode_ascii_check_accepts_only_ascii_scalars() {
+        assert!(unicode_is_ascii("plain ascii"));
+        assert!(!unicode_is_ascii("café"));
     }
 }
