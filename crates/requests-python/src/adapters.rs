@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -61,8 +61,8 @@ struct AdapterState {
     poolmanager_module: Py<PyAny>,
     proxy_manager_behavior: BehaviorProof,
     socks_manager_behavior: BehaviorProof,
-    methods: Vec<(String, Py<PyAny>)>,
-    globals: Vec<(String, Py<PyAny>)>,
+    methods: Vec<(String, BehaviorProof)>,
+    globals: Vec<(String, BehaviorProof)>,
 }
 
 static ADAPTER_STATE: PyOnceLock<AdapterState> = PyOnceLock::new();
@@ -89,37 +89,62 @@ struct CallableProof {
     function: Py<PyAny>,
     code: Py<PyAny>,
     defaults: Py<PyAny>,
+    default_items: Option<SequenceProof>,
     kwdefaults: Py<PyAny>,
     kwdefault_items: Option<MappingProof>,
     closure: Py<PyAny>,
-    closure_cells: Vec<(Py<PyAny>, Option<Py<PyAny>>)>,
+    closure_cells: Vec<ClosureCellProof>,
     attributes: MappingProof,
     annotations: MappingProof,
 }
 
+struct ClosureCellProof {
+    cell: Py<PyAny>,
+    contents: Option<Py<PyAny>>,
+    behavior: Option<BehaviorProof>,
+}
+
 struct DictProof {
     items: Vec<(String, Py<PyAny>)>,
-    callables: Vec<CallableProof>,
+    behaviors: Vec<BehaviorProof>,
 }
 
 struct MappingProof {
     mapping: Py<PyAny>,
     items: ObjectItems,
-    nested: Vec<(Py<PyAny>, Box<MappingProof>)>,
+    behaviors: Vec<BehaviorProof>,
+}
+
+struct SequenceProof {
+    sequence: Py<PyAny>,
+    items: Vec<Py<PyAny>>,
+    behaviors: Vec<BehaviorProof>,
+}
+
+enum BehaviorDetails {
+    Function(CallableProof),
+    Class(Box<DictProof>),
+    Partial {
+        function: Box<BehaviorProof>,
+        arguments: SequenceProof,
+        keywords: Option<MappingProof>,
+    },
+    Descriptor(Vec<(String, BehaviorProof)>),
+    Mapping(Box<MappingProof>),
 }
 
 struct BehaviorProof {
     object: Py<PyAny>,
-    class_dict: Option<DictProof>,
-    callable: Option<CallableProof>,
+    details: Option<BehaviorDetails>,
 }
 
 struct ManagerProof {
     manager: Py<PyAny>,
     manager_type: Py<PyAny>,
-    class_dict: DictProof,
+    class_behavior: BehaviorProof,
     objects: DictProof,
     mappings: Vec<(String, MappingProof)>,
+    pools_behavior: BehaviorProof,
     pools_dict: DictProof,
     pool_container: MappingProof,
     visible_pools: Vec<(Py<PyAny>, Py<PyAny>)>,
@@ -438,41 +463,59 @@ fn exact_dict_snapshot(
     Ok(true)
 }
 
-fn callable_proof(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<CallableProof>> {
-    let function_type = PyModule::import(py, "types")?.getattr("FunctionType")?;
-    if !value.is_instance(&function_type)? {
-        return Ok(None);
-    }
+fn object_identity(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<usize> {
+    PyModule::import(py, "builtins")?
+        .getattr("id")?
+        .call1((value,))?
+        .extract()
+}
+
+fn callable_proof(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    visited: &mut HashSet<usize>,
+) -> PyResult<CallableProof> {
     let closure = value.getattr("__closure__")?;
-    let closure_cells = if closure.is_none() {
-        Vec::new()
+    let mut closure_cells = Vec::new();
+    if !closure.is_none() {
+        for cell in closure.try_iter()? {
+            let cell = cell?;
+            let contents = cell.getattr("cell_contents").ok().map(Bound::unbind);
+            let behavior = contents
+                .as_ref()
+                .map(|contents| behavior_proof_inner(py, contents.bind(py), visited))
+                .transpose()?;
+            closure_cells.push(ClosureCellProof {
+                cell: cell.unbind(),
+                contents,
+                behavior,
+            });
+        }
+    }
+    let defaults = value.getattr("__defaults__")?;
+    let default_items = if defaults.is_none() {
+        None
     } else {
-        closure
-            .try_iter()?
-            .map(|cell| {
-                let cell = cell?;
-                let contents = cell.getattr("cell_contents").ok().map(Bound::unbind);
-                Ok((cell.unbind(), contents))
-            })
-            .collect::<PyResult<Vec<_>>>()?
+        Some(sequence_proof_inner(py, &defaults, visited)?)
     };
     let kwdefaults = value.getattr("__kwdefaults__")?;
     let kwdefault_items = if kwdefaults.is_none() {
         None
     } else {
-        Some(mapping_proof(&kwdefaults)?)
+        Some(mapping_proof_inner(py, &kwdefaults, visited)?)
     };
-    Ok(Some(CallableProof {
+    Ok(CallableProof {
         function: value.clone().unbind(),
         code: value.getattr("__code__")?.unbind(),
-        defaults: value.getattr("__defaults__")?.unbind(),
+        defaults: defaults.unbind(),
+        default_items,
         kwdefaults: kwdefaults.unbind(),
         kwdefault_items,
         closure: closure.unbind(),
         closure_cells,
-        attributes: mapping_proof(&value.getattr("__dict__")?)?,
-        annotations: mapping_proof(&value.getattr("__annotations__")?)?,
-    }))
+        attributes: mapping_proof_inner(py, &value.getattr("__dict__")?, visited)?,
+        annotations: mapping_proof_inner(py, &value.getattr("__annotations__")?, visited)?,
+    })
 }
 
 fn callable_proof_is_pristine(py: Python<'_>, proof: &CallableProof) -> PyResult<bool> {
@@ -499,6 +542,11 @@ fn callable_proof_is_pristine(py: Python<'_>, proof: &CallableProof) -> PyResult
     {
         return Ok(false);
     }
+    if let Some(expected) = &proof.default_items
+        && !sequence_proof_is_pristine(py, expected)?
+    {
+        return Ok(false);
+    }
     let closure = function.getattr("__closure__")?;
     if closure.is_none() {
         return Ok(proof.closure_cells.is_empty());
@@ -507,27 +555,40 @@ fn callable_proof_is_pristine(py: Python<'_>, proof: &CallableProof) -> PyResult
     if current.len() != proof.closure_cells.len() {
         return Ok(false);
     }
-    for (cell, (expected_cell, expected_contents)) in current.iter().zip(&proof.closure_cells) {
-        if !cell.is(expected_cell.bind(py)) {
+    for (cell, expected) in current.iter().zip(&proof.closure_cells) {
+        if !cell.is(expected.cell.bind(py)) {
             return Ok(false);
         }
         let contents = cell.getattr("cell_contents").ok();
-        match (contents, expected_contents) {
+        match (contents, &expected.contents) {
             (None, None) => {}
             (Some(contents), Some(expected)) if contents.is(expected.bind(py)) => {}
             _ => return Ok(false),
+        }
+        if let Some(behavior) = &expected.behavior
+            && !behavior_proof_is_pristine(py, behavior.object.bind(py), behavior)?
+        {
+            return Ok(false);
         }
     }
     Ok(true)
 }
 
-fn dict_proof(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<DictProof> {
+fn dict_proof_inner(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    visited: &mut HashSet<usize>,
+) -> PyResult<DictProof> {
     let items = dict_snapshot(value)?;
-    let callables = items
+    let behaviors = items
         .iter()
-        .filter_map(|(_, item)| callable_proof(py, item.bind(py)).transpose())
+        .map(|(_, item)| behavior_proof_inner(py, item.bind(py), visited))
         .collect::<PyResult<Vec<_>>>()?;
-    Ok(DictProof { items, callables })
+    Ok(DictProof { items, behaviors })
+}
+
+fn dict_proof(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<DictProof> {
+    dict_proof_inner(py, value, &mut HashSet::new())
 }
 
 fn dict_proof_is_pristine(
@@ -538,25 +599,112 @@ fn dict_proof_is_pristine(
     if !exact_dict_snapshot(py, value, &proof.items)? {
         return Ok(false);
     }
-    for callable in &proof.callables {
-        if !callable_proof_is_pristine(py, callable)? {
+    for behavior in &proof.behaviors {
+        if !behavior_proof_is_pristine(py, behavior.object.bind(py), behavior)? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-fn behavior_proof(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<BehaviorProof> {
+fn sequence_proof_inner(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    visited: &mut HashSet<usize>,
+) -> PyResult<SequenceProof> {
+    let items = value
+        .try_iter()?
+        .map(|item| item.map(Bound::unbind))
+        .collect::<PyResult<Vec<_>>>()?;
+    let behaviors = items
+        .iter()
+        .map(|item| behavior_proof_inner(py, item.bind(py), visited))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(SequenceProof {
+        sequence: value.clone().unbind(),
+        items,
+        behaviors,
+    })
+}
+
+fn behavior_proof_inner(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    visited: &mut HashSet<usize>,
+) -> PyResult<BehaviorProof> {
+    if !visited.insert(object_identity(py, value)?) {
+        return Ok(BehaviorProof {
+            object: value.clone().unbind(),
+            details: None,
+        });
+    }
+    let function_type = PyModule::import(py, "types")?.getattr("FunctionType")?;
     let type_type = PyModule::import(py, "builtins")?.getattr("type")?;
-    let class_dict = value
-        .is_instance(&type_type)?
-        .then(|| dict_proof(py, &value.getattr("__dict__")?))
-        .transpose()?;
+    let partial_type = PyModule::import(py, "functools")?.getattr("partial")?;
+    let details = if value.is_instance(&function_type)? {
+        Some(BehaviorDetails::Function(callable_proof(
+            py, value, visited,
+        )?))
+    } else if value.is_instance(&partial_type)? {
+        let function = Box::new(behavior_proof_inner(py, &value.getattr("func")?, visited)?);
+        let arguments = sequence_proof_inner(py, &value.getattr("args")?, visited)?;
+        let keywords = value.getattr("keywords")?;
+        let keywords = (!keywords.is_none())
+            .then(|| mapping_proof_inner(py, &keywords, visited))
+            .transpose()?;
+        Some(BehaviorDetails::Partial {
+            function,
+            arguments,
+            keywords,
+        })
+    } else if value.is_instance(&type_type)? {
+        Some(BehaviorDetails::Class(Box::new(dict_proof_inner(
+            py,
+            &value.getattr("__dict__")?,
+            visited,
+        )?)))
+    } else {
+        let mut members = Vec::new();
+        for name in ["__func__", "fget", "fset", "fdel"] {
+            if let Ok(member) = value.getattr(name)
+                && !member.is_none()
+            {
+                members.push((name.to_owned(), behavior_proof_inner(py, &member, visited)?));
+            }
+        }
+        if !members.is_empty() {
+            Some(BehaviorDetails::Descriptor(members))
+        } else {
+            None
+        }
+    };
     Ok(BehaviorProof {
         object: value.clone().unbind(),
-        class_dict,
-        callable: callable_proof(py, value)?,
+        details,
     })
+}
+
+fn behavior_proof(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<BehaviorProof> {
+    behavior_proof_inner(py, value, &mut HashSet::new())
+}
+
+fn sequence_proof_is_pristine(py: Python<'_>, proof: &SequenceProof) -> PyResult<bool> {
+    let sequence = proof.sequence.bind(py);
+    let items = sequence.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+    if items.len() != proof.items.len()
+        || items
+            .iter()
+            .zip(&proof.items)
+            .any(|(item, expected)| !item.is(expected.bind(py)))
+    {
+        return Ok(false);
+    }
+    for behavior in &proof.behaviors {
+        if !behavior_proof_is_pristine(py, behavior.object.bind(py), behavior)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn behavior_proof_is_pristine(
@@ -567,17 +715,39 @@ fn behavior_proof_is_pristine(
     if !value.is(proof.object.bind(py)) {
         return Ok(false);
     }
-    if let Some(class_dict) = &proof.class_dict
-        && !dict_proof_is_pristine(py, &value.getattr("__dict__")?, class_dict)?
-    {
-        return Ok(false);
+    match &proof.details {
+        Some(BehaviorDetails::Function(callable)) => callable_proof_is_pristine(py, callable),
+        Some(BehaviorDetails::Class(class_dict)) => {
+            dict_proof_is_pristine(py, &value.getattr("__dict__")?, class_dict)
+        }
+        Some(BehaviorDetails::Partial {
+            function,
+            arguments,
+            keywords,
+        }) => {
+            if !behavior_proof_is_pristine(py, &value.getattr("func")?, function)?
+                || !value.getattr("args")?.is(arguments.sequence.bind(py))
+                || !sequence_proof_is_pristine(py, arguments)?
+            {
+                return Ok(false);
+            }
+            let current = value.getattr("keywords")?;
+            match keywords {
+                Some(keywords) => mapping_proof_is_pristine(py, &current, keywords),
+                None => Ok(current.is_none()),
+            }
+        }
+        Some(BehaviorDetails::Descriptor(members)) => {
+            for (name, behavior) in members {
+                if !behavior_proof_is_pristine(py, &value.getattr(name.as_str())?, behavior)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Some(BehaviorDetails::Mapping(mapping)) => mapping_proof_is_pristine(py, value, mapping),
+        None => Ok(true),
     }
-    if let Some(callable) = &proof.callable
-        && !callable_proof_is_pristine(py, callable)?
-    {
-        return Ok(false);
-    }
-    Ok(true)
 }
 
 fn retry_state(py: Python<'_>) -> PyResult<&RetryStateGuard> {
@@ -788,7 +958,7 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
     .map(|name| {
         adapter_type
             .getattr(name)
-            .map(|value| (name.to_owned(), value.unbind()))
+            .and_then(|value| behavior_proof(py, &value).map(|proof| (name.to_owned(), proof)))
     })
     .collect::<PyResult<Vec<_>>>()?;
     let globals = [
@@ -813,7 +983,7 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
     .map(|name| {
         adapters
             .getattr(name)
-            .map(|value| (name.to_owned(), value.unbind()))
+            .and_then(|value| behavior_proof(py, &value).map(|proof| (name.to_owned(), proof)))
     })
     .collect::<PyResult<Vec<_>>>()?;
     let poolmanager_type = adapters.getattr("PoolManager")?;
@@ -874,14 +1044,14 @@ fn adapter_identity_is_pristine(
     {
         return Ok(false);
     }
-    for (name, original) in &state.methods {
-        if !adapter_type.getattr(name.as_str())?.is(original.bind(py)) {
+    for (name, proof) in &state.methods {
+        if !behavior_proof_is_pristine(py, &adapter_type.getattr(name.as_str())?, proof)? {
             return Ok(false);
         }
     }
     let module = state.adapters_module.bind(py);
-    for (name, original) in &state.globals {
-        if !module.getattr(name.as_str())?.is(original.bind(py)) {
+    for (name, proof) in &state.globals {
+        if !behavior_proof_is_pristine(py, &module.getattr(name.as_str())?, proof)? {
             return Ok(false);
         }
     }
@@ -1285,9 +1455,10 @@ fn manager_proof(manager: &Bound<'_, PyAny>) -> PyResult<ManagerProof> {
     Ok(ManagerProof {
         manager: manager.clone().unbind(),
         manager_type: manager.get_type().into_any().unbind(),
-        class_dict: dict_proof(py, &manager.get_type().getattr("__dict__")?)?,
+        class_behavior: behavior_proof(py, manager.get_type().as_any())?,
         objects: dict_proof(py, &manager.getattr("__dict__")?)?,
         mappings,
+        pools_behavior: behavior_proof(py, pools.get_type().as_any())?,
         pools_dict: dict_proof(py, &pools.getattr("__dict__")?)?,
         pool_container: mapping_proof(&pools.getattr("_container")?)?,
         visible_pools: visible_pools(manager)?,
@@ -1306,20 +1477,35 @@ fn object_items(value: &Bound<'_, PyAny>) -> PyResult<ObjectItems> {
         .collect()
 }
 
-fn mapping_proof(value: &Bound<'_, PyAny>) -> PyResult<MappingProof> {
+fn mapping_proof_inner(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    visited: &mut HashSet<usize>,
+) -> PyResult<MappingProof> {
     let items = object_items(value)?;
-    let mut nested = Vec::new();
+    let mut behaviors = Vec::new();
     for (_, item) in &items {
-        let item = item.bind(value.py());
-        if item.hasattr("items")? {
-            nested.push((item.clone().unbind(), Box::new(mapping_proof(item)?)));
+        let item = item.bind(py);
+        if item.hasattr("items")? && visited.insert(object_identity(py, item)?) {
+            behaviors.push(BehaviorProof {
+                object: item.clone().unbind(),
+                details: Some(BehaviorDetails::Mapping(Box::new(mapping_proof_inner(
+                    py, item, visited,
+                )?))),
+            });
+        } else {
+            behaviors.push(behavior_proof_inner(py, item, visited)?);
         }
     }
     Ok(MappingProof {
         mapping: value.clone().unbind(),
         items,
-        nested,
+        behaviors,
     })
+}
+
+fn mapping_proof(value: &Bound<'_, PyAny>) -> PyResult<MappingProof> {
+    mapping_proof_inner(value.py(), value, &mut HashSet::new())
 }
 
 fn mapping_proof_is_pristine(
@@ -1342,8 +1528,8 @@ fn mapping_proof_is_pristine(
     {
         return Ok(false);
     }
-    for (nested_value, nested_proof) in &proof.nested {
-        if !mapping_proof_is_pristine(py, nested_value.bind(py), nested_proof)? {
+    for behavior in &proof.behaviors {
+        if !behavior_proof_is_pristine(py, behavior.object.bind(py), behavior)? {
             return Ok(false);
         }
     }
@@ -1357,11 +1543,7 @@ fn manager_proof_is_pristine(
 ) -> PyResult<bool> {
     if !manager.is(proof.manager.bind(py))
         || !manager.get_type().as_any().is(proof.manager_type.bind(py))
-        || !dict_proof_is_pristine(
-            py,
-            &manager.get_type().getattr("__dict__")?,
-            &proof.class_dict,
-        )?
+        || !behavior_proof_is_pristine(py, manager.get_type().as_any(), &proof.class_behavior)?
         || !dict_proof_is_pristine(py, &manager.getattr("__dict__")?, &proof.objects)?
     {
         return Ok(false);
@@ -1372,7 +1554,8 @@ fn manager_proof_is_pristine(
         }
     }
     let pools = manager.getattr("pools")?;
-    if !dict_proof_is_pristine(py, &pools.getattr("__dict__")?, &proof.pools_dict)?
+    if !behavior_proof_is_pristine(py, pools.get_type().as_any(), &proof.pools_behavior)?
+        || !dict_proof_is_pristine(py, &pools.getattr("__dict__")?, &proof.pools_dict)?
         || !mapping_proof_is_pristine(py, &pools.getattr("_container")?, &proof.pool_container)?
     {
         return Ok(false);
@@ -2078,7 +2261,7 @@ impl NativeAdapterRaw {
         }
     }
 
-    fn fill_decoded(&mut self, py: Python<'_>, wanted: Option<usize>) -> PyResult<()> {
+    fn fill_decoded_bounded(&mut self, py: Python<'_>, wanted: Option<usize>) -> PyResult<()> {
         if self.decoded_offset > 0 {
             self.decoded.drain(..self.decoded_offset);
             self.decoded_offset = 0;
@@ -2138,6 +2321,42 @@ impl NativeAdapterRaw {
         Ok(())
     }
 
+    fn read_decoded_unbounded(
+        &mut self,
+        py: Python<'_>,
+        amount: Option<usize>,
+        decoder: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<u8>> {
+        let mut wire = Vec::new();
+        let read = match (self.body.as_mut(), amount) {
+            (Some(body), Some(amount)) => {
+                wire.resize(amount, 0);
+                py.detach(|| body.read(&mut wire))
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
+            }
+            (Some(body), None) => py
+                .detach(|| body.read_to_end(&mut wire))
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+            (None, _) => 0,
+        };
+        wire.truncate(read);
+        if read == 0 {
+            self.body = None;
+            self.decoder_eof = true;
+            self.closed = true;
+            return Ok(Vec::new());
+        }
+        let mut decoded = Self::decompress(decoder, py, &wire, -1)?;
+        if amount.is_none() {
+            decoded.extend(Self::decompress(decoder, py, b"", -1)?);
+            decoded.extend(decoder.call_method0("flush")?.extract::<Vec<u8>>()?);
+            self.body = None;
+            self.decoder_eof = true;
+            self.closed = true;
+        }
+        Ok(decoded)
+    }
+
     fn read_amount(
         &mut self,
         py: Python<'_>,
@@ -2150,8 +2369,12 @@ impl NativeAdapterRaw {
         if self.closed {
             return Ok(PyBytes::new(py, b"").into_any().unbind());
         }
-        if decode_content && self.decoder(py)?.is_some() {
-            self.fill_decoded(py, amount)?;
+        if decode_content && let Some(decoder) = self.decoder(py)? {
+            if !Self::decoder_is_bounded(decoder.bind(py))? {
+                let bytes = self.read_decoded_unbounded(py, amount, decoder.bind(py))?;
+                return Ok(PyBytes::new(py, &bytes).into_any().unbind());
+            }
+            self.fill_decoded_bounded(py, amount)?;
             let end = amount
                 .map(|amount| {
                     self.decoded_offset
@@ -2294,16 +2517,16 @@ impl NativeAdapterStream {
             self.done = true;
             return Ok(None);
         }
-        let chunk =
-            self.raw
-                .bind(py)
-                .borrow_mut()
-                .read_amount(py, self.amount, self.decode_content)?;
-        if chunk.bind(py).len()? == 0 {
-            self.done = true;
-            Ok(None)
-        } else {
-            Ok(Some(chunk))
+        loop {
+            let mut raw = self.raw.bind(py).borrow_mut();
+            let chunk = raw.read_amount(py, self.amount, self.decode_content)?;
+            if chunk.bind(py).len()? != 0 {
+                return Ok(Some(chunk));
+            }
+            if raw.closed {
+                self.done = true;
+                return Ok(None);
+            }
         }
     }
 

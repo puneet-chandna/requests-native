@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import gc
 import gzip
 import pickle
@@ -7,6 +8,7 @@ import random
 import socket
 import threading
 import weakref
+import zlib
 from collections import OrderedDict
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +22,8 @@ from requests import adapters
 from requests.adapters import HTTPAdapter, _rust_adapter_trial
 from requests.exceptions import RetryError
 from requests.models import PreparedRequest
+
+_PROVENANCE_PROBE = None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -87,7 +91,7 @@ def loopback(*responses):
 
 
 @contextmanager
-def socks5_loopback(body):
+def socks5_loopback(*bodies):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
@@ -117,16 +121,17 @@ def socks5_loopback(body):
                 raise AssertionError(f"unexpected SOCKS address type {address_type}")
             recv_exact(connection, 2)
             connection.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50")
-            request = b""
-            while b"\r\n\r\n" not in request:
-                request += connection.recv(4096)
-            observed["requests"] += 1
-            connection.sendall(
-                b"HTTP/1.1 200 OK\r\nContent-Length: "
-                + str(len(body)).encode()
-                + b"\r\n\r\n"
-                + body
-            )
+            for body in bodies:
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    request += connection.recv(4096)
+                observed["requests"] += 1
+                connection.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: "
+                    + str(len(body)).encode()
+                    + b"\r\n\r\n"
+                    + body
+                )
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
@@ -141,6 +146,38 @@ def prepared(url, body=None, method="GET"):
     request = PreparedRequest()
     request.prepare(method=method, url=url, headers={"X-Test": "adapter"}, data=body)
     return request
+
+
+@contextmanager
+def mutated_manager_behavior(manager, mutation):
+    if mutation == "pools_getitem":
+        function = type(manager.pools).__getitem__
+        original = function.__code__
+        function.__code__ = (lambda self, key: None).__code__
+        try:
+            yield
+        finally:
+            function.__code__ = original
+        return
+    if mutation == "key_partial_keywords":
+        partial = manager.key_fn_by_scheme["http"]
+        assert isinstance(partial, functools.partial)
+        partial.keywords["_mutated_behavior"] = True
+        try:
+            yield
+        finally:
+            del partial.keywords["_mutated_behavior"]
+        return
+    if mutation == "pool_init":
+        function = manager.pool_classes_by_scheme["http"].__init__
+        original = function.__code__
+        function.__code__ = (lambda self, *args, **kwargs: None).__code__
+        try:
+            yield
+        finally:
+            function.__code__ = original
+        return
+    raise AssertionError(f"unknown mutation {mutation}")
 
 
 def test_default_path_and_visible_urllib3_state_remain_python_compatible(monkeypatch):
@@ -877,7 +914,10 @@ def test_decoded_read_yields_before_wire_eof_and_close_releases_owner():
             raw = adapter.send(prepared(url), stream=True).raw
             assert server.first_chunk_sent.wait(1)
             chunk = raw.read(16, decode_content=True)
-            assert chunk == payload[:16]
+            if urllib3.__version__.startswith("1.26."):
+                assert chunk == b""
+            else:
+                assert chunk == payload[:16]
             assert not release.is_set()
             raw.close()
             release.set()
@@ -965,10 +1005,11 @@ def test_stream_none_and_decode_mode_switch_match_urllib3():
                 == bytes(range(256)) * 20
             )
             switched = adapter.send(prepared(url), stream=True).raw
-            assert switched.read(1, decode_content=True) == b"\x00"
             if urllib3.__version__.startswith("1.26."):
-                switched.read(1, decode_content=False)
+                assert switched.read(1, decode_content=True) == b""
+                assert switched.read(1, decode_content=False) == compressed[1:2]
             else:
+                assert switched.read(1, decode_content=True) == b"\x00"
                 with pytest.raises(RuntimeError, match="decode_content=False"):
                     switched.read(1, decode_content=False)
         assert server.requests == 2
@@ -1035,6 +1076,111 @@ def test_decode_mode_switch_without_supported_decoder_remains_wire_readable(enco
         assert server.requests == 1
 
 
+@pytest.mark.skipif(
+    not urllib3.__version__.startswith("1.26."),
+    reason="urllib3 1.26 uses its unbounded one-argument decoder ABI",
+)
+@pytest.mark.parametrize(
+    ("encoding", "compress"),
+    [
+        ("GZIP", lambda payload: gzip.compress(payload, mtime=0)),
+        ("deflate", zlib.compress),
+    ],
+)
+def test_urllib3_126_finite_decoded_read_uses_exact_wire_amount_without_retention(
+    encoding, compress
+):
+    payload = b"a" * 2_000_000
+    wire = compress(payload)
+    with loopback(
+        (200, {"Content-Encoding": encoding}, wire),
+        (200, {"Content-Encoding": encoding}, wire),
+    ) as (server, url):
+        adapter = HTTPAdapter()
+        with _rust_adapter_trial():
+            first = adapter.send(prepared(url), stream=True).raw
+            assert first.read(1, decode_content=True) == b""
+            assert first._retained_decoded_bytes_trial() == 0
+            assert first.read(1, decode_content=False) == wire[1:2]
+
+            amplified = adapter.send(prepared(url), stream=True).raw
+            produced = amplified.read(32, decode_content=True)
+            assert len(produced) > 32
+            assert produced == b"a" * len(produced)
+            assert amplified._retained_decoded_bytes_trial() == 0
+            assert amplified.read(1, decode_content=False) == wire[32:33]
+        assert server.requests == 2
+
+
+@pytest.mark.skipif(
+    not urllib3.__version__.startswith("1.26."),
+    reason="urllib3 1.26 uses whole-output stream chunks",
+)
+def test_urllib3_126_stream_returns_whole_decoder_chunks_and_flushes_at_eof():
+    payload = b"a" * 2_000_000
+    wire = gzip.compress(payload, mtime=0)
+    with loopback((200, {"Content-Encoding": "GZIP"}, wire)) as (server, url):
+        with _rust_adapter_trial():
+            raw = HTTPAdapter().send(prepared(url), stream=True).raw
+            chunks = []
+            for chunk in raw.stream(32, decode_content=True):
+                chunks.append(chunk)
+                assert raw._retained_decoded_bytes_trial() == 0
+            assert b"".join(chunks) == payload
+            assert any(len(chunk) > 32 for chunk in chunks)
+        assert server.requests == 1
+
+
+@pytest.mark.parametrize("target", ["proxy_manager_for", "proxy_from_url"])
+def test_adapter_callable_code_mutation_falls_back_before_proxy_cache_or_socket(
+    monkeypatch, target
+):
+    marker = object()
+    adapter = HTTPAdapter()
+    function = (
+        HTTPAdapter.proxy_manager_for
+        if target == "proxy_manager_for"
+        else adapters.proxy_from_url
+    )
+    original = function.__code__
+    calls = []
+    adapters._PROVENANCE_PROBE = calls
+
+    def replacement(*args, **kwargs):
+        _PROVENANCE_PROBE.append((args, kwargs))
+        return None
+
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    with loopback((200, {}, b"restored-adapter-callable")) as (server, proxy_url):
+        proxy_root = proxy_url.rsplit("/", 1)[0]
+        try:
+            function.__code__ = replacement.__code__
+            with _rust_adapter_trial():
+                assert (
+                    adapter.send(
+                        prepared("http://origin.example/"),
+                        proxies={"http": proxy_root},
+                    )
+                    is marker
+                )
+            assert calls == []
+            assert adapter.proxy_manager == {}
+            assert server.requests == 0
+        finally:
+            function.__code__ = original
+            del adapters._PROVENANCE_PROBE
+
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(
+                    prepared("http://origin.example/"),
+                    proxies={"http": proxy_root},
+                ).content
+                == b"restored-adapter-callable"
+            )
+        assert server.requests == 1
+
+
 def test_in_place_main_manager_mapping_mutations_fall_back_then_restore(monkeypatch):
     marker = object()
     monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
@@ -1055,6 +1201,88 @@ def test_in_place_main_manager_mapping_mutations_fall_back_then_restore(monkeypa
         with _rust_adapter_trial():
             assert adapter.send(prepared(url)).content == b"restored"
         assert server.requests == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["pools_getitem", "key_partial_keywords", "pool_init"],
+)
+def test_main_manager_behavior_mutations_fall_back_then_restore(monkeypatch, mutation):
+    marker = object()
+    adapter = HTTPAdapter()
+    manager = adapter.poolmanager
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    with loopback((200, {}, b"restored-main-behavior")) as (server, url):
+        with mutated_manager_behavior(manager, mutation):
+            with _rust_adapter_trial():
+                assert adapter.send(prepared(url)) is marker
+            assert list(manager.pools._container.items()) == []
+            assert server.requests == 0
+
+        with _rust_adapter_trial():
+            assert adapter.send(prepared(url)).content == b"restored-main-behavior"
+        assert server.requests == 1
+
+
+def test_proxy_manager_partial_behavior_mutation_falls_back_then_restores(monkeypatch):
+    marker = object()
+    with loopback((200, {}, b"first"), (200, {}, b"restored-proxy-behavior")) as (
+        server,
+        proxy_url,
+    ):
+        proxy_root = proxy_url.rsplit("/", 1)[0]
+        adapter = HTTPAdapter()
+        request = prepared("http://origin.example/")
+        proxies = {"http": proxy_root}
+        with _rust_adapter_trial():
+            assert adapter.send(request, proxies=proxies).content == b"first"
+        manager = adapter.proxy_manager[proxy_root]
+        monkeypatch.setattr(
+            adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker
+        )
+
+        with mutated_manager_behavior(manager, "key_partial_keywords"):
+            with _rust_adapter_trial():
+                assert adapter.send(request, proxies=proxies) is marker
+            assert server.requests == 1
+
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(request, proxies=proxies).content
+                == b"restored-proxy-behavior"
+            )
+        assert server.requests == 2
+
+
+def test_socks_manager_partial_behavior_mutation_falls_back_then_restores(monkeypatch):
+    if not isinstance(adapters.SOCKSProxyManager, type):
+        pytest.skip("PySocks is unavailable")
+    marker = object()
+    with socks5_loopback(b"first", b"restored-socks-behavior") as (
+        observed,
+        proxy_url,
+    ):
+        adapter = HTTPAdapter()
+        request = prepared("http://origin.example/")
+        proxies = {"http": proxy_url}
+        with _rust_adapter_trial():
+            assert adapter.send(request, proxies=proxies).content == b"first"
+        manager = adapter.proxy_manager[proxy_url]
+        monkeypatch.setattr(
+            adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker
+        )
+
+        with mutated_manager_behavior(manager, "key_partial_keywords"):
+            with _rust_adapter_trial():
+                assert adapter.send(request, proxies=proxies) is marker
+            assert observed == {"connections": 1, "requests": 1}
+
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(request, proxies=proxies).content
+                == b"restored-socks-behavior"
+            )
+        assert observed == {"connections": 1, "requests": 2}
 
 
 def test_proxy_constructor_mutation_falls_back_before_cache_or_socket(monkeypatch):
