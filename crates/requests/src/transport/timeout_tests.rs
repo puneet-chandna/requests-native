@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -294,6 +294,76 @@ fn frozen_root_bundle() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/certs/expired/ca/ca.crt")
 }
 
+fn frozen_mtls_client(filename: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tls/mtls-client")
+        .join(filename)
+}
+
+fn existing_parent_alias(path: &Path) -> PathBuf {
+    let parent = path.parent().expect("fixture has a parent");
+    parent
+        .join("..")
+        .join(parent.file_name().expect("fixture parent has a filename"))
+        .join(path.file_name().expect("fixture has a filename"))
+}
+
+struct ValidCapathDirectory {
+    path: PathBuf,
+}
+
+impl ValidCapathDirectory {
+    fn new(root: &Path) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let directory = Self {
+            path: std::env::temp_dir().join(format!(
+                "requests-protocol-tls-capath-{}-{timestamp}",
+                std::process::id(),
+            )),
+        };
+        std::fs::create_dir(&directory.path).expect("create valid capath fixture");
+        std::fs::copy(root, directory.path.join("117adfc4.0"))
+            .expect("copy frozen root into valid capath fixture");
+        directory
+    }
+}
+
+impl Drop for ValidCapathDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn assert_valid_https_send(
+    result: &(Error, Vec<ConnectCall>, Vec<PoolKey>),
+    expected_tls: TlsPoolKey,
+    expected_identity: Option<IdentityKey>,
+) {
+    let (error, calls, keys) = result;
+    assert_eq!(
+        keys.len(),
+        1,
+        "valid TLS material must have one production-derived key",
+    );
+    assert_https_pool_key(&keys[0], expected_tls, expected_identity);
+    assert_eq!(
+        error.kind(),
+        ErrorKind::Connect,
+        "valid TLS material must load before the controlled connector error: {error}",
+    );
+    assert_eq!(
+        calls,
+        &[ConnectCall {
+            host: "secure.test".to_owned(),
+            port: 443,
+            target: "secure.test".to_owned(),
+        }],
+    );
+}
+
 #[test]
 fn tls_loading_plain_http_never_reads_missing_root_or_identity_paths() {
     let (error, calls, keys) = send_with_recording_tls(
@@ -345,65 +415,176 @@ fn tls_loading_https_missing_root_fails_before_connector() {
 }
 
 #[test]
-fn tls_loading_https_valid_root_reaches_connector_once() {
+fn tls_loading_https_valid_material_preserves_lexical_keys_and_reaches_connector() {
     let root = frozen_root_bundle();
     assert!(root.is_file(), "frozen root fixture must exist: {root:?}");
-    let root_directory = root.parent().expect("frozen root has a parent");
-    let alias = root_directory
-        .join("..")
-        .join(
-            root_directory
-                .file_name()
-                .expect("frozen root parent has a filename"),
-        )
-        .join(root.file_name().expect("frozen root has a filename"));
+    let root_alias = existing_parent_alias(&root);
     assert!(
-        alias.is_file(),
-        "lexical alias of frozen root must exist: {alias:?}"
+        root_alias.is_file(),
+        "lexical alias of frozen root must exist: {root_alias:?}"
     );
     assert_ne!(
-        root, alias,
+        root, root_alias,
         "existing frozen root spellings must remain lexically distinct",
     );
-    let (error, calls, keys) = send_with_recording_tls(
-        "https://secure.test/path",
-        TlsConfig {
-            roots: CertificateSource::PemBundle(root.clone()),
-            identity: None,
-        },
-    );
 
-    assert_eq!(keys.len(), 1);
-    assert_https_pool_key(&keys[0], TlsPoolKey::pem_bundle(&root), None);
-    assert_eq!(
-        error.kind(),
-        ErrorKind::Connect,
-        "valid root must load before the controlled connector error: {error}",
+    let capath = ValidCapathDirectory::new(&root);
+    let capath_path = capath.path.clone();
+    let capath_alias = existing_parent_alias(&capath_path);
+    assert!(capath_path.is_dir(), "valid capath fixture must exist");
+    assert!(
+        capath_alias.is_dir(),
+        "lexical alias of valid capath fixture must exist: {capath_alias:?}",
     );
-    assert_eq!(
-        calls,
-        [ConnectCall {
-            host: "secure.test".to_owned(),
-            port: 443,
-            target: "secure.test".to_owned(),
-        }],
-    );
-
-    let (alias_error, alias_calls, alias_keys) = send_with_recording_tls(
-        "https://secure.test/path",
-        TlsConfig {
-            roots: CertificateSource::PemBundle(alias.clone()),
-            identity: None,
-        },
-    );
-    assert_eq!(alias_keys.len(), 1);
-    assert_https_pool_key(&alias_keys[0], TlsPoolKey::pem_bundle(&alias), None);
     assert_ne!(
-        keys[0], alias_keys[0],
-        "existing-file lexical aliases must remain distinct pool identities",
+        capath_path, capath_alias,
+        "existing capath spellings must remain lexically distinct",
     );
-    assert_eq!(alias_error.kind(), ErrorKind::Connect);
-    assert_eq!(alias_calls, calls);
+
+    let combined = frozen_mtls_client("client-combined.pem");
+    let combined_alias = existing_parent_alias(&combined);
+    let certificate_chain = frozen_mtls_client("client-chain.pem");
+    let certificate_chain_alias = existing_parent_alias(&certificate_chain);
+    let private_key = frozen_mtls_client("client.key");
+    let private_key_alias = existing_parent_alias(&private_key);
+    for path in [
+        &combined,
+        &combined_alias,
+        &certificate_chain,
+        &certificate_chain_alias,
+        &private_key,
+        &private_key_alias,
+    ] {
+        assert!(path.is_file(), "frozen mTLS fixture must exist: {path:?}");
+    }
+    assert_ne!(combined, combined_alias);
+    assert_ne!(certificate_chain, certificate_chain_alias);
+    assert_ne!(private_key, private_key_alias);
+
+    let cases = [
+        (
+            TlsConfig {
+                roots: CertificateSource::PemBundle(root.clone()),
+                identity: None,
+            },
+            TlsPoolKey::pem_bundle(&root),
+            None,
+        ),
+        (
+            TlsConfig {
+                roots: CertificateSource::PemBundle(root_alias.clone()),
+                identity: None,
+            },
+            TlsPoolKey::pem_bundle(&root_alias),
+            None,
+        ),
+        (
+            TlsConfig {
+                roots: CertificateSource::PemDirectory(capath_path.clone()),
+                identity: None,
+            },
+            TlsPoolKey::pem_directory(&capath_path),
+            None,
+        ),
+        (
+            TlsConfig {
+                roots: CertificateSource::PemDirectory(capath_alias.clone()),
+                identity: None,
+            },
+            TlsPoolKey::pem_directory(&capath_alias),
+            None,
+        ),
+        (
+            TlsConfig {
+                roots: CertificateSource::Disabled,
+                identity: Some(Identity {
+                    certificate_chain: combined.clone(),
+                    private_key: None,
+                }),
+            },
+            TlsPoolKey::disabled(),
+            Some(IdentityKey::from_paths(&combined, None)),
+        ),
+        (
+            TlsConfig {
+                roots: CertificateSource::Disabled,
+                identity: Some(Identity {
+                    certificate_chain: combined_alias.clone(),
+                    private_key: None,
+                }),
+            },
+            TlsPoolKey::disabled(),
+            Some(IdentityKey::from_paths(&combined_alias, None)),
+        ),
+        (
+            TlsConfig {
+                roots: CertificateSource::Disabled,
+                identity: Some(Identity {
+                    certificate_chain: certificate_chain.clone(),
+                    private_key: Some(private_key.clone()),
+                }),
+            },
+            TlsPoolKey::disabled(),
+            Some(IdentityKey::from_paths(
+                &certificate_chain,
+                Some(&private_key),
+            )),
+        ),
+        (
+            TlsConfig {
+                roots: CertificateSource::Disabled,
+                identity: Some(Identity {
+                    certificate_chain: certificate_chain_alias.clone(),
+                    private_key: Some(private_key.clone()),
+                }),
+            },
+            TlsPoolKey::disabled(),
+            Some(IdentityKey::from_paths(
+                &certificate_chain_alias,
+                Some(&private_key),
+            )),
+        ),
+        (
+            TlsConfig {
+                roots: CertificateSource::Disabled,
+                identity: Some(Identity {
+                    certificate_chain: certificate_chain.clone(),
+                    private_key: Some(private_key_alias.clone()),
+                }),
+            },
+            TlsPoolKey::disabled(),
+            Some(IdentityKey::from_paths(
+                &certificate_chain,
+                Some(&private_key_alias),
+            )),
+        ),
+    ];
+    let results = cases
+        .into_iter()
+        .map(|(tls, expected_tls, expected_identity)| {
+            (
+                send_with_recording_tls("https://secure.test/path", tls),
+                expected_tls,
+                expected_identity,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (result, expected_tls, expected_identity) in &results {
+        assert_valid_https_send(result, expected_tls.clone(), expected_identity.clone());
+    }
+    for (original, alias, label) in [
+        (0, 1, "bundle"),
+        (2, 3, "directory"),
+        (4, 5, "combined identity"),
+        (6, 7, "separate certificate chain"),
+        (6, 8, "separate private key"),
+    ] {
+        assert_ne!(
+            results[original].0.2[0], results[alias].0.2[0],
+            "existing {label} lexical aliases must remain distinct pool identities",
+        );
+    }
 }
 
 #[test]
