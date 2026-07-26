@@ -37,6 +37,7 @@ const DEADLINE_PHASE_DELAY: Duration = Duration::from_millis(600);
 const UPLOAD_TOTAL_LONG: Duration = Duration::from_millis(900);
 const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const DEFAULT_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 const SCRIPTED_RESPONSE: &[u8] =
     b"HTTP/1.1 201 Created\r\nx-fixture: direct\r\nContent-Length: 7\r\n\r\ndirect\n";
 const CONNECTION_CLOSE_RESPONSE: &[u8] =
@@ -2988,7 +2989,11 @@ fn request_framing_get_preserves_explicit_host_and_same_name_value_order() {
         vec![&b"first"[..], &b"second"[..]]
     );
     assert_eq!(request.header_values("x-unrelated"), vec![&b"between"[..]]);
-    assert_eq!(request.headers.len(), 4);
+    assert_eq!(
+        request.header_values("accept-encoding"),
+        vec![DEFAULT_ACCEPT_ENCODING.as_bytes()]
+    );
+    assert_eq!(request.headers.len(), 5);
     assert!(request.header_values("content-length").is_empty());
     assert!(request.header_values("transfer-encoding").is_empty());
     assert!(request.body.is_empty());
@@ -3005,7 +3010,10 @@ fn request_framing_get_inserts_missing_host_from_authority() {
     let observation = server.finish().expect("loopback fixture completed");
     assert_eq!(
         observation.request_bytes,
-        format!("GET /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\n\r\n").into_bytes()
+        format!(
+            "GET /direct?source=task10 HTTP/1.1\r\naccept-encoding: {DEFAULT_ACCEPT_ENCODING}\r\nhost: {authority}\r\n\r\n"
+        )
+        .into_bytes()
     );
     let request = CapturedRequest::parse(&observation);
 
@@ -3029,7 +3037,10 @@ fn request_framing_head_has_no_request_body_framing() {
     let observation = server.finish().expect("loopback fixture completed");
     assert_eq!(
         observation.request_bytes,
-        format!("HEAD /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\n\r\n").into_bytes()
+        format!(
+            "HEAD /direct?source=task10 HTTP/1.1\r\naccept-encoding: {DEFAULT_ACCEPT_ENCODING}\r\nhost: {authority}\r\n\r\n"
+        )
+        .into_bytes()
     );
     let request = CapturedRequest::parse(&observation);
 
@@ -3059,7 +3070,7 @@ fn request_framing_fixed_post_uses_content_length() {
     assert_eq!(
         observation.request_bytes,
         format!(
-            "POST /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\ncontent-length: 5\r\n\r\nfixed"
+            "POST /direct?source=task10 HTTP/1.1\r\naccept-encoding: {DEFAULT_ACCEPT_ENCODING}\r\nhost: {authority}\r\ncontent-length: 5\r\n\r\nfixed"
         )
         .into_bytes()
     );
@@ -3071,7 +3082,7 @@ fn request_framing_fixed_post_uses_content_length() {
     assert_eq!(request.header_values("host"), vec![authority.as_bytes()]);
     assert_eq!(request.header_values("content-length"), vec![&b"5"[..]]);
     assert!(request.header_values("transfer-encoding").is_empty());
-    assert_eq!(request.headers.len(), 2);
+    assert_eq!(request.headers.len(), 3);
     assert_eq!(request.body, b"fixed");
 }
 
@@ -3095,7 +3106,7 @@ fn request_framing_unknown_length_non_unpin_body_is_polled_after_connect_and_chu
     assert_eq!(
         observation.request_bytes,
         format!(
-            "POST /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
+            "POST /direct?source=task10 HTTP/1.1\r\naccept-encoding: {DEFAULT_ACCEPT_ENCODING}\r\nhost: {authority}\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
         )
         .into_bytes()
     );
@@ -3118,7 +3129,7 @@ fn request_framing_unknown_length_non_unpin_body_is_polled_after_connect_and_chu
         request.header_values("transfer-encoding"),
         vec![&b"chunked"[..]]
     );
-    assert_eq!(request.headers.len(), 2);
+    assert_eq!(request.headers.len(), 3);
     assert_eq!(request.body, b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n");
 }
 
@@ -3232,7 +3243,10 @@ fn request_framing_strips_fragment_from_wire_but_retains_response_url() {
     let observation = server.finish().expect("loopback fixture completed");
     assert_eq!(
         observation.request_bytes,
-        format!("GET /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\n\r\n").into_bytes()
+        format!(
+            "GET /direct?source=task10 HTTP/1.1\r\naccept-encoding: {DEFAULT_ACCEPT_ENCODING}\r\nhost: {authority}\r\n\r\n"
+        )
+        .into_bytes()
     );
     let request = CapturedRequest::parse(&observation);
 
@@ -3290,7 +3304,10 @@ fn get_over_new_plain_connection() {
     assert_eq!(observation.accepted_connections, 1);
     assert_eq!(
         observation.request_bytes,
-        format!("GET /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\n\r\n").into_bytes()
+        format!(
+            "GET /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\naccept-encoding: {DEFAULT_ACCEPT_ENCODING}\r\n\r\n"
+        )
+        .into_bytes()
     );
 }
 
@@ -3346,7 +3363,10 @@ fn complete_connection_close_response_is_successful() {
         assert_eq!(observation.accepted_connections, 1, "iteration {iteration}");
         assert_eq!(
             observation.request_bytes,
-            format!("GET /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\n\r\n").into_bytes(),
+            format!(
+                "GET /direct?source=task10 HTTP/1.1\r\nhost: {authority}\r\naccept-encoding: {DEFAULT_ACCEPT_ENCODING}\r\n\r\n"
+            )
+            .into_bytes(),
             "iteration {iteration}"
         );
     }
