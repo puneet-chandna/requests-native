@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::io::{Read, Write};
 use std::marker::PhantomPinned;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_core::Stream;
 use requests::{
-    AsyncBody, BodySource, Client, ErrorKind, HeaderName, HeaderValue, Method, RequestBuilder,
-    ResponseBody, StatusCode, Timeout,
+    AsyncBody, BodySource, Client, ErrorKind, HeaderName, HeaderValue, Method, Proxy,
+    RequestBuilder, ResponseBody, StatusCode, Timeout, Uri, Version,
 };
 
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -41,6 +41,9 @@ const FRAMING_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nx-fixture: framing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const HEAD_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nx-fixture: framing\r\nContent-Length: 7\r\nConnection: close\r\n\r\n";
+const NO_LENGTH_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nraw";
+const CHUNKED_METADATA_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n";
 const DEADLINE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nx-fixture: deadline\r\nContent-Length: 2\r\n\r\nok";
 
@@ -54,6 +57,12 @@ struct ScriptedServer {
     address: SocketAddr,
     shutdown: Option<Sender<()>>,
     worker: Option<JoinHandle<Result<Observation, String>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScriptedConnectionMode {
+    KeepOpen,
+    CloseAfterWrite,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +150,41 @@ struct PendingUploadServer {
     shutdown: Sender<()>,
     result: Receiver<Result<PendingUploadObservation, String>>,
     worker: Option<JoinHandle<()>>,
+}
+
+struct CallerTaskBody {
+    chunk: Option<Bytes>,
+    length: u64,
+    caller_thread: thread::ThreadId,
+    polls: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+    all_polls_on_caller_runtime_thread: Arc<AtomicBool>,
+}
+
+impl AsyncBody for CallerTaskBody {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<requests::Result<Bytes>>> {
+        self.polls.fetch_add(1, Ordering::AcqRel);
+        if thread::current().id() != self.caller_thread
+            || tokio::runtime::Handle::try_current().is_err()
+        {
+            self.all_polls_on_caller_runtime_thread
+                .store(false, Ordering::Release);
+        }
+        Poll::Ready(self.chunk.take().map(Ok))
+    }
+
+    fn size_hint(&self) -> Option<u64> {
+        Some(self.length)
+    }
+}
+
+impl Drop for CallerTaskBody {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -406,25 +450,35 @@ fn read_pool_requests(
     while let Some(request_len) = complete_request_len(&connection.request_buffer)? {
         let remainder = connection.request_buffer.split_off(request_len);
         let request_bytes = std::mem::replace(&mut connection.request_buffer, remainder);
+        let is_head = request_bytes.starts_with(b"HEAD ");
         requests.push(PoolRequestObservation {
             connection_id: connection.id,
             request_bytes,
         });
-        write_pool_response(connection, script)?;
+        write_pool_response(connection, script, is_head)?;
         connection.requests_served += 1;
     }
     Ok(())
 }
 
-fn write_pool_response(connection: &mut PoolConnection, script: PoolScript) -> Result<(), String> {
+fn write_pool_response(
+    connection: &mut PoolConnection,
+    script: PoolScript,
+    is_head: bool,
+) -> Result<(), String> {
     const COMPLETE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const COMPLETE_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
     const PARTIAL: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\npartial\r\n";
     const MALFORMED: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\n";
 
-    let response = match (script, connection.id, connection.requests_served) {
-        (PoolScript::HoldFirstBody, 0, 0) => PARTIAL,
-        (PoolScript::MalformedFirstBody, 0, 0) => MALFORMED,
-        _ => COMPLETE,
+    let response = if is_head {
+        COMPLETE_HEAD
+    } else {
+        match (script, connection.id, connection.requests_served) {
+            (PoolScript::HoldFirstBody, 0, 0) => PARTIAL,
+            (PoolScript::MalformedFirstBody, 0, 0) => MALFORMED,
+            _ => COMPLETE,
+        }
     };
     connection
         .stream
@@ -1031,6 +1085,14 @@ impl ScriptedServer {
     }
 
     fn spawn_with_response(response: &'static [u8]) -> Self {
+        Self::spawn_with_mode(response, ScriptedConnectionMode::KeepOpen)
+    }
+
+    fn spawn_close_after_response(response: &'static [u8]) -> Self {
+        Self::spawn_with_mode(response, ScriptedConnectionMode::CloseAfterWrite)
+    }
+
+    fn spawn_with_mode(response: &'static [u8], mode: ScriptedConnectionMode) -> Self {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .expect("bind loopback fixture");
         listener
@@ -1038,7 +1100,7 @@ impl ScriptedServer {
             .expect("make fixture listener nonblocking");
         let address = listener.local_addr().expect("read fixture address");
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        let worker = thread::spawn(move || serve(listener, &shutdown_rx, response));
+        let worker = thread::spawn(move || serve(listener, &shutdown_rx, response, mode));
 
         Self {
             address,
@@ -1087,6 +1149,7 @@ fn serve(
     listener: TcpListener,
     shutdown: &Receiver<()>,
     response: &[u8],
+    mode: ScriptedConnectionMode,
 ) -> Result<Observation, String> {
     let deadline = Instant::now() + ACCEPT_TIMEOUT;
     let (mut stream, _) = loop {
@@ -1125,6 +1188,13 @@ fn serve(
     stream
         .flush()
         .map_err(|error| format!("flush scripted response: {error}"))?;
+    if mode == ScriptedConnectionMode::CloseAfterWrite {
+        drop(stream);
+        return Ok(Observation {
+            accepted_connections: 1,
+            request_bytes,
+        });
+    }
     stream
         .set_nonblocking(true)
         .map_err(|error| format!("make accepted stream nonblocking: {error}"))?;
@@ -1359,12 +1429,15 @@ struct CapturedRequest {
 impl CapturedRequest {
     fn parse(observation: &Observation) -> Self {
         assert_eq!(observation.accepted_connections, 1);
-        let head_offset = observation
-            .request_bytes
+        Self::parse_bytes(&observation.request_bytes)
+    }
+
+    fn parse_bytes(request_bytes: &[u8]) -> Self {
+        let head_offset = request_bytes
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
             .expect("captured request has a complete head");
-        let head = std::str::from_utf8(&observation.request_bytes[..head_offset])
+        let head = std::str::from_utf8(&request_bytes[..head_offset])
             .expect("captured request head is UTF-8");
         let mut lines = head.split("\r\n");
         let request_line = lines.next().expect("captured request line").to_owned();
@@ -1374,7 +1447,7 @@ impl CapturedRequest {
                 (name.to_ascii_lowercase(), value.trim().as_bytes().to_vec())
             })
             .collect();
-        let body = observation.request_bytes[head_offset + 4..].to_vec();
+        let body = request_bytes[head_offset + 4..].to_vec();
         Self {
             request_line,
             headers,
@@ -1545,6 +1618,22 @@ fn complete_exchange(
         Ok(Err(error)) => panic!("HTTP exchange failed: {error}"),
         Err(error) => panic!("HTTP exchange timed out: {error}"),
     }
+}
+
+fn complete_top_level_exchange(
+    runtime: &tokio::runtime::Runtime,
+    future: impl Future<Output = requests::Result<requests::Response>>,
+) -> Bytes {
+    runtime
+        .block_on(async {
+            tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+                let response = future.await?;
+                response.bytes().await
+            })
+            .await
+        })
+        .expect("top-level exchange exceeded outer bound")
+        .expect("top-level exchange failed")
 }
 
 fn send_response(runtime: &tokio::runtime::Runtime, request: RequestBuilder) -> requests::Response {
@@ -3187,4 +3276,470 @@ fn complete_connection_close_response_is_successful() {
             "iteration {iteration}"
         );
     }
+}
+
+#[test]
+fn client_execute_uses_the_existing_request_framing_pipeline() {
+    let runtime = runtime();
+    let server = ScriptedServer::spawn_with_response(FRAMING_RESPONSE);
+    let client = Client::new().expect("build execute client");
+    let request = RequestBuilder::new(Method::POST, server.url())
+        .header(
+            HeaderName::from_static("x-execute"),
+            HeaderValue::from_static("same-pipeline"),
+        )
+        .body(Bytes::from_static(b"execute"))
+        .build()
+        .expect("build standalone execute request");
+
+    let response = runtime
+        .block_on(async { tokio::time::timeout(EXCHANGE_TIMEOUT, client.execute(request)).await })
+        .expect("execute exceeded outer bound")
+        .expect("execute failed");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        runtime
+            .block_on(response.bytes())
+            .expect("collect execute body")
+            .is_empty()
+    );
+
+    drop(client);
+    let observation = server.finish().expect("execute fixture completed");
+    let request = CapturedRequest::parse(&observation);
+    assert_eq!(request.request_line, "POST /direct?source=task10 HTTP/1.1");
+    assert_eq!(
+        request.header_values("x-execute"),
+        vec![&b"same-pipeline"[..]]
+    );
+    assert_eq!(request.body, b"execute");
+}
+
+#[test]
+fn response_version_and_head_content_length_come_from_response_head() {
+    let runtime = runtime();
+    let server = ScriptedServer::spawn_with_response(HEAD_RESPONSE);
+    let client = Client::new().expect("build response metadata client");
+    let response = send_response(&runtime, client.head(server.url()));
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.version(), Version::HTTP_11);
+    assert_eq!(response.content_length(), Some(7));
+    assert!(
+        runtime
+            .block_on(response.bytes())
+            .expect("collect HEAD body")
+            .is_empty()
+    );
+
+    drop(client);
+    let observation = server.finish().expect("HEAD metadata fixture completed");
+    let request = CapturedRequest::parse(&observation);
+    assert_eq!(request.request_line, "HEAD /direct?source=task10 HTTP/1.1");
+}
+
+#[test]
+fn response_content_length_is_none_for_absent_and_chunked_metadata() {
+    let runtime = runtime();
+
+    for (wire_response, expected_body, close_after_write) in [
+        (NO_LENGTH_RESPONSE, b"raw".as_slice(), true),
+        (CHUNKED_METADATA_RESPONSE, b"ok".as_slice(), false),
+    ] {
+        let server = if close_after_write {
+            ScriptedServer::spawn_close_after_response(wire_response)
+        } else {
+            ScriptedServer::spawn_with_response(wire_response)
+        };
+        let client = Client::new().expect("build response metadata client");
+        let response = send_response(&runtime, client.get(server.url()));
+
+        assert_eq!(response.content_length(), None);
+        assert_eq!(
+            runtime
+                .block_on(async { tokio::time::timeout(EXCHANGE_TIMEOUT, response.bytes()).await })
+                .expect("response without fixed length exceeded outer bound")
+                .expect("collect response without fixed length"),
+            expected_body
+        );
+
+        drop(client);
+        server.finish().expect("metadata fixture completed");
+    }
+}
+
+#[test]
+fn response_text_decodes_the_complete_body_as_utf8_lossy() {
+    let runtime = runtime();
+    let mut first = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\nsplit \xF0\x9F".to_vec();
+    let tail = b"\x92\x96 bad \xFF".to_vec();
+    let server = PhasedServer::spawn(std::mem::take(&mut first), vec![tail]);
+    let client = Client::new().expect("build response text client");
+    let response = send_response(&runtime, client.get(server.url()));
+    server.wait_first();
+    let release = server.release_after(Duration::from_millis(75));
+
+    let text = runtime
+        .block_on(async { tokio::time::timeout(PHASE_TIMEOUT, response.text()).await })
+        .expect("response text exceeded outer bound")
+        .expect("response text failed");
+    release.join().expect("join text tail release");
+    server.wait_tail(0);
+    assert_eq!(text, "split 💖 bad \u{fffd}");
+
+    drop(client);
+    server.wait_peer_eof();
+    let observation = server.finish().expect("response text fixture completed");
+    assert!(
+        observation
+            .request_bytes
+            .starts_with(b"GET /phased HTTP/1.1\r\n")
+    );
+}
+
+#[test]
+fn client_builder_default_timeout_applies_to_bound_send_and_last_setter_wins() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(DEADLINE_PHASE_DELAY);
+    let client = Client::builder()
+        .timeout(Timeout {
+            connect: None,
+            read: None,
+            total: Some(DEADLINE_LONG),
+        })
+        .timeout(Timeout {
+            connect: None,
+            read: None,
+            total: Some(DEADLINE_SHORT),
+        })
+        .build()
+        .expect("build default-timeout client");
+
+    let error = expect_deadline_error(
+        send_deadline_request(&runtime, client.get(server.url())),
+        "bound send ignored its client default timeout",
+    );
+    assert_timeout_error(&error, "total", "response head");
+
+    drop(client);
+    let observation = server.finish().expect("default timeout fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn client_execute_uses_the_executing_clients_default_timeout() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(DEADLINE_PHASE_DELAY);
+    let source_client = Client::builder()
+        .timeout(Timeout {
+            connect: None,
+            read: None,
+            total: Some(DEADLINE_LONG),
+        })
+        .build()
+        .expect("build source client");
+    let executing_client = Client::builder()
+        .timeout(Timeout {
+            connect: None,
+            read: None,
+            total: Some(DEADLINE_SHORT),
+        })
+        .build()
+        .expect("build executing client");
+    let request = source_client
+        .get(server.url())
+        .build()
+        .expect("build request without explicit timeout");
+
+    let result = runtime
+        .block_on(async {
+            tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, executing_client.execute(request)).await
+        })
+        .expect("cross-client execute exceeded outer bound");
+    let error = expect_deadline_error(
+        result,
+        "executing client default did not replace the source client default",
+    );
+    assert_timeout_error(&error, "total", "response head");
+
+    drop(source_client);
+    drop(executing_client);
+    let observation = server
+        .finish()
+        .expect("cross-client default timeout fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn client_execute_applies_its_default_to_a_standalone_request() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(DEADLINE_PHASE_DELAY);
+    let executing_client = Client::builder()
+        .timeout(Timeout {
+            connect: None,
+            read: None,
+            total: Some(DEADLINE_SHORT),
+        })
+        .build()
+        .expect("build executing client");
+    let request = RequestBuilder::new(Method::GET, server.url())
+        .build()
+        .expect("build standalone request without explicit timeout");
+
+    let result = runtime
+        .block_on(async {
+            tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, executing_client.execute(request)).await
+        })
+        .expect("standalone execute exceeded outer bound");
+    let error = expect_deadline_error(
+        result,
+        "standalone request did not inherit the executing client default",
+    );
+    assert_timeout_error(&error, "total", "response head");
+
+    drop(executing_client);
+    let observation = server
+        .finish()
+        .expect("standalone default timeout fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn partial_request_timeout_wholly_replaces_the_bound_client_default() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(Duration::from_millis(350));
+    let client = Client::builder()
+        .timeout(Timeout {
+            connect: None,
+            read: None,
+            total: Some(DEADLINE_SHORT),
+        })
+        .build()
+        .expect("build default-timeout client");
+    let request = client.get(server.url()).timeout(Timeout {
+        connect: None,
+        read: Some(DEADLINE_LONG),
+        total: None,
+    });
+
+    let response = send_deadline_request(&runtime, request)
+        .expect("partial request timeout incorrectly merged the client total timeout");
+    assert_eq!(
+        collect_deadline_body(&runtime, response).expect("collect partial-override response body"),
+        Bytes::from_static(b"ok")
+    );
+
+    drop(client);
+    let observation = server
+        .finish()
+        .expect("partial request timeout fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn explicit_request_timeout_wholly_replaces_the_executing_client_default() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(Duration::from_millis(350));
+    let source_client = Client::new().expect("build source client");
+    let executing_client = Client::builder()
+        .timeout(Timeout {
+            connect: None,
+            read: None,
+            total: Some(DEADLINE_SHORT),
+        })
+        .build()
+        .expect("build executing client");
+    let request = source_client
+        .get(server.url())
+        .timeout(Timeout::default())
+        .build()
+        .expect("build request with explicit all-None timeout");
+
+    let response = runtime
+        .block_on(async {
+            tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, executing_client.execute(request)).await
+        })
+        .expect("explicit timeout execute exceeded outer bound")
+        .expect("explicit all-None timeout did not disable the client default");
+    assert_eq!(
+        collect_deadline_body(&runtime, response).expect("collect override response body"),
+        Bytes::from_static(b"ok")
+    );
+
+    drop(source_client);
+    drop(executing_client);
+    let observation = server
+        .finish()
+        .expect("explicit timeout override fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn zero_pool_idle_limit_disables_reuse_and_last_setter_wins() {
+    let runtime = runtime();
+    let server = PoolServer::spawn(PoolScript::KeepAlive, 2, 0);
+    let client = Client::builder()
+        .pool_max_idle_per_host(4)
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("build zero-idle client");
+
+    complete_exchange(&runtime, client.get(server.url("/builder-pool/first")));
+    complete_exchange(&runtime, client.get(server.url("/builder-pool/second")));
+
+    drop(client);
+    let observation = server.finish().expect("zero-idle pool fixture completed");
+    assert_eq!(observation.accepted_connections, 2);
+    assert_pool_requests(
+        &observation,
+        &[0, 1],
+        &["/builder-pool/first", "/builder-pool/second"],
+    );
+}
+
+#[test]
+fn configured_proxy_fails_closed_after_the_client_is_dropped() {
+    let runtime = runtime();
+    let origin = ScriptedServer::spawn();
+    let proxy = ScriptedServer::spawn();
+    let proxy_uri = format!("http://{}", proxy.authority())
+        .parse::<Uri>()
+        .expect("valid local proxy URI");
+    let client = Client::builder()
+        .proxy(Proxy::Http(proxy_uri))
+        .build()
+        .expect("build configured-proxy client");
+    let (body, probe) = TrackedBody::source(
+        [Bytes::from_static(b"proxy-body")],
+        Some(b"proxy-body".len() as u64),
+    );
+    let request = client.request(Method::POST, origin.url()).body(body);
+    drop(client);
+
+    let result = runtime
+        .block_on(async { tokio::time::timeout(EXCHANGE_TIMEOUT, request.send()).await })
+        .expect("configured proxy request exceeded outer bound");
+    let error = match result {
+        Err(error) => error,
+        Ok(response) => {
+            drop(response);
+            panic!("configured proxy silently used the direct transport")
+        }
+    };
+    assert_eq!(error.kind(), ErrorKind::Proxy);
+    assert!(
+        probe
+            .polls
+            .lock()
+            .expect("proxy body poll log lock")
+            .is_empty(),
+        "configured proxy must fail before polling the request body"
+    );
+
+    let proxy_observation = proxy.finish().expect("proxy fail-closed fixture completed");
+    assert_eq!(proxy_observation.accepted_connections, 0);
+    assert!(proxy_observation.request_bytes.is_empty());
+    let origin_observation = origin
+        .finish()
+        .expect("origin fail-closed fixture completed");
+    assert_eq!(origin_observation.accepted_connections, 0);
+    assert!(origin_observation.request_bytes.is_empty());
+}
+
+#[test]
+fn top_level_helpers_use_wire_methods_and_fresh_clients_without_a_shared_pool() {
+    let runtime = runtime();
+    let server = PoolServer::spawn(PoolScript::KeepAlive, 6, 0);
+
+    assert_eq!(
+        complete_top_level_exchange(&runtime, requests::get(server.url("/top-level/get"))),
+        Bytes::from_static(b"ok")
+    );
+    assert!(
+        complete_top_level_exchange(&runtime, requests::head(server.url("/top-level/head")))
+            .is_empty()
+    );
+    assert_eq!(
+        complete_top_level_exchange(
+            &runtime,
+            requests::post(server.url("/top-level/post"), Vec::from(&b"post"[..])),
+        ),
+        Bytes::from_static(b"ok")
+    );
+    assert_eq!(
+        complete_top_level_exchange(
+            &runtime,
+            requests::put(
+                server.url("/top-level/put"),
+                BodySource::Bytes(Bytes::from_static(b"put")),
+            ),
+        ),
+        Bytes::from_static(b"ok")
+    );
+    assert_eq!(
+        complete_top_level_exchange(
+            &runtime,
+            requests::patch(server.url("/top-level/patch"), Bytes::from_static(b"patch"),),
+        ),
+        Bytes::from_static(b"ok")
+    );
+    assert_eq!(
+        complete_top_level_exchange(&runtime, requests::delete(server.url("/top-level/delete")),),
+        Bytes::from_static(b"ok")
+    );
+
+    let observation = server.finish().expect("top-level helper fixture completed");
+    assert_eq!(observation.accepted_connections, 6);
+    assert_eq!(observation.connection_ids(), [0, 1, 2, 3, 4, 5]);
+    let expected = [
+        ("GET /top-level/get HTTP/1.1", b"".as_slice()),
+        ("HEAD /top-level/head HTTP/1.1", b"".as_slice()),
+        ("POST /top-level/post HTTP/1.1", b"post".as_slice()),
+        ("PUT /top-level/put HTTP/1.1", b"put".as_slice()),
+        ("PATCH /top-level/patch HTTP/1.1", b"patch".as_slice()),
+        ("DELETE /top-level/delete HTTP/1.1", b"".as_slice()),
+    ];
+    for (observed, (request_line, body)) in observation.requests.iter().zip(expected) {
+        let request = CapturedRequest::parse_bytes(&observed.request_bytes);
+        assert_eq!(request.request_line, request_line);
+        assert_eq!(request.body, body);
+    }
+}
+
+#[test]
+fn top_level_streamed_post_is_polled_on_the_callers_tokio_runtime_and_moved_once() {
+    let runtime = runtime();
+    let server = ScriptedServer::spawn_with_response(FRAMING_RESPONSE);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let all_polls_on_caller_runtime_thread = Arc::new(AtomicBool::new(true));
+    let body = BodySource::Stream(Box::pin(CallerTaskBody {
+        chunk: Some(Bytes::from_static(b"caller")),
+        length: 6,
+        caller_thread: thread::current().id(),
+        polls: Arc::clone(&polls),
+        drops: Arc::clone(&drops),
+        all_polls_on_caller_runtime_thread: Arc::clone(&all_polls_on_caller_runtime_thread),
+    }));
+
+    let response = runtime
+        .block_on(async {
+            tokio::time::timeout(EXCHANGE_TIMEOUT, requests::post(server.url(), body)).await
+        })
+        .expect("top-level POST exceeded outer bound")
+        .expect("top-level POST failed");
+    assert!(
+        runtime
+            .block_on(response.bytes())
+            .expect("collect top-level POST body")
+            .is_empty()
+    );
+
+    let observation = server.finish().expect("top-level POST fixture completed");
+    let request = CapturedRequest::parse(&observation);
+    assert_eq!(request.request_line, "POST /direct?source=task10 HTTP/1.1");
+    assert_eq!(request.body, b"caller");
+    assert!(polls.load(Ordering::Acquire) >= 1);
+    assert!(all_polls_on_caller_runtime_thread.load(Ordering::Acquire));
+    assert_eq!(drops.load(Ordering::Acquire), 1);
 }
