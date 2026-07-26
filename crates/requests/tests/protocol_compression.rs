@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_core::Stream;
-use requests::{Client, ErrorKind, Response, ResponseBody};
+use requests::{Client, ContentCodecs, ErrorKind, HeaderName, HeaderValue, Response, ResponseBody};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const ASYNC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -88,8 +88,36 @@ fn response_bytes(
         .expect("response body timed out")
 }
 
+fn response_body_bytes(
+    runtime: &tokio::runtime::Runtime,
+    mut body: ResponseBody,
+) -> requests::Result<Bytes> {
+    runtime.block_on(async {
+        let mut collected = Vec::new();
+        while let Some(frame) = tokio::time::timeout(ASYNC_TIMEOUT, next_frame(&mut body))
+            .await
+            .expect("response body frame timed out")
+        {
+            collected.extend_from_slice(&frame?);
+        }
+        Ok(Bytes::from(collected))
+    })
+}
+
 async fn next_frame(body: &mut ResponseBody) -> Option<requests::Result<Bytes>> {
     poll_fn(|context| Pin::new(&mut *body).poll_next(context)).await
+}
+
+fn captured_headers(request: &[u8], expected_name: &str) -> Vec<String> {
+    let head = std::str::from_utf8(request).expect("fixture request head is UTF-8");
+    head.split("\r\n")
+        .skip(1)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(expected_name)
+                .then(|| value.trim().to_owned())
+        })
+        .collect()
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
@@ -140,6 +168,35 @@ fn write_fixed_response(
     Ok(())
 }
 
+fn write_chunked_response(
+    stream: &mut TcpStream,
+    encoding: &str,
+    body: &[u8],
+    connection: &str,
+) -> Result<(), String> {
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|error| format!("set response write timeout: {error}"))?;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\n\
+         Transfer-Encoding: chunked\r\nX-Wire-Fixture: preserved\r\n\
+         Connection: {connection}\r\n\r\n"
+    );
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|error| format!("write response head: {error}"))?;
+    for part in body.chunks((body.len() / 3).max(1)) {
+        write_http_chunk(stream, part)?;
+        thread::yield_now();
+    }
+    stream
+        .write_all(b"0\r\n\r\n")
+        .map_err(|error| format!("finish chunked response: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("flush chunked response: {error}"))
+}
+
 struct FixedServer {
     address: SocketAddr,
     worker: Option<JoinHandle<Result<Vec<u8>, String>>>,
@@ -156,6 +213,24 @@ impl FixedServer {
                 .map_err(|error| format!("accept request: {error}"))?;
             let request = read_request(&mut stream)?;
             write_fixed_response(&mut stream, encoding, &body, "close")?;
+            Ok(request)
+        });
+        Self {
+            address,
+            worker: Some(worker),
+        }
+    }
+
+    fn spawn_chunked(encoding: &'static str, body: Vec<u8>) -> Self {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind chunked response fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept request: {error}"))?;
+            let request = read_request(&mut stream)?;
+            write_chunked_response(&mut stream, encoding, &body, "close")?;
             Ok(request)
         });
         Self {
@@ -373,6 +448,322 @@ fn concatenated_raw_deflate_decodes_only_the_first_stream() {
         SECOND_RAW_DEFLATE,
         FIRST_MEMBER,
     );
+}
+
+fn configured_client(brotli: bool, zstandard: bool) -> Client {
+    Client::builder()
+        .content_codecs(ContentCodecs::new(brotli, zstandard))
+        .build()
+        .expect("build codec-configured client")
+}
+
+fn assert_inventory_header(brotli: bool, zstandard: bool, expected: &str) {
+    let runtime = runtime();
+    let client = configured_client(brotli, zstandard);
+    let server = FixedServer::spawn("gzip", Vec::new());
+    let response = send_response(&runtime, &client, &server.url("/inventory"));
+    assert!(
+        response_bytes(&runtime, response)
+            .expect("read empty inventory response")
+            .is_empty()
+    );
+    let request = server.finish().expect("inventory fixture completed");
+    assert_eq!(
+        captured_headers(&request, "accept-encoding"),
+        vec![expected.to_owned()]
+    );
+}
+
+#[test]
+fn content_inventory_default_client_advertises_all_compiled_codecs() {
+    let runtime = runtime();
+    let client = Client::new().expect("build default client");
+    let server = FixedServer::spawn("gzip", Vec::new());
+    let response = send_response(&runtime, &client, &server.url("/inventory/default"));
+    assert!(
+        response_bytes(&runtime, response)
+            .expect("read empty default response")
+            .is_empty()
+    );
+    let request = server
+        .finish()
+        .expect("default inventory fixture completed");
+    assert_eq!(
+        captured_headers(&request, "accept-encoding"),
+        vec!["gzip, deflate, br, zstd"]
+    );
+}
+
+#[test]
+fn content_inventory_configured_client_advertises_brotli_and_zstandard() {
+    assert_inventory_header(true, true, "gzip, deflate, br, zstd");
+}
+
+#[test]
+fn content_inventory_configured_client_omits_brotli() {
+    assert_inventory_header(false, true, "gzip, deflate, zstd");
+}
+
+#[test]
+fn content_inventory_configured_client_omits_zstandard() {
+    assert_inventory_header(true, false, "gzip, deflate, br");
+}
+
+#[test]
+fn content_inventory_configured_client_omits_both_optional_codecs() {
+    assert_inventory_header(false, false, "gzip, deflate");
+}
+
+fn assert_optional_codec_projection(
+    encoding: &'static str,
+    wire: &'static str,
+    client: &Client,
+    expected: &[u8],
+    path: &str,
+) {
+    let runtime = runtime();
+    let wire = hex_bytes(wire);
+    let server = FixedServer::spawn(encoding, wire.clone());
+    let response = send_response(&runtime, client, &server.url(path));
+    assert_eq!(
+        response.headers().get("content-encoding").unwrap(),
+        encoding
+    );
+    assert_eq!(
+        response.headers().get("content-length").unwrap(),
+        wire.len().to_string().as_str()
+    );
+    assert_eq!(response.content_length(), Some(wire.len() as u64));
+    assert_eq!(
+        response.headers().get("x-wire-fixture").unwrap(),
+        "preserved"
+    );
+    assert_eq!(
+        response_bytes(&runtime, response).expect("read optional codec response"),
+        expected
+    );
+    server.finish().expect("optional codec fixture completed");
+}
+
+#[test]
+fn content_inventory_enabled_brotli_decodes_the_public_body() {
+    let client = configured_client(true, false);
+    assert_optional_codec_projection("br", BROTLI, &client, PAYLOAD, "/inventory/br/enabled");
+}
+
+#[test]
+fn content_inventory_disabled_brotli_passes_the_raw_representation_through() {
+    let client = configured_client(false, true);
+    let wire = hex_bytes(BROTLI);
+    assert_optional_codec_projection("br", BROTLI, &client, &wire, "/inventory/br/disabled");
+}
+
+#[test]
+fn content_inventory_enabled_zstandard_decodes_the_public_body() {
+    let client = configured_client(false, true);
+    assert_optional_codec_projection(
+        "zstd",
+        ZSTANDARD,
+        &client,
+        PAYLOAD,
+        "/inventory/zstd/enabled",
+    );
+}
+
+#[test]
+fn content_inventory_disabled_zstandard_passes_the_raw_representation_through() {
+    let client = configured_client(true, false);
+    let wire = hex_bytes(ZSTANDARD);
+    assert_optional_codec_projection(
+        "zstd",
+        ZSTANDARD,
+        &client,
+        &wire,
+        "/inventory/zstd/disabled",
+    );
+}
+
+#[test]
+fn content_inventory_gzip_remains_enabled_when_optional_codecs_are_disabled() {
+    let client = configured_client(false, false);
+    assert_optional_codec_projection("gzip", GZIP, &client, PAYLOAD, "/inventory/gzip/required");
+}
+
+#[test]
+fn content_inventory_deflate_remains_enabled_when_optional_codecs_are_disabled() {
+    let client = configured_client(false, false);
+    assert_optional_codec_projection(
+        "deflate",
+        ZLIB_DEFLATE,
+        &client,
+        PAYLOAD,
+        "/inventory/deflate/required",
+    );
+}
+
+fn send_with_accept_encoding(
+    runtime: &tokio::runtime::Runtime,
+    client: &Client,
+    url: String,
+    value: &'static str,
+) -> Response {
+    runtime
+        .block_on(async {
+            tokio::time::timeout(
+                ASYNC_TIMEOUT,
+                client
+                    .get(url)
+                    .header(
+                        HeaderName::from_static("accept-encoding"),
+                        HeaderValue::from_static(value),
+                    )
+                    .send(),
+            )
+            .await
+        })
+        .expect("explicit Accept-Encoding response head timed out")
+        .expect("explicit Accept-Encoding request failed")
+}
+
+#[test]
+fn content_inventory_explicit_accept_encoding_is_the_only_value_sent() {
+    let runtime = runtime();
+    let client = configured_client(true, true);
+    let server = FixedServer::spawn("gzip", Vec::new());
+    let response = send_with_accept_encoding(
+        &runtime,
+        &client,
+        server.url("/explicit/preserved"),
+        "identity",
+    );
+    assert!(
+        response_bytes(&runtime, response)
+            .expect("read empty explicit response")
+            .is_empty()
+    );
+    let request = server.finish().expect("explicit fixture completed");
+    assert_eq!(
+        captured_headers(&request, "accept-encoding"),
+        vec!["identity"]
+    );
+}
+
+#[test]
+fn content_inventory_explicit_header_does_not_disable_configured_brotli_decoder() {
+    let runtime = runtime();
+    let client = configured_client(true, false);
+
+    let server = FixedServer::spawn("br", hex_bytes(BROTLI));
+    let response =
+        send_with_accept_encoding(&runtime, &client, server.url("/explicit/br"), "identity");
+    let request = server.finish().expect("explicit Brotli fixture completed");
+    assert_eq!(
+        captured_headers(&request, "accept-encoding"),
+        vec!["identity"]
+    );
+    assert_eq!(
+        response_bytes(&runtime, response).expect("decode enabled Brotli"),
+        PAYLOAD
+    );
+}
+
+#[test]
+fn content_inventory_explicit_header_does_not_enable_disabled_zstandard_decoder() {
+    let runtime = runtime();
+    let client = configured_client(true, false);
+    let server = FixedServer::spawn("zstd", hex_bytes(ZSTANDARD));
+    let response =
+        send_with_accept_encoding(&runtime, &client, server.url("/explicit/zstd"), "br, zstd");
+    let request = server
+        .finish()
+        .expect("explicit Zstandard fixture completed");
+    assert_eq!(
+        captured_headers(&request, "accept-encoding"),
+        vec!["br, zstd"]
+    );
+    assert_eq!(
+        response_bytes(&runtime, response).expect("read disabled Zstandard representation"),
+        hex_bytes(ZSTANDARD)
+    );
+}
+
+#[test]
+fn content_inventory_x_gzip_is_decoded_but_never_advertised() {
+    let runtime = runtime();
+    let client = configured_client(false, false);
+    let server = FixedServer::spawn("x-gzip", hex_bytes(GZIP));
+    let response = send_response(&runtime, &client, &server.url("/inventory/x-gzip"));
+    assert_eq!(
+        response_bytes(&runtime, response).expect("decode x-gzip response"),
+        PAYLOAD
+    );
+    let request = server.finish().expect("x-gzip fixture completed");
+    assert_eq!(
+        captured_headers(&request, "accept-encoding"),
+        vec!["gzip, deflate"]
+    );
+}
+
+#[test]
+fn content_inventory_body_view_selectors_consume_the_response() {
+    let _: fn(Response) -> ResponseBody = Response::into_body;
+    let _: fn(Response) -> ResponseBody = Response::into_raw_body;
+}
+
+#[test]
+fn content_inventory_raw_body_view_is_transfer_deframed_and_content_encoded() {
+    let runtime = runtime();
+    let client = configured_client(true, true);
+    let wire = hex_bytes(GZIP);
+
+    let raw_server = FixedServer::spawn_chunked("gzip", wire.clone());
+    let raw_response = send_response(&runtime, &client, &raw_server.url("/view/raw"));
+    assert_eq!(
+        raw_response.headers().get("content-encoding").unwrap(),
+        "gzip"
+    );
+    assert_eq!(
+        raw_response.headers().get("transfer-encoding").unwrap(),
+        "chunked"
+    );
+    assert!(raw_response.headers().get("content-length").is_none());
+    assert_eq!(raw_response.content_length(), None);
+    assert_eq!(
+        raw_response.headers().get("x-wire-fixture").unwrap(),
+        "preserved"
+    );
+    let raw_body = raw_response.into_raw_body();
+    assert_eq!(
+        response_body_bytes(&runtime, raw_body).expect("read raw body view"),
+        wire
+    );
+    raw_server.finish().expect("raw view fixture completed");
+}
+
+#[test]
+fn content_inventory_decoded_body_view_preserves_wire_headers() {
+    let runtime = runtime();
+    let client = configured_client(true, true);
+    let wire = hex_bytes(GZIP);
+    let decoded_server = FixedServer::spawn("gzip", hex_bytes(GZIP));
+    let decoded_response = send_response(&runtime, &client, &decoded_server.url("/view/decoded"));
+    assert_eq!(
+        decoded_response.headers().get("content-encoding").unwrap(),
+        "gzip"
+    );
+    assert_eq!(decoded_response.content_length(), Some(wire.len() as u64));
+    assert_eq!(
+        decoded_response.headers().get("x-wire-fixture").unwrap(),
+        "preserved"
+    );
+    let decoded_body = decoded_response.into_body();
+    assert_eq!(
+        response_body_bytes(&runtime, decoded_body).expect("read decoded body view"),
+        PAYLOAD
+    );
+    decoded_server
+        .finish()
+        .expect("decoded view fixture completed");
 }
 
 enum GateCommand {
