@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,8 +9,13 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::Method;
 
-use super::{Connector, DeadlineSource, Transport, select_deadline_source};
-use crate::{AsyncBody, BodySource, Error, ErrorKind, RequestBuilder, Timeout};
+use super::{
+    Connector, DEFAULT_MAX_IDLE_PER_HOST, DeadlineSource, Transport, select_deadline_source,
+};
+use crate::{
+    AsyncBody, BodySource, CertificateSource, ContentCodecs, Error, ErrorKind, Identity,
+    RequestBuilder, Timeout, TlsConfig,
+};
 
 const SHORT_DEADLINE: Duration = Duration::from_millis(200);
 const LONG_DEADLINE: Duration = Duration::from_millis(800);
@@ -212,6 +218,104 @@ fn assert_implicit_connector_call(url: &str, expected: ConnectCall) {
         );
         assert_eq!(connector.calls(), vec![expected]);
     });
+}
+
+fn send_with_recording_tls(url: &str, tls: TlsConfig) -> (Error, Vec<ConnectCall>) {
+    runtime().block_on(async {
+        let connector = RecordingConnector::default();
+        let transport = Transport::with_configuration(
+            Arc::new(connector.clone()),
+            None,
+            tls,
+            Timeout::default(),
+            DEFAULT_MAX_IDLE_PER_HOST,
+            ContentCodecs::new(true, true),
+        );
+        let request = RequestBuilder::new(Method::GET, url)
+            .build()
+            .expect("build deferred TLS-loading request");
+        let result = tokio::time::timeout(OUTER_BOUND, transport.send(request))
+            .await
+            .expect("deferred TLS-loading request exceeded outer bound");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("controlled connector unexpectedly produced a response"),
+        };
+        (error, connector.calls())
+    })
+}
+
+fn frozen_root_bundle() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/certs/expired/ca/ca.crt")
+}
+
+#[test]
+fn tls_loading_plain_http_never_reads_missing_root_or_identity_paths() {
+    let (error, calls) = send_with_recording_tls(
+        "http://plain.test/path",
+        TlsConfig {
+            roots: CertificateSource::PemBundle(PathBuf::from("red-e-missing-root.pem")),
+            identity: Some(Identity {
+                certificate_chain: PathBuf::from("red-e-missing-client-chain.pem"),
+                private_key: Some(PathBuf::from("red-e-missing-client.key")),
+            }),
+        },
+    );
+
+    assert_eq!(error.kind(), ErrorKind::Connect);
+    assert_eq!(
+        calls,
+        [ConnectCall {
+            host: "plain.test".to_owned(),
+            port: 80,
+            target: "plain.test".to_owned(),
+        }],
+    );
+}
+
+#[test]
+fn tls_loading_https_missing_root_fails_before_connector() {
+    let (error, calls) = send_with_recording_tls(
+        "https://secure.test/path",
+        TlsConfig {
+            roots: CertificateSource::PemBundle(PathBuf::from("red-e-missing-root.pem")),
+            identity: None,
+        },
+    );
+
+    assert!(calls.is_empty(), "TLS load failure must precede connect");
+    assert_eq!(
+        format!("{:?}", error.kind()),
+        "Tls",
+        "missing TLS root must be an exact TLS error: {error}",
+    );
+}
+
+#[test]
+fn tls_loading_https_valid_root_reaches_connector_once() {
+    let root = frozen_root_bundle();
+    assert!(root.is_file(), "frozen root fixture must exist: {root:?}");
+    let (error, calls) = send_with_recording_tls(
+        "https://secure.test/path",
+        TlsConfig {
+            roots: CertificateSource::PemBundle(root),
+            identity: None,
+        },
+    );
+
+    assert_eq!(
+        error.kind(),
+        ErrorKind::Connect,
+        "valid root must load before the controlled connector error: {error}",
+    );
+    assert_eq!(
+        calls,
+        [ConnectCall {
+            host: "secure.test".to_owned(),
+            port: 443,
+            target: "secure.test".to_owned(),
+        }],
+    );
 }
 
 async fn send_with_safety_release(timeout: Timeout) -> Error {

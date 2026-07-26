@@ -32,6 +32,13 @@ fn direct_key() -> PoolKey {
     key(Scheme::HTTP, "example.test:80", None, "tls-default", None)
 }
 
+fn identity_key(certificate_chain: &str, private_key: Option<&str>) -> IdentityKey {
+    IdentityKey::new(&format!(
+        "certificate-chain:{certificate_chain};private-key:{}",
+        private_key.unwrap_or("<combined>")
+    ))
+}
+
 fn controlled_connection(
     id: usize,
     readable: impl IntoIterator<Item = u8>,
@@ -106,6 +113,144 @@ fn pool_key_includes_scheme_authority_proxy_tls_and_optional_identity() {
             Some("client-certificate-a"),
         )
     );
+}
+
+#[test]
+fn tls_pool_modes_are_pairwise_distinct_and_lexically_stable() {
+    let modes = [
+        TlsPoolKey::new("plain"),
+        TlsPoolKey::new("platform"),
+        TlsPoolKey::new("pem-bundle:ca.pem"),
+        TlsPoolKey::new("pem-directory:capath"),
+        TlsPoolKey::new("disabled"),
+    ];
+    for (index, left) in modes.iter().enumerate() {
+        assert_eq!(left, &modes[index]);
+        for right in &modes[index + 1..] {
+            assert_ne!(left, right);
+        }
+    }
+
+    assert_eq!(
+        TlsPoolKey::new("pem-bundle:ca.pem"),
+        TlsPoolKey::new("pem-bundle:ca.pem"),
+    );
+    assert_ne!(
+        TlsPoolKey::new("pem-bundle:ca.pem"),
+        TlsPoolKey::new("pem-bundle:./ca.pem"),
+        "pool identity must preserve the configured lexical path",
+    );
+    let first_bytes = b"identical frozen CA bytes";
+    let second_bytes = b"identical frozen CA bytes";
+    assert_eq!(first_bytes, second_bytes);
+    assert_ne!(
+        TlsPoolKey::new("pem-bundle:fixtures/a/ca.pem"),
+        TlsPoolKey::new("pem-bundle:fixtures/b/ca.pem"),
+        "different paths remain distinct even when their bytes are the same",
+    );
+}
+
+#[test]
+fn combined_and_separate_client_identities_have_distinct_lexical_keys() {
+    let combined = identity_key("client.pem", None);
+    let separate = identity_key("client.pem", Some("client.key"));
+
+    assert_eq!(combined, identity_key("client.pem", None));
+    assert_ne!(combined, separate);
+    assert_ne!(
+        identity_key("client.pem", Some("client.key")),
+        identity_key("./client.pem", Some("client.key")),
+        "identity pool keys must preserve certificate path spelling",
+    );
+    assert_ne!(
+        identity_key("client.pem", Some("client.key")),
+        identity_key("client.pem", Some("./client.key")),
+        "identity pool keys must preserve private-key path spelling",
+    );
+}
+
+#[test]
+fn distinct_tls_keys_own_separate_pool_generations() {
+    let mut pool = Pool::new(1);
+    let bundle = key(
+        Scheme::HTTPS,
+        "example.test:443",
+        None,
+        "pem-bundle:ca.pem",
+        Some("certificate-chain:client.pem;private-key:<combined>"),
+    );
+    let directory = key(
+        Scheme::HTTPS,
+        "example.test:443",
+        None,
+        "pem-directory:capath",
+        Some("certificate-chain:client.pem;private-key:<combined>"),
+    );
+    let (bundle_connection, _) = controlled_connection(1, []);
+    let (directory_connection, _) = controlled_connection(2, []);
+
+    pool.release(
+        fresh_lease(&pool, bundle.clone(), bundle_connection).complete(LeaseTerminal::CleanEof),
+    );
+    pool.release(
+        fresh_lease(&pool, directory.clone(), directory_connection)
+            .complete(LeaseTerminal::CleanEof),
+    );
+
+    let bundle_generation = pool.generation(&bundle).expect("bundle generation");
+    let directory_generation = pool.generation(&directory).expect("directory generation");
+    assert!(
+        !std::ptr::eq(bundle_generation, directory_generation),
+        "structurally distinct TLS keys must not share a pool generation",
+    );
+    assert_eq!(pool.idle_len(&bundle), 1);
+    assert_eq!(pool.idle_len(&directory), 1);
+}
+
+#[test]
+fn production_tls_pool_identity_inventory_is_structural_and_path_only() {
+    let compact = include_str!("pool.rs")
+        .split_whitespace()
+        .collect::<String>();
+    let (key_definitions, _) = compact
+        .split_once("pub(super)structPoolKey{")
+        .expect("pool source keeps key definitions before PoolKey");
+
+    for required in [
+        "usestd::path::PathBuf;",
+        "pub(super)enumTlsPoolKey{",
+        "Plain,",
+        "Platform,",
+        "PemBundle(PathBuf),",
+        "PemDirectory(PathBuf),",
+        "Disabled,",
+        "pub(super)structIdentityKey{",
+        "certificate_chain:PathBuf,",
+        "private_key:Option<PathBuf>,",
+    ] {
+        assert!(
+            key_definitions.contains(required),
+            "production pool identity requires structural source fragment {required:?}",
+        );
+    }
+    for forbidden in [
+        "structTlsPoolKey(String);",
+        "structIdentityKey(String);",
+        ".canonicalize(",
+        "std::fs::read(",
+        "std::fs::read_to_string(",
+        "read_to_end(",
+        "DefaultHasher",
+        "std::hash::",
+        "Sha256",
+        "sha256",
+        ".hash(",
+    ] {
+        assert!(
+            !key_definitions.contains(forbidden),
+            "pool identity must remain lexical and path-only, found {forbidden:?}",
+        );
+    }
 }
 
 #[test]

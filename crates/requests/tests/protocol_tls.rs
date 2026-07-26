@@ -30,6 +30,8 @@ const WRONG_HOST_SERVER: ServerIdentity = ServerIdentity {
     private_key: include_bytes!("../../../tests/fixtures/tls/wrong-host/wrong-host.key"),
 };
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ntls-ok";
+const POOLED_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: keep-alive\r\n\r\ntls-pool";
 static NEXT_CAPATH_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -53,6 +55,12 @@ struct TlsObservation {
     request_bytes: Vec<u8>,
     handshake_error: Option<String>,
     events: Vec<ServerEvent>,
+}
+
+#[derive(Debug)]
+struct PooledTlsObservation {
+    accepts: usize,
+    request_bytes: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -276,6 +284,68 @@ async fn serve_one_tls(
         handshake_error: None,
         events,
     })
+}
+
+async fn serve_two_tls_requests_on_one_connection(
+    listener: TcpListener,
+) -> Result<PooledTlsObservation, String> {
+    let (stream, _) = tokio::time::timeout(IO_TIMEOUT, listener.accept())
+        .await
+        .map_err(|_| "pooled TLS fixture first accept timed out".to_owned())?
+        .map_err(|error| format!("accept pooled TLS fixture connection: {error}"))?;
+    let mut stream = tokio::time::timeout(
+        IO_TIMEOUT,
+        tls_acceptor(VALID_SERVER, ClientAuthentication::None).accept(stream),
+    )
+    .await
+    .map_err(|_| "pooled TLS fixture handshake timed out".to_owned())?
+    .map_err(|error| format!("pooled TLS fixture handshake failed: {error}"))?;
+
+    let serving = async move {
+        let mut request_bytes = Vec::with_capacity(2);
+        for request_number in 1..=2 {
+            let request = tokio::time::timeout(IO_TIMEOUT, read_request_head(&mut stream))
+                .await
+                .map_err(|_| {
+                    format!("pooled TLS fixture request {request_number} read timed out")
+                })??;
+            request_bytes.push(request);
+            tokio::time::timeout(IO_TIMEOUT, stream.write_all(POOLED_RESPONSE))
+                .await
+                .map_err(|_| {
+                    format!("pooled TLS fixture response {request_number} write timed out")
+                })?
+                .map_err(|error| {
+                    format!("write pooled TLS fixture response {request_number}: {error}")
+                })?;
+        }
+        tokio::time::timeout(IO_TIMEOUT, stream.shutdown())
+            .await
+            .map_err(|_| "pooled TLS fixture shutdown timed out".to_owned())?
+            .map_err(|error| format!("shutdown pooled TLS fixture: {error}"))?;
+        Ok(PooledTlsObservation {
+            accepts: 1,
+            request_bytes,
+        })
+    };
+    tokio::pin!(serving);
+    let second_accept = tokio::time::timeout(IO_TIMEOUT, listener.accept());
+    tokio::pin!(second_accept);
+
+    tokio::select! {
+        result = &mut serving => result,
+        accepted = &mut second_accept => match accepted {
+            Ok(Ok((_, peer))) => Err(format!(
+                "pooled TLS fixture rejected unexpected second TCP connection from {peer}"
+            )),
+            Ok(Err(error)) => Err(format!(
+                "pooled TLS fixture second-accept monitor failed: {error}"
+            )),
+            Err(_) => Err(
+                "pooled TLS fixture did not serve two requests within its accept bound".to_owned()
+            ),
+        },
+    }
 }
 
 fn assert_pre_socket_bundle_failure(bundle: PathBuf) {
@@ -858,6 +928,104 @@ async fn await_server(
         .expect("TLS fixture task timed out")
         .expect("TLS fixture task panicked")
         .expect("TLS fixture failed")
+}
+
+async fn await_pooled_server(
+    server: tokio::task::JoinHandle<Result<PooledTlsObservation, String>>,
+) -> Result<PooledTlsObservation, String> {
+    tokio::time::timeout(IO_TIMEOUT, server)
+        .await
+        .map_err(|_| "pooled TLS fixture task timed out".to_owned())?
+        .map_err(|error| format!("pooled TLS fixture task panicked: {error}"))?
+}
+
+#[test]
+fn pooled_tls_connection_does_not_reload_overwritten_ca_bundle() {
+    runtime().block_on(async {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind pooled TLS loopback fixture");
+        let address = listener
+            .local_addr()
+            .expect("read pooled TLS fixture address");
+        let server = tokio::spawn(serve_two_tls_requests_on_one_connection(listener));
+        let directory = CapathDirectory::new();
+        let bundle = directory.write("pooled-ca.pem", FROZEN_CA_CERTIFICATE);
+        let client = Client::builder()
+            .tls(TlsConfig {
+                roots: CertificateSource::PemBundle(bundle.clone()),
+                identity: None,
+            })
+            .build()
+            .expect("build pooled TLS client without I/O");
+
+        let first_url = format!("https://localhost:{}/pool-first", address.port());
+        let first = match tokio::time::timeout(IO_TIMEOUT, client.get(&first_url).send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                server.abort();
+                let _ = server.await;
+                panic!(
+                    "first pooled TLS request failed: {:?}: {error}",
+                    error.kind()
+                );
+            }
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("first pooled TLS request timed out");
+            }
+        };
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = tokio::time::timeout(IO_TIMEOUT, first.bytes())
+            .await
+            .expect("first pooled TLS response body timed out")
+            .expect("read first pooled TLS response body");
+        assert_eq!(first_body.as_ref(), b"tls-pool");
+
+        std::fs::write(&bundle, b"garbage after first TLS connection")
+            .expect("overwrite the configured CA bundle at the same lexical path");
+
+        let second_url = format!("https://localhost:{}/pool-second", address.port());
+        let second = match tokio::time::timeout(IO_TIMEOUT, client.get(&second_url).send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let server_result = await_pooled_server(server).await;
+                panic!(
+                    "second pooled TLS request failed after CA overwrite: {:?}: {error}; \
+                     server: {server_result:?}",
+                    error.kind()
+                );
+            }
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("second pooled TLS request timed out");
+            }
+        };
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = tokio::time::timeout(IO_TIMEOUT, second.bytes())
+            .await
+            .expect("second pooled TLS response body timed out")
+            .expect("read second pooled TLS response body");
+        assert_eq!(second_body.as_ref(), b"tls-pool");
+
+        let observation = await_pooled_server(server)
+            .await
+            .expect("pooled TLS fixture failed");
+        assert_eq!(observation.accepts, 1);
+        assert_eq!(observation.request_bytes.len(), 2);
+        assert!(
+            observation.request_bytes[0].starts_with(b"GET /pool-first HTTP/1.1\r\n"),
+            "unexpected first pooled request: {:?}",
+            String::from_utf8_lossy(&observation.request_bytes[0]),
+        );
+        assert!(
+            observation.request_bytes[1].starts_with(b"GET /pool-second HTTP/1.1\r\n"),
+            "unexpected second pooled request: {:?}",
+            String::from_utf8_lossy(&observation.request_bytes[1]),
+        );
+    });
 }
 
 #[test]
