@@ -14,7 +14,6 @@ platform-smoke = [
     "dep:hyper-rustls",
     "hyper-util/client-legacy",
     "hyper-util/http1",
-    "dep:rustls",
 ]
 
 [dependencies]
@@ -29,6 +28,9 @@ hyper = { version = "1", features = ["client", "http1"] }
 indexmap = "2"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"], optional = true }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 url = "2"
