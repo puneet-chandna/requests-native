@@ -209,13 +209,23 @@ fn distinct_tls_keys_own_separate_pool_generations() {
 
 #[test]
 fn production_tls_pool_identity_inventory_is_structural_and_path_only() {
-    let compact = include_str!("pool.rs")
+    let pool_source = include_str!("pool.rs")
         .split_whitespace()
         .collect::<String>();
-    let (key_definitions, _) = compact
-        .split_once("pub(super)structPoolKey{")
-        .expect("pool source keeps key definitions before PoolKey");
+    let (key_definitions, _) = pool_source
+        .split_once("pub(super)enumLeaseTerminal{")
+        .expect("pool source keeps key derivation before lease state");
+    let transport_source = include_str!("mod.rs")
+        .split_whitespace()
+        .collect::<String>();
+    let (_, send_and_after) = transport_source
+        .split_once("pubasyncfnsend(")
+        .expect("transport source keeps one production send path");
+    let (send_key_derivation, _) = send_and_after
+        .split_once("letmutrequest=request.into_parts();")
+        .expect("production send derives its key before consuming the request");
 
+    let mut violations = Vec::new();
     for required in [
         "usestd::path::PathBuf;",
         "pub(super)enumTlsPoolKey{",
@@ -228,29 +238,50 @@ fn production_tls_pool_identity_inventory_is_structural_and_path_only() {
         "certificate_chain:PathBuf,",
         "private_key:Option<PathBuf>,",
     ] {
-        assert!(
-            key_definitions.contains(required),
-            "production pool identity requires structural source fragment {required:?}",
-        );
+        if !key_definitions.contains(required) {
+            violations.push(format!(
+                "missing structural pool identity fragment {required:?}"
+            ));
+        }
+    }
+    for required in ["letkey=", "PoolKey", "self.tls"] {
+        if !send_key_derivation.contains(required) {
+            violations.push(format!(
+                "production send key derivation must contain {required:?}"
+            ));
+        }
+    }
+    if send_key_derivation.contains("PoolKey::new(scheme,authority,None,TlsPoolKey::plain(),None)")
+    {
+        violations
+            .push("HTTPS-capable production derivation must not hardcode Plain/None".to_owned());
     }
     for forbidden in [
         "structTlsPoolKey(String);",
         "structIdentityKey(String);",
-        ".canonicalize(",
-        "std::fs::read(",
-        "std::fs::read_to_string(",
+        "canonicalize(",
+        "metadata(",
+        "fs::",
+        ".read(",
         "read_to_end(",
         "DefaultHasher",
         "std::hash::",
         "Sha256",
         "sha256",
-        ".hash(",
+        "hash(",
+        "digest(",
     ] {
-        assert!(
-            !key_definitions.contains(forbidden),
-            "pool identity must remain lexical and path-only, found {forbidden:?}",
-        );
+        if key_definitions.contains(forbidden) || send_key_derivation.contains(forbidden) {
+            violations.push(format!(
+                "pool key derivation must remain lexical and path-only, found {forbidden:?}"
+            ));
+        }
     }
+    assert!(
+        violations.is_empty(),
+        "production TLS pool-key contract violations:\n{}",
+        violations.join("\n"),
+    );
 }
 
 #[test]

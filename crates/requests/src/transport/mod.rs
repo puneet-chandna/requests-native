@@ -30,6 +30,8 @@ pub(crate) const DEFAULT_MAX_IDLE_PER_HOST: usize = 10;
 
 pub(crate) struct Transport {
     pool: Arc<Mutex<Pool>>,
+    #[cfg(test)]
+    derived_pool_keys: Mutex<Vec<PoolKey>>,
     connector: Arc<dyn Connector>,
     proxy: Option<Proxy>,
     #[allow(dead_code)]
@@ -367,6 +369,8 @@ impl Transport {
     ) -> Self {
         Self {
             pool: Arc::new(Mutex::new(Pool::new(pool_max_idle_per_host))),
+            #[cfg(test)]
+            derived_pool_keys: Mutex::new(Vec::new()),
             connector,
             proxy,
             tls,
@@ -384,6 +388,16 @@ impl Transport {
                 .clear()
         };
         drop(evicted);
+    }
+
+    #[cfg(test)]
+    fn drain_derived_pool_keys(&self) -> Vec<PoolKey> {
+        std::mem::take(
+            &mut *self
+                .derived_pool_keys
+                .lock()
+                .expect("derived pool-key observation lock poisoned"),
+        )
     }
 
     pub async fn send(&self, request: Request) -> Result<TransportResponse> {
@@ -411,6 +425,11 @@ impl Transport {
             .clone();
         let target = authority.as_str().to_owned();
         let key = PoolKey::new(scheme, authority, None, TlsPoolKey::plain(), None);
+        #[cfg(test)]
+        self.derived_pool_keys
+            .lock()
+            .expect("derived pool-key observation lock poisoned")
+            .push(key.clone());
         let mut request = request.into_parts();
         if !request.headers.contains_key(ACCEPT_ENCODING) {
             request.headers.insert(
