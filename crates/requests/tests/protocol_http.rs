@@ -4,6 +4,8 @@ use std::io::{Read, Write};
 use std::marker::PhantomPinned;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::pin::Pin;
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -2724,11 +2726,15 @@ fn assert_pool_requests(
 #[test]
 fn pool_clean_eof_reuses_one_connection_for_two_requests() {
     let runtime = runtime();
+    assert_pool_clean_eof_reuse(&runtime);
+}
+
+fn assert_pool_clean_eof_reuse(runtime: &tokio::runtime::Runtime) {
     let server = PoolServer::spawn(PoolScript::KeepAlive, 2, 0);
     let client = Client::new().expect("build pooled client");
 
-    let (_, _, first) = complete_exchange(&runtime, client.get(server.url("/pool/first")));
-    let (_, _, second) = complete_exchange(&runtime, client.get(server.url("/pool/second")));
+    let (_, _, first) = complete_exchange(runtime, client.get(server.url("/pool/first")));
+    let (_, _, second) = complete_exchange(runtime, client.get(server.url("/pool/second")));
     assert_eq!(first, Bytes::from_static(b"ok"));
     assert_eq!(second, Bytes::from_static(b"ok"));
 
@@ -2784,10 +2790,14 @@ fn pool_response_drop_before_body_uses_a_second_connection() {
 #[test]
 fn pool_last_client_drop_closes_its_idle_connection() {
     let runtime = runtime();
+    assert_pool_last_client_drop(&runtime);
+}
+
+fn assert_pool_last_client_drop(runtime: &tokio::runtime::Runtime) {
     let server = PoolServer::spawn(PoolScript::KeepAlive, 1, 1);
     let client = Client::new().expect("build pooled client");
 
-    let (_, _, body) = complete_exchange(&runtime, client.get(server.url("/pool/last-client")));
+    let (_, _, body) = complete_exchange(runtime, client.get(server.url("/pool/last-client")));
     assert_eq!(body, Bytes::from_static(b"ok"));
     drop(client);
 
@@ -2800,10 +2810,14 @@ fn pool_last_client_drop_closes_its_idle_connection() {
 #[test]
 fn pool_partial_body_drop_forces_a_second_connection() {
     let runtime = runtime();
+    assert_pool_partial_body_drop(&runtime);
+}
+
+fn assert_pool_partial_body_drop(runtime: &tokio::runtime::Runtime) {
     let server = PoolServer::spawn(PoolScript::HoldFirstBody, 2, 1);
     let client = Client::new().expect("build pooled client");
 
-    let response = send_response(&runtime, client.get(server.url("/pool/drop")));
+    let response = send_response(runtime, client.get(server.url("/pool/drop")));
     let mut body = response.into_body();
     let partial = runtime
         .block_on(async {
@@ -2815,7 +2829,7 @@ fn pool_partial_body_drop_forces_a_second_connection() {
     assert_eq!(partial, Bytes::from_static(b"partial"));
     drop(body);
 
-    let (_, _, second) = complete_exchange(&runtime, client.get(server.url("/pool/after-drop")));
+    let (_, _, second) = complete_exchange(runtime, client.get(server.url("/pool/after-drop")));
     assert_eq!(second, Bytes::from_static(b"ok"));
 
     let observation = server.finish().expect("pool fixture completed");
@@ -2827,10 +2841,14 @@ fn pool_partial_body_drop_forces_a_second_connection() {
 #[test]
 fn pool_partial_body_close_forces_a_second_connection() {
     let runtime = runtime();
+    assert_pool_partial_body_close(&runtime);
+}
+
+fn assert_pool_partial_body_close(runtime: &tokio::runtime::Runtime) {
     let server = PoolServer::spawn(PoolScript::HoldFirstBody, 2, 1);
     let client = Client::new().expect("build pooled client");
 
-    let response = send_response(&runtime, client.get(server.url("/pool/close")));
+    let response = send_response(runtime, client.get(server.url("/pool/close")));
     let mut body = response.into_body();
     let partial = runtime
         .block_on(async {
@@ -2845,7 +2863,7 @@ fn pool_partial_body_close_forces_a_second_connection() {
         .expect("timed out closing partial pooled response")
         .expect("close partial pooled response");
 
-    let (_, _, second) = complete_exchange(&runtime, client.get(server.url("/pool/after-close")));
+    let (_, _, second) = complete_exchange(runtime, client.get(server.url("/pool/after-close")));
     assert_eq!(second, Bytes::from_static(b"ok"));
 
     let observation = server.finish().expect("pool fixture completed");
@@ -2857,10 +2875,14 @@ fn pool_partial_body_close_forces_a_second_connection() {
 #[test]
 fn pool_malformed_body_error_forces_a_second_connection() {
     let runtime = runtime();
+    assert_pool_malformed_body_error(&runtime);
+}
+
+fn assert_pool_malformed_body_error(runtime: &tokio::runtime::Runtime) {
     let server = PoolServer::spawn(PoolScript::MalformedFirstBody, 2, 1);
     let client = Client::new().expect("build pooled client");
 
-    let response = send_response(&runtime, client.get(server.url("/pool/malformed")));
+    let response = send_response(runtime, client.get(server.url("/pool/malformed")));
     let mut body = response.into_body();
     let error = runtime
         .block_on(async {
@@ -2873,7 +2895,7 @@ fn pool_malformed_body_error_forces_a_second_connection() {
     drop(body);
 
     let (_, _, second) =
-        complete_exchange(&runtime, client.get(server.url("/pool/after-malformed")));
+        complete_exchange(runtime, client.get(server.url("/pool/after-malformed")));
     assert_eq!(second, Bytes::from_static(b"ok"));
 
     let observation = server.finish().expect("pool fixture completed");
@@ -3701,26 +3723,30 @@ fn configured_proxy_fails_closed_after_the_client_is_dropped() {
 #[test]
 fn top_level_helpers_use_wire_methods_and_fresh_clients_without_a_shared_pool() {
     let runtime = runtime();
+    assert_top_level_helpers_use_fresh_clients(&runtime);
+}
+
+fn assert_top_level_helpers_use_fresh_clients(runtime: &tokio::runtime::Runtime) {
     let server = PoolServer::spawn(PoolScript::KeepAlive, 6, 0);
 
     assert_eq!(
-        complete_top_level_exchange(&runtime, requests::get(server.url("/top-level/get"))),
+        complete_top_level_exchange(runtime, requests::get(server.url("/top-level/get"))),
         Bytes::from_static(b"ok")
     );
     assert!(
-        complete_top_level_exchange(&runtime, requests::head(server.url("/top-level/head")))
+        complete_top_level_exchange(runtime, requests::head(server.url("/top-level/head")))
             .is_empty()
     );
     assert_eq!(
         complete_top_level_exchange(
-            &runtime,
+            runtime,
             requests::post(server.url("/top-level/post"), Vec::from(&b"post"[..])),
         ),
         Bytes::from_static(b"ok")
     );
     assert_eq!(
         complete_top_level_exchange(
-            &runtime,
+            runtime,
             requests::put(
                 server.url("/top-level/put"),
                 BodySource::Bytes(Bytes::from_static(b"put")),
@@ -3730,13 +3756,13 @@ fn top_level_helpers_use_wire_methods_and_fresh_clients_without_a_shared_pool() 
     );
     assert_eq!(
         complete_top_level_exchange(
-            &runtime,
+            runtime,
             requests::patch(server.url("/top-level/patch"), Bytes::from_static(b"patch"),),
         ),
         Bytes::from_static(b"ok")
     );
     assert_eq!(
-        complete_top_level_exchange(&runtime, requests::delete(server.url("/top-level/delete")),),
+        complete_top_level_exchange(runtime, requests::delete(server.url("/top-level/delete")),),
         Bytes::from_static(b"ok")
     );
 
@@ -4185,5 +4211,317 @@ fn blocking_execute_client_and_top_level_helpers_preserve_wire_contracts() {
         let request = CapturedRequest::parse_bytes(&observed.request_bytes);
         assert_eq!(request.request_line, request_line);
         assert_eq!(request.body, body);
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+const RESOURCE_CHILD_ENV: &str = "REQUESTS_STEP14_PROTOCOL_RESOURCE_CHILD";
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+const RESOURCE_CHILD_TOKEN: &str = "cf20011-step14-resource-child";
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+const RESOURCE_SENTINEL_ENV: &str = "REQUESTS_STEP14_PROTOCOL_RESOURCE_SENTINEL";
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+const RESOURCE_SUCCESS_SENTINEL: &str = "requests-step14-resource-child-complete";
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+const RESOURCE_TEST_NAME: &str = "protocol_lifecycle_resources_remain_bounded";
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+const RESOURCE_CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+const RESOURCE_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+const RESOURCE_STABLE_SAMPLES: usize = 3;
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+#[derive(Clone, Debug)]
+struct ResourceSnapshot {
+    total_fds: usize,
+    socket_fds: usize,
+    targets: Vec<String>,
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+impl ResourceSnapshot {
+    fn has_same_counts(&self, expected: &Self) -> bool {
+        debug_assert_eq!(self.total_fds + 1, self.targets.len());
+        debug_assert_eq!(expected.total_fds + 1, expected.targets.len());
+        self.total_fds == expected.total_fds && self.socket_fds == expected.socket_fds
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+fn read_resource_snapshot_once() -> std::io::Result<ResourceSnapshot> {
+    let mut targets = Vec::new();
+    let mut total_fds = 0;
+    let mut socket_fds = 0;
+    let sampler_target = format!("/proc/{}/fd", std::process::id());
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let target = std::fs::read_link(entry.path())?;
+        let target = target.to_string_lossy();
+        let is_sampler = target == sampler_target || target == "/proc/self/fd";
+        if !is_sampler {
+            total_fds += 1;
+            if target.starts_with("socket:[") {
+                socket_fds += 1;
+            }
+        }
+        targets.push(format!(
+            "{} -> {}{}",
+            entry.file_name().to_string_lossy(),
+            target,
+            if is_sampler { " (sampler)" } else { "" }
+        ));
+    }
+    targets.sort();
+    Ok(ResourceSnapshot {
+        total_fds,
+        socket_fds,
+        targets,
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+fn wait_for_stable_resources(label: &str) -> ResourceSnapshot {
+    wait_for_resource_counts(label, None, || {})
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+fn wait_for_exact_resources(label: &str, expected: &ResourceSnapshot) -> ResourceSnapshot {
+    wait_for_resource_counts(label, Some(expected), || {})
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+fn wait_for_exact_resources_on_runtime(
+    label: &str,
+    expected: &ResourceSnapshot,
+    runtime: &tokio::runtime::Runtime,
+) -> ResourceSnapshot {
+    wait_for_resource_counts(label, Some(expected), || {
+        runtime.block_on(tokio::task::yield_now());
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+fn wait_for_resource_counts<P>(
+    label: &str,
+    expected: Option<&ResourceSnapshot>,
+    mut progress: P,
+) -> ResourceSnapshot
+where
+    P: FnMut(),
+{
+    let deadline = Instant::now() + RESOURCE_SETTLE_TIMEOUT;
+    let mut stable_samples = 0;
+    let mut last_snapshot: Option<ResourceSnapshot> = None;
+    let mut last_error: Option<std::io::Error>;
+    loop {
+        progress();
+        match read_resource_snapshot_once() {
+            Ok(snapshot) => {
+                let matches_expected =
+                    expected.is_none_or(|expected| snapshot.has_same_counts(expected));
+                let matches_previous = last_snapshot
+                    .as_ref()
+                    .is_some_and(|previous| snapshot.has_same_counts(previous));
+                stable_samples = if matches_expected {
+                    if matches_previous {
+                        stable_samples + 1
+                    } else {
+                        1
+                    }
+                } else {
+                    0
+                };
+                last_snapshot = Some(snapshot);
+                last_error = None;
+                if stable_samples >= RESOURCE_STABLE_SAMPLES {
+                    let snapshot =
+                        last_snapshot.expect("stable resource count lost its final sample");
+                    eprintln!("{label}: {snapshot:?}");
+                    return snapshot;
+                }
+            }
+            Err(error) => {
+                stable_samples = 0;
+                last_error = Some(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            let expected = expected
+                .map(|snapshot| format!("{snapshot:#?}"))
+                .unwrap_or_else(|| "<any stable count>".to_owned());
+            let observed = last_snapshot
+                .map(|snapshot| format!("{snapshot:#?}"))
+                .unwrap_or_else(|| "<no successful sample>".to_owned());
+            panic!(
+                "{label} did not produce {RESOURCE_STABLE_SAMPLES} consecutive exact samples\n\
+                 expected: {expected}\nobserved: {observed}\nlast read error: {last_error:?}"
+            );
+        }
+        thread::sleep(RESOURCE_POLL_INTERVAL);
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+fn warm_async_exchange(caller_runtime: &tokio::runtime::Runtime) {
+    let server = ScriptedServer::spawn_close_after_response(CONNECTION_CLOSE_RESPONSE);
+    let client = Client::new().expect("build async resource warm-up client");
+    let (_, _, body) = complete_exchange(caller_runtime, client.get(server.url()));
+    assert_eq!(body, Bytes::from_static(b"ok"));
+    drop(client);
+    server
+        .finish()
+        .expect("async resource warm-up fixture completed");
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+fn run_resource_wave(caller_runtime: &tokio::runtime::Runtime) {
+    assert_pool_clean_eof_reuse(caller_runtime);
+    assert_pool_last_client_drop(caller_runtime);
+    assert_pool_partial_body_drop(caller_runtime);
+    assert_pool_partial_body_close(caller_runtime);
+    assert_pool_malformed_body_error(caller_runtime);
+    assert_top_level_helpers_use_fresh_clients(caller_runtime);
+
+    blocking_full_body_read_reuses_one_connection();
+    blocking_partial_body_drop_forces_a_second_connection();
+    blocking_partial_body_close_forces_a_second_connection();
+    blocking_execute_client_and_top_level_helpers_preserve_wire_contracts();
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+fn run_resource_child() {
+    let pre_driver = wait_for_stable_resources("pre-driver");
+    let driver = blocking::BlockingRuntimeDriver::process_local()
+        .expect("initialize process-local blocking driver");
+    driver
+        .submit(async {})
+        .expect("submit no-I/O blocking driver warm-up")
+        .wait()
+        .expect("wait for no-I/O blocking driver warm-up");
+    drop(driver);
+    let driver_baseline = wait_for_stable_resources("driver-only-baseline");
+    eprintln!(
+        "intentional process-runtime delta: total_fds={:+}, socket_fds={:+}",
+        driver_baseline.total_fds as isize - pre_driver.total_fds as isize,
+        driver_baseline.socket_fds as isize - pre_driver.socket_fds as isize
+    );
+
+    // A real blocking exchange may initialize I/O state but must not retain its sockets.
+    blocking_full_body_read_reuses_one_connection();
+    wait_for_exact_resources("after-blocking-warm-up", &driver_baseline);
+
+    let caller_runtime = runtime();
+    let combined_baseline = wait_for_stable_resources("combined-baseline");
+    warm_async_exchange(&caller_runtime);
+    wait_for_exact_resources_on_runtime("after-async-warm-up", &combined_baseline, &caller_runtime);
+
+    run_resource_wave(&caller_runtime);
+    let wave_one =
+        wait_for_exact_resources_on_runtime("wave-1", &combined_baseline, &caller_runtime);
+
+    run_resource_wave(&caller_runtime);
+    let wave_two =
+        wait_for_exact_resources_on_runtime("wave-2", &combined_baseline, &caller_runtime);
+    assert!(
+        wave_two.has_same_counts(&wave_one),
+        "wave 2 differs from wave 1\nwave 1: {wave_one:#?}\nwave 2: {wave_two:#?}"
+    );
+
+    drop(caller_runtime);
+    wait_for_exact_resources("after-caller-runtime", &driver_baseline);
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+fn run_resource_test_in_child() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock precedes Unix epoch")
+        .as_nanos();
+    let sentinel_path = std::env::temp_dir().join(format!(
+        "requests-step14-resource-{}-{nonce}.sentinel",
+        std::process::id()
+    ));
+    let mut child = Command::new(std::env::current_exe().expect("resolve current test binary"))
+        .arg(RESOURCE_TEST_NAME)
+        .arg("--exact")
+        .arg("--test-threads=1")
+        .arg("--nocapture")
+        .env(RESOURCE_CHILD_ENV, RESOURCE_CHILD_TOKEN)
+        .env(RESOURCE_SENTINEL_ENV, &sentinel_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn isolated protocol resource test");
+    let deadline = Instant::now() + RESOURCE_CHILD_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(RESOURCE_POLL_INTERVAL),
+            Ok(None) => {
+                let _ = child.kill();
+                let status = child
+                    .wait()
+                    .expect("wait for killed isolated resource test");
+                let _ = std::fs::remove_file(&sentinel_path);
+                panic!(
+                    "isolated resource test exceeded {RESOURCE_CHILD_TIMEOUT:?}; \
+                     killed child exited with {status}"
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let status = child
+                    .wait()
+                    .expect("wait after isolated resource-test poll failure");
+                let _ = std::fs::remove_file(&sentinel_path);
+                panic!(
+                    "failed to poll isolated resource test: {error}; \
+                     killed child exited with {status}"
+                );
+            }
+        }
+    };
+    let sentinel = std::fs::read_to_string(&sentinel_path);
+    let _ = std::fs::remove_file(&sentinel_path);
+    assert!(
+        status.success(),
+        "isolated resource test failed with {status}; child diagnostics were inherited"
+    );
+    assert_eq!(
+        sentinel.expect("isolated resource test did not write its success sentinel"),
+        RESOURCE_SUCCESS_SENTINEL,
+        "isolated resource test wrote an invalid success sentinel"
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+fn resource_child_mode_selected() -> bool {
+    let expected_arguments = [
+        std::ffi::OsString::from(RESOURCE_TEST_NAME),
+        std::ffi::OsString::from("--exact"),
+        std::ffi::OsString::from("--test-threads=1"),
+        std::ffi::OsString::from("--nocapture"),
+    ];
+    std::env::var_os(RESOURCE_CHILD_ENV).as_deref()
+        == Some(std::ffi::OsStr::new(RESOURCE_CHILD_TOKEN))
+        && std::env::var_os(RESOURCE_SENTINEL_ENV).is_some()
+        && std::env::args_os().skip(1).eq(expected_arguments)
+}
+
+#[cfg(all(target_os = "linux", feature = "blocking"))]
+#[test]
+fn protocol_lifecycle_resources_remain_bounded() {
+    if resource_child_mode_selected() {
+        run_resource_child();
+        let sentinel_path =
+            std::env::var_os(RESOURCE_SENTINEL_ENV).expect("resource sentinel path disappeared");
+        std::fs::write(sentinel_path, RESOURCE_SUCCESS_SENTINEL)
+            .expect("write resource child success sentinel");
+        eprintln!("{RESOURCE_SUCCESS_SENTINEL}");
+    } else {
+        run_resource_test_in_child();
     }
 }
