@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_core::Stream;
-use requests::{Client, ContentCodecs, ErrorKind, HeaderName, HeaderValue, Response, ResponseBody};
+use requests::{
+    Client, ContentCodecs, ErrorKind, HeaderName, HeaderValue, Response, ResponseBody, Timeout,
+};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const ASYNC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1008,6 +1010,131 @@ fn write_http_chunk(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), String> 
     stream
         .flush()
         .map_err(|error| format!("flush HTTP chunk: {error}"))
+}
+
+struct CadencedGzipServer {
+    address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl CadencedGzipServer {
+    fn spawn(wire: Vec<u8>) -> Self {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind cadenced gzip fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("make cadenced gzip listener nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("read cadenced fixture address");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            let mut stream = accept_gated(&listener, &worker_shutdown)?;
+            read_gated_request(&mut stream, &worker_shutdown)?;
+            stream
+                .set_nonblocking(false)
+                .map_err(|error| format!("make cadenced connection blocking: {error}"))?;
+            stream
+                .set_write_timeout(Some(IO_TIMEOUT))
+                .map_err(|error| format!("set cadenced write timeout: {error}"))?;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\
+                      Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .map_err(|error| format!("write cadenced response head: {error}"))?;
+
+            write_http_chunk(&mut stream, &wire[..12])?;
+            for extra in wire[12..108].chunks_exact(8) {
+                sleep_cadence(&worker_shutdown)?;
+                write_http_chunk(&mut stream, extra)?;
+            }
+            sleep_cadence(&worker_shutdown)?;
+            write_http_chunk(&mut stream, &wire[108..])?;
+            stream
+                .write_all(b"0\r\n\r\n")
+                .map_err(|error| format!("finish cadenced response: {error}"))?;
+            stream
+                .flush()
+                .map_err(|error| format!("flush cadenced response: {error}"))
+        });
+        Self {
+            address,
+            shutdown,
+            worker: Some(worker),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/cadenced-gzip", self.address)
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.worker
+            .take()
+            .expect("cadenced gzip worker exists")
+            .join()
+            .map_err(|_| "cadenced gzip worker panicked".to_owned())?
+    }
+}
+
+impl Drop for CadencedGzipServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn sleep_cadence(shutdown: &AtomicBool) -> Result<(), String> {
+    for _ in 0..20 {
+        if shutdown.load(Ordering::Acquire) {
+            return Err("cadenced gzip fixture shut down".to_owned());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+#[test]
+fn decoded_read_timeout_resets_on_compressed_wire_progress() {
+    let base = hex_bytes(GZIP);
+    let mut wire = base[..10].to_vec();
+    wire[3] = 0x04;
+    wire.extend_from_slice(&96_u16.to_le_bytes());
+    wire.extend_from_slice(&[0_u8; 96]);
+    wire.extend_from_slice(&base[10..]);
+
+    let runtime = runtime();
+    let client = Client::new().expect("build cadenced gzip client");
+    let server = CadencedGzipServer::spawn(wire);
+    let response = runtime
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client
+                    .get(server.url())
+                    .timeout(Timeout {
+                        connect: None,
+                        read: Some(Duration::from_millis(400)),
+                        total: None,
+                    })
+                    .send(),
+            )
+            .await
+        })
+        .expect("cadenced gzip response head timed out")
+        .expect("cadenced gzip response head failed");
+    let decoded = runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(5), response.bytes()).await })
+        .expect("cadenced gzip body exceeded the outer timeout")
+        .expect("compressed wire progress must reset the read timeout");
+
+    assert_eq!(decoded, PAYLOAD);
+    server.finish().expect("cadenced gzip fixture completed");
 }
 
 #[test]
