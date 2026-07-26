@@ -675,6 +675,11 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
     );
     let production_default = compact.find("#[cfg(not(test))]letnative_root_loader=None;");
     let blocking_load = compact.find("spawn_blocking(move||{");
+    let blocking_end = blocking_load.and_then(|start| {
+        compact[start..]
+            .find("}).await")
+            .map(|end| start + end + "}).await".len())
+    });
     let blocking_body = compact
         .split_once("spawn_blocking(move||{")
         .and_then(|(_, after)| after.split_once("}).await").map(|(body, _)| body));
@@ -684,19 +689,25 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
             && body.matches("native_root_loader").count() == 1
             && !body.contains("letnative_root_loader=")
     });
+    let exact_loader_flow = matches!(
+        (test_override, blocking_end),
+        (Some(start), Some(end))
+            if compact[start..end].matches("native_root_loader").count() == 4
+    );
     if !matches!(
         (test_override, production_default, blocking_load),
         (Some(test), Some(default), Some(blocking))
             if test < default && default < blocking
     ) || !exact_load
+        || !exact_loader_flow
         || compact.matches("tls::load(").count() != 1
         || compact.matches("letnative_root_loader=").count() != 2
         || compact.matches(".native_root_loader()").count() != 1
     {
         violations.push(
             "cfg(test) must select native_root_loader from EstablishmentControl, cfg(not(test)) \
-             must select None, and the exact tls::load argument must be the only occurrence of \
-             that variable inside the awaited spawn_blocking closure",
+             must select None, and the bounded post-selection flow must contain only those two \
+             bindings, the control getter, and the sole exact tls::load argument",
         );
     }
     for required in [
