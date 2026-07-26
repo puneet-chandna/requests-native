@@ -45,6 +45,10 @@ const SECOND_RAW_DEFLATE: &str = "2b4e4dcecf4bd1cd4dcd4d4a2d520400";
 
 const CORRUPT_GZIP: &str = "1f8b08000000000002ff4bcc29c848d44d4a2d49d44d4fcccd4dd44d49cd2949ac49a48630032313330b2b1b3b072717370f2f1fbf80a090b088a898b884a494b48cac9c3c00f1b1f4157c000000";
 const CORRUPT_ZLIB: &str = "789c4bcc29c848d44d4a2d49d44d4fcccd4dd44d49cd2949ac49a48630032313330b2b1b3b072717370f2f1fbf80a090b088a898b884a494b48cac9c3c00baaa2446";
+const CORRUPT_RAW_DEFLATE: &str = "4bcc29c848d44d4a2d49d44d4fcccd4dd44d49cd2949ac495b8630032313330b2b1b3b072717370f2f1fbf80a090b088a898b884a494b48cac9c3c00";
+const CORRUPT_BROTLI: &str =
+    "1b7a00e80572714853f8ae5dd22c2c0d19e4aa541a32e9e7b8ca878604b5f77842830f484801";
+const CORRUPT_ZSTANDARD: &str = "28b52ffd6403076d08003410000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff656e64010000fd0efc6b0a8ee43ec4";
 
 #[derive(Clone, Copy)]
 struct CodecCase {
@@ -1099,6 +1103,7 @@ struct RecoveryObservation {
 
 struct CorruptRecoveryServer {
     address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<RecoveryObservation, String>>>,
 }
 
@@ -1106,41 +1111,31 @@ impl CorruptRecoveryServer {
     fn spawn(encoding: &'static str, corrupt: Vec<u8>) -> Self {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .expect("bind corrupt response fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("make corrupt listener nonblocking");
         let address = listener.local_addr().expect("read corrupt fixture address");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
         let worker = thread::spawn(move || {
-            let (mut first, _) = listener
-                .accept()
-                .map_err(|error| format!("accept corrupt connection: {error}"))?;
-            read_request(&mut first)?;
+            let mut first = accept_gated(&listener, &worker_shutdown)?;
+            read_gated_request(&mut first, &worker_shutdown)?;
+            first
+                .set_nonblocking(false)
+                .map_err(|error| format!("make corrupt connection blocking: {error}"))?;
             write_fixed_response(&mut first, encoding, &corrupt, "keep-alive")?;
 
-            let mut probe = [0_u8; 4096];
-            let read = first
-                .read(&mut probe)
-                .map_err(|error| format!("observe corrupt connection disposition: {error}"))?;
-            if read == 0 {
-                let (mut second, _) = listener
-                    .accept()
-                    .map_err(|error| format!("accept recovery connection: {error}"))?;
-                read_request(&mut second)?;
-                second
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
-                          Connection: close\r\n\r\nok",
-                    )
-                    .map_err(|error| format!("write recovery response: {error}"))?;
+            if observe_corrupt_connection(&mut first, &worker_shutdown)? {
+                let mut second = accept_gated(&listener, &worker_shutdown)?;
+                read_gated_request(&mut second, &worker_shutdown)?;
+                write_recovery_response(&mut second)?;
                 return Ok(RecoveryObservation {
                     accepted_connections: 2,
                     corrupt_connection_closed: true,
                 });
             }
 
-            first
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
-                      Connection: close\r\n\r\nok",
-                )
-                .map_err(|error| format!("write wrongly reused recovery response: {error}"))?;
+            write_recovery_response(&mut first)?;
             Ok(RecoveryObservation {
                 accepted_connections: 1,
                 corrupt_connection_closed: false,
@@ -1148,6 +1143,7 @@ impl CorruptRecoveryServer {
         });
         Self {
             address,
+            shutdown,
             worker: Some(worker),
         }
     }
@@ -1167,68 +1163,289 @@ impl CorruptRecoveryServer {
 
 impl Drop for CorruptRecoveryServer {
     fn drop(&mut self) {
-        // A failed assertion must not make fixture cleanup wait on peer EOF.
-        drop(self.worker.take());
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
+}
+
+fn observe_corrupt_connection(
+    stream: &mut TcpStream,
+    shutdown: &AtomicBool,
+) -> Result<bool, String> {
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| format!("make corrupt connection nonblocking: {error}"))?;
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Err("corrupt fixture shut down".to_owned());
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(read) => {
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return Ok(false);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => {
+                return Err(format!("observe corrupt connection disposition: {error}"));
+            }
+        }
+    }
+}
+
+fn write_recovery_response(stream: &mut TcpStream) -> Result<(), String> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("make recovery connection blocking: {error}"))?;
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|error| format!("set recovery write timeout: {error}"))?;
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
+              Connection: close\r\n\r\nok",
+        )
+        .map_err(|error| format!("write recovery response: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("flush recovery response: {error}"))
 }
 
 fn assert_content_decoding(error: &requests::Error) {
     assert_eq!(error.kind(), ErrorKind::ContentDecoding);
 }
 
-#[test]
-fn corrupt_raw_gzip_errors_once_during_decoded_streaming_and_dirties_the_lease() {
+#[derive(Clone, Copy)]
+enum FailureProjection {
+    Streaming,
+    Aggregate,
+}
+
+#[derive(Clone, Copy)]
+struct FailureCase {
+    name: &'static str,
+    encoding: &'static str,
+    wire: &'static str,
+}
+
+fn assert_corrupt_recovery(case: FailureCase, projection: FailureProjection) {
     let runtime = runtime();
     let client = Client::new().expect("build pooled client");
-    let server = CorruptRecoveryServer::spawn("gzip", hex_bytes(CORRUPT_GZIP));
-    let response = send_response(&runtime, &client, &server.url("/corrupt/stream"));
-    let mut decoded_body = response.into_body();
-    let error = loop {
-        match runtime
-            .block_on(async {
-                tokio::time::timeout(ASYNC_TIMEOUT, next_frame(&mut decoded_body)).await
-            })
-            .expect("corrupt stream poll timed out")
-        {
-            Some(Ok(_)) => {}
-            Some(Err(error)) => break error,
-            None => panic!("corrupt gzip reached clean decoded EOF"),
+    let server = CorruptRecoveryServer::spawn(case.encoding, hex_bytes(case.wire));
+    let response = send_response(
+        &runtime,
+        &client,
+        &server.url(&format!("/corrupt/{}/first", case.name)),
+    );
+
+    match projection {
+        FailureProjection::Streaming => {
+            let mut decoded_body = response.into_body();
+            let mut decoded_before_error = 0;
+            let error = loop {
+                match runtime
+                    .block_on(async {
+                        tokio::time::timeout(ASYNC_TIMEOUT, next_frame(&mut decoded_body)).await
+                    })
+                    .expect("corrupt stream poll timed out")
+                {
+                    Some(Ok(frame)) => decoded_before_error += frame.len(),
+                    Some(Err(error)) => break error,
+                    None => panic!("corrupt {} reached clean decoded EOF", case.name),
+                }
+            };
+            assert!(
+                decoded_before_error > 0,
+                "corrupt {} must fail after decoded output",
+                case.name
+            );
+            assert_content_decoding(&error);
+            for _ in 0..2 {
+                assert!(
+                    runtime
+                        .block_on(async { next_frame(&mut decoded_body).await })
+                        .is_none(),
+                    "a decode error must terminate later {} body polls",
+                    case.name
+                );
+            }
+            drop(decoded_body);
+        }
+        FailureProjection::Aggregate => {
+            let error = response_bytes(&runtime, response)
+                .expect_err("corrupt aggregate response must fail");
+            assert_content_decoding(&error);
+        }
+    }
+
+    let recovery = send_response(
+        &runtime,
+        &client,
+        &server.url(&format!("/corrupt/{}/recovery", case.name)),
+    );
+    assert_eq!(
+        response_bytes(&runtime, recovery).expect("read recovery response"),
+        b"ok".as_slice()
+    );
+    let observation = server.finish().expect("corrupt fixture completed");
+    assert_eq!(observation.accepted_connections, 2);
+    assert!(observation.corrupt_connection_closed);
+}
+
+macro_rules! corrupt_codec_tests {
+    (
+        $streaming:ident,
+        $aggregate:ident,
+        $name:literal,
+        $encoding:literal,
+        $wire:expr
+    ) => {
+        #[test]
+        fn $streaming() {
+            assert_corrupt_recovery(
+                FailureCase {
+                    name: $name,
+                    encoding: $encoding,
+                    wire: $wire,
+                },
+                FailureProjection::Streaming,
+            );
+        }
+
+        #[test]
+        fn $aggregate() {
+            assert_corrupt_recovery(
+                FailureCase {
+                    name: $name,
+                    encoding: $encoding,
+                    wire: $wire,
+                },
+                FailureProjection::Aggregate,
+            );
         }
     };
-    assert_content_decoding(&error);
-    assert!(
-        runtime
-            .block_on(async { next_frame(&mut decoded_body).await })
-            .is_none(),
-        "a decode error must terminate later public body polls"
-    );
-    drop(decoded_body);
-
-    let recovery = send_response(&runtime, &client, &server.url("/corrupt/recovery"));
-    assert_eq!(
-        response_bytes(&runtime, recovery).expect("read recovery response"),
-        b"ok".as_slice()
-    );
-    let observation = server.finish().expect("corrupt fixture completed");
-    assert_eq!(observation.accepted_connections, 2);
-    assert!(observation.corrupt_connection_closed);
 }
 
-#[test]
-fn corrupt_raw_zlib_errors_from_decoded_bytes_and_forces_a_fresh_connection() {
+corrupt_codec_tests!(
+    content_failure_corrupt_gzip_stream_is_terminal_and_dirties_the_lease_once,
+    content_failure_corrupt_gzip_bytes_dirty_the_lease_once,
+    "gzip",
+    "gzip",
+    CORRUPT_GZIP
+);
+corrupt_codec_tests!(
+    content_failure_corrupt_zlib_stream_is_terminal_and_dirties_the_lease_once,
+    content_failure_corrupt_zlib_bytes_dirty_the_lease_once,
+    "zlib-deflate",
+    "deflate",
+    CORRUPT_ZLIB
+);
+corrupt_codec_tests!(
+    content_failure_corrupt_raw_deflate_stream_is_terminal_and_dirties_the_lease_once,
+    content_failure_corrupt_raw_deflate_bytes_dirty_the_lease_once,
+    "raw-deflate",
+    "deflate",
+    CORRUPT_RAW_DEFLATE
+);
+corrupt_codec_tests!(
+    content_failure_corrupt_brotli_stream_is_terminal_and_dirties_the_lease_once,
+    content_failure_corrupt_brotli_bytes_dirty_the_lease_once,
+    "brotli",
+    "br",
+    CORRUPT_BROTLI
+);
+corrupt_codec_tests!(
+    content_failure_corrupt_zstandard_stream_is_terminal_and_dirties_the_lease_once,
+    content_failure_corrupt_zstandard_bytes_dirty_the_lease_once,
+    "zstandard",
+    "zstd",
+    CORRUPT_ZSTANDARD
+);
+
+fn assert_accepted_truncation(
+    name: &str,
+    encoding: &'static str,
+    complete_wire: &str,
+    removed_suffix: usize,
+    expected: &[u8],
+) {
     let runtime = runtime();
-    let client = Client::new().expect("build pooled client");
-    let server = CorruptRecoveryServer::spawn("deflate", hex_bytes(CORRUPT_ZLIB));
-    let response = send_response(&runtime, &client, &server.url("/corrupt/bytes"));
-    let error = response_bytes(&runtime, response).expect_err("corrupt zlib bytes must fail");
-    assert_content_decoding(&error);
-
-    let recovery = send_response(&runtime, &client, &server.url("/corrupt/recovery"));
-    assert_eq!(
-        response_bytes(&runtime, recovery).expect("read recovery response"),
-        b"ok".as_slice()
+    let client = Client::new().expect("build client");
+    let mut wire = hex_bytes(complete_wire);
+    wire.truncate(
+        wire.len()
+            .checked_sub(removed_suffix)
+            .expect("truncation fixture keeps a wire prefix"),
     );
-    let observation = server.finish().expect("corrupt fixture completed");
-    assert_eq!(observation.accepted_connections, 2);
-    assert!(observation.corrupt_connection_closed);
+    let server = FixedServer::spawn(encoding, wire);
+    let response = send_response(
+        &runtime,
+        &client,
+        &server.url(&format!("/truncated/{name}")),
+    );
+    let result = response_bytes(&runtime, response);
+    server.finish().expect("truncation fixture completed");
+    assert_eq!(
+        result.expect("accepted truncation succeeds"),
+        expected,
+        "unexpected fixed {name} truncation outcome"
+    );
 }
+
+macro_rules! accepted_truncation_test {
+    ($test:ident, $name:literal, $encoding:literal, $wire:expr, $removed:expr, $expected:expr) => {
+        #[test]
+        fn $test() {
+            assert_accepted_truncation($name, $encoding, $wire, $removed, $expected);
+        }
+    };
+}
+
+accepted_truncation_test!(
+    content_failure_truncated_gzip_trailer_returns_the_complete_payload,
+    "gzip",
+    "gzip",
+    GZIP,
+    8,
+    PAYLOAD
+);
+accepted_truncation_test!(
+    content_failure_truncated_zlib_checksum_returns_the_complete_payload,
+    "zlib-deflate",
+    "deflate",
+    ZLIB_DEFLATE,
+    2,
+    PAYLOAD
+);
+accepted_truncation_test!(
+    content_failure_truncated_raw_deflate_returns_the_pinned_prefix,
+    "raw-deflate",
+    "deflate",
+    RAW_DEFLATE,
+    2,
+    &PAYLOAD[..123]
+);
+accepted_truncation_test!(
+    content_failure_truncated_brotli_returns_the_pinned_prefix,
+    "brotli",
+    "br",
+    BROTLI,
+    1,
+    &PAYLOAD[..116]
+);
+accepted_truncation_test!(
+    content_failure_truncated_zstandard_returns_empty,
+    "zstandard",
+    "zstd",
+    ZSTANDARD,
+    1,
+    b""
+);
