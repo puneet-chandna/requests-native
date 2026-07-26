@@ -18,6 +18,7 @@ pub enum ErrorKind {
     ReadTimeout,
     ResponseBody,
     Send,
+    Tls,
 }
 
 #[derive(Debug)]
@@ -119,7 +120,14 @@ impl Error {
         };
         Self::transport(
             ErrorKind::ConnectTimeout,
-            format!("TCP connect phase {source} after {timeout:?} for {target}"),
+            format!("connection establishment {source} after {timeout:?} for {target}"),
+        )
+    }
+
+    pub(crate) fn tls(error: impl fmt::Display) -> Self {
+        Self::transport(
+            ErrorKind::Tls,
+            format!("TLS configuration or handshake failed: {error}"),
         )
     }
 

@@ -7,6 +7,7 @@ mod pool;
 mod pool_tests;
 #[cfg(test)]
 mod timeout_tests;
+mod tls;
 
 use std::fmt;
 use std::future::Future;
@@ -22,9 +23,12 @@ use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, HOST};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinHandle;
 
-use self::pool::{ConnectionLease, IdleConnection, LeaseTerminal, Pool, PoolKey, TlsPoolKey};
+use self::pool::{
+    ConnectionLease, IdentityKey, IdleConnection, LeaseTerminal, Pool, PoolKey, TlsPoolKey,
+};
 use crate::models::RequestParts;
 use crate::{BodySource, ContentCodecs, Error, Proxy, Request, Result, Timeout, TlsConfig};
 
@@ -62,8 +66,6 @@ pub(super) enum EstablishmentStage {
     Http1,
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 pub(super) type NativeRootLoader =
     Arc<dyn Fn() -> rustls_native_certs::CertificateResult + Send + Sync>;
 
@@ -189,16 +191,28 @@ pub(crate) struct ConnectionDriver {
 }
 
 impl ConnectionDriver {
+    #[cfg(test)]
     fn spawn(
         task: impl Future<Output = Result<()>> + Send + 'static,
         shutdown: Option<std::net::TcpStream>,
     ) -> Self {
+        let mut driver = Self::with_shutdown(shutdown);
+        driver.start(task);
+        driver
+    }
+
+    fn with_shutdown(shutdown: Option<std::net::TcpStream>) -> Self {
         Self {
-            task: Some(tokio::spawn(task)),
+            task: None,
             shutdown,
             #[cfg(test)]
             shutdown_observer: None,
         }
+    }
+
+    fn start(&mut self, task: impl Future<Output = Result<()>> + Send + 'static) {
+        debug_assert!(self.task.is_none());
+        self.task = Some(tokio::spawn(task));
     }
 
     #[cfg(test)]
@@ -474,19 +488,34 @@ impl Transport {
             .host()
             .ok_or_else(|| Error::invalid_url(request.url()))?
             .to_owned();
-        let port = request.uri().port_u16().unwrap_or(80);
         let scheme = request
             .uri()
             .scheme()
             .cloned()
             .ok_or_else(|| Error::invalid_url(request.url()))?;
+        let port = request
+            .uri()
+            .port_u16()
+            .unwrap_or(if scheme == http::uri::Scheme::HTTPS {
+                443
+            } else {
+                80
+            });
         let authority = request
             .uri()
             .authority()
             .ok_or_else(|| Error::invalid_url(request.url()))?
             .clone();
         let target = authority.as_str().to_owned();
-        let key = PoolKey::new(scheme, authority, None, TlsPoolKey::plain(), None);
+        let (tls, identity) = if scheme == http::uri::Scheme::HTTPS {
+            (
+                TlsPoolKey::from_config(&self.tls),
+                self.tls.identity.as_ref().map(IdentityKey::from_identity),
+            )
+        } else {
+            (TlsPoolKey::plain(), None)
+        };
+        let key = PoolKey::new(scheme, authority, None, tls, identity);
         #[cfg(test)]
         self.derived_pool_keys
             .lock()
@@ -700,6 +729,36 @@ impl Transport {
                 .generation_number(&key)
         };
         let establishing = async {
+            let tls = self.tls.clone();
+            #[cfg(test)]
+            let establishment_control = self.establishment_control.as_ref().map(Arc::clone);
+            #[cfg(test)]
+            let native_root_loader = self
+                .establishment_control
+                .as_ref()
+                .and_then(|control| control.native_root_loader());
+            #[cfg(not(test))]
+            let native_root_loader = None;
+            let loaded_tls = if key.scheme == http::uri::Scheme::HTTPS {
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        #[cfg(test)]
+                        if let Some(control) = &establishment_control {
+                            control.blocking_load_started();
+                        }
+                        let result = tls::load(&tls, native_root_loader);
+                        #[cfg(test)]
+                        if let Some(control) = &establishment_control {
+                            control.blocking_load_finished(result.is_ok());
+                        }
+                        result
+                    })
+                    .await
+                    .map_err(Error::tls)??,
+                )
+            } else {
+                None
+            };
             #[cfg(test)]
             self.establishment_checkpoint(EstablishmentStage::Connect)
                 .await;
@@ -712,24 +771,28 @@ impl Transport {
                 .map_err(|error| Error::connect(target, error))?;
             let stream = tokio::net::TcpStream::from_std(stream)
                 .map_err(|error| Error::connect(target, error))?;
-            #[cfg(test)]
-            self.establishment_checkpoint(EstablishmentStage::Http1)
-                .await;
-            let (sender, connection) = http1::handshake(TokioIo::new(stream))
-                .await
-                .map_err(Error::handshake)?;
-            let driver = ConnectionDriver::spawn(
-                async move { connection.await.map_err(Error::connection) },
-                Some(shutdown),
-            );
+            let driver = ConnectionDriver::with_shutdown(Some(shutdown));
             #[cfg(test)]
             let driver =
                 driver.with_shutdown_observer(self.establishment_control.as_ref().map(Arc::clone));
-            Ok(ConnectionLease::new(
-                key,
-                generation,
-                IdleConnection::network(sender, driver),
-            ))
+            let connection = match loaded_tls {
+                Some(loaded_tls) => {
+                    #[cfg(test)]
+                    self.establishment_checkpoint(EstablishmentStage::Tls).await;
+                    let stream = tls::handshake(loaded_tls, host, stream).await?;
+                    #[cfg(test)]
+                    self.establishment_checkpoint(EstablishmentStage::Http1)
+                        .await;
+                    start_http1(stream, driver).await?
+                }
+                None => {
+                    #[cfg(test)]
+                    self.establishment_checkpoint(EstablishmentStage::Http1)
+                        .await;
+                    start_http1(stream, driver).await?
+                }
+            };
+            Ok(ConnectionLease::new(key, generation, connection))
         };
         tokio::pin!(establishing);
         match select_deadline_source(deadlines.connect_deadline, deadlines.total_deadline) {
@@ -769,8 +832,19 @@ impl Transport {
     }
 }
 
+async fn start_http1<IO>(stream: IO, mut driver: ConnectionDriver) -> Result<IdleConnection>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (sender, connection) = http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(Error::handshake)?;
+    driver.start(async move { connection.await.map_err(Error::connection) });
+    Ok(IdleConnection::network(sender, driver))
+}
+
 fn validate_request(request: &Request) -> Result<()> {
-    if request.uri().scheme_str() != Some("http") {
+    if !matches!(request.uri().scheme_str(), Some("http" | "https")) {
         return Err(Error::unsupported_scheme(
             request.url(),
             request.uri().scheme_str(),

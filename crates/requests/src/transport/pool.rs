@@ -2,6 +2,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::fmt;
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::{
     Arc,
@@ -12,6 +13,7 @@ use http::uri::{Authority, Scheme};
 use hyper::client::conn::http1::SendRequest;
 
 use super::{ConnectionDriver, OutgoingBody};
+use crate::{CertificateSource, Identity, TlsConfig};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct ProxyKey(String);
@@ -24,41 +26,72 @@ impl ProxyKey {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct TlsPoolKey(String);
+pub(super) enum TlsPoolKey {
+    Plain,
+    Platform,
+    PemBundle(PathBuf),
+    PemDirectory(PathBuf),
+    Disabled,
+    #[cfg(test)]
+    Test(String),
+}
 
 impl TlsPoolKey {
     pub(super) fn plain() -> Self {
-        Self("plain".to_owned())
+        Self::Plain
     }
 
     #[cfg(test)]
     pub(super) fn platform() -> Self {
-        Self("platform".to_owned())
+        Self::Platform
     }
 
     #[cfg(test)]
     pub(super) fn pem_bundle(path: &std::path::Path) -> Self {
-        Self(format!("pem-bundle:{}", path.display()))
+        Self::PemBundle(path.to_path_buf())
     }
 
     #[cfg(test)]
     pub(super) fn pem_directory(path: &std::path::Path) -> Self {
-        Self(format!("pem-directory:{}", path.display()))
+        Self::PemDirectory(path.to_path_buf())
     }
 
     #[cfg(test)]
     pub(super) fn disabled() -> Self {
-        Self("disabled".to_owned())
+        Self::Disabled
+    }
+
+    pub(super) fn from_config(tls: &TlsConfig) -> Self {
+        match &tls.roots {
+            CertificateSource::Platform => Self::Platform,
+            CertificateSource::PemBundle(path) => Self::PemBundle(path.clone()),
+            CertificateSource::PemDirectory(path) => Self::PemDirectory(path.clone()),
+            CertificateSource::Disabled => Self::Disabled,
+        }
     }
 
     #[cfg(test)]
     pub(super) fn new(value: &str) -> Self {
-        Self(value.to_owned())
+        match value {
+            "plain" => Self::Plain,
+            "platform" => Self::Platform,
+            "disabled" => Self::Disabled,
+            value if value.starts_with("pem-bundle:") => {
+                Self::PemBundle(PathBuf::from(&value["pem-bundle:".len()..]))
+            }
+            value if value.starts_with("pem-directory:") => {
+                Self::PemDirectory(PathBuf::from(&value["pem-directory:".len()..]))
+            }
+            value => Self::Test(value.to_owned()),
+        }
     }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct IdentityKey(String);
+pub(super) struct IdentityKey {
+    pub(super) certificate_chain: PathBuf,
+    pub(super) private_key: Option<PathBuf>,
+}
 
 impl IdentityKey {
     #[cfg(test)]
@@ -66,19 +99,25 @@ impl IdentityKey {
         certificate_chain: &std::path::Path,
         private_key: Option<&std::path::Path>,
     ) -> Self {
-        Self(format!(
-            "certificate-chain:{};private-key:{}",
-            certificate_chain.display(),
-            private_key.map_or_else(
-                || "<combined>".to_owned(),
-                |path| path.display().to_string(),
-            ),
-        ))
+        Self {
+            certificate_chain: certificate_chain.to_path_buf(),
+            private_key: private_key.map(std::path::Path::to_path_buf),
+        }
+    }
+
+    pub(super) fn from_identity(identity: &Identity) -> Self {
+        Self {
+            certificate_chain: identity.certificate_chain.clone(),
+            private_key: identity.private_key.clone(),
+        }
     }
 
     #[cfg(test)]
     pub(super) fn new(value: &str) -> Self {
-        Self(value.to_owned())
+        Self {
+            certificate_chain: PathBuf::from(value),
+            private_key: None,
+        }
     }
 }
 
@@ -94,11 +133,17 @@ pub(super) struct PoolKey {
 impl PoolKey {
     pub(super) fn new(
         scheme: Scheme,
-        authority: Authority,
+        mut authority: Authority,
         proxy: Option<ProxyKey>,
         tls: TlsPoolKey,
         identity: Option<IdentityKey>,
     ) -> Self {
+        if authority.port_u16().is_none() {
+            let default_port = if scheme == Scheme::HTTPS { 443 } else { 80 };
+            authority = format!("{authority}:{default_port}")
+                .parse()
+                .expect("existing URI authority plus effective port remains valid");
+        }
         Self {
             scheme,
             authority,
@@ -235,7 +280,7 @@ pub(super) struct PoolGeneration {
 
 #[derive(Debug)]
 pub(super) struct ConnectionLease {
-    key: PoolKey,
+    key: Box<PoolKey>,
     generation: u64,
     terminal: LeaseTerminal,
     connection: Option<IdleConnection>,
@@ -244,7 +289,7 @@ pub(super) struct ConnectionLease {
 impl ConnectionLease {
     pub(super) fn new(key: PoolKey, generation: u64, connection: IdleConnection) -> Self {
         Self {
-            key,
+            key: Box::new(key),
             generation,
             terminal: LeaseTerminal::Active,
             connection: Some(connection),
@@ -356,7 +401,7 @@ impl Pool {
 
         let generation = self
             .generations
-            .entry(lease.key.clone())
+            .entry(lease.key.as_ref().clone())
             .or_insert_with(|| PoolGeneration {
                 number: self.generation_number,
                 idle: Vec::new(),
