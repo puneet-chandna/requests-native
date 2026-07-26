@@ -342,10 +342,21 @@ fn pem_bundle_https_uses_encrypted_http1_transport() {
 }
 
 #[test]
-fn platform_roots_reject_local_untrusted_server_as_tls() {
+fn platform_roots_build_without_tls_io() {
+    Client::builder()
+        .tls(TlsConfig {
+            roots: CertificateSource::Platform,
+            identity: None,
+        })
+        .build()
+        .expect("build platform-roots client without I/O");
+}
+
+#[test]
+fn unrelated_pem_bundle_rejects_untrusted_server_as_tls() {
     run_tls_case(
         VALID_SERVER,
-        CertificateSource::Platform,
+        CertificateSource::PemBundle(repository_fixture("fixtures/tls/wrong-host/wrong-host.pem")),
         ExpectedClientResult::TlsFailure,
     );
 }
