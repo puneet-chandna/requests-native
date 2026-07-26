@@ -1,4 +1,5 @@
 mod connect;
+pub(crate) mod decode;
 mod pool;
 #[cfg(test)]
 mod pool_tests;
@@ -14,7 +15,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::header::{CONTENT_LENGTH, HOST};
+use http::HeaderValue;
+use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, HOST};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -22,7 +24,7 @@ use tokio::task::JoinHandle;
 
 use self::pool::{ConnectionLease, IdleConnection, LeaseTerminal, Pool, PoolKey, TlsPoolKey};
 use crate::models::RequestParts;
-use crate::{BodySource, Error, Proxy, Request, Result, Timeout, TlsConfig};
+use crate::{BodySource, ContentCodecs, Error, Proxy, Request, Result, Timeout, TlsConfig};
 
 pub(crate) const DEFAULT_MAX_IDLE_PER_HOST: usize = 10;
 
@@ -33,6 +35,7 @@ pub(crate) struct Transport {
     #[allow(dead_code)]
     tls: TlsConfig,
     default_timeout: Timeout,
+    content_codecs: ContentCodecs,
 }
 
 pub(super) trait Connector: Send + Sync {
@@ -135,6 +138,7 @@ pub(crate) struct TransportResponse {
     pub read_timeout: Option<Duration>,
     pub total_timeout: Option<Duration>,
     pub total_deadline: Option<Instant>,
+    pub content_codecs: ContentCodecs,
 }
 
 pub(crate) struct TransportLease {
@@ -329,6 +333,7 @@ impl Transport {
         tls: TlsConfig,
         default_timeout: Timeout,
         pool_max_idle_per_host: usize,
+        content_codecs: ContentCodecs,
     ) -> Self {
         Self::with_configuration(
             Arc::new(DirectConnector),
@@ -336,6 +341,7 @@ impl Transport {
             tls,
             default_timeout,
             pool_max_idle_per_host,
+            content_codecs,
         )
     }
 
@@ -347,6 +353,7 @@ impl Transport {
             TlsConfig::default(),
             Timeout::default(),
             DEFAULT_MAX_IDLE_PER_HOST,
+            ContentCodecs::new(true, true),
         )
     }
 
@@ -356,6 +363,7 @@ impl Transport {
         tls: TlsConfig,
         default_timeout: Timeout,
         pool_max_idle_per_host: usize,
+        content_codecs: ContentCodecs,
     ) -> Self {
         Self {
             pool: Arc::new(Mutex::new(Pool::new(pool_max_idle_per_host))),
@@ -363,6 +371,7 @@ impl Transport {
             proxy,
             tls,
             default_timeout,
+            content_codecs,
         }
     }
 
@@ -402,7 +411,13 @@ impl Transport {
             .clone();
         let target = authority.as_str().to_owned();
         let key = PoolKey::new(scheme, authority, None, TlsPoolKey::plain(), None);
-        let request = request.into_parts();
+        let mut request = request.into_parts();
+        if !request.headers.contains_key(ACCEPT_ENCODING) {
+            request.headers.insert(
+                ACCEPT_ENCODING,
+                HeaderValue::from_static(self.content_codecs.accept_encoding()),
+            );
+        }
         let connect_timeout = timeout.connect;
         let read_timeout = timeout.read;
         let total_timeout = timeout.total;
@@ -530,6 +545,7 @@ impl Transport {
             read_timeout,
             total_timeout,
             total_deadline,
+            content_codecs: self.content_codecs,
         })
     }
 

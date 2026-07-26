@@ -10,6 +10,7 @@ pub enum ErrorKind {
     Connect,
     ConnectTimeout,
     Connection,
+    ContentDecoding,
     Dns,
     Handshake,
     InvalidUrl,
@@ -167,6 +168,13 @@ impl Error {
         Self::transport(
             ErrorKind::ChunkedEncoding,
             format!("HTTP/1.1 chunked response body failed: {error}"),
+        )
+    }
+
+    pub(crate) fn content_decoding() -> Self {
+        Self::transport(
+            ErrorKind::ContentDecoding,
+            "response content decoding failed".to_owned(),
         )
     }
 

@@ -16,12 +16,13 @@ use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
-use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::{HeaderMap, StatusCode, Version};
 use hyper::body::{Body, Incoming};
 
+use crate::transport::decode::{ContentEncoding, DecodedBody};
 use crate::transport::{DeadlineSource, TransportLease, TransportResponse, select_deadline_source};
-use crate::{Error, Result};
+use crate::{ContentCodecs, Error, Result};
 
 pub struct Response {
     head: http::response::Parts,
@@ -32,6 +33,7 @@ pub struct Response {
     total_timeout: Option<Duration>,
     total_deadline: Option<Instant>,
     disposition: Option<ResponseDispositionState>,
+    content_codecs: ContentCodecs,
 }
 
 impl Response {
@@ -45,6 +47,7 @@ impl Response {
             total_timeout: response.total_timeout,
             total_deadline: response.total_deadline,
             disposition: Some(ResponseDispositionState::default()),
+            content_codecs: response.content_codecs,
         }
     }
 
@@ -79,12 +82,31 @@ impl Response {
     }
 
     pub fn into_body(mut self) -> ResponseBody {
+        self.take_body(true)
+    }
+
+    pub fn into_raw_body(mut self) -> ResponseBody {
+        self.take_body(false)
+    }
+
+    fn take_body(&mut self, decoded: bool) -> ResponseBody {
         let chunked = has_chunked_transfer_encoding(&self.head.headers);
+        let encoding = if decoded {
+            self.head
+                .headers
+                .get(CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| ContentEncoding::enabled(value, self.content_codecs))
+        } else {
+            None
+        };
         ResponseBody {
-            source: self
-                .body
-                .take()
-                .map(|body| ResponseBodySource::Incoming(Box::pin(body))),
+            source: self.body.take().map(|body| match encoding {
+                Some(encoding) => {
+                    ResponseBodySource::Decoded(Box::new(DecodedBody::new(body, encoding, chunked)))
+                }
+                None => ResponseBodySource::Incoming(Box::pin(body)),
+            }),
             driver: self.driver.take(),
             read_timeout: self.read_timeout.take(),
             read_deadline: None,
@@ -137,6 +159,7 @@ fn has_chunked_transfer_encoding(headers: &HeaderMap) -> bool {
 
 enum ResponseBodySource {
     Incoming(Pin<Box<Incoming>>),
+    Decoded(Box<DecodedBody>),
     #[cfg(test)]
     Pending,
 }
@@ -245,21 +268,32 @@ impl ResponseBody {
         Poll::Ready(Some(Err(error)))
     }
 
-    fn poll_source(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<Bytes>>> {
+    fn poll_source(&mut self, context: &mut Context<'_>) -> (Poll<Option<Result<Bytes>>>, bool) {
         loop {
             let result = match self.source.as_mut() {
                 Some(ResponseBodySource::Incoming(body)) => body.as_mut().poll_frame(context),
+                Some(ResponseBodySource::Decoded(body)) => {
+                    let result = body.poll_next(context);
+                    let wire_progress = body.take_wire_progress();
+                    return match result {
+                        Poll::Pending => (Poll::Pending, wire_progress),
+                        result => (result, false),
+                    };
+                }
                 #[cfg(test)]
-                Some(ResponseBodySource::Pending) => return Poll::Pending,
+                Some(ResponseBodySource::Pending) => return (Poll::Pending, false),
                 None => {
-                    return Poll::Ready(Some(Err(Error::response_body(
-                        "response body was already consumed",
-                    ))));
+                    return (
+                        Poll::Ready(Some(Err(Error::response_body(
+                            "response body was already consumed",
+                        )))),
+                        false,
+                    );
                 }
             };
             match result {
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                    Ok(bytes) => return Poll::Ready(Some(Ok(bytes))),
+                    Ok(bytes) => return (Poll::Ready(Some(Ok(bytes))), false),
                     Err(_) => continue,
                 },
                 Poll::Ready(Some(Err(error))) => {
@@ -268,10 +302,10 @@ impl ResponseBody {
                     } else {
                         Error::response_body(error)
                     };
-                    return Poll::Ready(Some(Err(error)));
+                    return (Poll::Ready(Some(Err(error))), false);
                 }
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return (Poll::Ready(None), false),
+                Poll::Pending => return (Poll::Pending, false),
             }
         }
     }
@@ -353,7 +387,8 @@ impl Stream for ResponseBody {
             return self.finish_error(ResponseEvent::ReadError, error);
         }
 
-        match self.poll_source(context) {
+        let (source_poll, wire_progress) = self.poll_source(context);
+        match source_poll {
             Poll::Ready(Some(Ok(bytes))) => {
                 drop(self.read_deadline.take());
                 self.disposition.apply(ResponseEvent::Partial);
@@ -362,6 +397,8 @@ impl Stream for ResponseBody {
             Poll::Ready(Some(Err(error))) => {
                 let event = if error.kind() == crate::ErrorKind::ChunkedEncoding {
                     ResponseEvent::ProtocolError
+                } else if error.kind() == crate::ErrorKind::ContentDecoding {
+                    ResponseEvent::DecodeError
                 } else {
                     ResponseEvent::ReadError
                 };
@@ -371,7 +408,11 @@ impl Stream for ResponseBody {
                 self.finish_now(ResponseEvent::CleanEof);
                 return Poll::Ready(None);
             }
-            Poll::Pending => {}
+            Poll::Pending => {
+                if wire_progress {
+                    drop(self.read_deadline.take());
+                }
+            }
         }
 
         if self.read_deadline.is_none()

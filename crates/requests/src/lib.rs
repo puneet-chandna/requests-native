@@ -12,7 +12,9 @@ mod transport;
 pub mod utils;
 
 pub use body::{AsyncBody, BodySource};
-pub use client::{CertificateSource, Client, ClientBuilder, Identity, Proxy, TlsConfig};
+pub use client::{
+    CertificateSource, Client, ClientBuilder, ContentCodecs, Identity, Proxy, TlsConfig,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 pub use models::{

@@ -6,6 +6,35 @@ use http::{Method, Uri};
 use crate::transport::{DEFAULT_MAX_IDLE_PER_HOST, Transport};
 use crate::{Error, Request, RequestBuilder, Response, Result, Timeout};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentCodecs {
+    brotli: bool,
+    zstandard: bool,
+}
+
+impl ContentCodecs {
+    pub fn new(brotli: bool, zstandard: bool) -> Self {
+        Self { brotli, zstandard }
+    }
+
+    pub(crate) const fn accept_encoding(self) -> &'static str {
+        match (self.brotli, self.zstandard) {
+            (true, true) => "gzip, deflate, br, zstd",
+            (false, true) => "gzip, deflate, zstd",
+            (true, false) => "gzip, deflate, br",
+            (false, false) => "gzip, deflate",
+        }
+    }
+
+    pub(crate) fn decodes(self, encoding: &str) -> bool {
+        encoding.eq_ignore_ascii_case("gzip")
+            || encoding.eq_ignore_ascii_case("x-gzip")
+            || encoding.eq_ignore_ascii_case("deflate")
+            || (self.brotli && encoding.eq_ignore_ascii_case("br"))
+            || (self.zstandard && encoding.eq_ignore_ascii_case("zstd"))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Proxy {
     Http(Uri),
@@ -52,6 +81,7 @@ pub struct ClientBuilder {
     tls: TlsConfig,
     timeout: Timeout,
     pool_max_idle_per_host: usize,
+    content_codecs: ContentCodecs,
 }
 
 impl Default for ClientBuilder {
@@ -61,6 +91,7 @@ impl Default for ClientBuilder {
             tls: TlsConfig::default(),
             timeout: Timeout::default(),
             pool_max_idle_per_host: DEFAULT_MAX_IDLE_PER_HOST,
+            content_codecs: ContentCodecs::new(true, true),
         }
     }
 }
@@ -86,6 +117,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn content_codecs(mut self, content_codecs: ContentCodecs) -> Self {
+        self.content_codecs = content_codecs;
+        self
+    }
+
     pub fn build(self) -> Result<Client> {
         if let Some(proxy) = &self.proxy {
             validate_proxy(proxy)?;
@@ -96,6 +132,7 @@ impl ClientBuilder {
                 self.tls,
                 self.timeout,
                 self.pool_max_idle_per_host,
+                self.content_codecs,
             )),
         })
     }
