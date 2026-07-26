@@ -500,6 +500,10 @@ impl Response {
         self.inner.status()
     }
 
+    pub fn reason(&self) -> &str {
+        self.inner.reason()
+    }
+
     pub fn headers(&self) -> &HeaderMap {
         self.inner.headers()
     }
@@ -520,6 +524,16 @@ impl Response {
         let Self { inner, driver } = self;
         ResponseBody {
             inner: Some(inner.into_body()),
+            driver,
+            remainder: None,
+            terminal: false,
+        }
+    }
+
+    pub fn into_raw_body(self) -> ResponseBody {
+        let Self { inner, driver } = self;
+        ResponseBody {
+            inner: Some(inner.into_raw_body()),
             driver,
             remainder: None,
             terminal: false,

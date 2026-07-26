@@ -260,10 +260,10 @@ where
     let parsed = parse(proxy)?;
     let username = percent_decode(parsed.username())?;
     let password = percent_decode(parsed.password().unwrap_or_default())?;
-    let authenticated = !username.is_empty();
+    let authenticated = !username.is_empty() && !password.is_empty();
     stream
         .write_all(if authenticated {
-            &[5, 1, 2]
+            &[5, 2, 0, 2]
         } else {
             &[5, 1, 0]
         })
@@ -271,14 +271,13 @@ where
         .map_err(Error::proxy)?;
     let mut method = [0_u8; 2];
     stream.read_exact(&mut method).await.map_err(Error::proxy)?;
-    let expected_method = if authenticated { 2 } else { 0 };
-    if method != [5, expected_method] {
+    if method[0] != 5 || (method[1] != 0 && (!authenticated || method[1] != 2)) {
         return Err(Error::proxy(format!(
             "SOCKS5 proxy selected unsupported authentication method {}",
             method[1]
         )));
     }
-    if authenticated {
+    if method[1] == 2 {
         let username = length_prefixed(username.as_bytes(), "SOCKS5 username")?;
         let password = length_prefixed(password.as_bytes(), "SOCKS5 password")?;
         let mut credentials = vec![1];

@@ -14,6 +14,7 @@ import threading
 import typing
 import warnings
 from contextlib import contextmanager
+from functools import wraps
 from typing import Any
 
 from urllib3.exceptions import (
@@ -752,7 +753,31 @@ class HTTPAdapter(BaseAdapter):
 
 _HTTP_ADAPTER_COMPAT_SEND = HTTPAdapter.send
 _HTTP_ADAPTER_COMPAT_CLOSE = HTTPAdapter.close
+_HTTP_ADAPTER_COMPAT_INIT = HTTPAdapter.__init__
 _ADAPTER_TRIAL_STATE = threading.local()
+
+
+def _drop_rust_adapter_trial(identity: int) -> None:
+    try:
+        from . import _requests_rust
+    except ImportError:
+        return
+    _requests_rust._adapter_drop_trial(identity)
+
+
+@wraps(_HTTP_ADAPTER_COMPAT_INIT)
+def _trial_http_adapter_init(self: HTTPAdapter, *args: Any, **kwargs: Any) -> None:
+    _HTTP_ADAPTER_COMPAT_INIT(self, *args, **kwargs)
+    try:
+        from . import _requests_rust
+    except ImportError:
+        return
+    identity = id(self)
+
+    def callback(_reference: Any, identity: int = identity) -> None:
+        _drop_rust_adapter_trial(identity)
+
+    _requests_rust._adapter_register_trial(self, callback)
 
 
 @contextmanager
@@ -806,13 +831,13 @@ def _trial_http_adapter_send(
 
 def _trial_http_adapter_close(self: HTTPAdapter) -> None:
     _HTTP_ADAPTER_COMPAT_CLOSE(self)
-    if getattr(_ADAPTER_TRIAL_STATE, "enabled", False):
-        try:
-            from . import _requests_rust
-        except ImportError:
-            return
-        _requests_rust._adapter_close_trial(self)
+    try:
+        from . import _requests_rust
+    except ImportError:
+        return
+    _requests_rust._adapter_close_trial(self)
 
 
+HTTPAdapter.__init__ = _trial_http_adapter_init
 HTTPAdapter.send = _trial_http_adapter_send
 HTTPAdapter.close = _trial_http_adapter_close

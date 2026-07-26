@@ -55,6 +55,15 @@ impl Response {
         self.head.status
     }
 
+    pub fn reason(&self) -> &str {
+        self.head
+            .extensions
+            .get::<hyper::ext::ReasonPhrase>()
+            .and_then(|reason| std::str::from_utf8(reason.as_bytes()).ok())
+            .or_else(|| self.head.status.canonical_reason())
+            .unwrap_or("")
+    }
+
     pub fn version(&self) -> Version {
         self.head.version
     }

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import gc
+import gzip
 import pickle
 import threading
 import weakref
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pytest
 from urllib3.util.retry import Retry
 
 import requests
@@ -24,12 +26,14 @@ class _Handler(BaseHTTPRequestHandler):
         with server.lock:
             server.requests += 1
             server.clients.add(self.client_address)
-            status, headers, body = server.responses.pop(0)
+            response = server.responses.pop(0)
+        status, headers, body = response[:3]
+        reason = response[3] if len(response) == 4 else None
         if status is None:
             self.close_connection = True
             self.connection.close()
             return
-        self.send_response(status)
+        self.send_response(status, message=reason)
         for name, value in headers.items():
             self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
@@ -343,3 +347,296 @@ def test_close_order_duplicates_repetition_and_first_error_match_oracle():
     else:
         raise AssertionError("close must preserve the first visible manager failure")
     assert events[-2:] == ["main", "first"]
+
+
+def test_manager_replacement_before_first_trial_falls_back_without_native_effects(
+    monkeypatch,
+):
+    marker = object()
+    adapter = HTTPAdapter()
+    adapter.poolmanager = object()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    before = requests._requests_rust._adapter_pool_side_table_trial()
+    with _rust_adapter_trial():
+        assert adapter.send(prepared("http://example.test/")) is marker
+    assert requests._requests_rust._adapter_pool_side_table_trial() == before
+
+
+def test_zero_timeout_and_timeout_total_fall_back_before_native_effects(monkeypatch):
+    marker = object()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    adapter = HTTPAdapter()
+    with _rust_adapter_trial():
+        assert adapter.send(prepared("http://example.test/"), timeout=0) is marker
+
+    from urllib3.util import Timeout
+
+    with _rust_adapter_trial():
+        assert (
+            adapter.send(
+                prepared("http://example.test/"),
+                timeout=Timeout(total=1),
+            )
+            is marker
+        )
+
+
+def test_verify_true_default_bundle_mutation_falls_back(monkeypatch):
+    marker = object()
+    adapter = HTTPAdapter()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    monkeypatch.setattr(adapters, "DEFAULT_CA_BUNDLE_PATH", object())
+    with _rust_adapter_trial():
+        assert adapter.send(prepared("https://example.test/"), verify=True) is marker
+
+
+def test_raw_read_zero_is_inert_and_custom_reason_is_preserved():
+    compressed = gzip.compress(b"payload")
+    with loopback((200, {"Content-Encoding": "gzip"}, compressed, "Very Fine")) as (
+        server,
+        url,
+    ):
+        adapter = HTTPAdapter()
+        with _rust_adapter_trial():
+            response = adapter.send(prepared(url), stream=True)
+            assert response.reason == "Very Fine"
+            assert response.raw.read(0, decode_content=False) == b""
+            assert response.raw.read(decode_content=False) == compressed
+            adapter.close()
+        assert server.requests == 1
+
+
+def test_raw_stream_decode_content_true_decodes_but_false_preserves_wire():
+    compressed = gzip.compress(b"payload")
+    with loopback(
+        (200, {"Content-Encoding": "gzip"}, compressed),
+        (200, {"Content-Encoding": "gzip"}, compressed),
+    ) as (server, url):
+        adapter = HTTPAdapter()
+        with _rust_adapter_trial():
+            raw = adapter.send(prepared(url), stream=True).raw
+            assert b"".join(raw.stream(3, decode_content=False)) == compressed
+            decoded = adapter.send(prepared(url), stream=True).raw
+            assert b"".join(decoded.stream(3, decode_content=True)) == b"payload"
+            adapter.close()
+        assert server.requests == 2
+
+
+def test_retry_drain_ignores_invalid_content_encoding():
+    retry = Retry(total=1, status=1, status_forcelist={503})
+    with loopback(
+        (503, {"Content-Encoding": "gzip"}, b"invalid-gzip"),
+        (200, {}, b"done"),
+    ) as (server, url):
+        adapter = HTTPAdapter(max_retries=retry)
+        with _rust_adapter_trial():
+            assert adapter.send(prepared(url)).content == b"done"
+            adapter.close()
+        assert server.requests == 2
+
+
+def test_close_outside_trial_clears_native_generation_and_reentry_is_fresh():
+    with loopback(
+        (200, {}, b"first"),
+        (200, {}, b"second"),
+    ) as (server, url):
+        adapter = HTTPAdapter()
+        with _rust_adapter_trial():
+            outstanding = adapter.send(prepared(url), stream=True)
+        adapter.close()
+        assert outstanding.content == b"first"
+        with _rust_adapter_trial():
+            assert adapter.send(prepared(url)).content == b"second"
+        assert server.requests == 2
+        assert len(server.clients) == 2
+
+
+def test_pool_block_holds_capacity_until_raw_release_but_overflow_does_not():
+    with loopback(
+        (200, {}, b"held"),
+        (200, {}, b"blocked"),
+        (200, {}, b"overflow-one"),
+        (200, {}, b"overflow-two"),
+    ) as (server, url):
+        adapter = HTTPAdapter(pool_maxsize=1, pool_block=True)
+        completed = threading.Event()
+        result = []
+        with _rust_adapter_trial():
+            held = adapter.send(prepared(url), stream=True)
+
+            def blocked_send():
+                with _rust_adapter_trial():
+                    result.append(adapter.send(prepared(url)).content)
+                completed.set()
+
+            worker = threading.Thread(target=blocked_send)
+            worker.start()
+            assert not completed.wait(0.1)
+            assert server.requests == 1
+            held.close()
+            assert completed.wait(2)
+            worker.join(timeout=2)
+            assert result == [b"blocked"]
+            adapter.close()
+
+        adapter = HTTPAdapter(pool_maxsize=1, pool_block=False)
+        completed.clear()
+        result.clear()
+        with _rust_adapter_trial():
+            held = adapter.send(prepared(url), stream=True)
+            worker = threading.Thread(target=blocked_send)
+            worker.start()
+            assert completed.wait(2)
+            worker.join(timeout=2)
+            assert result == [b"overflow-two"]
+            held.close()
+            adapter.close()
+
+
+def test_pool_connections_lru_evicts_native_origin_with_visible_manager():
+    with (
+        loopback((200, {}, b"a1"), (200, {}, b"a2")) as (server_a, url_a),
+        loopback((200, {}, b"b")) as (server_b, url_b),
+    ):
+        adapter = HTTPAdapter(pool_connections=1)
+        with _rust_adapter_trial():
+            assert adapter.send(prepared(url_a)).content == b"a1"
+            assert adapter.send(prepared(url_b)).content == b"b"
+            assert adapter.send(prepared(url_a)).content == b"a2"
+            assert len(adapter.poolmanager.pools) == 1
+            adapter.close()
+        assert server_a.requests == 2
+        assert len(server_a.clients) == 2
+        assert server_b.requests == 1
+
+
+def test_manager_and_request_shape_mutations_fall_back_then_restore(monkeypatch):
+    marker = object()
+    adapter = HTTPAdapter()
+    request = prepared("http://example.test/")
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+
+    adapter.poolmanager.connection_pool_kw["maxsize"] += 1
+    with _rust_adapter_trial():
+        assert adapter.send(request) is marker
+    adapter.poolmanager.connection_pool_kw["maxsize"] -= 1
+
+    adapter.poolmanager.connection_from_url = lambda *a, **k: None
+    with _rust_adapter_trial():
+        assert adapter.send(request) is marker
+    del adapter.poolmanager.connection_from_url
+
+    request.headers = {}
+    with _rust_adapter_trial():
+        assert adapter.send(request) is marker
+
+    with loopback((200, {}, b"restored-manager")) as (server, url):
+        with _rust_adapter_trial():
+            response = adapter.send(prepared(url))
+            assert type(response.raw).__module__ == "requests._requests_rust"
+            assert response.content == b"restored-manager"
+            adapter.close()
+        assert server.requests == 1
+
+
+def test_preused_visible_main_or_proxy_manager_falls_back_then_restores(monkeypatch):
+    marker = object()
+    adapter = HTTPAdapter()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    adapter.poolmanager.connection_from_url("http://preused.example/")
+    with _rust_adapter_trial():
+        assert adapter.send(prepared("http://example.test/")) is marker
+    adapter.poolmanager.clear()
+
+    adapter.proxy_manager_for("http://proxy.example/")
+    with _rust_adapter_trial():
+        assert (
+            adapter.send(
+                prepared("http://example.test/"),
+                proxies={"http": "http://proxy.example/"},
+            )
+            is marker
+        )
+    adapter.proxy_manager.clear()
+
+    with loopback((200, {}, b"restored-preuse")) as (server, url):
+        with _rust_adapter_trial():
+            response = adapter.send(prepared(url))
+            assert type(response.raw).__module__ == "requests._requests_rust"
+            assert response.content == b"restored-preuse"
+            adapter.close()
+        assert server.requests == 1
+
+
+def test_terminal_status_exhaustion_precedes_retry_after_parsing_and_sleep(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    retry = Retry(
+        total=0,
+        status=0,
+        status_forcelist={503},
+        raise_on_status=False,
+    )
+    with loopback((503, {"Retry-After": "malformed"}, b"terminal")) as (server, url):
+        with _rust_adapter_trial():
+            response = HTTPAdapter(max_retries=retry).send(prepared(url))
+            assert response.status_code == 503
+            assert response.content == b"terminal"
+        assert server.requests == 1
+    assert sleeps == []
+
+
+def test_respect_retry_after_false_never_parses_malformed_header(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    retry = Retry(
+        total=1,
+        status=1,
+        status_forcelist={503},
+        respect_retry_after_header=False,
+    )
+    with loopback(
+        (503, {"Retry-After": "malformed"}, b"discard"),
+        (200, {}, b"done"),
+    ) as (server, url):
+        with _rust_adapter_trial():
+            assert HTTPAdapter(max_retries=retry).send(prepared(url)).content == b"done"
+        assert server.requests == 2
+    assert sleeps == []
+
+
+def test_redirect_exhaustion_uses_raise_on_redirect_not_raise_on_status():
+    retry = Retry(
+        total=1,
+        redirect=0,
+        status=1,
+        status_forcelist={503},
+        raise_on_redirect=False,
+        raise_on_status=True,
+    )
+    with loopback((503, {"Location": "/elsewhere"}, b"redirect-terminal")) as (
+        server,
+        url,
+    ):
+        with _rust_adapter_trial():
+            response = HTTPAdapter(max_retries=retry).send(prepared(url))
+            assert response.status_code == 503
+            assert response.content == b"redirect-terminal"
+        assert server.requests == 1
+
+    retry = Retry(
+        total=1,
+        redirect=0,
+        status=1,
+        status_forcelist={503},
+        raise_on_redirect=True,
+        raise_on_status=False,
+    )
+    with loopback((503, {"Location": "/elsewhere"}, b"redirect-terminal")) as (
+        server,
+        url,
+    ):
+        with pytest.raises(RetryError, match="too many redirects"):
+            with _rust_adapter_trial():
+                HTTPAdapter(max_retries=retry).send(prepared(url))
+        assert server.requests == 1

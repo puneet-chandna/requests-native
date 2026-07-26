@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import urllib3
 from urllib3.util.retry import Retry
 
@@ -145,3 +146,58 @@ def test_status_and_redirect_history_without_error_is_snapshotted():
             "redirect_location": "/elsewhere",
         }
     ]
+
+
+def test_effectful_collections_and_unsupported_history_rows_fall_back_inertly():
+    yielded = []
+
+    def statuses():
+        yielded.append("consumed")
+        yield 503
+
+    retry = Retry(total=1)
+    retry.status_forcelist = statuses()
+    assert snapshot(retry)["eligible"] is False
+    assert yielded == []
+
+    retry = Retry(total=1)
+    retry.history = ((None, None, None, None, None),)
+    assert snapshot(retry)["eligible"] is False
+
+
+def test_retry_instance_method_and_constant_shadows_are_ineligible():
+    retry = Retry(total=1)
+    retry.get_retry_after = lambda response: 0
+    assert snapshot(retry)["eligible"] is False
+
+    retry = Retry(total=1)
+    retry.RETRY_AFTER_STATUS_CODES = frozenset({418})
+    assert snapshot(retry)["eligible"] is False
+
+
+def test_allowed_method_case_is_not_normalized():
+    retry = Retry(total=1, allowed_methods={"get"}, status_forcelist={503})
+    record = snapshot(retry)
+    assert record["eligible"] is True
+    assert record["allowed_methods"] == ["get"]
+
+
+def test_urllib3_126_post_init_method_whitelist_takes_precedence():
+    if not urllib3.__version__.startswith("1.26."):
+        pytest.skip("method_whitelist was removed in urllib3 2.x")
+    retry = Retry(total=1, allowed_methods={"GET"})
+    retry.method_whitelist = {"post"}
+    assert snapshot(retry)["allowed_methods"] == ["post"]
+
+
+def test_retry_class_and_module_mutations_fall_back_then_restore(monkeypatch):
+    retry = Retry(total=1)
+    with monkeypatch.context() as patched:
+        patched.setattr(Retry, "get_retry_after", lambda self, response: 0)
+        assert snapshot(retry)["eligible"] is False
+    assert snapshot(retry)["eligible"] is True
+
+    with monkeypatch.context() as patched:
+        patched.setattr(urllib3.util.retry, "Retry", object())
+        assert snapshot(retry)["eligible"] is False
+    assert snapshot(retry)["eligible"] is True

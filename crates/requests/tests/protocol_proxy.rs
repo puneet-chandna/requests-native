@@ -268,6 +268,135 @@ fn socks5_and_socks5h_preserve_local_versus_remote_dns_semantics() {
     assert!(remote.request_head.starts_with(b"GET /socks HTTP/1.1\r\n"));
 }
 
+#[derive(Debug)]
+struct Socks5AuthObservation {
+    methods: Vec<u8>,
+    credentials: Option<(String, String)>,
+}
+
+fn exercise_socks5_auth(
+    credentials: &str,
+    selected_method: u8,
+) -> Result<Socks5AuthObservation, requests::Error> {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind SOCKS5 auth proxy");
+    let address = listener.local_addr().expect("SOCKS5 auth proxy address");
+    let task = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept SOCKS5 auth connection");
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("set SOCKS5 auth timeout");
+        let mut greeting = [0_u8; 2];
+        stream.read_exact(&mut greeting).expect("read greeting");
+        let mut methods = vec![0; greeting[1] as usize];
+        stream.read_exact(&mut methods).expect("read methods");
+        stream
+            .write_all(&[5, selected_method])
+            .expect("select method");
+        if !methods.contains(&selected_method) {
+            return Socks5AuthObservation {
+                methods,
+                credentials: None,
+            };
+        }
+        let credentials = if selected_method == 2 {
+            let mut version = [0_u8; 1];
+            stream.read_exact(&mut version).expect("read auth version");
+            assert_eq!(version[0], 1);
+            let username = read_length_prefixed(&mut stream);
+            let password = read_length_prefixed(&mut stream);
+            stream.write_all(&[1, 0]).expect("accept credentials");
+            Some((
+                String::from_utf8(username).expect("username UTF-8"),
+                String::from_utf8(password).expect("password UTF-8"),
+            ))
+        } else {
+            None
+        };
+        let _destination = serve_socks5_request(&mut stream);
+        let _request = read_head(&mut stream);
+        stream.write_all(RESPONSE).expect("write HTTP response");
+        Socks5AuthObservation {
+            methods,
+            credentials,
+        }
+    });
+    let uri = format!("socks5://{credentials}{address}")
+        .parse()
+        .expect("valid SOCKS5 auth URI");
+    let client = Client::builder()
+        .proxy(Proxy::Socks5 {
+            uri,
+            remote_dns: false,
+        })
+        .build()
+        .expect("build SOCKS5 auth client");
+    let result = runtime().block_on(client.get("http://127.0.0.1:8124/auth").send());
+    let observation = task.join().expect("join SOCKS5 auth proxy");
+    result.map(|response| {
+        runtime()
+            .block_on(response.bytes())
+            .expect("collect auth response");
+        observation
+    })
+}
+
+fn read_length_prefixed(stream: &mut TcpStream) -> Vec<u8> {
+    let mut length = [0_u8; 1];
+    stream.read_exact(&mut length).expect("read length");
+    let mut value = vec![0; length[0] as usize];
+    stream.read_exact(&mut value).expect("read value");
+    value
+}
+
+fn serve_socks5_request(stream: &mut TcpStream) -> String {
+    let mut request = [0_u8; 4];
+    stream
+        .read_exact(&mut request)
+        .expect("read SOCKS5 request");
+    assert_eq!(request[0..4], [5, 1, 0, 1]);
+    let mut address = [0_u8; 4];
+    stream.read_exact(&mut address).expect("read SOCKS5 IPv4");
+    let mut port = [0_u8; 2];
+    stream.read_exact(&mut port).expect("read SOCKS5 port");
+    stream
+        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+        .expect("write SOCKS5 success");
+    format!(
+        "{}:{}",
+        std::net::Ipv4Addr::from(address),
+        u16::from_be_bytes(port)
+    )
+}
+
+#[test]
+fn socks5_credentials_offer_no_auth_and_password_auth_and_accept_either() {
+    let no_auth = exercise_socks5_auth("user:pass@", 0).expect("proxy selected no auth");
+    assert_eq!(no_auth.methods, [0, 2]);
+    assert_eq!(no_auth.credentials, None);
+
+    let authenticated = exercise_socks5_auth("user:pass@", 2).expect("proxy selected auth");
+    assert_eq!(authenticated.methods, [0, 2]);
+    assert_eq!(
+        authenticated.credentials,
+        Some(("user".to_owned(), "pass".to_owned()))
+    );
+}
+
+#[test]
+fn socks5_incomplete_credentials_offer_only_no_auth() {
+    let username_only = exercise_socks5_auth("user@", 0).expect("username-only no auth");
+    assert_eq!(username_only.methods, [0]);
+
+    let password_only = exercise_socks5_auth(":pass@", 0).expect("password-only no auth");
+    assert_eq!(password_only.methods, [0]);
+}
+
+#[test]
+fn socks5_rejects_a_method_that_was_not_offered() {
+    let error = exercise_socks5_auth("user@", 2).expect_err("auth was not offered");
+    assert_eq!(error.kind(), ErrorKind::Proxy);
+}
+
 fn tls_acceptor() -> TlsAcceptor {
     let certificate = include_bytes!("../../../tests/certs/valid/server/server.pem");
     let private_key = include_bytes!("../../../tests/certs/valid/server/server.key");

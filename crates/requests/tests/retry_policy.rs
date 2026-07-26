@@ -163,3 +163,32 @@ fn none_and_empty_allowed_methods_both_mean_all_methods() {
     configured.allowed_methods = Some(MethodSet::new(BTreeSet::new()));
     assert!(RetryState::new(configured).is_retry("PATCH", 503, false));
 }
+
+#[test]
+fn configured_allowed_method_case_is_preserved_while_request_method_is_uppercased() {
+    let mut configured = policy();
+    configured.allowed_methods = Some(methods(&["get"]));
+    let state = RetryState::new(configured);
+
+    assert!(!state.allows_method("get"));
+    assert!(!state.is_retry("get", 503, false));
+}
+
+#[test]
+fn connect_and_other_retries_do_not_use_the_read_method_gate() {
+    let mut configured = policy();
+    configured.allowed_methods = Some(methods(&["GET"]));
+    let state = RetryState::new(configured);
+
+    assert!(
+        state
+            .increment(RetryReason::Connect, "POST", "http://x", None)
+            .is_ok()
+    );
+    assert!(
+        state
+            .increment(RetryReason::Other, "POST", "http://x", None)
+            .is_ok()
+    );
+    assert!(!state.allows_method("POST"));
+}

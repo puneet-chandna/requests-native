@@ -23,12 +23,7 @@ pub struct MethodSet(BTreeSet<String>);
 
 impl MethodSet {
     pub fn new(methods: impl IntoIterator<Item = String>) -> Self {
-        Self(
-            methods
-                .into_iter()
-                .map(|method| method.to_ascii_uppercase())
-                .collect(),
-        )
+        Self(methods.into_iter().collect())
     }
 
     fn allows(&self, method: &str) -> bool {
