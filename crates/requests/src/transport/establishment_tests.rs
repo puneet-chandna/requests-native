@@ -635,9 +635,16 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
     }
     match (tls_load, platform_loader, system_loader) {
         (Some(load), Some(platform), Some(system))
-            if load.contains(
-                "CertificateSource::Platform=>load_platform_roots(native_root_loader)",
-            ) && platform.matches("native_root_loader()").count() == 1
+            if load.contains("native_root_loader:Option<NativeRootLoader>")
+                && load.contains(
+                    "CertificateSource::Platform=>load_platform_roots(native_root_loader)",
+                )
+                && platform.contains("native_root_loader:Option<NativeRootLoader>")
+                && platform.contains(
+                    "letnative_root_loader=native_root_loader\
+                     .unwrap_or_else(||Arc::new(system_native_roots));",
+                )
+                && platform.matches("native_root_loader()").count() == 1
                 && platform
                     .matches("rustls_native_certs::load_native_certs")
                     .count()
@@ -649,26 +656,46 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
                 && tls_compact
                     .matches("rustls_native_certs::load_native_certs()")
                     .count()
-                    == 1 => {}
+                    == 1
+                && tls_compact.matches("native_root_loader()").count() == 1
+                && tls_compact.matches("load_platform_roots").count() == 2
+                && tls_compact.matches("system_native_roots").count() == 2 => {}
         _ => violations.push(
-            "bounded Platform arm must call load_platform_roots(native_root_loader), whose \
-             injected call is distinct from one bounded system_native_roots native-loader call",
+            "bounded Platform arm must pass its Option<NativeRootLoader> to load_platform_roots; \
+             that helper must resolve None only through system_native_roots, invoke the selected \
+             value once, and bind the sole native-loader call to the system helper",
         ),
     }
     if !compact.contains("spawn_blocking") || !compact.contains(".await") {
         violations.push("the one blocking loader must be awaited inside establishment");
     }
-    let injected_loader = compact.find(".native_root_loader()");
-    let blocking_load = compact.find("spawn_blocking");
-    let tls_load_call = compact.find("tls::load");
+    let test_override = compact.find(
+        "#[cfg(test)]letnative_root_loader=self.establishment_control.as_ref()\
+         .and_then(|control|control.native_root_loader());",
+    );
+    let production_default = compact.find("#[cfg(not(test))]letnative_root_loader=None;");
+    let blocking_load = compact.find("spawn_blocking(move||{");
+    let blocking_body = compact
+        .split_once("spawn_blocking(move||{")
+        .and_then(|(_, after)| after.split_once("}).await").map(|(body, _)| body));
+    let exact_load = blocking_body.is_some_and(|body| {
+        body.matches("tls::load(").count() == 1
+            && body.contains("tls::load(&tls,native_root_loader)")
+            && !body.contains("letnative_root_loader=")
+    });
     if !matches!(
-        (injected_loader, blocking_load, tls_load_call),
-        (Some(injected), Some(blocking), Some(load))
-            if injected < blocking && blocking < load
-    ) {
+        (test_override, production_default, blocking_load),
+        (Some(test), Some(default), Some(blocking))
+            if test < default && default < blocking
+    ) || !exact_load
+        || compact.matches("tls::load(").count() != 1
+        || compact.matches("letnative_root_loader=").count() != 2
+        || compact.matches(".native_root_loader()").count() != 1
+    {
         violations.push(
-            "the production pool-miss callsite must pass the injected native-root loader into \
-             tls::load inside the awaited blocking stage",
+            "cfg(test) must select native_root_loader from EstablishmentControl, cfg(not(test)) \
+             must select None, and that exact variable must be the sole loader value passed to \
+             the sole tls::load call inside the awaited spawn_blocking closure",
         );
     }
     for required in [
