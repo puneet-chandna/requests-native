@@ -254,3 +254,23 @@ def test_complete_retry_behavior_dependencies_fall_back_then_restore(monkeypatch
         assert snapshot(retry)["eligible"] is False
         delattr(retry, name)
         assert snapshot(retry)["eligible"] is True
+
+
+def test_retry_function_behavior_mutations_fall_back_then_restore():
+    retry = Retry(total=1)
+    function = Retry.is_retry
+    original_code = function.__code__
+    original_defaults = function.__defaults__
+    try:
+        function.__code__ = (lambda self, *args, **kwargs: False).__code__
+        assert snapshot(retry)["eligible"] is False
+    finally:
+        function.__code__ = original_code
+    assert snapshot(retry)["eligible"] is True
+
+    try:
+        function.__defaults__ = (not original_defaults[0],)
+        assert snapshot(retry)["eligible"] is False
+    finally:
+        function.__defaults__ = original_defaults
+    assert snapshot(retry)["eligible"] is True

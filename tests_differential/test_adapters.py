@@ -3,8 +3,11 @@ from __future__ import annotations
 import gc
 import gzip
 import pickle
+import random
+import socket
 import threading
 import weakref
+from collections import OrderedDict
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -80,6 +83,57 @@ def loopback(*responses):
     finally:
         server.shutdown()
         server.server_close()
+        worker.join(timeout=5)
+
+
+@contextmanager
+def socks5_loopback(body):
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    observed = {"connections": 0, "requests": 0}
+
+    def recv_exact(connection, amount):
+        data = b""
+        while len(data) < amount:
+            data += connection.recv(amount - len(data))
+        return data
+
+    def serve():
+        connection, _ = listener.accept()
+        with connection:
+            observed["connections"] += 1
+            version, count = recv_exact(connection, 2)
+            assert version == 5
+            recv_exact(connection, count)
+            connection.sendall(b"\x05\x00")
+            version, command, _, address_type = recv_exact(connection, 4)
+            assert (version, command) == (5, 1)
+            if address_type == 1:
+                recv_exact(connection, 4)
+            elif address_type == 3:
+                recv_exact(connection, recv_exact(connection, 1)[0])
+            else:
+                raise AssertionError(f"unexpected SOCKS address type {address_type}")
+            recv_exact(connection, 2)
+            connection.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50")
+            request = b""
+            while b"\r\n\r\n" not in request:
+                request += connection.recv(4096)
+            observed["requests"] += 1
+            connection.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\n\r\n"
+                + body
+            )
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        yield observed, f"socks5h://127.0.0.1:{listener.getsockname()[1]}"
+    finally:
+        listener.close()
         worker.join(timeout=5)
 
 
@@ -912,13 +966,16 @@ def test_stream_none_and_decode_mode_switch_match_urllib3():
             )
             switched = adapter.send(prepared(url), stream=True).raw
             assert switched.read(1, decode_content=True) == b"\x00"
-            with pytest.raises(RuntimeError, match="decode_content=False"):
+            if urllib3.__version__.startswith("1.26."):
                 switched.read(1, decode_content=False)
+            else:
+                with pytest.raises(RuntimeError, match="decode_content=False"):
+                    switched.read(1, decode_content=False)
         assert server.requests == 2
 
 
 def test_decoded_retention_is_bounded_to_pending_output():
-    payload = bytes(range(256)) * 400
+    payload = random.Random(0).randbytes(100_000)
     compressed = gzip.compress(payload)
     with loopback((200, {"Content-Encoding": "gzip"}, compressed)) as (server, url):
         with _rust_adapter_trial():
@@ -926,7 +983,55 @@ def test_decoded_retention_is_bounded_to_pending_output():
             retained = []
             while raw.read(1024, decode_content=True):
                 retained.append(raw._retained_decoded_bytes_trial())
-            assert max(retained) < len(payload) // 2
+            assert max(retained) < 16_384
+        assert server.requests == 1
+
+
+def test_decoder_selection_uses_live_version_capabilities_and_normalizes_case():
+    import urllib3.response
+
+    payload = b"decoder-capability-payload"
+    compressed = gzip.compress(payload)
+    decoders = urllib3.response.HTTPResponse.CONTENT_DECODERS
+    cases = [("GZIP", compressed, payload), (None, b"plain-wire", b"plain-wire")]
+    optional_wires = {
+        "br": (
+            urllib3.response.brotli.compress(payload)
+            if "br" in decoders
+            else b"unsupported-br-wire"
+        ),
+        "zstd": (
+            urllib3.response.zstd.compress(payload)
+            if "zstd" in decoders
+            else b"unsupported-zstd-wire"
+        ),
+        "x-gzip": compressed,
+    }
+    for encoding, wire in optional_wires.items():
+        expected = payload if encoding in decoders else wire
+        cases.append((encoding, wire, expected))
+
+    responses = [
+        (200, {} if encoding is None else {"Content-Encoding": encoding}, wire)
+        for encoding, wire, _ in cases
+    ]
+    with loopback(*responses) as (server, url):
+        adapter = HTTPAdapter()
+        with _rust_adapter_trial():
+            for _, _, expected in cases:
+                raw = adapter.send(prepared(url), stream=True).raw
+                assert raw.read(decode_content=True) == expected
+        assert server.requests == len(cases)
+
+
+@pytest.mark.parametrize("encoding", [None, "identity"])
+def test_decode_mode_switch_without_supported_decoder_remains_wire_readable(encoding):
+    headers = {} if encoding is None else {"Content-Encoding": encoding}
+    with loopback((200, headers, b"abcdef")) as (server, url):
+        with _rust_adapter_trial():
+            raw = HTTPAdapter().send(prepared(url), stream=True).raw
+            assert raw.read(2, decode_content=True) == b"ab"
+            assert raw.read(2, decode_content=False) == b"cd"
         assert server.requests == 1
 
 
@@ -1006,3 +1111,166 @@ def test_proxy_manager_mutation_after_creation_falls_back_then_restores(monkeypa
                 == b"restored"
             )
         assert server.requests == 2
+
+
+def test_nested_main_pool_container_mutations_fall_back_then_restore(monkeypatch):
+    marker = object()
+    adapter = HTTPAdapter()
+    pools = adapter.poolmanager.pools
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    mutations = [
+        ("_container", OrderedDict()),
+        ("_maxsize", pools._maxsize + 1),
+        ("dispose_func", object()),
+        ("lock", threading.RLock()),
+    ]
+    with loopback((200, {}, b"restored-main")) as (server, url):
+        for name, replacement in mutations:
+            original = getattr(pools, name)
+            setattr(pools, name, replacement)
+            with _rust_adapter_trial():
+                assert adapter.send(prepared(url)) is marker
+            assert server.requests == 0
+            setattr(pools, name, original)
+
+        with _rust_adapter_trial():
+            assert adapter.send(prepared(url)).content == b"restored-main"
+        assert server.requests == 1
+
+
+def test_nested_proxy_manager_mutations_fall_back_then_restore(monkeypatch):
+    marker = object()
+    with loopback((200, {}, b"first"), (200, {}, b"restored-proxy")) as (
+        server,
+        proxy_url,
+    ):
+        proxy_root = proxy_url.rsplit("/", 1)[0]
+        adapter = HTTPAdapter()
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(
+                    prepared("http://origin.example/"), proxies={"http": proxy_root}
+                ).content
+                == b"first"
+            )
+        manager = adapter.proxy_manager[proxy_root]
+        monkeypatch.setattr(
+            adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker
+        )
+        mutations = [
+            (manager.pools, "_container", OrderedDict()),
+            (manager.pools, "_maxsize", manager.pools._maxsize + 1),
+            (manager.pools, "dispose_func", object()),
+            (manager, "proxy_headers", {"X-Mutated": "yes"}),
+        ]
+        for owner, name, replacement in mutations:
+            original = getattr(owner, name)
+            setattr(owner, name, replacement)
+            with _rust_adapter_trial():
+                assert (
+                    adapter.send(
+                        prepared("http://origin.example/"),
+                        proxies={"http": proxy_root},
+                    )
+                    is marker
+                )
+            assert server.requests == 1
+            setattr(owner, name, original)
+
+        manager.proxy_headers["X-Mutated"] = "yes"
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(
+                    prepared("http://origin.example/"), proxies={"http": proxy_root}
+                )
+                is marker
+            )
+        assert server.requests == 1
+        del manager.proxy_headers["X-Mutated"]
+
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(
+                    prepared("http://origin.example/"), proxies={"http": proxy_root}
+                ).content
+                == b"restored-proxy"
+            )
+        assert server.requests == 2
+
+
+def test_proxy_manager_class_behavior_is_frozen_before_visible_creation(monkeypatch):
+    import urllib3.poolmanager
+
+    marker = object()
+    function = urllib3.poolmanager.ProxyManager.connection_from_url
+    original_code = function.__code__
+    adapter = HTTPAdapter()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    with loopback((200, {}, b"restored-class")) as (server, proxy_url):
+        proxy_root = proxy_url.rsplit("/", 1)[0]
+        try:
+            function.__code__ = (lambda self, *args, **kwargs: None).__code__
+            with _rust_adapter_trial():
+                assert (
+                    adapter.send(
+                        prepared("http://origin.example/"),
+                        proxies={"http": proxy_root},
+                    )
+                    is marker
+                )
+            assert adapter.proxy_manager == {}
+            assert server.requests == 0
+        finally:
+            function.__code__ = original_code
+
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(
+                    prepared("http://origin.example/"), proxies={"http": proxy_root}
+                ).content
+                == b"restored-class"
+            )
+        assert server.requests == 1
+
+
+def test_socks_manager_class_behavior_is_frozen_before_visible_creation(monkeypatch):
+    socks_manager = adapters.SOCKSProxyManager
+    if not isinstance(socks_manager, type):
+        pytest.skip("PySocks is unavailable")
+    marker = object()
+    function = socks_manager.__init__
+    original_code = function.__code__
+    adapter = HTTPAdapter()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    with socks5_loopback(b"restored-socks") as (observed, proxy_url):
+        try:
+            captured = None
+
+            def replacement(self, *args, **kwargs):
+                if captured:
+                    raise AssertionError("unreachable")
+                return None
+
+            function.__code__ = replacement.__code__
+            with _rust_adapter_trial():
+                assert (
+                    adapter.send(
+                        prepared("http://origin.example/"),
+                        proxies={"http": proxy_url},
+                    )
+                    is marker
+                )
+            assert adapter.proxy_manager == {}
+            assert observed == {"connections": 0, "requests": 0}
+        finally:
+            function.__code__ = original_code
+
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(
+                    prepared("http://origin.example/"),
+                    proxies={"http": proxy_url},
+                ).content
+                == b"restored-socks"
+            )
+        assert observed == {"connections": 1, "requests": 1}

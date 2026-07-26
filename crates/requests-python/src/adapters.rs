@@ -45,8 +45,8 @@ struct RetryStateGuard {
     retry_type: Py<PyAny>,
     history_type: Py<PyAny>,
     retry_module: Py<PyAny>,
-    class_items: Vec<(String, Py<PyAny>)>,
-    module_items: Vec<(String, Py<PyAny>)>,
+    class_dict: DictProof,
+    module_dict: DictProof,
 }
 
 static RETRY_STATE: PyOnceLock<RetryStateGuard> = PyOnceLock::new();
@@ -57,9 +57,10 @@ struct AdapterState {
     prepared_request_type: Py<PyAny>,
     prepared_getattribute: Py<PyAny>,
     poolmanager_type: Py<PyAny>,
-    poolmanager_class_items: Vec<(String, Py<PyAny>)>,
+    poolmanager_behavior: BehaviorProof,
     poolmanager_module: Py<PyAny>,
-    proxy_manager_constructor: Py<PyAny>,
+    proxy_manager_behavior: BehaviorProof,
+    socks_manager_behavior: BehaviorProof,
     methods: Vec<(String, Py<PyAny>)>,
     globals: Vec<(String, Py<PyAny>)>,
 }
@@ -84,12 +85,43 @@ struct PoolRealm {
 
 type ObjectItems = Vec<(Py<PyAny>, Py<PyAny>)>;
 
+struct CallableProof {
+    function: Py<PyAny>,
+    code: Py<PyAny>,
+    defaults: Py<PyAny>,
+    kwdefaults: Py<PyAny>,
+    kwdefault_items: Option<MappingProof>,
+    closure: Py<PyAny>,
+    closure_cells: Vec<(Py<PyAny>, Option<Py<PyAny>>)>,
+    attributes: MappingProof,
+    annotations: MappingProof,
+}
+
+struct DictProof {
+    items: Vec<(String, Py<PyAny>)>,
+    callables: Vec<CallableProof>,
+}
+
+struct MappingProof {
+    mapping: Py<PyAny>,
+    items: ObjectItems,
+    nested: Vec<(Py<PyAny>, Box<MappingProof>)>,
+}
+
+struct BehaviorProof {
+    object: Py<PyAny>,
+    class_dict: Option<DictProof>,
+    callable: Option<CallableProof>,
+}
+
 struct ManagerProof {
     manager: Py<PyAny>,
     manager_type: Py<PyAny>,
-    class_items: Vec<(String, Py<PyAny>)>,
-    objects: Vec<(String, Py<PyAny>)>,
-    mappings: Vec<(String, ObjectItems)>,
+    class_dict: DictProof,
+    objects: DictProof,
+    mappings: Vec<(String, MappingProof)>,
+    pools_dict: DictProof,
+    pool_container: MappingProof,
     visible_pools: Vec<(Py<PyAny>, Py<PyAny>)>,
 }
 
@@ -205,8 +237,8 @@ fn retry_snapshot(
         || !retry_module.as_any().is(guard.retry_module.bind(py))
         || !retry_module.getattr("Retry")?.is(retry_type)
         || !retry.get_type().as_any().is(retry_type)
-        || !exact_dict_snapshot(py, &retry_type.getattr("__dict__")?, &guard.class_items)?
-        || !exact_dict_snapshot(py, retry_module.dict().as_any(), &guard.module_items)?
+        || !dict_proof_is_pristine(py, &retry_type.getattr("__dict__")?, &guard.class_dict)?
+        || !dict_proof_is_pristine(py, retry_module.dict().as_any(), &guard.module_dict)?
     {
         return Ok(Err(
             "Retry must have the exact urllib3.util.retry.Retry type".to_owned(),
@@ -218,7 +250,8 @@ fn retry_snapshot(
         Err(_) => return Ok(Err("Retry instance dictionary is unsupported".to_owned())),
     };
     if guard
-        .class_items
+        .class_dict
+        .items
         .iter()
         .any(|(name, _)| instance_dict.contains(name).unwrap_or(true))
     {
@@ -361,16 +394,16 @@ fn initialize_retry_state(py: Python<'_>) -> PyResult<RetryStateGuard> {
     PyModule::import(py, "copyreg")?
         .getattr("_slotnames")?
         .call1((&retry_type,))?;
-    let class_items = dict_snapshot(&retry_type.getattr("__dict__")?)?;
-    let module_items = dict_snapshot(retry_module.dict().as_any())?;
+    let class_dict = dict_proof(py, &retry_type.getattr("__dict__")?)?;
+    let module_dict = dict_proof(py, retry_module.dict().as_any())?;
     Ok(RetryStateGuard {
         urllib3_version: urllib3_module.getattr("__version__")?.unbind(),
         urllib3_module: urllib3_module.into_any().unbind(),
         retry_type: retry_type.unbind(),
         history_type: retry_module.getattr("RequestHistory")?.unbind(),
         retry_module: retry_module.into_any().unbind(),
-        class_items,
-        module_items,
+        class_dict,
+        module_dict,
     })
 }
 
@@ -401,6 +434,148 @@ fn exact_dict_snapshot(
         if !current.is(original.bind(py)) {
             return Ok(false);
         }
+    }
+    Ok(true)
+}
+
+fn callable_proof(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<CallableProof>> {
+    let function_type = PyModule::import(py, "types")?.getattr("FunctionType")?;
+    if !value.is_instance(&function_type)? {
+        return Ok(None);
+    }
+    let closure = value.getattr("__closure__")?;
+    let closure_cells = if closure.is_none() {
+        Vec::new()
+    } else {
+        closure
+            .try_iter()?
+            .map(|cell| {
+                let cell = cell?;
+                let contents = cell.getattr("cell_contents").ok().map(Bound::unbind);
+                Ok((cell.unbind(), contents))
+            })
+            .collect::<PyResult<Vec<_>>>()?
+    };
+    let kwdefaults = value.getattr("__kwdefaults__")?;
+    let kwdefault_items = if kwdefaults.is_none() {
+        None
+    } else {
+        Some(mapping_proof(&kwdefaults)?)
+    };
+    Ok(Some(CallableProof {
+        function: value.clone().unbind(),
+        code: value.getattr("__code__")?.unbind(),
+        defaults: value.getattr("__defaults__")?.unbind(),
+        kwdefaults: kwdefaults.unbind(),
+        kwdefault_items,
+        closure: closure.unbind(),
+        closure_cells,
+        attributes: mapping_proof(&value.getattr("__dict__")?)?,
+        annotations: mapping_proof(&value.getattr("__annotations__")?)?,
+    }))
+}
+
+fn callable_proof_is_pristine(py: Python<'_>, proof: &CallableProof) -> PyResult<bool> {
+    let function = proof.function.bind(py);
+    if !function.getattr("__code__")?.is(proof.code.bind(py))
+        || !function
+            .getattr("__defaults__")?
+            .is(proof.defaults.bind(py))
+        || !function
+            .getattr("__kwdefaults__")?
+            .is(proof.kwdefaults.bind(py))
+        || !function.getattr("__closure__")?.is(proof.closure.bind(py))
+        || !mapping_proof_is_pristine(py, &function.getattr("__dict__")?, &proof.attributes)?
+        || !mapping_proof_is_pristine(
+            py,
+            &function.getattr("__annotations__")?,
+            &proof.annotations,
+        )?
+    {
+        return Ok(false);
+    }
+    if let Some(expected) = &proof.kwdefault_items
+        && !mapping_proof_is_pristine(py, &function.getattr("__kwdefaults__")?, expected)?
+    {
+        return Ok(false);
+    }
+    let closure = function.getattr("__closure__")?;
+    if closure.is_none() {
+        return Ok(proof.closure_cells.is_empty());
+    }
+    let current = closure.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+    if current.len() != proof.closure_cells.len() {
+        return Ok(false);
+    }
+    for (cell, (expected_cell, expected_contents)) in current.iter().zip(&proof.closure_cells) {
+        if !cell.is(expected_cell.bind(py)) {
+            return Ok(false);
+        }
+        let contents = cell.getattr("cell_contents").ok();
+        match (contents, expected_contents) {
+            (None, None) => {}
+            (Some(contents), Some(expected)) if contents.is(expected.bind(py)) => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+fn dict_proof(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<DictProof> {
+    let items = dict_snapshot(value)?;
+    let callables = items
+        .iter()
+        .filter_map(|(_, item)| callable_proof(py, item.bind(py)).transpose())
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(DictProof { items, callables })
+}
+
+fn dict_proof_is_pristine(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    proof: &DictProof,
+) -> PyResult<bool> {
+    if !exact_dict_snapshot(py, value, &proof.items)? {
+        return Ok(false);
+    }
+    for callable in &proof.callables {
+        if !callable_proof_is_pristine(py, callable)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn behavior_proof(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<BehaviorProof> {
+    let type_type = PyModule::import(py, "builtins")?.getattr("type")?;
+    let class_dict = value
+        .is_instance(&type_type)?
+        .then(|| dict_proof(py, &value.getattr("__dict__")?))
+        .transpose()?;
+    Ok(BehaviorProof {
+        object: value.clone().unbind(),
+        class_dict,
+        callable: callable_proof(py, value)?,
+    })
+}
+
+fn behavior_proof_is_pristine(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    proof: &BehaviorProof,
+) -> PyResult<bool> {
+    if !value.is(proof.object.bind(py)) {
+        return Ok(false);
+    }
+    if let Some(class_dict) = &proof.class_dict
+        && !dict_proof_is_pristine(py, &value.getattr("__dict__")?, class_dict)?
+    {
+        return Ok(false);
+    }
+    if let Some(callable) = &proof.callable
+        && !callable_proof_is_pristine(py, callable)?
+    {
+        return Ok(false);
     }
     Ok(true)
 }
@@ -642,9 +817,10 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
     })
     .collect::<PyResult<Vec<_>>>()?;
     let poolmanager_type = adapters.getattr("PoolManager")?;
-    let poolmanager_class_items = dict_snapshot(&poolmanager_type.getattr("__dict__")?)?;
     let poolmanager_module = PyModule::import(py, "urllib3.poolmanager")?;
-    let proxy_manager_constructor = poolmanager_module.getattr("ProxyManager")?.unbind();
+    let poolmanager_behavior = behavior_proof(py, &poolmanager_type)?;
+    let proxy_manager_behavior = behavior_proof(py, &poolmanager_module.getattr("ProxyManager")?)?;
+    let socks_manager_behavior = behavior_proof(py, &adapters.getattr("SOCKSProxyManager")?)?;
     let prepared_getattribute = prepared_request_type.getattr("__getattribute__")?.unbind();
     Ok(AdapterState {
         adapters_module: adapters.into_any().unbind(),
@@ -652,9 +828,10 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
         prepared_request_type: prepared_request_type.unbind(),
         prepared_getattribute,
         poolmanager_type: poolmanager_type.unbind(),
-        poolmanager_class_items,
+        poolmanager_behavior,
         poolmanager_module: poolmanager_module.into_any().unbind(),
-        proxy_manager_constructor,
+        proxy_manager_behavior,
+        socks_manager_behavior,
         methods,
         globals,
     })
@@ -712,9 +889,16 @@ fn adapter_identity_is_pristine(
     if !poolmanager_module
         .as_any()
         .is(state.poolmanager_module.bind(py))
-        || !poolmanager_module
-            .getattr("ProxyManager")?
-            .is(state.proxy_manager_constructor.bind(py))
+        || !behavior_proof_is_pristine(
+            py,
+            &poolmanager_module.getattr("ProxyManager")?,
+            &state.proxy_manager_behavior,
+        )?
+        || !behavior_proof_is_pristine(
+            py,
+            &module.getattr("SOCKSProxyManager")?,
+            &state.socks_manager_behavior,
+        )?
     {
         return Ok(false);
     }
@@ -1084,23 +1268,28 @@ fn manager_pool_count(manager: &Bound<'_, PyAny>) -> PyResult<usize> {
 }
 
 fn manager_proof(manager: &Bound<'_, PyAny>) -> PyResult<ManagerProof> {
+    let py = manager.py();
     let mut mappings = Vec::new();
     for name in [
         "headers",
         "connection_pool_kw",
         "pool_classes_by_scheme",
         "key_fn_by_scheme",
+        "proxy_headers",
     ] {
         if let Ok(mapping) = manager.getattr(name) {
-            mappings.push((name.to_owned(), object_items(&mapping)?));
+            mappings.push((name.to_owned(), mapping_proof(&mapping)?));
         }
     }
+    let pools = manager.getattr("pools")?;
     Ok(ManagerProof {
         manager: manager.clone().unbind(),
         manager_type: manager.get_type().into_any().unbind(),
-        class_items: dict_snapshot(&manager.get_type().getattr("__dict__")?)?,
-        objects: dict_snapshot(&manager.getattr("__dict__")?)?,
+        class_dict: dict_proof(py, &manager.get_type().getattr("__dict__")?)?,
+        objects: dict_proof(py, &manager.getattr("__dict__")?)?,
         mappings,
+        pools_dict: dict_proof(py, &pools.getattr("__dict__")?)?,
+        pool_container: mapping_proof(&pools.getattr("_container")?)?,
         visible_pools: visible_pools(manager)?,
     })
 }
@@ -1117,20 +1306,48 @@ fn object_items(value: &Bound<'_, PyAny>) -> PyResult<ObjectItems> {
         .collect()
 }
 
-fn exact_object_items(
+fn mapping_proof(value: &Bound<'_, PyAny>) -> PyResult<MappingProof> {
+    let items = object_items(value)?;
+    let mut nested = Vec::new();
+    for (_, item) in &items {
+        let item = item.bind(value.py());
+        if item.hasattr("items")? {
+            nested.push((item.clone().unbind(), Box::new(mapping_proof(item)?)));
+        }
+    }
+    Ok(MappingProof {
+        mapping: value.clone().unbind(),
+        items,
+        nested,
+    })
+}
+
+fn mapping_proof_is_pristine(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
-    expected: &ObjectItems,
+    proof: &MappingProof,
 ) -> PyResult<bool> {
+    if !value.is(proof.mapping.bind(py)) {
+        return Ok(false);
+    }
     let current = object_items(value)?;
-    Ok(current.len() == expected.len()
-        && current
+    if current.len() != proof.items.len()
+        || current
             .iter()
-            .zip(expected)
-            .all(|((key, value), (expected_key, expected_value))| {
-                key.bind(py).eq(expected_key.bind(py)).unwrap_or(false)
-                    && value.bind(py).is(expected_value.bind(py))
-            }))
+            .zip(&proof.items)
+            .any(|((key, value), (expected_key, expected_value))| {
+                !key.bind(py).is(expected_key.bind(py))
+                    || !value.bind(py).is(expected_value.bind(py))
+            })
+    {
+        return Ok(false);
+    }
+    for (nested_value, nested_proof) in &proof.nested {
+        if !mapping_proof_is_pristine(py, nested_value.bind(py), nested_proof)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn manager_proof_is_pristine(
@@ -1140,19 +1357,25 @@ fn manager_proof_is_pristine(
 ) -> PyResult<bool> {
     if !manager.is(proof.manager.bind(py))
         || !manager.get_type().as_any().is(proof.manager_type.bind(py))
-        || !exact_dict_snapshot(
+        || !dict_proof_is_pristine(
             py,
             &manager.get_type().getattr("__dict__")?,
-            &proof.class_items,
+            &proof.class_dict,
         )?
-        || !exact_dict_snapshot(py, &manager.getattr("__dict__")?, &proof.objects)?
+        || !dict_proof_is_pristine(py, &manager.getattr("__dict__")?, &proof.objects)?
     {
         return Ok(false);
     }
     for (name, expected) in &proof.mappings {
-        if !exact_object_items(py, &manager.getattr(name.as_str())?, expected)? {
+        if !mapping_proof_is_pristine(py, &manager.getattr(name.as_str())?, expected)? {
             return Ok(false);
         }
+    }
+    let pools = manager.getattr("pools")?;
+    if !dict_proof_is_pristine(py, &pools.getattr("__dict__")?, &proof.pools_dict)?
+        || !mapping_proof_is_pristine(py, &pools.getattr("_container")?, &proof.pool_container)?
+    {
+        return Ok(false);
     }
     let pools = visible_pools(manager)?;
     Ok(pools.len() == proof.visible_pools.len()
@@ -1177,17 +1400,22 @@ fn visible_pools(manager: &Bound<'_, PyAny>) -> PyResult<Vec<(Py<PyAny>, Py<PyAn
         .collect()
 }
 
+fn refresh_manager_pools(py: Python<'_>, proof: &mut ManagerProof) -> PyResult<()> {
+    let manager = proof.manager.bind(py);
+    let pools = manager.getattr("pools")?;
+    proof.pools_dict = dict_proof(py, &pools.getattr("__dict__")?)?;
+    proof.pool_container = mapping_proof(&pools.getattr("_container")?)?;
+    proof.visible_pools = visible_pools(manager)?;
+    Ok(())
+}
+
 fn manager_identity_is_pristine(py: Python<'_>, manager: &Bound<'_, PyAny>) -> PyResult<bool> {
     let state = adapter_state(py)?;
     let manager_type = state.poolmanager_type.bind(py);
     if !manager.get_type().as_any().is(manager_type) {
         return Ok(false);
     }
-    if !exact_dict_snapshot(
-        py,
-        &manager_type.getattr("__dict__")?,
-        &state.poolmanager_class_items,
-    )? {
+    if !behavior_proof_is_pristine(py, manager_type, &state.poolmanager_behavior)? {
         return Ok(false);
     }
     let dictionary = manager.getattr("__dict__")?;
@@ -1667,7 +1895,7 @@ fn _adapter_send_trial(
             return Ok(py.NotImplemented());
         };
         entry.visible_pool_count = manager_pool_count(entry.poolmanager.bind(py))?;
-        entry.manager_proof.visible_pools = visible_pools(entry.poolmanager.bind(py))?;
+        refresh_manager_pools(py, &mut entry.manager_proof)?;
     }
     if !adapter_identity_is_pristine(py, adapter, request)?
         || !registered_adapter_pristine(py, adapter)?
@@ -1782,7 +2010,7 @@ fn _adapter_close_trial(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<
         realm.order.clear();
     }
     entry.visible_pool_count = manager_pool_count(entry.poolmanager.bind(py))?;
-    entry.manager_proof.visible_pools = visible_pools(entry.poolmanager.bind(py))?;
+    refresh_manager_pools(py, &mut entry.manager_proof)?;
     Ok(count)
 }
 
@@ -1804,23 +2032,50 @@ impl NativeAdapterRaw {
         let Some(encoding) = self.content_encoding.as_deref() else {
             return Ok(None);
         };
-        if !encoding.split(',').all(|coding| {
-            matches!(
-                coding.trim().to_ascii_lowercase().as_str(),
-                "gzip" | "x-gzip" | "deflate" | "br" | "zstd"
-            )
-        }) {
+        let encoding = encoding.to_ascii_lowercase();
+        let response_module = PyModule::import(py, "urllib3.response")?;
+        let content_decoders = response_module
+            .getattr("HTTPResponse")?
+            .getattr("CONTENT_DECODERS")?;
+        let supported = |coding: &str| content_decoders.contains(coding);
+        if !supported(&encoding)?
+            && (!encoding.contains(',')
+                || !encoding
+                    .split(',')
+                    .map(str::trim)
+                    .any(|coding| supported(coding).unwrap_or(false)))
+        {
             return Ok(None);
         }
         if self.decoder.is_none() {
             self.decoder = Some(
-                PyModule::import(py, "urllib3.response")?
+                response_module
                     .getattr("_get_decoder")?
-                    .call1((encoding,))?
+                    .call1((&encoding,))?
                     .unbind(),
             );
         }
         Ok(self.decoder.as_ref().map(|decoder| decoder.clone_ref(py)))
+    }
+
+    fn decoder_is_bounded(decoder: &Bound<'_, PyAny>) -> PyResult<bool> {
+        decoder.hasattr("has_unconsumed_tail")
+    }
+
+    fn decompress(
+        decoder: &Bound<'_, PyAny>,
+        py: Python<'_>,
+        wire: &[u8],
+        maximum: isize,
+    ) -> PyResult<Vec<u8>> {
+        let wire = PyBytes::new(py, wire);
+        if Self::decoder_is_bounded(decoder)? {
+            decoder
+                .call_method1("decompress", (wire, maximum))?
+                .extract()
+        } else {
+            decoder.call_method1("decompress", (wire,))?.extract()
+        }
     }
 
     fn fill_decoded(&mut self, py: Python<'_>, wanted: Option<usize>) -> PyResult<()> {
@@ -1830,13 +2085,13 @@ impl NativeAdapterRaw {
         }
         while !self.decoder_eof && wanted.is_none_or(|wanted| self.decoded.len() < wanted) {
             let decoder = self.decoder(py)?;
-            let has_tail = decoder.as_ref().is_some_and(|decoder| {
-                decoder
+            let has_tail = match &decoder {
+                Some(decoder) if Self::decoder_is_bounded(decoder.bind(py))? => decoder
                     .bind(py)
-                    .getattr("has_unconsumed_tail")
-                    .and_then(|value| value.is_truthy())
-                    .unwrap_or(false)
-            });
+                    .getattr("has_unconsumed_tail")?
+                    .is_truthy()?,
+                _ => false,
+            };
             let mut wire = if has_tail { Vec::new() } else { vec![0; 8192] };
             let read = if has_tail {
                 0
@@ -1852,6 +2107,8 @@ impl NativeAdapterRaw {
             if read == 0 && !has_tail {
                 self.body = None;
                 if let Some(decoder) = decoder {
+                    self.decoded
+                        .extend(Self::decompress(decoder.bind(py), py, b"", -1)?);
                     self.decoded.extend(
                         decoder
                             .bind(py)
@@ -1863,18 +2120,17 @@ impl NativeAdapterRaw {
                 break;
             }
             if let Some(decoder) = decoder {
+                if Self::decoder_is_bounded(decoder.bind(py))? {
+                    self.decode_started = true;
+                }
                 let maximum = wanted
                     .map(|wanted| {
                         isize::try_from(wanted.saturating_sub(self.decoded.len()))
                             .unwrap_or(isize::MAX)
                     })
                     .unwrap_or(-1);
-                self.decoded.extend(
-                    decoder
-                        .bind(py)
-                        .call_method1("decompress", (PyBytes::new(py, &wire), maximum))?
-                        .extract::<Vec<u8>>()?,
-                );
+                self.decoded
+                    .extend(Self::decompress(decoder.bind(py), py, &wire, maximum)?);
             } else {
                 self.decoded.extend(wire);
             }
@@ -1894,8 +2150,7 @@ impl NativeAdapterRaw {
         if self.closed {
             return Ok(PyBytes::new(py, b"").into_any().unbind());
         }
-        if decode_content {
-            self.decode_started = true;
+        if decode_content && self.decoder(py)?.is_some() {
             self.fill_decoded(py, amount)?;
             let end = amount
                 .map(|amount| {
