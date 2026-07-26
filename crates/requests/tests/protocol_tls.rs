@@ -59,6 +59,7 @@ struct TlsObservation {
 enum ExpectedClientResult {
     Success,
     TlsFailure,
+    RequiredIdentityFailure,
 }
 
 #[derive(Clone, Copy)]
@@ -682,7 +683,7 @@ fn run_mtls_case(
             MTLS_CLIENT_CHAIN,
             "ordered mTLS client chain",
         )),
-        ExpectedClientResult::TlsFailure => None,
+        ExpectedClientResult::TlsFailure | ExpectedClientResult::RequiredIdentityFailure => None,
     };
     run_tls_case_with_client_authentication(
         VALID_SERVER,
@@ -795,7 +796,7 @@ fn run_tls_case_with_client_authentication(
                     "encrypted request must carry the explicit loopback authority"
                 );
             }
-            ExpectedClientResult::TlsFailure => {
+            ExpectedClientResult::TlsFailure | ExpectedClientResult::RequiredIdentityFailure => {
                 let error = match sent {
                     Ok(Err(error)) => error,
                     Ok(Ok(_)) => {
@@ -810,14 +811,28 @@ fn run_tls_case_with_client_authentication(
                     }
                 };
                 let kind = format!("{:?}", error.kind());
-                assert_ne!(kind, "Dns", "TLS rejection must not be a DNS error");
-                assert_ne!(kind, "Connect", "TLS rejection must not be a connect error");
-                if kind != "Tls" {
-                    server.abort();
-                    let _ = server.await;
-                    panic!("verification failure must be TLS: {error}");
+                match expected {
+                    ExpectedClientResult::TlsFailure => {
+                        if kind != "Tls" {
+                            server.abort();
+                            let _ = server.await;
+                            panic!("server verification failure must be TLS, got {kind}: {error}");
+                        }
+                    }
+                    ExpectedClientResult::RequiredIdentityFailure => {
+                        let allowed =
+                            matches!(kind.as_str(), "Tls" | "Handshake" | "Send" | "Connection");
+                        if !allowed {
+                            server.abort();
+                            let _ = server.await;
+                            panic!(
+                                "required client identity must fail after connect as \
+                                 Tls, Handshake, Send, or Connection; got {kind}: {error}"
+                            );
+                        }
+                    }
+                    ExpectedClientResult::Success => unreachable!(),
                 }
-                assert_eq!(kind, "Tls", "verification failure must be TLS: {error}");
 
                 let observation = await_server(server).await;
                 assert!(!observation.tls_completed);
@@ -924,7 +939,7 @@ fn mtls_loopback_requires_client_identity_before_http() {
     run_mtls_case(
         CertificateSource::PemBundle(frozen_ca_bundle()),
         None,
-        ExpectedClientResult::TlsFailure,
+        ExpectedClientResult::RequiredIdentityFailure,
     );
 }
 
