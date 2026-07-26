@@ -1,5 +1,7 @@
 mod connect;
 pub(crate) mod decode;
+#[cfg(test)]
+mod establishment_tests;
 mod pool;
 #[cfg(test)]
 mod pool_tests;
@@ -32,6 +34,8 @@ pub(crate) struct Transport {
     pool: Arc<Mutex<Pool>>,
     #[cfg(test)]
     derived_pool_keys: Mutex<Vec<PoolKey>>,
+    #[cfg(test)]
+    establishment_control: Option<Arc<dyn EstablishmentControl>>,
     connector: Arc<dyn Connector>,
     proxy: Option<Proxy>,
     #[allow(dead_code)]
@@ -47,6 +51,27 @@ pub(super) trait Connector: Send + Sync {
         port: u16,
         target: &str,
     ) -> Pin<Box<dyn Future<Output = Result<tokio::net::TcpStream>> + Send>>;
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EstablishmentStage {
+    Connect,
+    Tls,
+    Http1,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) trait EstablishmentControl: Send + Sync {
+    fn blocking_load_started(&self);
+    fn blocking_load_finished(&self, succeeded: bool);
+    fn checkpoint(
+        &self,
+        stage: EstablishmentStage,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    fn raw_shutdown_taken(&self);
 }
 
 struct DirectConnector;
@@ -151,6 +176,8 @@ pub(crate) struct TransportLease {
 pub(crate) struct ConnectionDriver {
     task: Option<JoinHandle<Result<()>>>,
     shutdown: Option<std::net::TcpStream>,
+    #[cfg(test)]
+    shutdown_observer: Option<Arc<dyn EstablishmentControl>>,
 }
 
 impl ConnectionDriver {
@@ -161,7 +188,15 @@ impl ConnectionDriver {
         Self {
             task: Some(tokio::spawn(task)),
             shutdown,
+            #[cfg(test)]
+            shutdown_observer: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_shutdown_observer(mut self, observer: Option<Arc<dyn EstablishmentControl>>) -> Self {
+        self.shutdown_observer = observer;
+        self
     }
 
     #[cfg(test)]
@@ -229,6 +264,10 @@ impl ConnectionDriver {
 
     fn shutdown_socket_once(&mut self) {
         if let Some(stream) = self.shutdown.take() {
+            #[cfg(test)]
+            if let Some(observer) = &self.shutdown_observer {
+                observer.raw_shutdown_taken();
+            }
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
@@ -371,6 +410,8 @@ impl Transport {
             pool: Arc::new(Mutex::new(Pool::new(pool_max_idle_per_host))),
             #[cfg(test)]
             derived_pool_keys: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            establishment_control: None,
             connector,
             proxy,
             tls,
@@ -398,6 +439,19 @@ impl Transport {
                 .lock()
                 .expect("derived pool-key observation lock poisoned"),
         )
+    }
+
+    #[cfg(test)]
+    fn with_test_establishment_control(mut self, control: Arc<dyn EstablishmentControl>) -> Self {
+        self.establishment_control = Some(control);
+        self
+    }
+
+    #[cfg(test)]
+    async fn establishment_checkpoint(&self, stage: EstablishmentStage) {
+        if let Some(control) = &self.establishment_control {
+            control.checkpoint(stage).await;
+        }
     }
 
     pub async fn send(&self, request: Request) -> Result<TransportResponse> {
@@ -638,6 +692,9 @@ impl Transport {
                 .generation_number(&key)
         };
         let establishing = async {
+            #[cfg(test)]
+            self.establishment_checkpoint(EstablishmentStage::Connect)
+                .await;
             let stream = self.connector.connect(host, port, target).await?;
             let stream = stream
                 .into_std()
@@ -647,6 +704,9 @@ impl Transport {
                 .map_err(|error| Error::connect(target, error))?;
             let stream = tokio::net::TcpStream::from_std(stream)
                 .map_err(|error| Error::connect(target, error))?;
+            #[cfg(test)]
+            self.establishment_checkpoint(EstablishmentStage::Http1)
+                .await;
             let (sender, connection) = http1::handshake(TokioIo::new(stream))
                 .await
                 .map_err(Error::handshake)?;
@@ -654,6 +714,9 @@ impl Transport {
                 async move { connection.await.map_err(Error::connection) },
                 Some(shutdown),
             );
+            #[cfg(test)]
+            let driver =
+                driver.with_shutdown_observer(self.establishment_control.as_ref().map(Arc::clone));
             Ok(ConnectionLease::new(
                 key,
                 generation,
@@ -957,10 +1020,16 @@ mod tests {
         let driver = ConnectionDriver {
             task: None,
             shutdown: None,
+            shutdown_observer: None,
         };
-        let ConnectionDriver { task, shutdown } = &driver;
+        let ConnectionDriver {
+            task,
+            shutdown,
+            shutdown_observer,
+        } = &driver;
         let _: &Option<std::net::TcpStream> = shutdown;
         assert!(task.is_none());
+        assert!(shutdown_observer.is_none());
     }
 
     #[test]

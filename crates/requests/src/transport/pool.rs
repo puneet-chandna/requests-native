@@ -331,6 +331,11 @@ impl Pool {
             .map_or(0, |generation| generation.idle.len())
     }
 
+    #[cfg(test)]
+    pub(super) fn generation_count(&self) -> usize {
+        self.generations.len()
+    }
+
     pub(super) fn acquire(&mut self, key: &PoolKey) -> Option<ConnectionLease> {
         let generation = self.generations.get_mut(key)?;
         let connection = generation.idle.pop()?;

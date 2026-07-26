@@ -855,8 +855,12 @@ fn assert_connect_timeout(error: &Error, source: &str) {
     assert_eq!(error.kind(), ErrorKind::ConnectTimeout);
     let message = error.to_string().to_ascii_lowercase();
     assert!(
-        message.contains("connect"),
-        "connect timeout must identify its phase: {message}"
+        message.contains("connection establishment"),
+        "connect timeout must identify the complete establishment phase: {message}"
+    );
+    assert!(
+        !message.contains("tcp connect"),
+        "connect timeout must not describe establishment as TCP-only: {message}"
     );
     match source {
         "connect" => {
