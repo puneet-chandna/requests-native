@@ -251,6 +251,18 @@ fn production_tls_pool_identity_inventory_is_structural_and_path_only() {
             ));
         }
     }
+    for required in [
+        "CertificateSource::Platform",
+        "CertificateSource::Disabled",
+        "CertificateSource::PemBundle",
+        "CertificateSource::PemDirectory",
+    ] {
+        if !key_definitions.contains(required) && !send_key_derivation.contains(required) {
+            violations.push(format!(
+                "bounded production key factory must directly contain {required:?}"
+            ));
+        }
+    }
     if send_key_derivation.contains("PoolKey::new(scheme,authority,None,TlsPoolKey::plain(),None)")
     {
         violations

@@ -32,6 +32,26 @@ impl TlsPoolKey {
     }
 
     #[cfg(test)]
+    pub(super) fn platform() -> Self {
+        Self("platform".to_owned())
+    }
+
+    #[cfg(test)]
+    pub(super) fn pem_bundle(path: &std::path::Path) -> Self {
+        Self(format!("pem-bundle:{}", path.display()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn pem_directory(path: &std::path::Path) -> Self {
+        Self(format!("pem-directory:{}", path.display()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn disabled() -> Self {
+        Self("disabled".to_owned())
+    }
+
+    #[cfg(test)]
     pub(super) fn new(value: &str) -> Self {
         Self(value.to_owned())
     }
@@ -41,6 +61,21 @@ impl TlsPoolKey {
 pub(super) struct IdentityKey(String);
 
 impl IdentityKey {
+    #[cfg(test)]
+    pub(super) fn from_paths(
+        certificate_chain: &std::path::Path,
+        private_key: Option<&std::path::Path>,
+    ) -> Self {
+        Self(format!(
+            "certificate-chain:{};private-key:{}",
+            certificate_chain.display(),
+            private_key.map_or_else(
+                || "<combined>".to_owned(),
+                |path| path.display().to_string(),
+            ),
+        ))
+    }
+
     #[cfg(test)]
     pub(super) fn new(value: &str) -> Self {
         Self(value.to_owned())

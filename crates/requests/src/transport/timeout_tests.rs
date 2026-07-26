@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::Method;
 
-use super::pool::{PoolKey, TlsPoolKey};
+use super::pool::{IdentityKey, PoolKey, TlsPoolKey};
 use super::{
     Connector, DEFAULT_MAX_IDLE_PER_HOST, DeadlineSource, Transport, select_deadline_source,
 };
@@ -278,6 +278,18 @@ fn missing_tls_material_key(tls: TlsConfig) -> PoolKey {
     key
 }
 
+fn assert_https_pool_key(
+    key: &PoolKey,
+    expected_tls: TlsPoolKey,
+    expected_identity: Option<IdentityKey>,
+) {
+    assert_eq!(key.scheme, http::uri::Scheme::HTTPS);
+    assert_eq!(key.authority.host(), "secure.test");
+    assert_eq!(key.proxy, None);
+    assert_eq!(key.tls, expected_tls);
+    assert_eq!(key.identity, expected_identity);
+}
+
 fn frozen_root_bundle() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/certs/expired/ca/ca.crt")
 }
@@ -336,15 +348,33 @@ fn tls_loading_https_missing_root_fails_before_connector() {
 fn tls_loading_https_valid_root_reaches_connector_once() {
     let root = frozen_root_bundle();
     assert!(root.is_file(), "frozen root fixture must exist: {root:?}");
+    let root_directory = root.parent().expect("frozen root has a parent");
+    let alias = root_directory
+        .join("..")
+        .join(
+            root_directory
+                .file_name()
+                .expect("frozen root parent has a filename"),
+        )
+        .join(root.file_name().expect("frozen root has a filename"));
+    assert!(
+        alias.is_file(),
+        "lexical alias of frozen root must exist: {alias:?}"
+    );
+    assert_ne!(
+        root, alias,
+        "existing frozen root spellings must remain lexically distinct",
+    );
     let (error, calls, keys) = send_with_recording_tls(
         "https://secure.test/path",
         TlsConfig {
-            roots: CertificateSource::PemBundle(root),
+            roots: CertificateSource::PemBundle(root.clone()),
             identity: None,
         },
     );
 
     assert_eq!(keys.len(), 1);
+    assert_https_pool_key(&keys[0], TlsPoolKey::pem_bundle(&root), None);
     assert_eq!(
         error.kind(),
         ErrorKind::Connect,
@@ -358,6 +388,22 @@ fn tls_loading_https_valid_root_reaches_connector_once() {
             target: "secure.test".to_owned(),
         }],
     );
+
+    let (alias_error, alias_calls, alias_keys) = send_with_recording_tls(
+        "https://secure.test/path",
+        TlsConfig {
+            roots: CertificateSource::PemBundle(alias.clone()),
+            identity: None,
+        },
+    );
+    assert_eq!(alias_keys.len(), 1);
+    assert_https_pool_key(&alias_keys[0], TlsPoolKey::pem_bundle(&alias), None);
+    assert_ne!(
+        keys[0], alias_keys[0],
+        "existing-file lexical aliases must remain distinct pool identities",
+    );
+    assert_eq!(alias_error.kind(), ErrorKind::Connect);
+    assert_eq!(alias_calls, calls);
 }
 
 #[test]
@@ -434,6 +480,7 @@ fn actual_https_pool_keys_preserve_root_mode_and_lexical_paths() {
             identity: None,
         },
     );
+    assert_https_pool_key(&platform, TlsPoolKey::platform(), None);
     let (disabled, disabled_error, disabled_calls) = recorded_pool_key(
         "https://secure.test/path",
         TlsConfig {
@@ -441,6 +488,7 @@ fn actual_https_pool_keys_preserve_root_mode_and_lexical_paths() {
             identity: None,
         },
     );
+    assert_https_pool_key(&disabled, TlsPoolKey::disabled(), None);
     assert_eq!(disabled_error.kind(), ErrorKind::Connect);
     assert_eq!(
         disabled_calls,
@@ -450,14 +498,18 @@ fn actual_https_pool_keys_preserve_root_mode_and_lexical_paths() {
             target: "secure.test".to_owned(),
         }],
     );
+    let bundle_path = PathBuf::from("ca.pem");
+    let directory_path = PathBuf::from("capath");
     let bundle = missing_tls_material_key(TlsConfig {
-        roots: CertificateSource::PemBundle(PathBuf::from("ca.pem")),
+        roots: CertificateSource::PemBundle(bundle_path.clone()),
         identity: None,
     });
     let directory = missing_tls_material_key(TlsConfig {
-        roots: CertificateSource::PemDirectory(PathBuf::from("capath")),
+        roots: CertificateSource::PemDirectory(directory_path.clone()),
         identity: None,
     });
+    assert_https_pool_key(&bundle, TlsPoolKey::pem_bundle(&bundle_path), None);
+    assert_https_pool_key(&directory, TlsPoolKey::pem_directory(&directory_path), None);
 
     let modes = [&platform, &disabled, &bundle, &directory];
     for (index, left) in modes.iter().enumerate() {
@@ -472,23 +524,27 @@ fn actual_https_pool_keys_preserve_root_mode_and_lexical_paths() {
             identity: None,
         }),
     );
-    assert_ne!(
-        bundle,
-        missing_tls_material_key(TlsConfig {
-            roots: CertificateSource::PemBundle(PathBuf::from("./ca.pem")),
-            identity: None,
-        }),
-    );
-    assert_ne!(
-        missing_tls_material_key(TlsConfig {
-            roots: CertificateSource::PemBundle(PathBuf::from("uninspected-a/ca.pem")),
-            identity: None,
-        }),
-        missing_tls_material_key(TlsConfig {
-            roots: CertificateSource::PemBundle(PathBuf::from("uninspected-b/ca.pem")),
-            identity: None,
-        }),
-    );
+    let alias_path = PathBuf::from("./ca.pem");
+    let alias = missing_tls_material_key(TlsConfig {
+        roots: CertificateSource::PemBundle(alias_path.clone()),
+        identity: None,
+    });
+    assert_https_pool_key(&alias, TlsPoolKey::pem_bundle(&alias_path), None);
+    assert_ne!(bundle, alias);
+
+    let first_path = PathBuf::from("uninspected-a/ca.pem");
+    let second_path = PathBuf::from("uninspected-b/ca.pem");
+    let first = missing_tls_material_key(TlsConfig {
+        roots: CertificateSource::PemBundle(first_path.clone()),
+        identity: None,
+    });
+    let second = missing_tls_material_key(TlsConfig {
+        roots: CertificateSource::PemBundle(second_path.clone()),
+        identity: None,
+    });
+    assert_https_pool_key(&first, TlsPoolKey::pem_bundle(&first_path), None);
+    assert_https_pool_key(&second, TlsPoolKey::pem_bundle(&second_path), None);
+    assert_ne!(first, second);
 }
 
 #[test]
@@ -502,20 +558,36 @@ fn actual_https_pool_keys_preserve_identity_shape_and_lexical_paths() {
     );
     assert_eq!(error.kind(), ErrorKind::Connect);
     assert_eq!(calls.len(), 1);
+    assert_https_pool_key(&without_identity, TlsPoolKey::disabled(), None);
+    let certificate_chain = PathBuf::from("client.pem");
+    let private_key = PathBuf::from("client.key");
     let combined = missing_tls_material_key(TlsConfig {
         roots: CertificateSource::Disabled,
         identity: Some(Identity {
-            certificate_chain: PathBuf::from("client.pem"),
+            certificate_chain: certificate_chain.clone(),
             private_key: None,
         }),
     });
     let separate = missing_tls_material_key(TlsConfig {
         roots: CertificateSource::Disabled,
         identity: Some(Identity {
-            certificate_chain: PathBuf::from("client.pem"),
-            private_key: Some(PathBuf::from("client.key")),
+            certificate_chain: certificate_chain.clone(),
+            private_key: Some(private_key.clone()),
         }),
     });
+    assert_https_pool_key(
+        &combined,
+        TlsPoolKey::disabled(),
+        Some(IdentityKey::from_paths(&certificate_chain, None)),
+    );
+    assert_https_pool_key(
+        &separate,
+        TlsPoolKey::disabled(),
+        Some(IdentityKey::from_paths(
+            &certificate_chain,
+            Some(&private_key),
+        )),
+    );
 
     assert_ne!(without_identity, combined);
     assert_ne!(combined, separate);
@@ -530,26 +602,41 @@ fn actual_https_pool_keys_preserve_identity_shape_and_lexical_paths() {
             }),
         }),
     );
-    assert_ne!(
-        separate,
-        missing_tls_material_key(TlsConfig {
-            roots: CertificateSource::Disabled,
-            identity: Some(Identity {
-                certificate_chain: PathBuf::from("./client.pem"),
-                private_key: Some(PathBuf::from("client.key")),
-            }),
+    let certificate_alias = PathBuf::from("./client.pem");
+    let certificate_alias_key = missing_tls_material_key(TlsConfig {
+        roots: CertificateSource::Disabled,
+        identity: Some(Identity {
+            certificate_chain: certificate_alias.clone(),
+            private_key: Some(private_key.clone()),
         }),
+    });
+    assert_https_pool_key(
+        &certificate_alias_key,
+        TlsPoolKey::disabled(),
+        Some(IdentityKey::from_paths(
+            &certificate_alias,
+            Some(&private_key),
+        )),
     );
-    assert_ne!(
-        separate,
-        missing_tls_material_key(TlsConfig {
-            roots: CertificateSource::Disabled,
-            identity: Some(Identity {
-                certificate_chain: PathBuf::from("client.pem"),
-                private_key: Some(PathBuf::from("./client.key")),
-            }),
+    assert_ne!(separate, certificate_alias_key);
+
+    let private_key_alias = PathBuf::from("./client.key");
+    let private_alias_key = missing_tls_material_key(TlsConfig {
+        roots: CertificateSource::Disabled,
+        identity: Some(Identity {
+            certificate_chain: certificate_chain.clone(),
+            private_key: Some(private_key_alias.clone()),
         }),
+    });
+    assert_https_pool_key(
+        &private_alias_key,
+        TlsPoolKey::disabled(),
+        Some(IdentityKey::from_paths(
+            &certificate_chain,
+            Some(&private_key_alias),
+        )),
     );
+    assert_ne!(separate, private_alias_key);
 }
 
 async fn send_with_safety_release(timeout: Timeout) -> Error {
