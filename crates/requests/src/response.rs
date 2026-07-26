@@ -7,7 +7,7 @@
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,7 +20,7 @@ use http::header::TRANSFER_ENCODING;
 use http::{HeaderMap, StatusCode};
 use hyper::body::{Body, Incoming};
 
-use crate::transport::{TransportLease, TransportResponse};
+use crate::transport::{DeadlineSource, TransportLease, TransportResponse, select_deadline_source};
 use crate::{Error, Result};
 
 pub struct Response {
@@ -29,6 +29,8 @@ pub struct Response {
     url: String,
     driver: Option<ResponseBodyDriver>,
     read_timeout: Option<Duration>,
+    total_timeout: Option<Duration>,
+    total_deadline: Option<Instant>,
     disposition: Option<ResponseDispositionState>,
 }
 
@@ -40,6 +42,8 @@ impl Response {
             url: response.url,
             driver: Some(ResponseBodyDriver::Network(response.lease)),
             read_timeout: response.read_timeout,
+            total_timeout: response.total_timeout,
+            total_deadline: response.total_deadline,
             disposition: Some(ResponseDispositionState::default()),
         }
     }
@@ -66,6 +70,8 @@ impl Response {
             driver: self.driver.take(),
             read_timeout: self.read_timeout.take(),
             read_deadline: None,
+            total_timeout: self.total_timeout.take(),
+            total_deadline: self.total_deadline.take().map(BodyDeadline::new),
             chunked,
             terminal: false,
             disposition: self
@@ -149,12 +155,34 @@ pub struct ResponseBody {
     source: Option<ResponseBodySource>,
     driver: Option<ResponseBodyDriver>,
     read_timeout: Option<Duration>,
-    read_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    read_deadline: Option<BodyDeadline>,
+    total_timeout: Option<Duration>,
+    total_deadline: Option<BodyDeadline>,
     chunked: bool,
     terminal: bool,
     disposition: ResponseDispositionState,
     #[cfg(test)]
     probe: Option<TestResponseBodyProbe>,
+}
+
+struct BodyDeadline {
+    at: Instant,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl BodyDeadline {
+    fn new(at: Instant) -> Self {
+        Self { at, sleep: None }
+    }
+
+    fn poll(&mut self, context: &mut Context<'_>) -> Poll<()> {
+        let sleep = self.sleep.get_or_insert_with(|| {
+            Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                self.at,
+            )))
+        });
+        sleep.as_mut().poll(context)
+    }
 }
 
 impl ResponseBody {
@@ -172,6 +200,7 @@ impl ResponseBody {
         self.terminal = true;
         drop(self.source.take());
         drop(self.read_deadline.take());
+        drop(self.total_deadline.take());
         self.disposition.apply(event);
         #[cfg(test)]
         if let Some(probe) = &self.probe {
@@ -225,6 +254,37 @@ impl ResponseBody {
         }
     }
 
+    fn poll_timeout(&mut self, context: &mut Context<'_>) -> Option<Error> {
+        let read_at = self.read_deadline.as_ref().map(|deadline| deadline.at);
+        let total_at = self.total_deadline.as_ref().map(|deadline| deadline.at);
+        match select_deadline_source(read_at, total_at)? {
+            DeadlineSource::Read => {
+                let deadline = self
+                    .read_deadline
+                    .as_mut()
+                    .expect("selected read deadline exists");
+                deadline.poll(context).is_ready().then(|| {
+                    Error::read_timeout(
+                        self.read_timeout
+                            .expect("read deadline exists only when timeout is configured"),
+                    )
+                })
+            }
+            DeadlineSource::Total => {
+                let deadline = self
+                    .total_deadline
+                    .as_mut()
+                    .expect("selected total deadline exists");
+                deadline.poll(context).is_ready().then(|| {
+                    Error::response_body_total_timeout(
+                        self.total_timeout
+                            .expect("total deadline exists only when timeout is configured"),
+                    )
+                })
+            }
+        }
+    }
+
     #[cfg(test)]
     fn test_pending_body_and_driver() -> (Self, TestDriverFailure, TestResponseBodyProbe) {
         let shared = Arc::new(ControlledDriverShared {
@@ -246,6 +306,8 @@ impl ResponseBody {
                 })),
                 read_timeout: None,
                 read_deadline: None,
+                total_timeout: None,
+                total_deadline: None,
                 chunked: false,
                 terminal: false,
                 disposition: ResponseDispositionState::without_native_lease(),
@@ -263,6 +325,10 @@ impl Stream for ResponseBody {
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.terminal {
             return Poll::Ready(None);
+        }
+
+        if let Some(error) = self.poll_timeout(context) {
+            return self.finish_error(ResponseEvent::ReadError, error);
         }
 
         match self.poll_source(context) {
@@ -288,8 +354,13 @@ impl Stream for ResponseBody {
 
         if self.read_deadline.is_none()
             && let Some(timeout) = self.read_timeout
+            && let Some(at) = Instant::now().checked_add(timeout)
         {
-            self.read_deadline = Some(Box::pin(tokio::time::sleep(timeout)));
+            self.read_deadline = Some(BodyDeadline::new(at));
+        }
+
+        if let Some(error) = self.poll_timeout(context) {
+            return self.finish_error(ResponseEvent::ReadError, error);
         }
 
         if let Some(driver) = self.driver.as_mut() {
@@ -305,14 +376,6 @@ impl Stream for ResponseBody {
             }
         }
 
-        if let Some(deadline) = self.read_deadline.as_mut()
-            && deadline.as_mut().poll(context).is_ready()
-        {
-            let timeout = self
-                .read_timeout
-                .expect("read deadline exists only when read timeout is configured");
-            return self.finish_error(ResponseEvent::ReadError, Error::read_timeout(timeout));
-        }
         Poll::Pending
     }
 }

@@ -10,7 +10,8 @@ use std::future::Future;
 use std::net::Shutdown;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, HOST};
@@ -27,6 +28,93 @@ const MAX_IDLE_PER_KEY: usize = 10;
 
 pub(crate) struct Transport {
     pool: Arc<Mutex<Pool>>,
+    connector: Arc<dyn Connector>,
+}
+
+pub(super) trait Connector: Send + Sync {
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        target: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio::net::TcpStream>> + Send>>;
+}
+
+struct DirectConnector;
+
+impl Connector for DirectConnector {
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        target: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio::net::TcpStream>> + Send>> {
+        let host = host.to_owned();
+        let target = target.to_owned();
+        Box::pin(async move { connect::connect(&host, port, &target).await })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DeadlineSource {
+    Read,
+    Total,
+}
+
+pub(super) fn select_deadline_source(
+    read_deadline: Option<Instant>,
+    total_deadline: Option<Instant>,
+) -> Option<DeadlineSource> {
+    match (read_deadline, total_deadline) {
+        (Some(read), Some(total)) if read <= total => Some(DeadlineSource::Read),
+        (Some(_), Some(_)) => Some(DeadlineSource::Total),
+        (Some(_), None) => Some(DeadlineSource::Read),
+        (None, Some(_)) => Some(DeadlineSource::Total),
+        (None, None) => None,
+    }
+}
+
+fn deadline_for(
+    source: Option<DeadlineSource>,
+    read_deadline: Option<Instant>,
+    total_deadline: Option<Instant>,
+) -> Option<Instant> {
+    match source {
+        Some(DeadlineSource::Read) => read_deadline,
+        Some(DeadlineSource::Total) => total_deadline,
+        None => None,
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_for_body_completion(completion: &mut Option<BodyCompletion>) -> Instant {
+    match completion {
+        Some(completion) => completion.await,
+        None => std::future::pending().await,
+    }
+}
+
+enum ExchangeEvent {
+    Deadline(DeadlineSource),
+    Response(std::result::Result<http::Response<Incoming>, hyper::Error>),
+    UploadComplete(Instant),
+    Driver(std::result::Result<Result<()>, tokio::task::JoinError>),
+}
+
+#[derive(Clone, Copy)]
+struct EstablishmentDeadlines {
+    connect_timeout: Option<Duration>,
+    connect_deadline: Option<Instant>,
+    total_timeout: Option<Duration>,
+    total_deadline: Option<Instant>,
 }
 
 impl fmt::Debug for Transport {
@@ -40,7 +128,9 @@ pub(crate) struct TransportResponse {
     pub body: Incoming,
     pub url: String,
     pub lease: TransportLease,
-    pub read_timeout: Option<std::time::Duration>,
+    pub read_timeout: Option<Duration>,
+    pub total_timeout: Option<Duration>,
+    pub total_deadline: Option<Instant>,
 }
 
 pub(crate) struct TransportLease {
@@ -64,6 +154,7 @@ impl ConnectionDriver {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_running(&self) -> bool {
         self.task.is_some()
     }
@@ -230,8 +321,13 @@ impl Drop for TransportLease {
 
 impl Transport {
     pub(crate) fn new() -> Self {
+        Self::with_connector(Arc::new(DirectConnector))
+    }
+
+    fn with_connector(connector: Arc<dyn Connector>) -> Self {
         Self {
             pool: Arc::new(Mutex::new(Pool::new(MAX_IDLE_PER_KEY))),
+            connector,
         }
     }
 
@@ -247,6 +343,7 @@ impl Transport {
     }
 
     pub async fn send(&self, request: Request) -> Result<TransportResponse> {
+        let started = Instant::now();
         validate_request(&request)?;
         let host = request
             .uri()
@@ -267,31 +364,108 @@ impl Transport {
         let target = authority.as_str().to_owned();
         let key = PoolKey::new(scheme, authority, None, TlsPoolKey::plain(), None);
         let request = request.into_parts();
+        let connect_timeout = request.timeout.connect;
         let read_timeout = request.timeout.read;
-        let (outgoing, url) = outgoing_request(request)?;
+        let total_timeout = request.timeout.total;
+        let connect_deadline = connect_timeout.and_then(|timeout| started.checked_add(timeout));
+        let total_deadline = total_timeout.and_then(|timeout| started.checked_add(timeout));
+        let establishment_deadlines = EstablishmentDeadlines {
+            connect_timeout,
+            connect_deadline,
+            total_timeout,
+            total_deadline,
+        };
+        let track_body_completion = read_timeout.is_some() || total_timeout.is_some();
+        let (outgoing, url, mut body_completion) =
+            outgoing_request(request, track_body_completion)?;
 
-        let mut lease = self.acquire_connection(key, &host, port, &target).await?;
+        let mut lease = self
+            .acquire_connection(key, &host, port, &target, establishment_deadlines)
+            .await?;
         let response = {
+            let exchange_started = Instant::now();
+            let upload_completed_at = body_completion
+                .as_ref()
+                .and_then(BodyCompletion::completed_at);
+            let mut completion_pending = body_completion.is_some() && upload_completed_at.is_none();
+            if upload_completed_at.is_some() {
+                body_completion.take();
+            }
+            let mut head_read_deadline = upload_completed_at.and_then(|completed_at| {
+                read_timeout.and_then(|timeout| {
+                    std::cmp::max(exchange_started, completed_at).checked_add(timeout)
+                })
+            });
             let (sender, driver) = lease.connection_mut().network_parts_mut();
             let sending = sender.send_request(outgoing);
             tokio::pin!(sending);
             loop {
-                if !driver.is_running() {
-                    break sending.as_mut().await.map_err(Error::send);
+                if completion_pending
+                    && let Some(completed_at) = body_completion
+                        .as_ref()
+                        .and_then(BodyCompletion::completed_at)
+                {
+                    completion_pending = false;
+                    body_completion.take();
+                    head_read_deadline = read_timeout.and_then(|timeout| {
+                        std::cmp::max(exchange_started, completed_at).checked_add(timeout)
+                    });
                 }
-
-                let Some(driver_task) = driver.task_mut() else {
-                    continue;
-                };
-                tokio::select! {
-                    biased;
-                    result = &mut sending => break result.map_err(Error::send),
-                    driver_result = driver_task => {
-                        match driver.finish(driver_result) {
-                            Ok(()) => continue,
-                            Err(error) => break Err(error),
+                let deadline_source = select_deadline_source(head_read_deadline, total_deadline);
+                let deadline = deadline_for(deadline_source, head_read_deadline, total_deadline);
+                let event = {
+                    let deadline_wait = wait_for_deadline(deadline);
+                    tokio::pin!(deadline_wait);
+                    let driver_wait = std::future::poll_fn(|context| {
+                        let Some(task) = driver.task_mut() else {
+                            return Poll::Pending;
+                        };
+                        Pin::new(task).poll(context)
+                    });
+                    tokio::pin!(driver_wait);
+                    tokio::select! {
+                        biased;
+                        () = &mut deadline_wait => ExchangeEvent::Deadline(
+                            deadline_source.expect("finite deadline wait requires a source"),
+                        ),
+                        result = &mut sending => ExchangeEvent::Response(result),
+                        completed_at = wait_for_body_completion(&mut body_completion),
+                            if completion_pending => {
+                            ExchangeEvent::UploadComplete(completed_at)
                         }
+                        driver_result = &mut driver_wait => ExchangeEvent::Driver(driver_result),
                     }
+                };
+                match event {
+                    ExchangeEvent::Deadline(DeadlineSource::Read) => {
+                        break Err(Error::response_head_timeout(
+                            read_timeout
+                                .expect("read deadline exists only when timeout is configured"),
+                            false,
+                        ));
+                    }
+                    ExchangeEvent::Deadline(DeadlineSource::Total) => {
+                        let timeout = total_timeout
+                            .expect("total deadline exists only when timeout is configured");
+                        let error = if completion_pending {
+                            Error::request_exchange_total_timeout(timeout)
+                        } else {
+                            Error::response_head_timeout(timeout, true)
+                        };
+                        break Err(error);
+                    }
+                    ExchangeEvent::Response(result) => break result.map_err(Error::send),
+                    ExchangeEvent::UploadComplete(completed_at) => {
+                        completion_pending = false;
+                        body_completion.take();
+                        head_read_deadline = read_timeout.and_then(|timeout| {
+                            std::cmp::max(exchange_started, completed_at).checked_add(timeout)
+                        });
+                    }
+                    ExchangeEvent::Driver(driver_result) => match driver.finish(driver_result) {
+                        Ok(()) => continue,
+                        Err(error) => break Err(error),
+                    },
                 }
             }
         };
@@ -303,7 +477,7 @@ impl Transport {
                     .await;
                 return match cleanup {
                     Ok(()) => Err(send_error),
-                    Err(driver_error) => Err(Error::send_with_cleanup(send_error, driver_error)),
+                    Err(driver_error) => Err(Error::with_cleanup(send_error, driver_error)),
                 };
             }
         };
@@ -315,6 +489,8 @@ impl Transport {
             url,
             lease: TransportLease::new(Arc::clone(&self.pool), lease),
             read_timeout,
+            total_timeout,
+            total_deadline,
         })
     }
 
@@ -324,6 +500,7 @@ impl Transport {
         host: &str,
         port: u16,
         target: &str,
+        deadlines: EstablishmentDeadlines,
     ) -> Result<ConnectionLease> {
         loop {
             let candidate = {
@@ -341,7 +518,26 @@ impl Transport {
             }
             let ready = {
                 let (sender, _) = lease.connection_mut().network_parts_mut();
-                sender.ready().await
+                match deadlines.total_deadline {
+                    Some(deadline) => {
+                        tokio::select! {
+                            biased;
+                            () = tokio::time::sleep_until(
+                                tokio::time::Instant::from_std(deadline)
+                            ) => None,
+                            result = sender.ready() => Some(result),
+                        }
+                    }
+                    None => Some(sender.ready().await),
+                }
+            };
+            let Some(ready) = ready else {
+                TransportLease::new(Arc::clone(&self.pool), lease).finish_now(false);
+                return Err(Error::request_exchange_total_timeout(
+                    deadlines
+                        .total_timeout
+                        .expect("total deadline exists only when timeout is configured"),
+                ));
             };
             if ready.is_ok() && lease.is_live() && lease.peer_is_open() {
                 return Ok(lease);
@@ -349,7 +545,8 @@ impl Transport {
             TransportLease::new(Arc::clone(&self.pool), lease).finish_now(false);
         }
 
-        self.connect_connection(key, host, port, target).await
+        self.connect_connection(key, host, port, target, deadlines)
+            .await
     }
 
     async fn connect_connection(
@@ -358,6 +555,7 @@ impl Transport {
         host: &str,
         port: u16,
         target: &str,
+        deadlines: EstablishmentDeadlines,
     ) -> Result<ConnectionLease> {
         let generation = {
             self.pool
@@ -365,27 +563,64 @@ impl Transport {
                 .expect("transport pool lock poisoned")
                 .generation_number(&key)
         };
-        let stream = connect::connect(host, port, target).await?;
-        let stream = stream
-            .into_std()
-            .map_err(|error| Error::connect(target, error))?;
-        let shutdown = stream
-            .try_clone()
-            .map_err(|error| Error::connect(target, error))?;
-        let stream = tokio::net::TcpStream::from_std(stream)
-            .map_err(|error| Error::connect(target, error))?;
-        let (sender, connection) = http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(Error::handshake)?;
-        let driver = ConnectionDriver::spawn(
-            async move { connection.await.map_err(Error::connection) },
-            Some(shutdown),
-        );
-        Ok(ConnectionLease::new(
-            key,
-            generation,
-            IdleConnection::network(sender, driver),
-        ))
+        let establishing = async {
+            let stream = self.connector.connect(host, port, target).await?;
+            let stream = stream
+                .into_std()
+                .map_err(|error| Error::connect(target, error))?;
+            let shutdown = stream
+                .try_clone()
+                .map_err(|error| Error::connect(target, error))?;
+            let stream = tokio::net::TcpStream::from_std(stream)
+                .map_err(|error| Error::connect(target, error))?;
+            let (sender, connection) = http1::handshake(TokioIo::new(stream))
+                .await
+                .map_err(Error::handshake)?;
+            let driver = ConnectionDriver::spawn(
+                async move { connection.await.map_err(Error::connection) },
+                Some(shutdown),
+            );
+            Ok(ConnectionLease::new(
+                key,
+                generation,
+                IdleConnection::network(sender, driver),
+            ))
+        };
+        tokio::pin!(establishing);
+        match select_deadline_source(deadlines.connect_deadline, deadlines.total_deadline) {
+            None => establishing.await,
+            Some(source) => {
+                let deadline = match source {
+                    DeadlineSource::Read => deadlines
+                        .connect_deadline
+                        .expect("connect deadline selected only when configured"),
+                    DeadlineSource::Total => deadlines
+                        .total_deadline
+                        .expect("total deadline selected only when configured"),
+                };
+                tokio::select! {
+                    biased;
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        let (timeout, total) = match source {
+                            DeadlineSource::Read => (
+                                deadlines.connect_timeout.expect(
+                                    "connect deadline selected only when timeout is configured"
+                                ),
+                                false,
+                            ),
+                            DeadlineSource::Total => (
+                                deadlines.total_timeout.expect(
+                                    "total deadline selected only when timeout is configured"
+                                ),
+                                true,
+                            ),
+                        };
+                        Err(Error::connect_timeout(target, timeout, total))
+                    },
+                    result = &mut establishing => result,
+                }
+            }
+        }
     }
 }
 
@@ -423,7 +658,10 @@ fn parsed_content_length(value: &http::HeaderValue) -> Option<u64> {
     value.parse().ok()
 }
 
-fn outgoing_request(mut request: RequestParts) -> Result<(http::Request<OutgoingBody>, String)> {
+fn outgoing_request(
+    mut request: RequestParts,
+    track_body_completion: bool,
+) -> Result<(http::Request<OutgoingBody>, String, Option<BodyCompletion>)> {
     let origin = request
         .uri
         .path_and_query()
@@ -442,20 +680,113 @@ fn outgoing_request(mut request: RequestParts) -> Result<(http::Request<Outgoing
         request.headers.insert(HOST, host);
     }
 
-    let mut outgoing = http::Request::new(OutgoingBody::new(request.body));
+    let (body, completion) = OutgoingBody::new(request.body, track_body_completion);
+    let mut outgoing = http::Request::new(body);
     *outgoing.method_mut() = request.method;
     *outgoing.uri_mut() = origin;
     *outgoing.headers_mut() = request.headers;
-    Ok((outgoing, request.url))
+    Ok((outgoing, request.url, completion))
 }
 
 struct OutgoingBody {
     source: BodySource,
+    progress: Option<Arc<BodyProgress>>,
 }
 
 impl OutgoingBody {
-    fn new(source: BodySource) -> Self {
-        Self { source }
+    fn new(source: BodySource, track_completion: bool) -> (Self, Option<BodyCompletion>) {
+        let initially_complete = match &source {
+            BodySource::Empty => true,
+            BodySource::Bytes(bytes) => bytes.is_empty(),
+            BodySource::Stream(_) => false,
+        };
+        let progress = track_completion.then(|| Arc::new(BodyProgress::new(initially_complete)));
+        let completion = progress.as_ref().map(|progress| BodyCompletion {
+            progress: Arc::clone(progress),
+        });
+        (Self { source, progress }, completion)
+    }
+
+    fn mark_complete(&self) {
+        if let Some(progress) = &self.progress {
+            progress.mark_complete();
+        }
+    }
+}
+
+struct BodyProgress {
+    state: Mutex<BodyProgressState>,
+}
+
+struct BodyProgressState {
+    completed_at: Option<Instant>,
+    waker: Option<Waker>,
+}
+
+impl BodyProgress {
+    fn new(complete: bool) -> Self {
+        Self {
+            state: Mutex::new(BodyProgressState {
+                completed_at: complete.then(Instant::now),
+                waker: None,
+            }),
+        }
+    }
+
+    fn mark_complete(&self) {
+        let waker = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("request body progress lock poisoned");
+            if state.completed_at.is_some() {
+                return;
+            }
+            state.completed_at = Some(Instant::now());
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn completed_at(&self) -> Option<Instant> {
+        self.state
+            .lock()
+            .expect("request body progress lock poisoned")
+            .completed_at
+    }
+
+    fn poll_complete(&self, context: &mut Context<'_>) -> Poll<Instant> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("request body progress lock poisoned");
+        if let Some(completed_at) = state.completed_at {
+            state.waker.take();
+            Poll::Ready(completed_at)
+        } else {
+            state.waker = Some(context.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+struct BodyCompletion {
+    progress: Arc<BodyProgress>,
+}
+
+impl BodyCompletion {
+    fn completed_at(&self) -> Option<Instant> {
+        self.progress.completed_at()
+    }
+}
+
+impl Future for BodyCompletion {
+    type Output = Instant;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.progress.poll_complete(context)
     }
 }
 
@@ -469,9 +800,18 @@ impl Body for OutgoingBody {
     ) -> Poll<Option<Result<Frame<Self::Data>>>> {
         let body = self.get_mut();
         match std::mem::take(&mut body.source) {
-            BodySource::Empty => Poll::Ready(None),
-            BodySource::Bytes(bytes) if bytes.is_empty() => Poll::Ready(None),
-            BodySource::Bytes(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+            BodySource::Empty => {
+                body.mark_complete();
+                Poll::Ready(None)
+            }
+            BodySource::Bytes(bytes) if bytes.is_empty() => {
+                body.mark_complete();
+                Poll::Ready(None)
+            }
+            BodySource::Bytes(bytes) => {
+                body.mark_complete();
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
             BodySource::Stream(mut stream) => match stream.as_mut().poll_next(context) {
                 Poll::Pending => {
                     body.source = BodySource::Stream(stream);
@@ -481,7 +821,10 @@ impl Body for OutgoingBody {
                     body.source = BodySource::Stream(stream);
                     Poll::Ready(Some(chunk.map(Frame::data)))
                 }
-                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Ready(None) => {
+                    body.mark_complete();
+                    Poll::Ready(None)
+                }
             },
         }
     }
@@ -586,9 +929,10 @@ mod tests {
                 .build()
                 .unwrap();
 
-        let (outgoing, url) = outgoing_request(request.into_parts()).unwrap();
+        let (outgoing, url, completion) = outgoing_request(request.into_parts(), false).unwrap();
 
         assert_eq!(outgoing.uri().to_string(), "/direct?source=unit");
+        assert!(completion.is_none());
         assert_eq!(outgoing.headers().len(), 1);
         assert_eq!(
             outgoing.headers().get("host"),

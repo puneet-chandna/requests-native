@@ -7,6 +7,7 @@ pub enum ErrorKind {
     Builder,
     ChunkedEncoding,
     Connect,
+    ConnectTimeout,
     Connection,
     Dns,
     Handshake,
@@ -85,6 +86,18 @@ impl Error {
         )
     }
 
+    pub(crate) fn connect_timeout(target: &str, timeout: std::time::Duration, total: bool) -> Self {
+        let source = if total {
+            "total timeout"
+        } else {
+            "connect timeout"
+        };
+        Self::transport(
+            ErrorKind::ConnectTimeout,
+            format!("TCP connect phase {source} after {timeout:?} for {target}"),
+        )
+    }
+
     pub(crate) fn handshake(error: impl fmt::Display) -> Self {
         Self::transport(
             ErrorKind::Handshake,
@@ -99,9 +112,15 @@ impl Error {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn send_with_cleanup(primary: Self, cleanup: Self) -> Self {
+        Self::with_cleanup(primary, cleanup)
+    }
+
+    pub(crate) fn with_cleanup(primary: Self, cleanup: Self) -> Self {
+        let kind = primary.kind;
         Self::transport(
-            ErrorKind::Send,
+            kind,
             format!("{primary}; connection cleanup also failed: {cleanup}"),
         )
     }
@@ -131,6 +150,32 @@ impl Error {
         Self::transport(
             ErrorKind::ReadTimeout,
             format!("HTTP/1.1 response body read timed out after {timeout:?}"),
+        )
+    }
+
+    pub(crate) fn response_body_total_timeout(timeout: std::time::Duration) -> Self {
+        Self::transport(
+            ErrorKind::ReadTimeout,
+            format!("HTTP/1.1 response body total timeout after {timeout:?}"),
+        )
+    }
+
+    pub(crate) fn response_head_timeout(timeout: std::time::Duration, total: bool) -> Self {
+        let source = if total {
+            "total timeout"
+        } else {
+            "read timeout"
+        };
+        Self::transport(
+            ErrorKind::ReadTimeout,
+            format!("HTTP/1.1 response head {source} after {timeout:?}"),
+        )
+    }
+
+    pub(crate) fn request_exchange_total_timeout(timeout: std::time::Duration) -> Self {
+        Self::transport(
+            ErrorKind::ReadTimeout,
+            format!("HTTP/1.1 request exchange total timeout after {timeout:?}"),
         )
     }
 

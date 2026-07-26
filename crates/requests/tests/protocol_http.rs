@@ -1828,6 +1828,42 @@ fn timeout_contract_read_none_and_total_none_allow_delayed_response_head() {
 }
 
 #[test]
+fn timeout_contract_into_body_outside_runtime_preserves_total_deadline() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(Duration::ZERO);
+    let client = Client::new().expect("build deadline client");
+    let response = send_deadline_request(
+        &runtime,
+        client.get(server.url()).timeout(Timeout {
+            connect: None,
+            read: None,
+            total: Some(DEADLINE_LONG),
+        }),
+    )
+    .expect("response head should arrive before the total deadline");
+
+    let mut body = response.into_body();
+    let bytes = runtime
+        .block_on(async {
+            tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, async {
+                let mut collected = Vec::new();
+                while let Some(frame) = next_response_frame(&mut body).await {
+                    collected.extend_from_slice(&frame?);
+                }
+                Ok::<_, requests::Error>(Bytes::from(collected))
+            })
+            .await
+        })
+        .expect("body collection exceeded outer bound")
+        .expect("body collection failed");
+    assert_eq!(bytes, Bytes::from_static(b"ok"));
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
 fn timeout_contract_total_precedes_read_while_waiting_for_response_head() {
     let runtime = runtime();
     let server = DeadlineServer::delayed_head(DEADLINE_PHASE_DELAY);
