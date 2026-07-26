@@ -753,8 +753,10 @@ fn capath_ignores_invalid_basenames() {
 }
 
 #[test]
-fn capath_ignores_non_ascii_decimal_suffixes_even_with_valid_pem() {
+fn capath_ignores_non_ascii_numeric_hash_and_suffix_fields_even_with_valid_pem() {
     let directory = CapathDirectory::new();
+    directory.write("١17adfc4.0", FROZEN_CA_CERTIFICATE);
+    directory.write("１17adfc4.0", FROZEN_CA_CERTIFICATE);
     directory.write("117adfc4.١", FROZEN_CA_CERTIFICATE);
     directory.write("117adfc4.１２", FROZEN_CA_CERTIFICATE);
     assert_capath_rejected(&directory);

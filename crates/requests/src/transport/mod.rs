@@ -64,9 +64,17 @@ pub(super) enum EstablishmentStage {
 
 #[cfg(test)]
 #[allow(dead_code)]
+pub(super) type NativeRootLoader =
+    Arc<dyn Fn() -> rustls_native_certs::CertificateResult + Send + Sync>;
+
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) trait EstablishmentControl: Send + Sync {
     fn blocking_load_started(&self);
     fn blocking_load_finished(&self, succeeded: bool);
+    fn native_root_loader(&self) -> Option<NativeRootLoader> {
+        None
+    }
     fn checkpoint(
         &self,
         stage: EstablishmentStage,

@@ -14,7 +14,8 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use super::{
-    Connector, DEFAULT_MAX_IDLE_PER_HOST, EstablishmentControl, EstablishmentStage, Transport,
+    Connector, DEFAULT_MAX_IDLE_PER_HOST, EstablishmentControl, EstablishmentStage,
+    NativeRootLoader, Transport,
 };
 use crate::{
     BodySource, CertificateSource, ContentCodecs, Error, ErrorKind, RequestBuilder, Timeout,
@@ -49,6 +50,7 @@ struct TestEstablishmentControl {
     load_released: Mutex<bool>,
     load_release: Condvar,
     load_finished: AtomicBool,
+    native_root_loader: Mutex<Option<NativeRootLoader>>,
     raw_shutdowns: AtomicUsize,
 }
 
@@ -102,6 +104,7 @@ impl TestEstablishmentControl {
             load_released: Mutex::new(false),
             load_release: Condvar::new(),
             load_finished: AtomicBool::new(false),
+            native_root_loader: Mutex::new(None),
             raw_shutdowns: AtomicUsize::new(0),
         })
     }
@@ -126,6 +129,13 @@ impl TestEstablishmentControl {
             .lock()
             .expect("load release lock poisoned") = true;
         self.load_release.notify_all();
+    }
+
+    fn inject_native_root_loader(&self, loader: NativeRootLoader) {
+        *self
+            .native_root_loader
+            .lock()
+            .expect("native-root loader lock poisoned") = Some(loader);
     }
 
     async fn await_released_load_completion(&self) {
@@ -166,6 +176,13 @@ impl EstablishmentControl for TestEstablishmentControl {
     fn blocking_load_finished(&self, succeeded: bool) {
         self.record(ObservedStage::LoadFinished(succeeded));
         self.load_finished.store(true, Ordering::Release);
+    }
+
+    fn native_root_loader(&self) -> Option<NativeRootLoader> {
+        self.native_root_loader
+            .lock()
+            .expect("native-root loader lock poisoned")
+            .clone()
     }
 
     fn checkpoint(
@@ -309,6 +326,15 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn frozen_ca_bundle() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/certs/expired/ca/ca.crt")
+}
+
+fn injected_native_roots() -> rustls_native_certs::CertificateResult {
+    let mut result = rustls_native_certs::CertificateResult::default();
+    let mut pem = Cursor::new(include_bytes!("../../../../tests/certs/expired/ca/ca.crt"));
+    result.certs = rustls_pemfile::certs(&mut pem)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse deterministic injected native root");
+    result
 }
 
 fn frozen_mtls_client(filename: &str) -> PathBuf {
@@ -534,6 +560,10 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
         .split_once("\n}\n\nfn validate_request")
         .expect("establishment function remains bounded before validation");
     let compact = connection.split_whitespace().collect::<String>();
+    let tls_production = tls
+        .split_once("#[cfg(test)]\nmod tests {")
+        .map_or(tls.as_str(), |(production, _)| production);
+    let tls_compact = tls_production.split_whitespace().collect::<String>();
     let mut violations = Vec::new();
 
     let raw_shutdown_calls = production.matches(".raw_shutdown_taken()").count();
@@ -582,15 +612,64 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
     if production.matches("tokio::task::spawn_blocking").count() != 1 {
         violations.push("HTTPS establishment needs exactly one blocking load/parse task");
     }
-    if tls
-        .matches("rustls_native_certs::load_native_certs")
-        .count()
-        != 1
-    {
-        violations.push("Platform roots need exactly one native-root loader invocation");
+    let tls_load = tls_compact
+        .split_once("pub(super)fnload(")
+        .and_then(|(_, after)| {
+            after
+                .split_once("fnload_platform_roots(")
+                .map(|(body, _)| body)
+        });
+    let platform_loader =
+        tls_compact
+            .split_once("fnload_platform_roots(")
+            .and_then(|(_, after)| {
+                after
+                    .split_once("fnsystem_native_roots(")
+                    .map(|(body, _)| body)
+            });
+    let system_loader = tls_compact
+        .split_once("fnsystem_native_roots(")
+        .map(|(_, body)| body);
+    if tls_production.contains("#[cfg(test)]") {
+        violations.push("the bounded Platform/native-root helper chain must be production code");
+    }
+    match (tls_load, platform_loader, system_loader) {
+        (Some(load), Some(platform), Some(system))
+            if load.contains(
+                "CertificateSource::Platform=>load_platform_roots(native_root_loader)",
+            ) && platform.matches("native_root_loader()").count() == 1
+                && platform
+                    .matches("rustls_native_certs::load_native_certs")
+                    .count()
+                    == 0
+                && system
+                    .matches("rustls_native_certs::load_native_certs()")
+                    .count()
+                    == 1
+                && tls_compact
+                    .matches("rustls_native_certs::load_native_certs()")
+                    .count()
+                    == 1 => {}
+        _ => violations.push(
+            "bounded Platform arm must call load_platform_roots(native_root_loader), whose \
+             injected call is distinct from one bounded system_native_roots native-loader call",
+        ),
     }
     if !compact.contains("spawn_blocking") || !compact.contains(".await") {
         violations.push("the one blocking loader must be awaited inside establishment");
+    }
+    let injected_loader = compact.find(".native_root_loader()");
+    let blocking_load = compact.find("spawn_blocking");
+    let tls_load_call = compact.find("tls::load");
+    if !matches!(
+        (injected_loader, blocking_load, tls_load_call),
+        (Some(injected), Some(blocking), Some(load))
+            if injected < blocking && blocking < load
+    ) {
+        violations.push(
+            "the production pool-miss callsite must pass the injected native-root loader into \
+             tls::load inside the awaited blocking stage",
+        );
     }
     for required in [
         "blocking_load_started",
@@ -748,6 +827,14 @@ fn default_platform_roots_use_awaited_native_loader_before_connector() {
             "default certificate source must remain Platform",
         );
         let control = TestEstablishmentControl::new(None);
+        let native_root_loads = Arc::new(AtomicUsize::new(0));
+        control.inject_native_root_loader({
+            let native_root_loads = Arc::clone(&native_root_loads);
+            Arc::new(move || {
+                native_root_loads.fetch_add(1, Ordering::AcqRel);
+                injected_native_roots()
+            })
+        });
         let connector = FailingConnector::default();
         let transport = transport(Arc::new(connector.clone()), tls, Arc::clone(&control));
         let error = expect_error(
@@ -763,8 +850,11 @@ fn default_platform_roots_use_awaited_native_loader_before_connector() {
             "controlled connector unexpectedly returned a response",
         );
 
-        assert_eq!(error.kind(), ErrorKind::Connect);
-        assert_eq!(connector.calls(), 1);
+        assert_eq!(
+            native_root_loads.load(Ordering::Acquire),
+            1,
+            "the actual Platform path must invoke the injected native-root loader exactly once",
+        );
         assert_eq!(
             control.stages(),
             [
@@ -774,6 +864,8 @@ fn default_platform_roots_use_awaited_native_loader_before_connector() {
             ],
             "default Platform roots must execute the awaited loader before connect",
         );
+        assert_eq!(error.kind(), ErrorKind::Connect);
+        assert_eq!(connector.calls(), 1);
         assert_eq!(control.raw_shutdowns.load(Ordering::Acquire), 0);
         assert_no_pool_entry(&transport);
     });
