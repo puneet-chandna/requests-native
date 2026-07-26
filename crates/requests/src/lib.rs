@@ -1,12 +1,17 @@
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "blocking")]
+#[doc(hidden)]
+pub mod adapters;
+#[cfg(feature = "blocking")]
 pub mod blocking;
 mod body;
 mod client;
 mod error;
 mod models;
 mod response;
+#[doc(hidden)]
+pub mod retry;
 pub mod structures;
 mod transport;
 pub mod utils;

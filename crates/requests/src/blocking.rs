@@ -318,6 +318,7 @@ impl DriverRegistry {
     }
 }
 
+#[derive(Clone)]
 pub struct Client {
     inner: AsyncClient,
     driver: BlockingRuntimeDriver,
@@ -411,6 +412,11 @@ impl Client {
             inner,
             driver: self.driver.clone(),
         })
+    }
+
+    #[doc(hidden)]
+    pub fn clear_pool(&self) {
+        self.inner.clear_pool();
     }
 }
 

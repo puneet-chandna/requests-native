@@ -208,6 +208,11 @@ impl Client {
     pub async fn execute(&self, request: Request) -> Result<Response> {
         execute_request(&self.transport, request).await
     }
+
+    #[doc(hidden)]
+    pub fn clear_pool(&self) {
+        self.transport.clear_pool();
+    }
 }
 
 pub(crate) async fn execute_request(transport: &Transport, request: Request) -> Result<Response> {

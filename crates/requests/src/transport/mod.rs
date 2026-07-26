@@ -444,8 +444,7 @@ impl Transport {
         }
     }
 
-    #[allow(dead_code)]
-    fn clear_pool(&self) {
+    pub(crate) fn clear_pool(&self) {
         let evicted = {
             self.pool
                 .lock()

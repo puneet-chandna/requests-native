@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import os.path
 import socket  # noqa: F401
+import threading
 import typing
 import warnings
+from contextlib import contextmanager
 from typing import Any
 
 from urllib3.exceptions import (
@@ -746,3 +748,71 @@ class HTTPAdapter(BaseAdapter):
                 raise
 
         return self.build_response(request, resp)
+
+
+_HTTP_ADAPTER_COMPAT_SEND = HTTPAdapter.send
+_HTTP_ADAPTER_COMPAT_CLOSE = HTTPAdapter.close
+_ADAPTER_TRIAL_STATE = threading.local()
+
+
+@contextmanager
+def _rust_adapter_trial():
+    """Privately opt built-in adapters into the native Task 13 trial."""
+
+    previous = getattr(_ADAPTER_TRIAL_STATE, "enabled", False)
+    _ADAPTER_TRIAL_STATE.enabled = True
+    try:
+        yield
+    finally:
+        _ADAPTER_TRIAL_STATE.enabled = previous
+
+
+def _trial_http_adapter_send(
+    self: HTTPAdapter,
+    request: PreparedRequest,
+    stream: bool = False,
+    timeout: _t.TimeoutType = None,
+    verify: _t.VerifyType = True,
+    cert: _t.CertType = None,
+    proxies: dict[str, str] | None = None,
+) -> Response:
+    if getattr(_ADAPTER_TRIAL_STATE, "enabled", False):
+        try:
+            from . import _requests_rust
+        except ImportError:
+            pass
+        else:
+            result = _requests_rust._adapter_send_trial(
+                self,
+                request,
+                stream,
+                timeout,
+                verify,
+                cert,
+                proxies,
+            )
+            if result is not NotImplemented:
+                return result
+    return _HTTP_ADAPTER_COMPAT_SEND(
+        self,
+        request,
+        stream=stream,
+        timeout=timeout,
+        verify=verify,
+        cert=cert,
+        proxies=proxies,
+    )
+
+
+def _trial_http_adapter_close(self: HTTPAdapter) -> None:
+    _HTTP_ADAPTER_COMPAT_CLOSE(self)
+    if getattr(_ADAPTER_TRIAL_STATE, "enabled", False):
+        try:
+            from . import _requests_rust
+        except ImportError:
+            return
+        _requests_rust._adapter_close_trial(self)
+
+
+HTTPAdapter.send = _trial_http_adapter_send
+HTTPAdapter.close = _trial_http_adapter_close
