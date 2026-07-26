@@ -39,22 +39,31 @@ def test_direct_http_dependencies_are_required_and_explicit() -> None:
     assert core["features"]["blocking"] == ["tokio/rt-multi-thread"]
 
 
-def test_platform_smoke_keeps_tls_optional_and_legacy_client_gated() -> None:
+def test_direct_tls_is_required_and_legacy_client_stays_platform_gated() -> None:
     core = _core_manifest()
-    optional_tls = {
-        "hyper-rustls": "0.27",
-        "rustls": "0.23",
-    }
     assert core["features"]["platform-smoke"] == [
         "dep:hyper-rustls",
         "hyper-util/client-legacy",
         "hyper-util/http1",
-        "dep:rustls",
     ]
-    for dependency, version in optional_tls.items():
-        declaration = core["dependencies"][dependency]
-        assert declaration["version"] == version
-        assert declaration["optional"] is True
+    assert core["dependencies"]["hyper-rustls"] == {
+        "version": "0.27",
+        "default-features": False,
+        "features": ["http1", "native-tokio", "ring", "tls12"],
+        "optional": True,
+    }
+    assert core["dependencies"]["rustls"] == {
+        "version": "0.23",
+        "default-features": False,
+        "features": ["ring", "std", "tls12"],
+    }
+    assert core["dependencies"]["tokio-rustls"] == {
+        "version": "0.26",
+        "default-features": False,
+        "features": ["ring", "tls12"],
+    }
+    assert core["dependencies"]["rustls-pemfile"] == "2"
+    assert core["dependencies"]["rustls-native-certs"] == "0.8"
 
 
 def test_platform_probe_covers_plain_tls_connect_and_socks_shapes() -> None:
