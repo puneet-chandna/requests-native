@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+import urllib3
 from urllib3.util.retry import Retry
 
 import requests
@@ -826,3 +827,182 @@ def test_decoded_read_yields_before_wire_eof_and_close_releases_owner():
             assert not release.is_set()
             raw.close()
             release.set()
+
+
+def test_empty_redirect_location_consumes_status_not_redirect_budget():
+    retry = Retry(
+        total=1,
+        status=0,
+        redirect=1,
+        status_forcelist={302},
+        raise_on_status=True,
+        raise_on_redirect=False,
+    )
+    with loopback((302, {"Location": ""}, b"terminal")) as (server, url):
+        with pytest.raises(RetryError, match="too many 302 responses"):
+            with _rust_adapter_trial():
+                HTTPAdapter(max_retries=retry).send(prepared(url))
+        assert server.requests == 1
+
+
+@pytest.mark.parametrize(
+    ("total", "expected_requests"),
+    [(None, 1), (False, 1), (0, 1), (True, 2), (1, 2)],
+)
+def test_automatic_retry_after_uses_python_total_truthiness(total, expected_requests):
+    responses = [(503, {"Retry-After": "0"}, b"first")]
+    if expected_requests == 2:
+        responses.append((200, {}, b"second"))
+    retry = Retry(total=total)
+    with loopback(*responses) as (server, url):
+        with _rust_adapter_trial():
+            response = HTTPAdapter(max_retries=retry).send(prepared(url))
+            assert response.status_code == (200 if expected_requests == 2 else 503)
+        assert server.requests == expected_requests
+
+
+@pytest.mark.skipif(
+    urllib3.__version__.startswith("1.26."), reason="jitter is urllib3 2.x only"
+)
+@pytest.mark.parametrize(
+    ("random_value", "backoff_max", "expected_sleep"),
+    [(0.5, 120, [0.5]), (2.0, 120, [2.0]), (2.0, 0, [])],
+)
+def test_jitter_observation_is_unclamped_and_precedes_cap(
+    monkeypatch, random_value, backoff_max, expected_sleep
+):
+    random_calls = []
+    sleeps = []
+    monkeypatch.setattr(
+        "random.random", lambda: random_calls.append(random_value) or random_value
+    )
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    retry = Retry(
+        total=2,
+        status=2,
+        status_forcelist={503},
+        backoff_factor=0,
+        backoff_jitter=1,
+        backoff_max=backoff_max,
+    )
+    with loopback(
+        (503, {}, b"one"),
+        (503, {}, b"two"),
+        (200, {}, b"done"),
+    ) as (server, url):
+        with _rust_adapter_trial():
+            assert HTTPAdapter(max_retries=retry).send(prepared(url)).content == b"done"
+        assert server.requests == 3
+    assert random_calls == [random_value]
+    assert sleeps == expected_sleep
+
+
+def test_stream_none_and_decode_mode_switch_match_urllib3():
+    compressed = gzip.compress(bytes(range(256)) * 20)
+    with loopback(
+        (200, {"Content-Encoding": "gzip"}, compressed),
+        (200, {"Content-Encoding": "gzip"}, compressed),
+    ) as (server, url):
+        adapter = HTTPAdapter()
+        with _rust_adapter_trial():
+            raw = adapter.send(prepared(url), stream=True).raw
+            assert (
+                b"".join(raw.stream(None, decode_content=True))
+                == bytes(range(256)) * 20
+            )
+            switched = adapter.send(prepared(url), stream=True).raw
+            assert switched.read(1, decode_content=True) == b"\x00"
+            with pytest.raises(RuntimeError, match="decode_content=False"):
+                switched.read(1, decode_content=False)
+        assert server.requests == 2
+
+
+def test_decoded_retention_is_bounded_to_pending_output():
+    payload = bytes(range(256)) * 400
+    compressed = gzip.compress(payload)
+    with loopback((200, {"Content-Encoding": "gzip"}, compressed)) as (server, url):
+        with _rust_adapter_trial():
+            raw = HTTPAdapter().send(prepared(url), stream=True).raw
+            retained = []
+            while raw.read(1024, decode_content=True):
+                retained.append(raw._retained_decoded_bytes_trial())
+            assert max(retained) < len(payload) // 2
+        assert server.requests == 1
+
+
+def test_in_place_main_manager_mapping_mutations_fall_back_then_restore(monkeypatch):
+    marker = object()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    adapter = HTTPAdapter()
+    request = prepared("http://example.test/")
+    for mapping_name, key in (
+        ("key_fn_by_scheme", "http"),
+        ("pool_classes_by_scheme", "http"),
+    ):
+        mapping = getattr(adapter.poolmanager, mapping_name)
+        original = mapping[key]
+        mapping[key] = object()
+        with _rust_adapter_trial():
+            assert adapter.send(request) is marker
+        mapping[key] = original
+
+    with loopback((200, {}, b"restored")) as (server, url):
+        with _rust_adapter_trial():
+            assert adapter.send(prepared(url)).content == b"restored"
+        assert server.requests == 1
+
+
+def test_proxy_constructor_mutation_falls_back_before_cache_or_socket(monkeypatch):
+    import urllib3.poolmanager
+
+    marker = object()
+    adapter = HTTPAdapter()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    monkeypatch.setattr(urllib3.poolmanager, "ProxyManager", object())
+    with _rust_adapter_trial():
+        assert (
+            adapter.send(
+                prepared("http://origin.example/"),
+                proxies={"http": "http://proxy.example/"},
+            )
+            is marker
+        )
+    assert adapter.proxy_manager == {}
+
+
+def test_proxy_manager_mutation_after_creation_falls_back_then_restores(monkeypatch):
+    marker = object()
+    with loopback((200, {}, b"first"), (200, {}, b"restored")) as (server, proxy_url):
+        proxy_root = proxy_url.rsplit("/", 1)[0]
+        adapter = HTTPAdapter()
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(
+                    prepared("http://origin.example/"), proxies={"http": proxy_root}
+                ).content
+                == b"first"
+            )
+        manager = adapter.proxy_manager[proxy_root]
+        original = manager.connection_pool_kw["maxsize"]
+        manager.connection_pool_kw["maxsize"] = original + 1
+        monkeypatch.setattr(
+            adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker
+        )
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(
+                    prepared("http://origin.example/"),
+                    proxies={"http": proxy_root},
+                )
+                is marker
+            )
+        assert server.requests == 1
+        manager.connection_pool_kw["maxsize"] = original
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(
+                    prepared("http://origin.example/"), proxies={"http": proxy_root}
+                ).content
+                == b"restored"
+            )
+        assert server.requests == 2

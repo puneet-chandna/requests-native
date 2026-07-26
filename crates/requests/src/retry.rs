@@ -18,7 +18,7 @@ impl RetryCount {
     }
 
     fn is_truthy(self) -> bool {
-        !matches!(self, Self::Boolean(false) | Self::Limited(0))
+        matches!(self, Self::Boolean(true) | Self::Limited(1..))
     }
 }
 
@@ -154,7 +154,11 @@ impl RetryState {
         redirect_location: Option<&str>,
     ) -> Result<Self, RetryFailure> {
         let consumed_reason = match (reason, redirect_location) {
-            (RetryReason::Status { status }, Some(_)) => RetryReason::Redirect { status },
+            (RetryReason::Status { status }, Some(location))
+                if !location.is_empty() && matches!(status, 301 | 302 | 303 | 307 | 308) =>
+            {
+                RetryReason::Redirect { status }
+            }
             _ => reason,
         };
         let mut remaining = self.remaining.clone();
@@ -183,22 +187,29 @@ impl RetryState {
     }
 
     pub fn backoff(&self, random_unit: f64) -> f64 {
-        let consecutive_errors = self
-            .history
-            .iter()
-            .rev()
-            .take_while(|item| !matches!(item.reason, RetryReason::Redirect { .. }))
-            .count();
+        let consecutive_errors = self.consecutive_errors();
         if consecutive_errors <= 1 {
             return 0.0;
         }
         let exponent = i32::try_from(consecutive_errors - 1).unwrap_or(i32::MAX);
         let backoff = self.remaining.backoff.factor * 2_f64.powi(exponent)
-            + self.remaining.backoff.jitter * random_unit.clamp(0.0, 1.0);
+            + self.remaining.backoff.jitter * random_unit;
         self.remaining
             .backoff
             .maximum
             .map_or(backoff, |maximum| backoff.min(maximum))
             .max(0.0)
+    }
+
+    pub fn should_observe_random(&self) -> bool {
+        self.consecutive_errors() > 1 && self.remaining.backoff.jitter > 0.0
+    }
+
+    fn consecutive_errors(&self) -> usize {
+        self.history
+            .iter()
+            .rev()
+            .take_while(|item| !matches!(item.reason, RetryReason::Redirect { .. }))
+            .count()
     }
 }

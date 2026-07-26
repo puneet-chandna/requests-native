@@ -220,3 +220,37 @@ def test_retry_getattribute_version_and_module_dependencies_are_frozen(monkeypat
             patched.setattr(owner, name, value)
             assert snapshot(retry)["eligible"] is False
         assert snapshot(retry)["eligible"] is True
+
+
+def test_complete_retry_behavior_dependencies_fall_back_then_restore(monkeypatch):
+    retry = Retry(total=1)
+    class_names = [
+        "is_exhausted",
+        "_is_connection_error",
+        "_is_read_error",
+        "sleep_for_retry",
+        "_sleep_backoff",
+    ]
+    for name in class_names:
+        if not hasattr(Retry, name):
+            continue
+        with monkeypatch.context() as patched:
+            patched.setattr(Retry, name, lambda *args, **kwargs: False)
+            assert snapshot(retry)["eligible"] is False
+        assert snapshot(retry)["eligible"] is True
+
+    for name in ("takewhile", "random"):
+        if not hasattr(urllib3.util.retry, name):
+            continue
+        with monkeypatch.context() as patched:
+            patched.setattr(urllib3.util.retry, name, object())
+            assert snapshot(retry)["eligible"] is False
+        assert snapshot(retry)["eligible"] is True
+
+    for name in class_names:
+        if not hasattr(Retry, name):
+            continue
+        setattr(retry, name, lambda *args, **kwargs: False)
+        assert snapshot(retry)["eligible"] is False
+        delattr(retry, name)
+        assert snapshot(retry)["eligible"] is True

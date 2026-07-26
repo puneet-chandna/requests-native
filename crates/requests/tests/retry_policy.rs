@@ -95,16 +95,16 @@ fn method_filter_and_retry_after_status_admission_are_explicit() {
 }
 
 #[test]
-fn explicit_status_with_location_consumes_redirect_not_status_budget() {
+fn only_redirect_status_with_truthy_location_consumes_redirect_budget() {
     let state = RetryState::new(policy());
     let incremented = state
         .increment(
-            RetryReason::Status { status: 503 },
+            RetryReason::Status { status: 302 },
             "GET",
             "http://example.test/original",
             Some("/elsewhere"),
         )
-        .expect("status-forcelist response with Location retries original URL");
+        .expect("redirect response with Location retries original URL");
 
     assert_eq!(incremented.remaining().redirect, RetryCount::Limited(1));
     assert_eq!(incremented.remaining().status, RetryCount::Limited(2));
@@ -113,6 +113,22 @@ fn explicit_status_with_location_consumes_redirect_not_status_budget() {
         incremented.history()[0].redirect_location.as_deref(),
         Some("/elsewhere")
     );
+}
+
+#[test]
+fn empty_location_and_non_redirect_status_consume_status_budget() {
+    for (status, location) in [(302, ""), (503, "/elsewhere")] {
+        let incremented = RetryState::new(policy())
+            .increment(
+                RetryReason::Status { status },
+                "GET",
+                "http://example.test/original",
+                Some(location),
+            )
+            .expect("status retry");
+        assert_eq!(incremented.remaining().status, RetryCount::Limited(1));
+        assert_eq!(incremented.remaining().redirect, RetryCount::Limited(2));
+    }
 }
 
 #[test]
@@ -132,6 +148,34 @@ fn first_retry_has_zero_backoff_and_jitter_is_added_before_the_cap() {
         .increment(RetryReason::Connect, "GET", "http://two.test", None)
         .expect("second retry");
     assert_eq!(second.backoff(0.75), 2.5);
+    assert!(second.should_observe_random());
+}
+
+#[test]
+fn automatic_retry_after_requires_python_truthy_total_and_jitter_is_unclamped() {
+    for total in [
+        RetryCount::Unlimited,
+        RetryCount::Boolean(false),
+        RetryCount::Limited(0),
+    ] {
+        let mut configured = policy();
+        configured.total = total;
+        configured.status_forcelist = statuses(&[]);
+        assert!(!RetryState::new(configured).is_retry("GET", 503, true));
+    }
+
+    let mut configured = policy();
+    configured.backoff = BackoffPolicy {
+        factor: 0.0,
+        maximum: Some(120.0),
+        jitter: 1.0,
+    };
+    let second = RetryState::new(configured)
+        .increment(RetryReason::Connect, "GET", "http://one.test", None)
+        .unwrap()
+        .increment(RetryReason::Connect, "GET", "http://two.test", None)
+        .unwrap();
+    assert_eq!(second.backoff(2.0), 2.0);
 }
 
 #[test]
