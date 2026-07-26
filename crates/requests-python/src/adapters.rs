@@ -23,6 +23,8 @@ use requests::{
     Proxy, Timeout, TlsConfig, Uri,
 };
 
+use crate::errors::{MappingSite, map_core_error, map_typed_message};
+
 #[derive(PartialEq)]
 struct RetrySnapshot {
     version: String,
@@ -1972,36 +1974,23 @@ fn redirect_location(status: u16, headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn requests_exception(
-    py: Python<'_>,
-    name: &str,
-    message: String,
-    request: &Bound<'_, PyAny>,
-) -> PyErr {
-    let result = (|| -> PyResult<PyErr> {
-        let class = PyModule::import(py, "requests.exceptions")?.getattr(name)?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("request", request)?;
-        let value = class.call((message,), Some(&kwargs))?;
-        Ok(PyErr::from_value(value))
-    })();
-    result.unwrap_or_else(|error| error)
-}
-
 fn mapped_transport_error(
     py: Python<'_>,
     error: requests::Error,
     request: &Bound<'_, PyAny>,
 ) -> PyErr {
-    let name = match error.kind() {
-        ErrorKind::ConnectTimeout => "ConnectTimeout",
-        ErrorKind::ReadTimeout => "ReadTimeout",
-        ErrorKind::Proxy => "ProxyError",
-        ErrorKind::Tls | ErrorKind::Handshake => "SSLError",
-        ErrorKind::InvalidUrl => "InvalidURL",
-        _ => "ConnectionError",
+    let module = match PyModule::import(py, "requests.exceptions") {
+        Ok(module) => module,
+        Err(import_error) => return import_error,
     };
-    requests_exception(py, name, error.to_string(), request)
+    map_core_error(
+        py,
+        &module,
+        MappingSite::AdapterTransport,
+        &error,
+        Some(request),
+        None,
+    )
 }
 
 fn retry_reason(error: &requests::Error) -> RetryReason {
@@ -2064,6 +2053,9 @@ fn _adapter_send_trial(
     proxies: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let _ = stream;
+    if verify.is_exact_instance_of::<PyBool>() && !verify.extract::<bool>()? {
+        return Ok(py.NotImplemented());
+    }
     let input = match native_send_input(py, adapter, request, timeout, verify, cert, proxies)? {
         Ok(input) => input,
         Err(_) => return Ok(py.NotImplemented()),
@@ -2153,7 +2145,16 @@ fn _adapter_send_trial(
             Err(_) if input.retry.policy.raise_on_status => {
                 drain_response(py, response);
                 let message = format!("too many {status} responses");
-                return Err(requests_exception(py, "RetryError", message, request));
+                let module = PyModule::import(py, "requests.exceptions")?;
+                return Err(map_typed_message(
+                    py,
+                    &module,
+                    MappingSite::AdapterRetry,
+                    ErrorKind::Retry,
+                    &message,
+                    Some(request),
+                    None,
+                ));
             }
             Err(_) => return build_python_response(py, adapter, request, response),
         };

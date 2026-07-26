@@ -11,10 +11,12 @@ use pyo3::types::{
 use pyo3::wrap_pyfunction;
 use requests::utils::{encode_query_pairs, trim_python_whitespace_start};
 use requests::{
-    HeaderInput, HeaderPart, HeaderPreparationError, InvalidHeaderPart, PreparedHeader,
+    ErrorKind, HeaderInput, HeaderPart, HeaderPreparationError, InvalidHeaderPart, PreparedHeader,
     UrlPreparationError, append_url_params, is_non_http_url, prepare_headers, prepare_method,
     prepare_method_bytes, prepare_url, url_is_native_safe,
 };
+
+use crate::errors::{MappingSite, map_typed_message};
 
 struct CanonicalFunction {
     code: Py<PyCode>,
@@ -2662,24 +2664,34 @@ fn url_preparation_error(
     raw_url: &str,
     url_repr: &str,
 ) -> PyResult<PyErr> {
-    let (exception, message) = match error {
-        UrlPreparationError::InvalidLabel => {
-            (&state.invalid_url, "URL has an invalid label.".to_owned())
-        }
+    let (kind, message) = match error {
+        UrlPreparationError::InvalidLabel => (
+            ErrorKind::InvalidUrl,
+            "URL has an invalid label.".to_owned(),
+        ),
         UrlPreparationError::MissingHost => (
-            &state.invalid_url,
+            ErrorKind::InvalidUrl,
             format!("Invalid URL {url_repr}: No host supplied"),
         ),
         UrlPreparationError::MissingScheme => (
-            &state.missing_schema,
+            ErrorKind::MissingSchema,
             format!(
                 "Invalid URL {url_repr}: No scheme supplied. Perhaps you meant https://{raw_url}?"
             ),
         ),
-        UrlPreparationError::Parse => (&state.invalid_url, format!("Failed to parse: {raw_url}")),
+        UrlPreparationError::Parse => {
+            (ErrorKind::InvalidUrl, format!("Failed to parse: {raw_url}"))
+        }
     };
-    let instance = exception.bind(py).call1((message,))?;
-    Ok(PyErr::from_value(instance))
+    Ok(map_typed_message(
+        py,
+        state.models.bind(py),
+        MappingSite::UrlPreparation,
+        kind,
+        &message,
+        None,
+        None,
+    ))
 }
 
 struct PythonHeaderRow {
@@ -2995,8 +3007,15 @@ fn header_preparation_error(
         "Invalid leading whitespace, reserved character(s), or return character(s) in header {kind}: {}",
         part.repr()?.to_str()?
     );
-    let instance = state.invalid_header.bind(py).call1((message,))?;
-    Ok(PyErr::from_value(instance))
+    Ok(map_typed_message(
+        py,
+        state.utils.bind(py),
+        MappingSite::HeaderPreparation,
+        ErrorKind::InvalidHeader,
+        &message,
+        None,
+        None,
+    ))
 }
 
 fn is_trusted_ordered_dict(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<bool> {

@@ -13,10 +13,13 @@ pub enum ErrorKind {
     ContentDecoding,
     Dns,
     Handshake,
+    InvalidHeader,
     InvalidUrl,
+    MissingSchema,
     Proxy,
     ReadTimeout,
     ResponseBody,
+    Retry,
     Send,
     Tls,
 }
@@ -30,6 +33,14 @@ pub struct Error {
 impl Error {
     pub fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    #[doc(hidden)]
+    pub fn from_binding_parts(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
     }
 
     #[doc(hidden)]
@@ -243,6 +254,22 @@ mod tests {
 
         assert_eq!(error.kind(), ErrorKind::Body);
         assert_eq!(error.to_string(), "request body stream failed");
+        assert_send_static::<Error>();
+    }
+
+    #[test]
+    fn binding_parts_keep_python_free_kind_and_message() {
+        let cases = [
+            (ErrorKind::InvalidHeader, "invalid header"),
+            (ErrorKind::MissingSchema, "missing schema"),
+            (ErrorKind::Retry, "retry exhausted"),
+        ];
+
+        for (kind, message) in cases {
+            let error = Error::from_binding_parts(kind, message);
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), message);
+        }
         assert_send_static::<Error>();
     }
 

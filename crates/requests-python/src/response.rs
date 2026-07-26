@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{
-    PyAssertionError, PyAttributeError, PyLookupError, PyNameError, PyRuntimeError,
-    PyStopIteration, PyTypeError, PyUnicodeDecodeError,
+    PyAssertionError, PyAttributeError, PyLookupError, PyRuntimeError, PyStopIteration,
+    PyTypeError, PyUnicodeDecodeError,
 };
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -20,6 +20,7 @@ use pyo3::wrap_pyfunction;
 use requests::{ResponseDispositionState, ResponseEvent};
 
 use crate::bridge::{BridgeClosed, WorkerPayload};
+use crate::errors::{MappingSite, map_original_error};
 use crate::models::{canonical_code, intrinsic_builtin_name_is};
 use crate::runtime::run_with_actions_and_signal_checker;
 
@@ -554,8 +555,16 @@ impl NativeContentIterator {
     }
 
     fn wrap_stream_error(&self, py: Python<'_>, error: PyErr) -> PyErr {
-        match wrap_stream_error(py, error) {
-            Ok(error) | Err(error) => error,
+        match response_state(py) {
+            Ok(state) => map_original_error(
+                py,
+                state.models.bind(py),
+                MappingSite::ResponseStream,
+                error,
+                None,
+                None,
+            ),
+            Err(state_error) => state_error,
         }
     }
 }
@@ -604,46 +613,6 @@ impl NativeContentIterator {
         }
         Ok(())
     }
-}
-
-fn name_error_with_context(py: Python<'_>, name: &str, original: &PyErr) -> PyErr {
-    let error = PyNameError::new_err(format!("name '{name}' is not defined"));
-    error.set_context(py, Some(original.clone_ref(py)));
-    error
-}
-
-fn wrap_stream_error(py: Python<'_>, original: PyErr) -> PyResult<PyErr> {
-    let models = response_state(py)?.models.bind(py);
-    let mappings = [
-        ("ProtocolError", "ChunkedEncodingError"),
-        ("DecodeError", "ContentDecodingError"),
-        ("ReadTimeoutError", "ConnectionError"),
-        ("SSLError", "RequestsSSLError"),
-    ];
-    for (source_name, target_name) in mappings {
-        let Some(source) = models.dict().get_item(source_name)? else {
-            return Ok(name_error_with_context(py, source_name, &original));
-        };
-        match original.value(py).is_instance(&source) {
-            Ok(false) => continue,
-            Ok(true) => {
-                let Some(target) = models.dict().get_item(target_name)? else {
-                    return Ok(name_error_with_context(py, target_name, &original));
-                };
-                let wrapped = match target.call1((original.value(py),)) {
-                    Ok(value) => PyErr::from_value(value),
-                    Err(error) => error,
-                };
-                wrapped.set_context(py, Some(original));
-                return Ok(wrapped);
-            }
-            Err(error) => {
-                error.set_context(py, Some(original));
-                return Ok(error);
-            }
-        }
-    }
-    Ok(original)
 }
 
 fn native_iter_content(
@@ -845,27 +814,6 @@ fn _response_text_trial(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<
     text_dispatch(py, subject)
 }
 
-fn wrap_json_error(
-    py: Python<'_>,
-    models: &Bound<'_, PyModule>,
-    original: PyErr,
-) -> PyResult<PyErr> {
-    if !original
-        .value(py)
-        .is_instance(&models.getattr("JSONDecodeError")?)?
-    {
-        return Ok(original);
-    }
-    let value = original.value(py);
-    let wrapped = PyErr::from_value(models.getattr("RequestsJSONDecodeError")?.call1((
-        value.getattr("msg")?,
-        value.getattr("doc")?,
-        value.getattr("pos")?,
-    ))?);
-    wrapped.set_context(py, Some(original));
-    Ok(wrapped)
-}
-
 fn json_loads(
     py: Python<'_>,
     models: &Bound<'_, PyModule>,
@@ -878,7 +826,14 @@ fn json_loads(
         .call((value,), Some(kwargs))
     {
         Ok(result) => Ok(result.unbind()),
-        Err(error) => Err(wrap_json_error(py, models, error)?),
+        Err(error) => Err(map_original_error(
+            py,
+            models,
+            MappingSite::ResponseJson,
+            error,
+            None,
+            None,
+        )),
     }
 }
 

@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -209,7 +210,25 @@ fn driver_error(error: BlockingDriverError) -> PyErr {
 }
 
 fn task_error(error: BlockingTaskError) -> PyErr {
-    PyRuntimeError::new_err(error.to_string())
+    match error {
+        BlockingTaskError::WorkerStopped => {
+            PyRuntimeError::new_err("native requests worker stopped unexpectedly")
+        }
+        _ => PyRuntimeError::new_err(error.to_string()),
+    }
+}
+
+fn catch_native_unwind<T>(operation: impl FnOnce() -> T) -> PyResult<T> {
+    catch_unwind(AssertUnwindSafe(operation))
+        .map_err(|_| PyRuntimeError::new_err("native requests worker stopped unexpectedly"))
+}
+
+#[pyfunction]
+fn _panic_boundary_trial(should_panic: bool) -> PyResult<&'static str> {
+    catch_native_unwind(|| {
+        assert!(!should_panic, "intentional panic-boundary trial");
+        "ok"
+    })
 }
 
 pub(crate) fn run_with_actions<T, A, R, Fut, Build, Execute>(
@@ -572,6 +591,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_runtime_ready_error_probe, module)?)?;
     module.add_function(wrap_pyfunction!(_runtime_cancel_ownership_probe, module)?)?;
     module.add_function(wrap_pyfunction!(_runtime_signal_was_cancelled, module)?)?;
+    module.add_function(wrap_pyfunction!(_panic_boundary_trial, module)?)?;
     Ok(())
 }
 
