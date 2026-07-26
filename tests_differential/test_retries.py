@@ -201,3 +201,22 @@ def test_retry_class_and_module_mutations_fall_back_then_restore(monkeypatch):
         patched.setattr(urllib3.util.retry, "Retry", object())
         assert snapshot(retry)["eligible"] is False
     assert snapshot(retry)["eligible"] is True
+
+
+def test_retry_getattribute_version_and_module_dependencies_are_frozen(monkeypatch):
+    retry = Retry(total=1)
+    mutations = (
+        (
+            Retry,
+            "__getattribute__",
+            lambda self, name: object.__getattribute__(self, name),
+        ),
+        (urllib3, "__version__", "".join([urllib3.__version__, "-mutated"])),
+        (urllib3.util.retry, "time", object()),
+        (urllib3.util.retry, "RequestHistory", object()),
+    )
+    for owner, name, value in mutations:
+        with monkeypatch.context() as patched:
+            patched.setattr(owner, name, value)
+            assert snapshot(retry)["eligible"] is False
+        assert snapshot(retry)["eligible"] is True

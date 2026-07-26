@@ -16,6 +16,10 @@ impl RetryCount {
             Self::Limited(remaining) => Some(Self::Limited(remaining - 1)),
         }
     }
+
+    fn is_truthy(self) -> bool {
+        !matches!(self, Self::Boolean(false) | Self::Limited(0))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +141,7 @@ impl RetryState {
         self.allows_method(method)
             && (self.remaining.status_forcelist.contains(status)
                 || (self.remaining.respect_retry_after
+                    && self.remaining.total.is_truthy()
                     && has_retry_after
                     && matches!(status, 413 | 429 | 503)))
     }

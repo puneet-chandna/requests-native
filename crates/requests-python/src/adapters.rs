@@ -40,10 +40,13 @@ struct HistorySnapshot {
 }
 
 struct RetryStateGuard {
+    urllib3_module: Py<PyAny>,
+    urllib3_version: Py<PyAny>,
     retry_type: Py<PyAny>,
     history_type: Py<PyAny>,
     retry_module: Py<PyAny>,
     methods: Vec<(String, Py<PyAny>)>,
+    module_globals: Vec<(String, Py<PyAny>)>,
 }
 
 static RETRY_STATE: PyOnceLock<RetryStateGuard> = PyOnceLock::new();
@@ -64,10 +67,18 @@ static ADAPTER_STATE: PyOnceLock<AdapterState> = PyOnceLock::new();
 struct SideEntry {
     weak_adapter: Py<PyAny>,
     poolmanager: Py<PyAny>,
+    manager_objects: Vec<(String, Py<PyAny>)>,
+    visible_pools: Vec<(Py<PyAny>, Py<PyAny>)>,
     visible_pool_count: usize,
-    pools: HashMap<String, Arc<AdapterPool>>,
-    pool_order: VecDeque<String>,
+    direct_pools: PoolRealm,
+    proxy_pools: HashMap<String, PoolRealm>,
     proxy_managers: HashMap<String, Py<PyAny>>,
+}
+
+#[derive(Default)]
+struct PoolRealm {
+    pools: HashMap<String, Arc<AdapterPool>>,
+    order: VecDeque<String>,
 }
 
 static ADAPTER_POOLS: OnceLock<Mutex<HashMap<usize, SideEntry>>> = OnceLock::new();
@@ -76,8 +87,10 @@ static ADAPTER_POOLS: OnceLock<Mutex<HashMap<usize, SideEntry>>> = OnceLock::new
 struct NativeAdapterRaw {
     body: Option<AdapterResponseBody>,
     content_encoding: Option<String>,
-    decoded: Option<Vec<u8>>,
+    decoder: Option<Py<PyAny>>,
+    decoded: Vec<u8>,
     decoded_offset: usize,
+    decoder_eof: bool,
     status: u16,
     reason: String,
     headers: Py<PyAny>,
@@ -87,7 +100,7 @@ struct NativeAdapterRaw {
 #[pyclass(module = "requests._requests_rust", unsendable)]
 struct NativeAdapterStream {
     raw: Py<NativeAdapterRaw>,
-    amount: usize,
+    amount: isize,
     decode_content: bool,
     done: bool,
 }
@@ -170,13 +183,24 @@ fn retry_snapshot(
 ) -> PyResult<Result<RetrySnapshot, String>> {
     let guard = retry_state(py)?;
     let retry_module = PyModule::import(py, "urllib3.util.retry")?;
+    let urllib3_module = PyModule::import(py, "urllib3")?;
     let retry_type = guard.retry_type.bind(py);
-    if !retry_module.as_any().is(guard.retry_module.bind(py))
+    if !urllib3_module.as_any().is(guard.urllib3_module.bind(py))
+        || !urllib3_module
+            .getattr("__version__")?
+            .is(guard.urllib3_version.bind(py))
+        || !retry_module.as_any().is(guard.retry_module.bind(py))
         || !retry_module.getattr("Retry")?.is(retry_type)
         || !retry.get_type().as_any().is(retry_type)
         || guard.methods.iter().any(|(name, original)| {
             retry_type.getattr(name.as_str()).is_err_and(|_| true)
                 || retry_type
+                    .getattr(name.as_str())
+                    .is_ok_and(|current| !current.is(original.bind(py)))
+        })
+        || guard.module_globals.iter().any(|(name, original)| {
+            retry_module.getattr(name.as_str()).is_err()
+                || retry_module
                     .getattr(name.as_str())
                     .is_ok_and(|current| !current.is(original.bind(py)))
         })
@@ -199,9 +223,7 @@ fn retry_snapshot(
             "Retry instance shadows a guarded method or constant".to_owned()
         ));
     }
-    let version = PyModule::import(py, "urllib3")?
-        .getattr("__version__")?
-        .extract::<String>()?;
+    let version = guard.urllib3_version.bind(py).extract::<String>()?;
     let Some(total) = retry_count(retry, "total")? else {
         return Ok(Err(
             "total is not None, bool, or a nonnegative int".to_owned()
@@ -327,6 +349,7 @@ fn retry_snapshot(
 }
 
 fn initialize_retry_state(py: Python<'_>) -> PyResult<RetryStateGuard> {
+    let urllib3_module = PyModule::import(py, "urllib3")?;
     let retry_module = PyModule::import(py, "urllib3.util.retry")?;
     let retry_type = retry_module.getattr("Retry")?;
     let guarded = [
@@ -342,6 +365,7 @@ fn initialize_retry_state(py: Python<'_>) -> PyResult<RetryStateGuard> {
         "DEFAULT_ALLOWED_METHODS",
         "DEFAULT_BACKOFF_MAX",
         "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+        "__getattribute__",
     ]
     .into_iter()
     .filter_map(|name| {
@@ -351,11 +375,23 @@ fn initialize_retry_state(py: Python<'_>) -> PyResult<RetryStateGuard> {
             .map(|value| (name.to_owned(), value.unbind()))
     })
     .collect();
+    let module_globals = ["time", "re", "email", "RequestHistory"]
+        .into_iter()
+        .filter_map(|name| {
+            retry_module
+                .getattr(name)
+                .ok()
+                .map(|value| (name.to_owned(), value.unbind()))
+        })
+        .collect();
     Ok(RetryStateGuard {
+        urllib3_version: urllib3_module.getattr("__version__")?.unbind(),
+        urllib3_module: urllib3_module.into_any().unbind(),
         retry_type: retry_type.unbind(),
         history_type: retry_module.getattr("RequestHistory")?.unbind(),
         retry_module: retry_module.into_any().unbind(),
         methods: guarded,
+        module_globals,
     })
 }
 
@@ -551,6 +587,7 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
         PyModule::import(py, "requests.models")?.getattr("PreparedRequest")?;
     let methods = [
         "__getattribute__",
+        "__setstate__",
         "send",
         "close",
         "build_response",
@@ -595,14 +632,23 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
     })
     .collect::<PyResult<Vec<_>>>()?;
     let poolmanager_type = adapters.getattr("PoolManager")?;
-    let poolmanager_methods = ["__getattribute__", "connection_from_url"]
-        .into_iter()
-        .map(|name| {
-            poolmanager_type
-                .getattr(name)
-                .map(|value| (name.to_owned(), value.unbind()))
-        })
-        .collect::<PyResult<Vec<_>>>()?;
+    let poolmanager_methods = [
+        "__getattribute__",
+        "connection_from_url",
+        "connection_from_host",
+        "connection_from_context",
+        "_new_pool",
+        "clear",
+        "urlopen",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        poolmanager_type
+            .getattr(name)
+            .ok()
+            .map(|value| (name.to_owned(), value.unbind()))
+    })
+    .collect();
     let prepared_getattribute = prepared_request_type.getattr("__getattribute__")?.unbind();
     Ok(AdapterState {
         adapters_module: adapters.into_any().unbind(),
@@ -689,7 +735,7 @@ fn duration_value(value: &Bound<'_, PyAny>) -> PyResult<Option<Option<Duration>>
     if !seconds.is_finite() || seconds <= 0.0 {
         return Ok(None);
     }
-    Ok(Some(Some(Duration::from_secs_f64(seconds))))
+    Ok(Duration::try_from_secs_f64(seconds).ok().map(Some))
 }
 
 fn timeout_value(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<Timeout>> {
@@ -920,6 +966,9 @@ fn native_send_input(
     let Some(pool_maxsize) = exact_usize(adapter.getattr("_pool_maxsize")?) else {
         return Ok(Err("pool maximum is unsupported".to_owned()));
     };
+    if pool_maxsize == 0 {
+        return Ok(Err("zero-sized native pools are unsupported".to_owned()));
+    }
     let Some(pool_connections) = exact_usize(adapter.getattr("_pool_connections")?) else {
         return Ok(Err("pool settings are unsupported".to_owned()));
     };
@@ -982,7 +1031,21 @@ fn native_send_input(
     if revalidated_retry != retry {
         return Ok(Err("Retry state changed during admission".to_owned()));
     }
-    let pool_key = format!("{scheme}://{authority}|{proxy:?}|{tls:?}|{pool_maxsize}");
+    let normalized_scheme = scheme.to_ascii_lowercase();
+    let normalized_host = request_uri
+        .host()
+        .unwrap_or(authority.host())
+        .to_ascii_lowercase();
+    let explicit_port = request_uri.port_u16();
+    let effective_port = explicit_port.or(match normalized_scheme.as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    });
+    let pool_key = format!(
+        "{normalized_scheme}://{normalized_host}:{}|{proxy:?}|{tls:?}|{pool_maxsize}",
+        effective_port.map_or_else(String::new, |port| port.to_string())
+    );
     Ok(Ok(NativeSendInput {
         method,
         method_name,
@@ -1010,6 +1073,38 @@ fn adapter_id(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<usize> {
 
 fn manager_pool_count(manager: &Bound<'_, PyAny>) -> PyResult<usize> {
     manager.getattr("pools")?.len()
+}
+
+fn manager_objects(manager: &Bound<'_, PyAny>) -> PyResult<Vec<(String, Py<PyAny>)>> {
+    [
+        "headers",
+        "connection_pool_kw",
+        "pools",
+        "pool_classes_by_scheme",
+        "key_fn_by_scheme",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        manager
+            .getattr(name)
+            .ok()
+            .map(|value| Ok((name.to_owned(), value.unbind())))
+    })
+    .collect()
+}
+
+fn visible_pools(manager: &Bound<'_, PyAny>) -> PyResult<Vec<(Py<PyAny>, Py<PyAny>)>> {
+    manager
+        .getattr("pools")?
+        .getattr("_container")?
+        .call_method0("items")?
+        .try_iter()?
+        .map(|item| {
+            let item = item?;
+            let pair = item.cast::<PyTuple>()?;
+            Ok((pair.get_item(0)?.unbind(), pair.get_item(1)?.unbind()))
+        })
+        .collect()
 }
 
 fn manager_identity_is_pristine(py: Python<'_>, manager: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -1101,6 +1196,25 @@ fn registered_adapter_pristine(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> Py
             return Ok(false);
         }
     }
+    if entry.manager_objects.iter().any(|(name, original)| {
+        manager.getattr(name.as_str()).is_err()
+            || manager
+                .getattr(name.as_str())
+                .is_ok_and(|current| !current.is(original.bind(py)))
+    }) {
+        return Ok(false);
+    }
+    let pools = visible_pools(&manager)?;
+    if pools.len() != entry.visible_pools.len()
+        || pools.iter().zip(&entry.visible_pools).any(
+            |((key, value), (expected_key, expected_value))| {
+                !key.bind(py).is(expected_key.bind(py))
+                    || !value.bind(py).is(expected_value.bind(py))
+            },
+        )
+    {
+        return Ok(false);
+    }
     Ok(referent.is(adapter)
         && entry.poolmanager.bind(py).is(&manager)
         && manager_identity_is_pristine(py, &manager)?
@@ -1146,15 +1260,15 @@ fn _adapter_register_trial(
         SideEntry {
             weak_adapter,
             poolmanager: manager.unbind(),
+            manager_objects: manager_objects(&adapter.getattr("poolmanager")?)?,
+            visible_pools: visible_pools(&adapter.getattr("poolmanager")?)?,
             visible_pool_count,
-            pools: HashMap::new(),
-            pool_order: VecDeque::new(),
+            direct_pools: PoolRealm::default(),
+            proxy_pools: HashMap::new(),
             proxy_managers: HashMap::new(),
         },
     ) {
-        for pool in previous.pools.values() {
-            pool.clear();
-        }
+        clear_realms(previous);
     }
     Ok(true)
 }
@@ -1200,11 +1314,29 @@ fn _adapter_drop_trial(identity: usize) -> PyResult<usize> {
     let Some(entry) = table.remove(&identity) else {
         return Ok(0);
     };
-    let count = entry.pools.len();
-    for pool in entry.pools.values() {
+    let count = realm_pool_count(&entry);
+    clear_realms(entry);
+    Ok(count)
+}
+
+fn realm_pool_count(entry: &SideEntry) -> usize {
+    entry.direct_pools.pools.len()
+        + entry
+            .proxy_pools
+            .values()
+            .map(|realm| realm.pools.len())
+            .sum::<usize>()
+}
+
+fn clear_realms(entry: SideEntry) {
+    for pool in entry.direct_pools.pools.values() {
         pool.clear();
     }
-    Ok(count)
+    for realm in entry.proxy_pools.values() {
+        for pool in realm.pools.values() {
+            pool.clear();
+        }
+    }
 }
 
 fn reap_adapter_pools(py: Python<'_>, table: &mut HashMap<usize, SideEntry>) -> PyResult<()> {
@@ -1237,10 +1369,14 @@ fn adapter_pool(
         if !referent.is(adapter) || !entry.poolmanager.bind(py).is(&poolmanager) {
             return Ok(Err("visible pool manager identity changed".to_owned()));
         }
-        if let Some(pool) = entry.pools.get(&input.pool_key) {
+        let realm = match input.selected_proxy.as_deref() {
+            Some(proxy) => entry.proxy_pools.entry(proxy.to_owned()).or_default(),
+            None => &mut entry.direct_pools,
+        };
+        if let Some(pool) = realm.pools.get(&input.pool_key) {
             let pool = Arc::clone(pool);
-            entry.pool_order.retain(|key| key != &input.pool_key);
-            entry.pool_order.push_back(input.pool_key.clone());
+            realm.order.retain(|key| key != &input.pool_key);
+            realm.order.push_back(input.pool_key.clone());
             return Ok(Ok(pool));
         }
         let pool = Arc::new(
@@ -1253,19 +1389,19 @@ fn adapter_pool(
             )
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
         );
-        while entry.pools.len() >= input.pool_connections && input.pool_connections > 0 {
-            let Some(evicted_key) = entry.pool_order.pop_front() else {
+        while realm.pools.len() >= input.pool_connections && input.pool_connections > 0 {
+            let Some(evicted_key) = realm.order.pop_front() else {
                 break;
             };
-            if let Some(evicted) = entry.pools.remove(&evicted_key) {
+            if let Some(evicted) = realm.pools.remove(&evicted_key) {
                 evicted.clear();
             }
         }
         if input.pool_connections > 0 {
-            entry
+            realm
                 .pools
                 .insert(input.pool_key.clone(), Arc::clone(&pool));
-            entry.pool_order.push_back(input.pool_key.clone());
+            realm.order.push_back(input.pool_key.clone());
         }
         return Ok(Ok(pool));
     }
@@ -1326,6 +1462,15 @@ fn retry_after(py: Python<'_>, retry: &Bound<'_, PyAny>, headers: &HeaderMap) ->
 }
 
 fn sleep_before_retry(py: Python<'_>, state: &RetryState, retry_after: f64) -> PyResult<()> {
+    if retry_after > 0.0 {
+        PyModule::import(py, "time")?
+            .getattr("sleep")?
+            .call1((retry_after,))?;
+        return Ok(());
+    }
+    if state.backoff(0.0) <= 0.0 {
+        return Ok(());
+    }
     let random_unit = if state.remaining().backoff.jitter > 0.0 {
         PyModule::import(py, "random")?
             .getattr("random")?
@@ -1335,17 +1480,31 @@ fn sleep_before_retry(py: Python<'_>, state: &RetryState, retry_after: f64) -> P
         0.0
     };
     let backoff = state.backoff(random_unit);
-    let delay = if retry_after > 0.0 {
-        retry_after
-    } else {
-        backoff
-    };
+    let delay = backoff;
     if delay > 0.0 {
         PyModule::import(py, "time")?
             .getattr("sleep")?
             .call1((delay,))?;
     }
     Ok(())
+}
+
+fn drain_response(py: Python<'_>, response: AdapterResponse) {
+    let mut body = response.into_raw_body();
+    let _ = py.detach(move || {
+        let mut drained = Vec::new();
+        body.read_to_end(&mut drained)
+    });
+}
+
+fn redirect_location(status: u16, headers: &HeaderMap) -> Option<String> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    headers
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 fn requests_exception(
@@ -1411,8 +1570,10 @@ fn build_python_response(
         NativeAdapterRaw {
             body: Some(response.into_raw_body()),
             content_encoding,
-            decoded: None,
+            decoder: None,
+            decoded: Vec::new(),
             decoded_offset: 0,
+            decoder_eof: false,
             status,
             reason,
             headers,
@@ -1459,6 +1620,7 @@ fn _adapter_send_trial(
             return Ok(py.NotImplemented());
         };
         entry.visible_pool_count = manager_pool_count(entry.poolmanager.bind(py))?;
+        entry.visible_pools = visible_pools(entry.poolmanager.bind(py))?;
     }
     if !adapter_identity_is_pristine(py, adapter, request)?
         || !registered_adapter_pristine(py, adapter)?
@@ -1506,12 +1668,11 @@ fn _adapter_send_trial(
             }
         };
         let status = response.status().as_u16();
-        let location = response
+        let location = redirect_location(status, response.headers());
+        let has_retry_after = response
             .headers()
-            .get("location")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let has_retry_after = response.headers().contains_key("retry-after");
+            .get("retry-after")
+            .is_some_and(|value| !value.as_bytes().is_empty());
         if !retry_state.is_retry(&input.method_name, status, has_retry_after) {
             return build_python_response(py, adapter, request, response);
         }
@@ -1523,32 +1684,20 @@ fn _adapter_send_trial(
         );
         let next = match incremented {
             Ok(next) => next,
-            Err(_)
-                if location
-                    .as_deref()
-                    .is_some_and(|_| input.retry.policy.raise_on_redirect)
-                    || (location.is_none() && input.retry.policy.raise_on_status) =>
-            {
-                let message = if location.is_some() {
-                    "too many redirects".to_owned()
-                } else {
-                    format!("too many {status} responses")
-                };
+            Err(_) if input.retry.policy.raise_on_status => {
+                drain_response(py, response);
+                let message = format!("too many {status} responses");
                 return Err(requests_exception(py, "RetryError", message, request));
             }
             Err(_) => return build_python_response(py, adapter, request, response),
         };
-        let retry_after = if input.retry.policy.respect_retry_after {
-            retry_after(py, &retry_object, response.headers())?
+        let headers = response.headers().clone();
+        drain_response(py, response);
+        let retry_after = if input.retry.policy.respect_retry_after && has_retry_after {
+            retry_after(py, &retry_object, &headers)?
         } else {
             0.0
         };
-        let mut body = response.into_raw_body();
-        py.detach(move || {
-            let mut drained = Vec::new();
-            body.read_to_end(&mut drained)
-        })
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         retry_state = next;
         sleep_before_retry(py, &retry_state, retry_after)?;
     }
@@ -1572,13 +1721,21 @@ fn _adapter_close_trial(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<
     let Some(entry) = table.get_mut(&identity) else {
         return Ok(0);
     };
-    let count = entry.pools.len();
-    for pool in entry.pools.values() {
+    let count = realm_pool_count(entry);
+    for pool in entry.direct_pools.pools.values() {
         pool.clear();
     }
-    entry.pools.clear();
-    entry.pool_order.clear();
+    entry.direct_pools.pools.clear();
+    entry.direct_pools.order.clear();
+    for realm in entry.proxy_pools.values_mut() {
+        for pool in realm.pools.values() {
+            pool.clear();
+        }
+        realm.pools.clear();
+        realm.order.clear();
+    }
     entry.visible_pool_count = manager_pool_count(entry.poolmanager.bind(py))?;
+    entry.visible_pools = visible_pools(entry.poolmanager.bind(py))?;
     Ok(count)
 }
 
@@ -1591,41 +1748,70 @@ fn _adapter_pool_side_table_trial(py: Python<'_>) -> PyResult<usize> {
     let _ = py;
     Ok(table
         .values()
-        .filter(|entry| !entry.pools.is_empty())
+        .filter(|entry| realm_pool_count(entry) != 0)
         .count())
 }
 
 impl NativeAdapterRaw {
-    fn decoded_bytes(&mut self, py: Python<'_>) -> PyResult<()> {
-        if self.decoded.is_some() {
-            return Ok(());
-        }
-        let mut wire = Vec::new();
-        if let Some(mut body) = self.body.take() {
-            py.detach(|| body.read_to_end(&mut wire))
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        }
-        let decoded = match self.content_encoding.as_deref() {
-            Some(encoding)
-                if encoding.split(',').all(|coding| {
-                    matches!(
-                        coding.trim().to_ascii_lowercase().as_str(),
-                        "gzip" | "x-gzip" | "deflate" | "br" | "zstd"
-                    )
-                }) =>
-            {
-                let decoder = PyModule::import(py, "urllib3.response")?
-                    .getattr("_get_decoder")?
-                    .call1((encoding,))?;
-                let first = decoder
-                    .call_method1("decompress", (PyBytes::new(py, &wire),))?
-                    .extract::<Vec<u8>>()?;
-                let last = decoder.call_method0("flush")?.extract::<Vec<u8>>()?;
-                [first, last].concat()
-            }
-            Some(_) | None => wire,
+    fn decoder(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let Some(encoding) = self.content_encoding.as_deref() else {
+            return Ok(None);
         };
-        self.decoded = Some(decoded);
+        if !encoding.split(',').all(|coding| {
+            matches!(
+                coding.trim().to_ascii_lowercase().as_str(),
+                "gzip" | "x-gzip" | "deflate" | "br" | "zstd"
+            )
+        }) {
+            return Ok(None);
+        }
+        if self.decoder.is_none() {
+            self.decoder = Some(
+                PyModule::import(py, "urllib3.response")?
+                    .getattr("_get_decoder")?
+                    .call1((encoding,))?
+                    .unbind(),
+            );
+        }
+        Ok(self.decoder.as_ref().map(|decoder| decoder.clone_ref(py)))
+    }
+
+    fn fill_decoded(&mut self, py: Python<'_>, wanted: Option<usize>) -> PyResult<()> {
+        while !self.decoder_eof
+            && wanted.is_none_or(|wanted| self.decoded.len() - self.decoded_offset < wanted)
+        {
+            let mut wire = vec![0; 8192];
+            let read = match self.body.as_mut() {
+                Some(body) => py
+                    .detach(|| body.read(&mut wire))
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+                None => 0,
+            };
+            wire.truncate(read);
+            if read == 0 {
+                self.body = None;
+                if let Some(decoder) = self.decoder(py)? {
+                    self.decoded.extend(
+                        decoder
+                            .bind(py)
+                            .call_method0("flush")?
+                            .extract::<Vec<u8>>()?,
+                    );
+                }
+                self.decoder_eof = true;
+                break;
+            }
+            if let Some(decoder) = self.decoder(py)? {
+                self.decoded.extend(
+                    decoder
+                        .bind(py)
+                        .call_method1("decompress", (PyBytes::new(py, &wire),))?
+                        .extract::<Vec<u8>>()?,
+                );
+            } else {
+                self.decoded.extend(wire);
+            }
+        }
         Ok(())
     }
 
@@ -1642,18 +1828,17 @@ impl NativeAdapterRaw {
             return Ok(PyBytes::new(py, b"").into_any().unbind());
         }
         if decode_content {
-            self.decoded_bytes(py)?;
-            let decoded = self.decoded.as_ref().expect("initialized above");
+            self.fill_decoded(py, amount)?;
             let end = amount
                 .map(|amount| {
                     self.decoded_offset
                         .saturating_add(amount)
-                        .min(decoded.len())
+                        .min(self.decoded.len())
                 })
-                .unwrap_or(decoded.len());
-            let bytes = &decoded[self.decoded_offset..end];
+                .unwrap_or(self.decoded.len());
+            let bytes = &self.decoded[self.decoded_offset..end];
             self.decoded_offset = end;
-            if self.decoded_offset == decoded.len() {
+            if self.decoder_eof && self.decoded_offset == self.decoded.len() {
                 self.closed = true;
             }
             return Ok(PyBytes::new(py, bytes).into_any().unbind());
@@ -1720,7 +1905,10 @@ impl NativeAdapterRaw {
         let amount = match amt {
             None => None,
             Some(value) if value.is_none() => None,
-            Some(value) => Some(value.extract::<usize>()?),
+            Some(value) => match value.extract::<isize>()? {
+                value if value < 0 => None,
+                value => Some(value as usize),
+            },
         };
         self.read_amount(py, amount, decode_content)
     }
@@ -1729,14 +1917,14 @@ impl NativeAdapterRaw {
     fn stream(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
-        amt: usize,
+        amt: isize,
         decode_content: Option<bool>,
     ) -> PyResult<Py<NativeAdapterStream>> {
         Py::new(
             py,
             NativeAdapterStream {
                 raw: slf.into_pyobject(py)?.unbind(),
-                amount: amt.max(1),
+                amount: amt,
                 decode_content: decode_content.unwrap_or(false),
                 done: false,
             },
@@ -1765,9 +1953,13 @@ impl NativeAdapterStream {
         if self.done {
             return Ok(None);
         }
+        if self.amount == 0 {
+            self.done = true;
+            return Ok(None);
+        }
         let chunk = self.raw.bind(py).borrow_mut().read_amount(
             py,
-            Some(self.amount),
+            (self.amount >= 0).then_some(self.amount as usize),
             self.decode_content,
         )?;
         if chunk.bind(py).len()? == 0 {

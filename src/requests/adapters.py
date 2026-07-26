@@ -754,6 +754,7 @@ class HTTPAdapter(BaseAdapter):
 _HTTP_ADAPTER_COMPAT_SEND = HTTPAdapter.send
 _HTTP_ADAPTER_COMPAT_CLOSE = HTTPAdapter.close
 _HTTP_ADAPTER_COMPAT_INIT = HTTPAdapter.__init__
+_HTTP_ADAPTER_COMPAT_SETSTATE = HTTPAdapter.__setstate__
 _ADAPTER_TRIAL_STATE = threading.local()
 
 
@@ -768,16 +769,29 @@ def _drop_rust_adapter_trial(identity: int) -> None:
 @wraps(_HTTP_ADAPTER_COMPAT_INIT)
 def _trial_http_adapter_init(self: HTTPAdapter, *args: Any, **kwargs: Any) -> None:
     _HTTP_ADAPTER_COMPAT_INIT(self, *args, **kwargs)
+    _register_rust_adapter_trial(self)
+
+
+def _register_rust_adapter_trial(self: HTTPAdapter) -> None:
     try:
         from . import _requests_rust
     except ImportError:
         return
     identity = id(self)
+    cleanup = _requests_rust._adapter_drop_trial
 
-    def callback(_reference: Any, identity: int = identity) -> None:
-        _drop_rust_adapter_trial(identity)
+    def callback(
+        _reference: Any, identity: int = identity, cleanup: Any = cleanup
+    ) -> None:
+        cleanup(identity)
 
     _requests_rust._adapter_register_trial(self, callback)
+
+
+@wraps(_HTTP_ADAPTER_COMPAT_SETSTATE)
+def _trial_http_adapter_setstate(self: HTTPAdapter, state: dict[str, Any]) -> None:
+    _HTTP_ADAPTER_COMPAT_SETSTATE(self, state)
+    _register_rust_adapter_trial(self)
 
 
 @contextmanager
@@ -839,5 +853,6 @@ def _trial_http_adapter_close(self: HTTPAdapter) -> None:
 
 
 HTTPAdapter.__init__ = _trial_http_adapter_init
+HTTPAdapter.__setstate__ = _trial_http_adapter_setstate
 HTTPAdapter.send = _trial_http_adapter_send
 HTTPAdapter.close = _trial_http_adapter_close
