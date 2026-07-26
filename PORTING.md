@@ -667,8 +667,9 @@ Never merge:
 - fake mocks in production paths;
 - broad `allow` attributes hiding unfinished code.
 
-A temporarily non-compiling mechanical shard is acceptable in its isolated
-worktree while ownership is resolved. A deceptively compiling stub is not.
+A temporarily non-compiling internal phase is acceptable while its single
+delivery-task implementer is actively resolving ownership. It must not be
+presented as a completed delivery gate. A deceptively compiling stub is not.
 
 ## Translation workflow
 
@@ -694,21 +695,33 @@ Translate, review, and correct:
 Review whether this guide answered every ownership, dynamic Python, streaming,
 and error question. Amend the guide and ledgers before scaling.
 
-### Per-file loop
+### Consolidated delivery-task loop
 
-For each source file:
+For each dependency-coherent delivery task:
 
-1. record owned fields and references in `LIFETIMES.tsv`;
-2. confirm its API rows;
-3. copy the control-flow outline without cleanup;
-4. translate types and error paths;
-5. add focused Rust tests;
+1. assign one implementer for the entire task, including every internal phase
+   and the resulting fixes;
+2. record owned fields and references in `LIFETIMES.tsv`;
+3. confirm its API rows;
+4. copy each control-flow outline without cleanup;
+5. translate types and error paths with focused red/green tests;
 6. add differential tests for observable behavior;
-7. run the narrowest meaningful checks;
-8. request two independent adversarial reviews;
-9. fix all confirmed issues;
-10. commit only the owned files and tests;
-11. hand off remaining risks explicitly.
+7. make logical internal commits containing only the task-owned sources,
+   tests, and ledger rows, and run the narrowest meaningful checks while
+   developing;
+8. run the task's full affected regression gate once before review;
+9. request two independent adversarial reviews of the complete task in
+   parallel;
+10. require both reviewers to return their complete Critical/Important finding
+    sets in that first pass;
+11. give the same implementer one combined fix batch;
+12. run one parallel re-review, adding another round only for a genuine
+    remaining Critical/Important blocker;
+13. commit only the exact task-owned sources, tests, ledger rows, and review
+    record, then hand off remaining risks explicitly.
+
+Internal phases retain their focused acceptance checks, but they do not each
+start a separate implementer/reviewer/fixer cycle.
 
 ### Review roles
 
@@ -723,15 +736,22 @@ The implementer reports:
 
 Reviewer A compares Python and Rust control flow. Reviewer B attacks dynamic
 behavior, ownership, cancellation, resource cleanup, and platform assumptions.
-Neither reviewer assumes that compilation proves parity.
+Both review the whole delivery-task diff and supporting evidence concurrently;
+the package sent to each includes the exact commands and exact output, or
+durable unabridged output artifacts. Neither reviewer waits for the other or
+assumes that compilation proves parity.
 
-The fixer reproduces each confirmed issue, applies the smallest root fix, and
-runs the relevant differential and regression tests.
+The implementer is also the fixer. They reproduce the combined confirmed
+findings, apply root fixes with focused tests, and run the relevant
+differential and regression gates once before the parallel re-review.
 
-## Worktrees and git
+## Main-branch coordination and git
 
-Use isolated git worktrees for independent translation shards. Each shard has
-an explicit owned file list.
+The current port is developed directly on `main`; do not create worktrees or
+review branches. Across the entire repository, at most one agent may edit
+source/documentation or perform a mutating Git operation at any time.
+Reviewers and every other parallel agent are read-only until the orchestrator
+hands them a complete commit and evidence package.
 
 Rules:
 
@@ -740,12 +760,16 @@ Rules:
 - never stage with a broad pattern when unrelated files exist;
 - never overwrite user changes;
 - never run competing merges or rebases;
-- never amend another shard's commit without coordination;
-- use file-scoped commits with descriptive messages;
-- integrate and run full checks from one designated worktree.
+- never amend another task's commit without coordination;
+- use exact task-owned file commits with descriptive messages; never include
+  unrelated dirty files;
+- run full checks from the shared rewrite repository at delivery gates.
 
-If a shard discovers a shared-file requirement, stop and hand it to the
-integrator rather than editing outside its ownership.
+If a task discovers a shared-file requirement, the orchestrator resolves
+ownership before the sole mutating implementer edits it. Parallel work may
+prepare read-only oracle comparisons, attack matrices, or reviews, but may not
+edit files, stage, commit, merge, rebase, or otherwise race the shared
+worktree, index, or `HEAD`.
 
 ## Verification ladder
 
