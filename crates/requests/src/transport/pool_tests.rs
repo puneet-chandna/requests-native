@@ -109,6 +109,58 @@ fn pool_key_includes_scheme_authority_proxy_tls_and_optional_identity() {
 }
 
 #[test]
+fn implicit_http_and_explicit_port_80_share_pool_key() {
+    assert_eq!(
+        key(Scheme::HTTP, "example.test", None, "plain", None),
+        key(Scheme::HTTP, "example.test:80", None, "plain", None),
+    );
+}
+
+#[test]
+fn implicit_https_and_explicit_port_443_share_pool_key() {
+    assert_eq!(
+        key(
+            Scheme::HTTPS,
+            "example.test",
+            None,
+            "tls-bundle-a",
+            Some("identity-a"),
+        ),
+        key(
+            Scheme::HTTPS,
+            "example.test:443",
+            None,
+            "tls-bundle-a",
+            Some("identity-a"),
+        ),
+    );
+}
+
+#[test]
+fn nondefault_ports_remain_separate_pool_keys() {
+    assert_ne!(
+        key(Scheme::HTTP, "example.test", None, "plain", None),
+        key(Scheme::HTTP, "example.test:8080", None, "plain", None),
+    );
+    assert_ne!(
+        key(
+            Scheme::HTTPS,
+            "example.test",
+            None,
+            "tls-bundle-a",
+            Some("identity-a"),
+        ),
+        key(
+            Scheme::HTTPS,
+            "example.test:8443",
+            None,
+            "tls-bundle-a",
+            Some("identity-a"),
+        ),
+    );
+}
+
+#[test]
 fn current_generation_clean_eof_returns_idle_up_to_capacity_per_key() {
     let mut pool = Pool::new(2);
     let first_key = direct_key();

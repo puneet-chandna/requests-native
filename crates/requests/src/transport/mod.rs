@@ -934,6 +934,65 @@ mod tests {
     }
 
     #[test]
+    fn connection_driver_shutdown_handle_is_a_raw_standard_tcp_stream() {
+        let driver = ConnectionDriver {
+            task: None,
+            shutdown: None,
+        };
+        let ConnectionDriver { task, shutdown } = &driver;
+        let _: &Option<std::net::TcpStream> = shutdown;
+        assert!(task.is_none());
+    }
+
+    #[test]
+    fn production_http1_inventory_requires_one_shared_generic_seam() {
+        // The future helper is intentionally absent in RED. Referencing it as
+        // a Rust item would make the test target fail to compile, so this
+        // guard is lexical and strictly bounded to the production prefix.
+        let source = include_str!("mod.rs");
+        let (production, _) = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("transport source keeps one final cfg(test) module");
+
+        assert_eq!(
+            production.matches("http1::handshake(").count(),
+            1,
+            "plain and TLS streams must share exactly one Hyper HTTP/1 handshake"
+        );
+        for forbidden in [
+            "hyper_rustls",
+            "MaybeHttpsStream",
+            "dyn AsyncRead",
+            "dyn AsyncWrite",
+            "dyn tokio::io::AsyncRead",
+            "dyn tokio::io::AsyncWrite",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "production transport must not contain erased or wrapper I/O pattern {forbidden:?}"
+            );
+        }
+
+        let definitions = production
+            .lines()
+            .filter(|line| line.contains("fn start_http1<"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            definitions.len(),
+            1,
+            "production transport requires one generic start_http1 seam"
+        );
+        assert!(
+            !definitions[0].contains("pub"),
+            "start_http1 must remain private"
+        );
+        assert!(
+            production.matches("start_http1(").count() >= 2,
+            "plain and TLS establishment must both call the shared start_http1 seam"
+        );
+    }
+
+    #[test]
     fn request_validation_allows_http_and_https_but_rejects_other_schemes() {
         let bytes = RequestBuilder::new(Method::GET, "http://example.test/")
             .body(Bytes::from_static(b"body"))
