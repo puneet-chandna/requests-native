@@ -345,6 +345,49 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
     let compact = connection.split_whitespace().collect::<String>();
     let mut violations = Vec::new();
 
+    let raw_shutdown_calls = production.matches(".raw_shutdown_taken()").count();
+    if raw_shutdown_calls != 1 {
+        violations.push("production must contain exactly one raw-shutdown observation call");
+    }
+    let shutdown_helper = production
+        .split_once("fn shutdown_socket_once(&mut self) {")
+        .and_then(|(_, helper_and_after)| {
+            helper_and_after
+                .split_once("\n    }\n\n    fn take_and_abort_task_once")
+                .map(|(helper, _)| helper)
+        });
+    match shutdown_helper {
+        Some(helper) => {
+            let helper = helper.split_whitespace().collect::<String>();
+            if helper.matches(".raw_shutdown_taken()").count() != raw_shutdown_calls {
+                violations
+                    .push("raw-shutdown observation must occur only inside shutdown_socket_once");
+            }
+            if helper.matches("self.shutdown.take()").count() != 1
+                || helper.matches("stream.shutdown(Shutdown::Both)").count() != 1
+            {
+                violations.push(
+                    "shutdown_socket_once must retain one raw Option::take and one socket shutdown",
+                );
+            }
+            let ordered = [
+                helper.find("self.shutdown.take()"),
+                helper.find(".raw_shutdown_taken()"),
+                helper.find("stream.shutdown(Shutdown::Both)"),
+            ];
+            if !matches!(
+                ordered,
+                [Some(take), Some(observe), Some(shutdown)]
+                    if take < observe && observe < shutdown
+            ) {
+                violations.push(
+                    "shutdown_socket_once must take the raw socket, observe that take, then shut it down",
+                );
+            }
+        }
+        None => violations.push("production must retain one bounded shutdown_socket_once helper"),
+    }
+
     if production.matches("tokio::task::spawn_blocking").count() != 1 {
         violations.push("HTTPS establishment needs exactly one blocking load/parse task");
     }
