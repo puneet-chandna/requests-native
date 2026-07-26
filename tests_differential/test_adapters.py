@@ -1224,6 +1224,38 @@ def test_main_manager_behavior_mutations_fall_back_then_restore(monkeypatch, mut
         assert server.requests == 1
 
 
+def test_inherited_pool_base_behavior_mutation_falls_back_then_restores(monkeypatch):
+    import urllib3.connectionpool
+
+    marker = object()
+    adapter = HTTPAdapter()
+    manager = adapter.poolmanager
+    function = urllib3.connectionpool.ConnectionPool.__init__
+    original = function.__code__
+    calls = []
+    urllib3.connectionpool._PROVENANCE_PROBE = calls
+
+    def replacement(*args, **kwargs):
+        _PROVENANCE_PROBE.append((args, kwargs))
+
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    with loopback((200, {}, b"restored-inherited-base")) as (server, url):
+        try:
+            function.__code__ = replacement.__code__
+            with _rust_adapter_trial():
+                assert adapter.send(prepared(url)) is marker
+            assert calls == []
+            assert list(manager.pools._container.items()) == []
+            assert server.requests == 0
+        finally:
+            function.__code__ = original
+            del urllib3.connectionpool._PROVENANCE_PROBE
+
+        with _rust_adapter_trial():
+            assert adapter.send(prepared(url)).content == b"restored-inherited-base"
+        assert server.requests == 1
+
+
 def test_proxy_manager_partial_behavior_mutation_falls_back_then_restores(monkeypatch):
     marker = object()
     with loopback((200, {}, b"first"), (200, {}, b"restored-proxy-behavior")) as (

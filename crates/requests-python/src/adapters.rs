@@ -121,9 +121,14 @@ struct SequenceProof {
     behaviors: Vec<BehaviorProof>,
 }
 
+struct ClassProof {
+    dictionary: DictProof,
+    bases: SequenceProof,
+}
+
 enum BehaviorDetails {
     Function(CallableProof),
-    Class(Box<DictProof>),
+    Class(Box<ClassProof>),
     Partial {
         function: Box<BehaviorProof>,
         arguments: SequenceProof,
@@ -658,11 +663,12 @@ fn behavior_proof_inner(
             keywords,
         })
     } else if value.is_instance(&type_type)? {
-        Some(BehaviorDetails::Class(Box::new(dict_proof_inner(
-            py,
-            &value.getattr("__dict__")?,
-            visited,
-        )?)))
+        let bases = sequence_proof_inner(py, &value.getattr("__bases__")?, visited)?;
+        let dictionary = dict_proof_inner(py, &value.getattr("__dict__")?, visited)?;
+        Some(BehaviorDetails::Class(Box::new(ClassProof {
+            dictionary,
+            bases,
+        })))
     } else {
         let mut members = Vec::new();
         for name in ["__func__", "fget", "fset", "fdel"] {
@@ -717,9 +723,11 @@ fn behavior_proof_is_pristine(
     }
     match &proof.details {
         Some(BehaviorDetails::Function(callable)) => callable_proof_is_pristine(py, callable),
-        Some(BehaviorDetails::Class(class_dict)) => {
-            dict_proof_is_pristine(py, &value.getattr("__dict__")?, class_dict)
-        }
+        Some(BehaviorDetails::Class(class_proof)) => Ok(value
+            .getattr("__bases__")?
+            .is(class_proof.bases.sequence.bind(py))
+            && sequence_proof_is_pristine(py, &class_proof.bases)?
+            && dict_proof_is_pristine(py, &value.getattr("__dict__")?, &class_proof.dictionary)?),
         Some(BehaviorDetails::Partial {
             function,
             arguments,
