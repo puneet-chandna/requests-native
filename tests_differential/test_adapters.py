@@ -136,6 +136,37 @@ def test_nonreplayable_body_and_class_patch_fall_back(monkeypatch):
         assert HTTPAdapter().send(prepared("http://example.test/")) is marker
 
 
+def test_restored_instance_class_and_module_state_readmits_native_trial(monkeypatch):
+    marker = object()
+    adapter = HTTPAdapter()
+    request = prepared("http://example.test/")
+
+    adapter.send = lambda *args, **kwargs: marker
+    with _rust_adapter_trial():
+        assert adapter.send(request) is marker
+    del adapter.send
+
+    with monkeypatch.context() as patched:
+        patched.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+        patched.setattr(HTTPAdapter, "add_headers", lambda *a, **k: None)
+        with _rust_adapter_trial():
+            assert adapter.send(request) is marker
+
+    with monkeypatch.context() as patched:
+        patched.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+        patched.setattr(adapters, "select_proxy", lambda *a, **k: None)
+        with _rust_adapter_trial():
+            assert adapter.send(request) is marker
+
+    with loopback((200, {}, b"restored")) as (server, url):
+        with _rust_adapter_trial():
+            response = adapter.send(prepared(url))
+            assert type(response.raw).__module__ == "requests._requests_rust"
+            assert response.content == b"restored"
+            adapter.close()
+        assert server.requests == 1
+
+
 def test_retry_loop_closes_prior_response_and_uses_origin_thread_sleep(monkeypatch):
     sleeps = []
     monkeypatch.setattr("time.sleep", sleeps.append)
