@@ -1,7 +1,9 @@
 use std::io::Cursor;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use requests::{CertificateSource, Client, StatusCode, TlsConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -10,6 +12,7 @@ use tokio_rustls::TlsAcceptor;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_REQUEST_HEAD: usize = 16 * 1024;
+const FROZEN_CA_CERTIFICATE: &[u8] = include_bytes!("../../../tests/certs/expired/ca/ca.crt");
 const VALID_SERVER: ServerIdentity = ServerIdentity {
     certificate_chain: include_bytes!("../../../tests/certs/valid/server/server.pem"),
     private_key: include_bytes!("../../../tests/certs/valid/server/server.key"),
@@ -23,6 +26,7 @@ const WRONG_HOST_SERVER: ServerIdentity = ServerIdentity {
     private_key: include_bytes!("../../../tests/fixtures/tls/wrong-host/wrong-host.key"),
 };
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ntls-ok";
+static NEXT_CAPATH_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct ServerIdentity {
@@ -49,6 +53,47 @@ struct TlsObservation {
 enum ExpectedClientResult {
     Success,
     TlsFailure,
+}
+
+struct CapathDirectory {
+    path: PathBuf,
+}
+
+impl CapathDirectory {
+    fn new() -> Self {
+        let sequence = NEXT_CAPATH_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "requests-protocol-tls-capath-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("create unique capath fixture directory");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn write(&self, basename: &str, contents: &[u8]) -> PathBuf {
+        assert_eq!(
+            Path::new(basename).components().count(),
+            1,
+            "capath fixture writes only direct entries"
+        );
+        let path = self.path.join(basename);
+        std::fs::write(&path, contents).expect("write capath fixture entry");
+        path
+    }
+}
+
+impl Drop for CapathDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -213,6 +258,165 @@ fn pre_socket_empty_ca_bundle_is_tls_error() {
 #[test]
 fn pre_socket_garbage_ca_bundle_is_tls_error() {
     assert_pre_socket_bundle_failure(repository_fixture("fixtures/tls/garbage-ca.pem"));
+}
+
+fn capath_request_failure(directory: &CapathDirectory) -> (String, String) {
+    let client = Client::builder()
+        .tls(TlsConfig {
+            roots: CertificateSource::PemDirectory(directory.path().to_path_buf()),
+            identity: None,
+        })
+        .build()
+        .expect("client construction remains path-blind");
+    let error = runtime().block_on(async {
+        match tokio::time::timeout(
+            IO_TIMEOUT,
+            client.get("https://no-socket.invalid/check").send(),
+        )
+        .await
+        .expect("capath policy request timed out")
+        {
+            Ok(_) => panic!("capath policy request unexpectedly returned HTTP"),
+            Err(error) => error,
+        }
+    });
+    (format!("{:?}", error.kind()), error.to_string())
+}
+
+fn assert_capath_accepted(directory: &CapathDirectory) {
+    let (kind, error) = capath_request_failure(directory);
+    assert_eq!(
+        kind, "Dns",
+        "accepted capath must defer path loading and reach DNS: {error}"
+    );
+}
+
+fn assert_capath_rejected(directory: &CapathDirectory) -> String {
+    let (kind, error) = capath_request_failure(directory);
+    assert_ne!(kind, "Dns", "rejected capath must fail before DNS");
+    assert_ne!(kind, "Connect", "rejected capath must fail before connect");
+    assert_eq!(kind, "Tls", "rejected capath must be a TLS error: {error}");
+    error
+}
+
+#[test]
+fn capath_accepts_lowercase_hash_shaped_direct_entry() {
+    let directory = CapathDirectory::new();
+    directory.write("117adfc4.0", FROZEN_CA_CERTIFICATE);
+    assert_capath_accepted(&directory);
+}
+
+#[test]
+fn capath_accepts_uppercase_hex_hash_shape() {
+    let directory = CapathDirectory::new();
+    directory.write("ABCDEF12.0", FROZEN_CA_CERTIFICATE);
+    assert_capath_accepted(&directory);
+}
+
+#[test]
+fn capath_accepts_multi_digit_nonnegative_suffix() {
+    let directory = CapathDirectory::new();
+    directory.write("117adfc4.123", FROZEN_CA_CERTIFICATE);
+    assert_capath_accepted(&directory);
+}
+
+#[cfg(unix)]
+#[test]
+fn capath_accepts_file_symlink_to_valid_root() {
+    let directory = CapathDirectory::new();
+    let target = directory.write("root.pem", FROZEN_CA_CERTIFICATE);
+    std::os::unix::fs::symlink(target, directory.path().join("117adfc4.0"))
+        .expect("create eligible capath file symlink");
+    assert_capath_accepted(&directory);
+}
+
+#[test]
+fn capath_ignores_unrelated_valid_pem_name() {
+    let directory = CapathDirectory::new();
+    directory.write("root.pem", FROZEN_CA_CERTIFICATE);
+    assert_capath_rejected(&directory);
+}
+
+#[test]
+fn capath_accepts_eligible_root_alongside_unrelated_valid_pem() {
+    let directory = CapathDirectory::new();
+    directory.write("root.pem", FROZEN_CA_CERTIFICATE);
+    directory.write("117adfc4.0", FROZEN_CA_CERTIFICATE);
+    assert_capath_accepted(&directory);
+}
+
+#[test]
+fn capath_does_not_recurse_into_child_directory() {
+    let directory = CapathDirectory::new();
+    let child = directory.path().join("child");
+    std::fs::create_dir(&child).expect("create capath child directory");
+    std::fs::write(child.join("117adfc4.0"), FROZEN_CA_CERTIFICATE)
+        .expect("write nested eligible certificate");
+    assert_capath_rejected(&directory);
+}
+
+#[test]
+fn capath_rejects_directory_without_entries() {
+    let directory = CapathDirectory::new();
+    assert_capath_rejected(&directory);
+}
+
+#[test]
+fn capath_rejects_empty_eligible_entry() {
+    let directory = CapathDirectory::new();
+    directory.write("117adfc4.0", b"");
+    assert_capath_rejected(&directory);
+}
+
+#[test]
+fn capath_rejects_malformed_eligible_entry() {
+    let directory = CapathDirectory::new();
+    directory.write("117adfc4.0", b"not a PEM certificate");
+    assert_capath_rejected(&directory);
+}
+
+#[cfg(unix)]
+#[test]
+fn capath_rejects_broken_eligible_symlink() {
+    let directory = CapathDirectory::new();
+    std::os::unix::fs::symlink(
+        directory.path().join("missing-root.pem"),
+        directory.path().join("117adfc4.0"),
+    )
+    .expect("create broken eligible capath symlink");
+    assert_capath_rejected(&directory);
+}
+
+#[test]
+fn capath_ignores_invalid_basenames() {
+    let directory = CapathDirectory::new();
+    for basename in [
+        "117adfc.0",
+        "117adfc40.0",
+        "117adfcg.0",
+        "117adfc4.-1",
+        "117adfc4.nope",
+    ] {
+        directory.write(basename, FROZEN_CA_CERTIFICATE);
+    }
+    assert_capath_rejected(&directory);
+}
+
+#[test]
+fn capath_reports_lexically_first_malformed_eligible_entry() {
+    let directory = CapathDirectory::new();
+    directory.write("ffffffff.2", b"malformed second");
+    directory.write("00000000.10", b"malformed first");
+
+    let error = assert_capath_rejected(&directory);
+    assert!(
+        error.contains("00000000.10"),
+        "TLS error must name the lexically first eligible entry: {error}"
+    );
+    assert!(
+        !error.contains("ffffffff.2"),
+        "TLS error must stop at the lexically first malformed entry: {error}"
+    );
 }
 
 fn run_tls_case(
