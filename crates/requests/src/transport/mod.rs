@@ -934,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn request_validation_allows_bodies_and_rejects_https_before_io() {
+    fn request_validation_allows_http_and_https_but_rejects_other_schemes() {
         let bytes = RequestBuilder::new(Method::GET, "http://example.test/")
             .body(Bytes::from_static(b"body"))
             .build()
@@ -946,11 +946,15 @@ mod tests {
         let https = RequestBuilder::new(Method::GET, "https://example.test/")
             .build()
             .unwrap();
+        let ftp = RequestBuilder::new(Method::GET, "ftp://example.test/")
+            .build()
+            .unwrap();
 
         validate_request(&bytes).unwrap();
         validate_request(&stream).unwrap();
+        validate_request(&https).unwrap();
         assert_eq!(
-            validate_request(&https).unwrap_err().kind(),
+            validate_request(&ftp).unwrap_err().kind(),
             ErrorKind::InvalidUrl
         );
     }

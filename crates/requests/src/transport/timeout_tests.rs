@@ -33,6 +33,44 @@ struct ControlledConnectFuture {
     reported_started: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConnectCall {
+    host: String,
+    port: u16,
+    target: String,
+}
+
+#[derive(Clone, Default)]
+struct RecordingConnector {
+    calls: Arc<Mutex<Vec<ConnectCall>>>,
+}
+
+impl RecordingConnector {
+    fn calls(&self) -> Vec<ConnectCall> {
+        self.calls.lock().expect("connector calls lock").clone()
+    }
+}
+
+impl Connector for RecordingConnector {
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        target: &str,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<tokio::net::TcpStream>> + Send>> {
+        self.calls
+            .lock()
+            .expect("connector calls lock")
+            .push(ConnectCall {
+                host: host.to_owned(),
+                port,
+                target: target.to_owned(),
+            });
+        let target = target.to_owned();
+        Box::pin(async move { Err(Error::connect(&target, "controlled connector error")) })
+    }
+}
+
 impl ControlledConnector {
     fn new() -> Self {
         Self {
@@ -156,6 +194,26 @@ fn request(timeout: Timeout, body: BodySource) -> crate::Request {
         .expect("build connector contract request")
 }
 
+fn assert_implicit_connector_call(url: &str, expected: ConnectCall) {
+    runtime().block_on(async {
+        let connector = RecordingConnector::default();
+        let transport = Transport::with_connector(Arc::new(connector.clone()));
+        let request = RequestBuilder::new(Method::GET, url)
+            .build()
+            .expect("build implicit-port request");
+        let error = match transport.send(request).await {
+            Err(error) => error,
+            Ok(_) => panic!("controlled connector unexpectedly produced a response"),
+        };
+        assert_eq!(
+            error.kind(),
+            ErrorKind::Connect,
+            "request must reach the typed connector before its controlled error"
+        );
+        assert_eq!(connector.calls(), vec![expected]);
+    });
+}
+
 async fn send_with_safety_release(timeout: Timeout) -> Error {
     let connector = ControlledConnector::new();
     let transport = Arc::new(Transport::with_connector(Arc::new(connector.clone())));
@@ -216,6 +274,30 @@ fn assert_equal_read_total_tie_prefers_read(_phase: &str) {
     assert_eq!(
         select_deadline_source(Some(deadline), Some(deadline)),
         Some(DeadlineSource::Read)
+    );
+}
+
+#[test]
+fn implicit_http_uses_port_80_and_exact_connector_target() {
+    assert_implicit_connector_call(
+        "http://plain.test/path",
+        ConnectCall {
+            host: "plain.test".to_owned(),
+            port: 80,
+            target: "plain.test".to_owned(),
+        },
+    );
+}
+
+#[test]
+fn implicit_https_uses_port_443_and_exact_connector_target() {
+    assert_implicit_connector_call(
+        "https://secure.test/path",
+        ConnectCall {
+            host: "secure.test".to_owned(),
+            port: 443,
+            target: "secure.test".to_owned(),
+        },
     );
 }
 
