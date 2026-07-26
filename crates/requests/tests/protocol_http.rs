@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::marker::PhantomPinned;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -25,6 +25,12 @@ const POST_EXCHANGE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(3);
 const POOL_TIMEOUT: Duration = Duration::from_secs(5);
+const DEADLINE_FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEADLINE_OUTER_TIMEOUT: Duration = Duration::from_secs(4);
+const DEADLINE_SHORT: Duration = Duration::from_millis(200);
+const DEADLINE_LONG: Duration = Duration::from_millis(900);
+const DEADLINE_PHASE_DELAY: Duration = Duration::from_millis(600);
+const UPLOAD_TOTAL_LONG: Duration = Duration::from_millis(900);
 const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const SCRIPTED_RESPONSE: &[u8] =
@@ -35,6 +41,8 @@ const FRAMING_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nx-fixture: framing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const HEAD_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nx-fixture: framing\r\nContent-Length: 7\r\nConnection: close\r\n\r\n";
+const DEADLINE_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nx-fixture: deadline\r\nContent-Length: 2\r\n\r\nok";
 
 #[derive(Debug)]
 struct Observation {
@@ -72,6 +80,67 @@ struct PhasedServer {
     commands: Sender<PhaseCommand>,
     events: Receiver<PhaseEvent>,
     worker: Option<JoinHandle<Result<PhasedObservation, String>>>,
+}
+
+#[derive(Debug)]
+struct DeadlineObservation {
+    request_bytes: Vec<u8>,
+    peer_eof_count: usize,
+    expected_write_failures: usize,
+}
+
+struct DeadlinePhase {
+    delay: Option<Duration>,
+    bytes: Vec<u8>,
+}
+
+impl DeadlinePhase {
+    fn after(delay: Duration, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            delay: Some(delay),
+            bytes: bytes.into(),
+        }
+    }
+
+    fn gated(bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            delay: None,
+            bytes: bytes.into(),
+        }
+    }
+}
+
+enum DeadlineCommand {
+    ReleaseNext,
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeadlineEvent {
+    RequestCaptured,
+    PhaseSent(usize),
+}
+
+struct DeadlineServer {
+    address: SocketAddr,
+    commands: Sender<DeadlineCommand>,
+    events: Receiver<DeadlineEvent>,
+    result: Receiver<Result<DeadlineObservation, String>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct PendingUploadObservation {
+    request_bytes: Vec<u8>,
+    peer_eof_count: usize,
+    expected_close_errors: usize,
+}
+
+struct PendingUploadServer {
+    address: SocketAddr,
+    shutdown: Sender<()>,
+    result: Receiver<Result<PendingUploadObservation, String>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -572,6 +641,390 @@ fn write_phase(stream: &mut TcpStream, phase: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("flush phased response: {error}"))
 }
 
+impl DeadlineServer {
+    fn spawn(phases: Vec<DeadlinePhase>) -> Self {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind deadline loopback fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("make deadline fixture listener nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("read deadline fixture address");
+        let (command_tx, command_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = result_tx.send(serve_deadline(listener, command_rx, event_tx, phases));
+        });
+
+        Self {
+            address,
+            commands: command_tx,
+            events: event_rx,
+            result: result_rx,
+            worker: Some(worker),
+        }
+    }
+
+    fn delayed_head(delay: Duration) -> Self {
+        Self::spawn(vec![DeadlinePhase::after(delay, DEADLINE_RESPONSE)])
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/deadline", self.address)
+    }
+
+    fn finish(mut self) -> Result<DeadlineObservation, String> {
+        let result = self
+            .result
+            .recv_timeout(DEADLINE_FIXTURE_TIMEOUT)
+            .map_err(|error| format!("deadline fixture result timed out: {error}"))?;
+        self.join_worker()?;
+        result
+    }
+
+    async fn wait_request_captured(&self) {
+        loop {
+            match self.events.try_recv() {
+                Ok(DeadlineEvent::RequestCaptured) => return,
+                Ok(event) => panic!("unexpected deadline event before request capture: {event:?}"),
+                Err(TryRecvError::Empty) => tokio::task::yield_now().await,
+                Err(TryRecvError::Disconnected) => {
+                    panic!("deadline fixture ended before capturing the request")
+                }
+            }
+        }
+    }
+
+    fn release_next(&self, index: usize) {
+        self.commands
+            .send(DeadlineCommand::ReleaseNext)
+            .expect("release deadline response phase");
+        assert_eq!(
+            self.events
+                .recv_timeout(DEADLINE_FIXTURE_TIMEOUT)
+                .expect("wait for released deadline response phase"),
+            DeadlineEvent::PhaseSent(index)
+        );
+    }
+
+    fn signal_shutdown(&mut self) {
+        let _ = self.commands.send(DeadlineCommand::Shutdown);
+    }
+
+    fn join_worker(&mut self) -> Result<(), String> {
+        let worker = self
+            .worker
+            .take()
+            .ok_or_else(|| "deadline fixture worker already joined".to_owned())?;
+        worker
+            .join()
+            .map_err(|_| "deadline fixture worker panicked".to_owned())
+    }
+}
+
+impl Drop for DeadlineServer {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        let _ = self.result.recv_timeout(DEADLINE_FIXTURE_TIMEOUT);
+        let _ = self.join_worker();
+    }
+}
+
+fn serve_deadline(
+    listener: TcpListener,
+    commands: Receiver<DeadlineCommand>,
+    events: Sender<DeadlineEvent>,
+    phases: Vec<DeadlinePhase>,
+) -> Result<DeadlineObservation, String> {
+    let deadline = Instant::now() + DEADLINE_FIXTURE_TIMEOUT;
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(format!("deadline fixture accept failed: {error}")),
+        }
+        if deadline_shutdown_requested(&commands)? {
+            return Ok(DeadlineObservation {
+                request_bytes: Vec::new(),
+                peer_eof_count: 0,
+                expected_write_failures: 0,
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err("deadline fixture timed out accepting a connection".to_owned());
+        }
+        thread::sleep(SERVER_POLL_INTERVAL);
+    };
+
+    stream
+        .set_read_timeout(Some(DEADLINE_FIXTURE_TIMEOUT))
+        .map_err(|error| format!("set deadline fixture read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(DEADLINE_FIXTURE_TIMEOUT))
+        .map_err(|error| format!("set deadline fixture write timeout: {error}"))?;
+    let request_bytes = read_complete_request(&mut stream)?;
+    events
+        .send(DeadlineEvent::RequestCaptured)
+        .map_err(|_| "deadline fixture request event receiver closed".to_owned())?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| format!("make deadline fixture stream nonblocking: {error}"))?;
+    let mut observation = DeadlineObservation {
+        request_bytes,
+        peer_eof_count: 0,
+        expected_write_failures: 0,
+    };
+
+    for (index, phase) in phases.into_iter().enumerate() {
+        if !wait_for_deadline_phase(
+            &mut stream,
+            &commands,
+            deadline,
+            phase.delay,
+            &mut observation,
+        )? {
+            return Ok(observation);
+        }
+        if let Err(error) = write_deadline_phase(&mut stream, &phase.bytes) {
+            if expected_deadline_write_failure(&error) {
+                observation.expected_write_failures += 1;
+                return Ok(observation);
+            }
+            return Err(format!("write deadline response phase: {error}"));
+        }
+        events
+            .send(DeadlineEvent::PhaseSent(index))
+            .map_err(|_| "deadline fixture phase event receiver closed".to_owned())?;
+    }
+
+    loop {
+        if deadline_shutdown_requested(&commands)? {
+            return Ok(observation);
+        }
+        if observe_deadline_peer_eof(&mut stream)? {
+            observation.peer_eof_count = 1;
+            return Ok(observation);
+        }
+        if Instant::now() >= deadline {
+            return Err("deadline fixture timed out waiting for peer EOF".to_owned());
+        }
+        thread::sleep(SERVER_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_deadline_phase(
+    stream: &mut TcpStream,
+    commands: &Receiver<DeadlineCommand>,
+    deadline: Instant,
+    delay: Option<Duration>,
+    observation: &mut DeadlineObservation,
+) -> Result<bool, String> {
+    let release_at = delay.map(|delay| Instant::now() + delay);
+    loop {
+        if release_at.is_some_and(|release_at| Instant::now() >= release_at) {
+            return Ok(true);
+        }
+        match commands.try_recv() {
+            Ok(DeadlineCommand::ReleaseNext) if release_at.is_none() => return Ok(true),
+            Ok(DeadlineCommand::ReleaseNext) => {
+                return Err("release command targeted a delayed deadline phase".to_owned());
+            }
+            Ok(DeadlineCommand::Shutdown) | Err(TryRecvError::Disconnected) => return Ok(false),
+            Err(TryRecvError::Empty) => {}
+        }
+        if observe_deadline_peer_eof(stream)? {
+            observation.peer_eof_count = 1;
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            return Err("deadline fixture timed out before a response phase".to_owned());
+        }
+        thread::sleep(SERVER_POLL_INTERVAL);
+    }
+}
+
+fn deadline_shutdown_requested(commands: &Receiver<DeadlineCommand>) -> Result<bool, String> {
+    match commands.try_recv() {
+        Ok(DeadlineCommand::Shutdown) | Err(TryRecvError::Disconnected) => Ok(true),
+        Ok(DeadlineCommand::ReleaseNext) => {
+            Err("release command arrived outside a gated deadline phase".to_owned())
+        }
+        Err(TryRecvError::Empty) => Ok(false),
+    }
+}
+
+fn observe_deadline_peer_eof(stream: &mut TcpStream) -> Result<bool, String> {
+    let mut byte = [0_u8; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => Ok(true),
+        Ok(_) => Err("deadline fixture received bytes after the complete request".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(false),
+        Err(error) if expected_deadline_write_failure(&error) => Ok(true),
+        Err(error) => Err(format!("observe deadline fixture peer: {error}")),
+    }
+}
+
+fn write_deadline_phase(stream: &mut TcpStream, phase: &[u8]) -> std::io::Result<()> {
+    stream.set_nonblocking(false)?;
+    let write = stream.write_all(phase).and_then(|()| stream.flush());
+    let restore = stream.set_nonblocking(true);
+    write.and(restore)
+}
+
+fn expected_deadline_write_failure(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
+impl PendingUploadServer {
+    fn spawn() -> Self {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind pending-upload loopback fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("make pending-upload listener nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("read pending-upload fixture address");
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = result_tx.send(serve_pending_upload(listener, shutdown_rx));
+        });
+        Self {
+            address,
+            shutdown: shutdown_tx,
+            result: result_rx,
+            worker: Some(worker),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/upload", self.address)
+    }
+
+    fn finish(mut self) -> Result<PendingUploadObservation, String> {
+        let result = self
+            .result
+            .recv_timeout(DEADLINE_FIXTURE_TIMEOUT)
+            .map_err(|error| format!("pending-upload fixture result timed out: {error}"))?;
+        self.join_worker()?;
+        result
+    }
+
+    fn join_worker(&mut self) -> Result<(), String> {
+        let worker = self
+            .worker
+            .take()
+            .ok_or_else(|| "pending-upload fixture worker already joined".to_owned())?;
+        worker
+            .join()
+            .map_err(|_| "pending-upload fixture worker panicked".to_owned())
+    }
+}
+
+impl Drop for PendingUploadServer {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            let _ = self.shutdown.send(());
+            let _ = self.result.recv_timeout(DEADLINE_FIXTURE_TIMEOUT);
+            let _ = self.join_worker();
+        }
+    }
+}
+
+fn serve_pending_upload(
+    listener: TcpListener,
+    shutdown: Receiver<()>,
+) -> Result<PendingUploadObservation, String> {
+    let deadline = Instant::now() + DEADLINE_FIXTURE_TIMEOUT;
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(format!("pending-upload accept failed: {error}")),
+        }
+        if matches!(
+            shutdown.try_recv(),
+            Ok(()) | Err(TryRecvError::Disconnected)
+        ) {
+            return Ok(PendingUploadObservation {
+                request_bytes: Vec::new(),
+                peer_eof_count: 0,
+                expected_close_errors: 0,
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err("pending-upload fixture timed out accepting a connection".to_owned());
+        }
+        thread::sleep(SERVER_POLL_INTERVAL);
+    };
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| format!("make pending-upload stream nonblocking: {error}"))?;
+
+    let mut observation = PendingUploadObservation {
+        request_bytes: Vec::new(),
+        peer_eof_count: 0,
+        expected_close_errors: 0,
+    };
+    let mut head_captured = false;
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                if !head_captured {
+                    return Err("pending upload closed before request head capture".to_owned());
+                }
+                observation.peer_eof_count = 1;
+                return Ok(observation);
+            }
+            Ok(read) => {
+                if observation.request_bytes.len() + read > MAX_REQUEST_BYTES {
+                    return Err(format!(
+                        "pending upload exceeded {MAX_REQUEST_BYTES} captured bytes"
+                    ));
+                }
+                observation.request_bytes.extend_from_slice(&buffer[..read]);
+                head_captured = observation
+                    .request_bytes
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n");
+                if !head_captured && observation.request_bytes.len() >= MAX_REQUEST_HEAD_BYTES {
+                    return Err(format!(
+                        "pending upload head exceeded {MAX_REQUEST_HEAD_BYTES} bytes"
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if expected_deadline_write_failure(&error) && head_captured => {
+                observation.expected_close_errors = 1;
+                return Ok(observation);
+            }
+            Err(error) => return Err(format!("read pending upload: {error}")),
+        }
+        if matches!(
+            shutdown.try_recv(),
+            Ok(()) | Err(TryRecvError::Disconnected)
+        ) {
+            return Ok(observation);
+        }
+        if Instant::now() >= deadline {
+            return Err("pending-upload fixture timed out waiting for peer close".to_owned());
+        }
+        thread::sleep(SERVER_POLL_INTERVAL);
+    }
+}
+
 impl ScriptedServer {
     fn spawn() -> Self {
         Self::spawn_with_response(SCRIPTED_RESPONSE)
@@ -946,6 +1399,81 @@ struct BodyProbe {
     polls: Arc<Mutex<Vec<Option<Bytes>>>>,
 }
 
+#[derive(Clone)]
+struct PendingUploadProbe {
+    inner: Arc<PendingUploadProbeInner>,
+}
+
+struct PendingUploadProbeInner {
+    polls: AtomicUsize,
+    drops: AtomicUsize,
+}
+
+struct PendingUploadBody {
+    probe: PendingUploadProbe,
+}
+
+impl PendingUploadBody {
+    fn source() -> (BodySource, PendingUploadProbe) {
+        let probe = PendingUploadProbe {
+            inner: Arc::new(PendingUploadProbeInner {
+                polls: AtomicUsize::new(0),
+                drops: AtomicUsize::new(0),
+            }),
+        };
+        (
+            BodySource::Stream(Box::pin(Self {
+                probe: probe.clone(),
+            })),
+            probe,
+        )
+    }
+}
+
+impl AsyncBody for PendingUploadBody {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<requests::Result<Bytes>>> {
+        self.probe.inner.polls.fetch_add(1, Ordering::AcqRel);
+        Poll::Pending
+    }
+
+    fn size_hint(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl Drop for PendingUploadBody {
+    fn drop(&mut self) {
+        self.probe.inner.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl PendingUploadProbe {
+    async fn wait_pending(&self) {
+        tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, async {
+            while self.inner.polls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending upload body was never polled");
+        assert!(self.inner.polls.load(Ordering::Acquire) >= 1);
+    }
+
+    async fn assert_dropped_once(&self) {
+        tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, async {
+            while self.inner.drops.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending upload body was not dropped");
+        assert_eq!(self.inner.drops.load(Ordering::Acquire), 1);
+    }
+}
+
 struct TrackedBody {
     chunks: Mutex<VecDeque<Bytes>>,
     size_hint: Option<u64>,
@@ -1027,6 +1555,152 @@ fn send_response(runtime: &tokio::runtime::Runtime, request: RequestBuilder) -> 
     }
 }
 
+fn send_deadline_request(
+    runtime: &tokio::runtime::Runtime,
+    request: RequestBuilder,
+) -> requests::Result<requests::Response> {
+    runtime
+        .block_on(async { tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, request.send()).await })
+        .unwrap_or_else(|error| panic!("deadline-contract request exceeded outer bound: {error}"))
+}
+
+fn assert_timeout_error(error: &requests::Error, source: &str, phase: &str) {
+    assert_eq!(error.kind(), ErrorKind::ReadTimeout);
+    let message = error.to_string().to_ascii_lowercase();
+    match source {
+        "read" => {
+            assert!(
+                message.contains("read") && !message.contains("total"),
+                "timeout error must identify a read-specific timeout: {message}"
+            );
+        }
+        "total" => {
+            assert!(
+                message.contains("total"),
+                "timeout error must identify a total timeout: {message}"
+            );
+        }
+        _ => panic!("unsupported timeout source assertion: {source}"),
+    }
+    assert!(
+        message.contains(phase),
+        "timeout error must identify {phase:?}: {message}"
+    );
+}
+
+fn expect_deadline_error(
+    result: requests::Result<requests::Response>,
+    missing_timeout: &str,
+) -> requests::Error {
+    match result {
+        Err(error) => error,
+        Ok(response) => {
+            drop(response);
+            panic!("{missing_timeout}");
+        }
+    }
+}
+
+fn collect_deadline_body(
+    runtime: &tokio::runtime::Runtime,
+    response: requests::Response,
+) -> requests::Result<Bytes> {
+    runtime
+        .block_on(async { tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, response.bytes()).await })
+        .unwrap_or_else(|error| panic!("deadline-contract body exceeded outer bound: {error}"))
+}
+
+fn pending_upload_error(
+    runtime: &tokio::runtime::Runtime,
+    client: &Client,
+    server: &PendingUploadServer,
+    timeout: Timeout,
+) -> requests::Error {
+    let (body, probe) = PendingUploadBody::source();
+    let mut send = runtime.spawn(
+        client
+            .request(Method::POST, server.url())
+            .body(body)
+            .timeout(timeout)
+            .send(),
+    );
+    runtime.block_on(probe.wait_pending());
+    let result =
+        runtime.block_on(async { tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, &mut send).await });
+    let result = match result {
+        Ok(result) => result.expect("pending-upload request task failed"),
+        Err(error) => {
+            send.abort();
+            let _ = runtime.block_on(send);
+            runtime.block_on(probe.assert_dropped_once());
+            panic!("pending-upload request exceeded outer bound: {error}");
+        }
+    };
+    runtime.block_on(probe.assert_dropped_once());
+    match result {
+        Err(error) => error,
+        Ok(response) => {
+            drop(response);
+            panic!("permanently pending upload unexpectedly produced a response");
+        }
+    }
+}
+
+fn assert_pending_upload_timeout(error: &requests::Error) {
+    assert_eq!(error.kind(), ErrorKind::ReadTimeout);
+    let message = error.to_string().to_ascii_lowercase();
+    assert!(
+        message.contains("total"),
+        "pending-upload timeout must identify the total source: {message}"
+    );
+    assert!(
+        message.contains("request exchange")
+            || (message.contains("request send") && message.contains("response head")),
+        "pending-upload timeout must identify the combined send/head exchange: {message}"
+    );
+}
+
+fn assert_pending_upload_observation(observation: &PendingUploadObservation) {
+    let head_end = observation
+        .request_bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("pending upload captured a complete request head");
+    let head = std::str::from_utf8(&observation.request_bytes[..head_end])
+        .expect("pending-upload request head is UTF-8")
+        .to_ascii_lowercase();
+    assert!(head.starts_with("post /upload http/1.1\r\n"));
+    assert!(head.contains("\r\ntransfer-encoding: chunked"));
+    assert!(!head.contains("\r\ncontent-length:"));
+    assert!(
+        observation.request_bytes[head_end + 4..].is_empty(),
+        "permanently pending body must not produce upload bytes"
+    );
+    assert_eq!(
+        observation.peer_eof_count + observation.expected_close_errors,
+        1,
+        "pending-upload timeout must close its one connection"
+    );
+}
+
+fn assert_deadline_observation(observation: &DeadlineObservation) {
+    assert_eq!(
+        complete_request_len(&observation.request_bytes).expect("parse deadline request"),
+        Some(observation.request_bytes.len()),
+        "deadline fixture must capture one complete request"
+    );
+    assert!(
+        observation
+            .request_bytes
+            .starts_with(b"GET /deadline HTTP/1.1\r\n")
+    );
+    assert_eq!(
+        observation.peer_eof_count + observation.expected_write_failures,
+        1,
+        "deadline path must close its one connection"
+    );
+}
+
 async fn next_response_frame<S>(stream: &mut S) -> Option<S::Item>
 where
     S: Stream + Unpin,
@@ -1062,6 +1736,407 @@ async fn wait_for_pending_poll(pending: &Receiver<()>) {
             }
         }
     }
+}
+
+#[test]
+fn timeout_contract_total_expires_during_pending_request_upload() {
+    let runtime = runtime();
+    let server = PendingUploadServer::spawn();
+    let client = Client::new().expect("build pending-upload client");
+    let error = pending_upload_error(
+        &runtime,
+        &client,
+        &server,
+        Timeout {
+            connect: None,
+            read: None,
+            total: Some(DEADLINE_SHORT),
+        },
+    );
+    assert_pending_upload_timeout(&error);
+
+    drop(client);
+    let observation = server.finish().expect("pending-upload fixture completed");
+    assert_pending_upload_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_connect_and_read_do_not_govern_pending_request_upload() {
+    let runtime = runtime();
+    let server = PendingUploadServer::spawn();
+    let client = Client::new().expect("build pending-upload client");
+    let error = pending_upload_error(
+        &runtime,
+        &client,
+        &server,
+        Timeout {
+            connect: Some(DEADLINE_SHORT),
+            read: Some(DEADLINE_SHORT),
+            total: Some(UPLOAD_TOTAL_LONG),
+        },
+    );
+    assert_pending_upload_timeout(&error);
+
+    drop(client);
+    let observation = server.finish().expect("pending-upload fixture completed");
+    assert_pending_upload_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_response_head_uses_read_timeout() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(DEADLINE_PHASE_DELAY);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(DEADLINE_SHORT),
+        total: None,
+    };
+
+    let error = expect_deadline_error(
+        send_deadline_request(&runtime, client.get(server.url()).timeout(timeout)),
+        "delayed response head ignored the read timeout",
+    );
+    assert_timeout_error(&error, "read", "response head");
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_read_none_and_total_none_allow_delayed_response_head() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(Duration::from_millis(300));
+    let client = Client::new().expect("build deadline client");
+
+    let response = send_deadline_request(
+        &runtime,
+        client.get(server.url()).timeout(Timeout::default()),
+    )
+    .expect("None deadlines rejected a delayed response head");
+    let body = runtime
+        .block_on(async { tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, response.bytes()).await })
+        .expect("deadline control body exceeded outer bound")
+        .expect("deadline control body failed");
+    assert_eq!(body, Bytes::from_static(b"ok"));
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_total_precedes_read_while_waiting_for_response_head() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(DEADLINE_PHASE_DELAY);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(DEADLINE_LONG),
+        total: Some(DEADLINE_SHORT),
+    };
+
+    let error = expect_deadline_error(
+        send_deadline_request(&runtime, client.get(server.url()).timeout(timeout)),
+        "delayed response head ignored the shorter total timeout",
+    );
+    assert_timeout_error(&error, "total", "response head");
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_read_precedes_total_while_waiting_for_response_head() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(DEADLINE_PHASE_DELAY);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(DEADLINE_SHORT),
+        total: Some(DEADLINE_LONG),
+    };
+
+    let error = expect_deadline_error(
+        send_deadline_request(&runtime, client.get(server.url()).timeout(timeout)),
+        "delayed response head ignored the shorter read timeout",
+    );
+    assert_timeout_error(&error, "read", "response head");
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_total_timeout_expires_while_waiting_for_response_head() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(DEADLINE_PHASE_DELAY);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: None,
+        read: None,
+        total: Some(DEADLINE_SHORT),
+    };
+
+    let error = expect_deadline_error(
+        send_deadline_request(&runtime, client.get(server.url()).timeout(timeout)),
+        "delayed response head ignored the total timeout",
+    );
+    assert_timeout_error(&error, "total", "response head");
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_equal_head_durations_prefer_earlier_total_deadline() {
+    let runtime = runtime();
+    let server = DeadlineServer::delayed_head(DEADLINE_PHASE_DELAY);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(DEADLINE_SHORT),
+        total: Some(DEADLINE_SHORT),
+    };
+
+    let error = expect_deadline_error(
+        send_deadline_request(&runtime, client.get(server.url()).timeout(timeout)),
+        "equal response-head deadlines were ignored",
+    );
+    assert_timeout_error(&error, "total", "response head");
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_total_spans_response_head_and_multiple_body_reads() {
+    let runtime = runtime();
+    let server = DeadlineServer::spawn(vec![
+        DeadlinePhase::after(
+            Duration::from_millis(150),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n",
+        ),
+        DeadlinePhase::after(Duration::from_millis(250), b"3\r\ntwo\r\n"),
+        DeadlinePhase::after(Duration::from_millis(400), b"0\r\n\r\n"),
+    ]);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(Duration::from_millis(500)),
+        total: Some(Duration::from_millis(650)),
+    };
+
+    let response = send_deadline_request(&runtime, client.get(server.url()).timeout(timeout))
+        .expect("response head should arrive within both deadlines");
+    let error = collect_deadline_body(&runtime, response)
+        .expect_err("multiple short body gaps ignored the full-request total timeout");
+    assert_timeout_error(&error, "total", "response body");
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_read_precedes_total_while_waiting_for_response_body() {
+    let runtime = runtime();
+    let server = DeadlineServer::spawn(vec![
+        DeadlinePhase::after(
+            Duration::ZERO,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ),
+        DeadlinePhase::after(DEADLINE_PHASE_DELAY, b"2\r\nok\r\n0\r\n\r\n"),
+    ]);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(DEADLINE_SHORT),
+        total: Some(DEADLINE_LONG),
+    };
+
+    let response = send_deadline_request(&runtime, client.get(server.url()).timeout(timeout))
+        .expect("response head should arrive before either body deadline");
+    let error = collect_deadline_body(&runtime, response)
+        .expect_err("delayed body ignored the shorter read timeout");
+    assert_timeout_error(&error, "read", "response body");
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_total_precedes_read_while_waiting_for_response_body() {
+    let runtime = runtime();
+    let server = DeadlineServer::spawn(vec![
+        DeadlinePhase::after(
+            Duration::ZERO,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ),
+        DeadlinePhase::after(DEADLINE_PHASE_DELAY, b"2\r\nok\r\n0\r\n\r\n"),
+    ]);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(DEADLINE_LONG),
+        total: Some(DEADLINE_SHORT),
+    };
+
+    let response = send_deadline_request(&runtime, client.get(server.url()).timeout(timeout))
+        .expect("response head should arrive before either body deadline");
+    let error = collect_deadline_body(&runtime, response)
+        .expect_err("delayed body ignored the shorter total timeout");
+    assert_timeout_error(&error, "total", "response body");
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_total_only_expires_while_waiting_for_response_body() {
+    let runtime = runtime();
+    let server = DeadlineServer::spawn(vec![
+        DeadlinePhase::after(
+            Duration::ZERO,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ),
+        DeadlinePhase::after(DEADLINE_PHASE_DELAY, b"2\r\nok\r\n0\r\n\r\n"),
+    ]);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: None,
+        read: None,
+        total: Some(DEADLINE_SHORT),
+    };
+
+    let response = send_deadline_request(&runtime, client.get(server.url()).timeout(timeout))
+        .expect("response head should arrive before the total deadline");
+    let error = collect_deadline_body(&runtime, response)
+        .expect_err("delayed body ignored the total-only deadline");
+    assert_timeout_error(&error, "total", "response body");
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_equal_body_durations_prefer_earlier_total_deadline() {
+    let runtime = runtime();
+    let server = DeadlineServer::spawn(vec![
+        DeadlinePhase::after(
+            Duration::ZERO,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ),
+        DeadlinePhase::after(DEADLINE_PHASE_DELAY, b"2\r\nok\r\n0\r\n\r\n"),
+    ]);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: None,
+        read: Some(DEADLINE_SHORT),
+        total: Some(DEADLINE_SHORT),
+    };
+
+    let response = send_deadline_request(&runtime, client.get(server.url()).timeout(timeout))
+        .expect("response head should arrive before equal body deadlines");
+    let error = collect_deadline_body(&runtime, response)
+        .expect_err("delayed body ignored equal read and total timeouts");
+    assert_timeout_error(&error, "total", "response body");
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_connect_deadline_ends_before_delayed_head_and_body() {
+    let runtime = runtime();
+    let server = DeadlineServer::spawn(vec![
+        DeadlinePhase::after(
+            Duration::from_millis(300),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ),
+        DeadlinePhase::after(Duration::from_millis(300), b"2\r\nok\r\n0\r\n\r\n"),
+    ]);
+    let client = Client::new().expect("build deadline client");
+    let timeout = Timeout {
+        connect: Some(DEADLINE_SHORT),
+        read: None,
+        total: None,
+    };
+
+    let response = send_deadline_request(&runtime, client.get(server.url()).timeout(timeout))
+        .expect("completed connect deadline leaked into delayed response head");
+    let body = collect_deadline_body(&runtime, response)
+        .expect("completed connect deadline leaked into delayed response body");
+    assert_eq!(body, Bytes::from_static(b"ok"));
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+    assert_deadline_observation(&observation);
+}
+
+#[test]
+fn timeout_contract_all_none_allows_gated_response_head_and_body() {
+    let runtime = runtime();
+    let server = DeadlineServer::spawn(vec![
+        DeadlinePhase::gated(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        DeadlinePhase::gated(b"3\r\none\r\n"),
+        DeadlinePhase::gated(b"3\r\ntwo\r\n0\r\n\r\n"),
+    ]);
+    let client = Client::new().expect("build deadline client");
+    let request = client.get(server.url()).timeout(Timeout::default());
+    let response_task = runtime.spawn(request.send());
+
+    runtime
+        .block_on(async {
+            tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, server.wait_request_captured()).await
+        })
+        .expect("deadline fixture did not capture the gated request");
+    assert!(
+        !response_task.is_finished(),
+        "response head completed before its gate was released"
+    );
+    server.release_next(0);
+    let response = runtime
+        .block_on(async { tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, response_task).await })
+        .expect("gated response head exceeded outer bound")
+        .expect("gated response-head task failed")
+        .expect("None deadlines rejected a gated response head");
+
+    let body_task = runtime.spawn(response.bytes());
+    runtime.block_on(tokio::task::yield_now());
+    assert!(
+        !body_task.is_finished(),
+        "response body completed before its first gate was released"
+    );
+    server.release_next(1);
+    runtime.block_on(tokio::task::yield_now());
+    assert!(
+        !body_task.is_finished(),
+        "response body completed before its EOF gate was released"
+    );
+    server.release_next(2);
+    let body = runtime
+        .block_on(async { tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, body_task).await })
+        .expect("gated response body exceeded outer bound")
+        .expect("gated response-body task failed")
+        .expect("None deadlines rejected a gated response body");
+    assert_eq!(body, Bytes::from_static(b"onetwo"));
+
+    drop(client);
+    let observation = server.finish().expect("deadline fixture completed");
+    assert_eq!(observation.peer_eof_count, 1);
+    assert_deadline_observation(&observation);
 }
 
 #[test]

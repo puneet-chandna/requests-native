@@ -2,6 +2,8 @@ mod connect;
 mod pool;
 #[cfg(test)]
 mod pool_tests;
+#[cfg(test)]
+mod timeout_tests;
 
 use std::fmt;
 use std::future::Future;
