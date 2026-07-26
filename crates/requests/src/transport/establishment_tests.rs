@@ -337,6 +337,18 @@ fn injected_native_roots() -> rustls_native_certs::CertificateResult {
     result
 }
 
+fn injected_native_roots_with_error() -> rustls_native_certs::CertificateResult {
+    let mut result = injected_native_roots();
+    result.errors.push(rustls_native_certs::Error {
+        context: "controlled native-root partial failure",
+        kind: rustls_native_certs::ErrorKind::Io {
+            inner: std::io::Error::other("controlled native-root read failure"),
+            path: PathBuf::from("controlled-native-root.pem"),
+        },
+    });
+    result
+}
+
 fn frozen_mtls_client(filename: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/tls/mtls-client")
@@ -386,6 +398,7 @@ fn assert_no_pool_entry(transport: &Transport) {
 struct InvalidMaterialObservation {
     name: &'static str,
     kind: String,
+    message: String,
     stages: Vec<ObservedStage>,
     connector_calls: usize,
     accepts: usize,
@@ -419,9 +432,9 @@ async fn observe_invalid_material(
     )
     .await
     .expect("invalid TLS material exceeded outer bound");
-    let kind = match result {
-        Ok(_) => "Success".to_owned(),
-        Err(error) => format!("{:?}", error.kind()),
+    let (kind, message) = match result {
+        Ok(_) => ("Success".to_owned(), String::new()),
+        Err(error) => (format!("{:?}", error.kind()), error.to_string()),
     };
     let derived_keys = transport.drain_derived_pool_keys().len();
     let pool_generations = transport
@@ -441,6 +454,7 @@ async fn observe_invalid_material(
     InvalidMaterialObservation {
         name,
         kind,
+        message,
         stages: control.stages(),
         connector_calls: connector.calls(),
         accepts,
@@ -814,34 +828,48 @@ fn plain_http_skips_load_and_tls_before_connector_failure() {
 }
 
 #[test]
-fn native_load_failure_is_pre_socket_tls_and_never_enters_pool() {
+fn mixed_platform_root_result_is_pre_socket_tls_and_never_enters_pool() {
     runtime().block_on(async {
         let control = TestEstablishmentControl::new(None);
+        let native_root_loads = Arc::new(AtomicUsize::new(0));
+        control.inject_native_root_loader({
+            let native_root_loads = Arc::clone(&native_root_loads);
+            Arc::new(move || {
+                native_root_loads.fetch_add(1, Ordering::AcqRel);
+                injected_native_roots_with_error()
+            })
+        });
         let connector = FailingConnector::default();
         let transport = transport(
             Arc::new(connector.clone()),
-            TlsConfig {
-                roots: CertificateSource::PemBundle(std::path::PathBuf::from(
-                    "red-f-missing-root.pem",
-                )),
-                identity: None,
-            },
+            TlsConfig::default(),
             Arc::clone(&control),
         );
         let result = tokio::time::timeout(
             OUTER_BOUND,
             transport.send(request(
-                "https://load-failure.test/path",
+                "https://mixed-platform-roots.test/path",
                 Timeout::default(),
             )),
         )
         .await
-        .expect("native load failure exceeded outer bound");
+        .expect("mixed Platform root load exceeded outer bound");
         let error = expect_error(
             result,
-            "missing native root unexpectedly returned a response",
+            "mixed Platform root result unexpectedly returned a response",
         );
 
+        assert_eq!(native_root_loads.load(Ordering::Acquire), 1);
+        let message = error.to_string();
+        assert!(
+            message.contains("platform certificate store reported 1 loading error(s)"),
+            "mixed native-root failure needs stable store/count context: {message}",
+        );
+        assert!(
+            !message.contains("controlled native-root")
+                && !message.contains("controlled-native-root.pem"),
+            "dependency and OS error prose must remain private: {message}",
+        );
         assert_eq!(format!("{:?}", error.kind()), "Tls");
         assert_eq!(
             control.stages(),
@@ -990,6 +1018,14 @@ fn every_invalid_client_chain_uses_one_failed_load_before_downstream_work() {
     let read_failure = directory.directory("unreadable-client-chain.pem");
     let empty = directory.write("empty-client-chain.pem", b"");
     let malformed = directory.write("malformed-client-chain.pem", b"not a PEM certificate");
+    let mut malformed_intermediate_contents =
+        include_bytes!("../../../../tests/fixtures/tls/mtls-client/client.pem").to_vec();
+    malformed_intermediate_contents
+        .extend_from_slice(b"\n-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n");
+    let malformed_intermediate = directory.write(
+        "malformed-intermediate-client-chain.pem",
+        &malformed_intermediate_contents,
+    );
     let certificate_only = frozen_mtls_client("client-chain.pem");
     let valid_key = frozen_mtls_client("client.key");
     let cases = [
@@ -1000,7 +1036,12 @@ fn every_invalid_client_chain_uses_one_failed_load_before_downstream_work() {
             Some(valid_key.clone()),
         ),
         ("client-chain-empty", empty, Some(valid_key.clone())),
-        ("client-chain-malformed", malformed, Some(valid_key)),
+        ("client-chain-malformed", malformed, Some(valid_key.clone())),
+        (
+            "client-chain-malformed-intermediate",
+            malformed_intermediate,
+            Some(valid_key),
+        ),
         ("client-combined-without-key", certificate_only, None),
     ];
 
@@ -1024,6 +1065,22 @@ fn every_invalid_client_chain_uses_one_failed_load_before_downstream_work() {
         observations
     });
     assert_invalid_material_observations(&observations);
+    let malformed_intermediate = observations
+        .iter()
+        .find(|observation| observation.name == "client-chain-malformed-intermediate")
+        .expect("malformed intermediate observation must exist");
+    assert!(
+        malformed_intermediate
+            .message
+            .contains("invalid client certificate at index 1"),
+        "identity error needs stable element context: {malformed_intermediate:?}",
+    );
+    assert!(
+        malformed_intermediate
+            .message
+            .contains("malformed-intermediate-client-chain.pem"),
+        "identity error needs controlled path context: {malformed_intermediate:?}",
+    );
 }
 
 #[test]

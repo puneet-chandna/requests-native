@@ -65,6 +65,12 @@ pub(super) fn load(
 fn load_platform_roots(native_root_loader: Option<NativeRootLoader>) -> Result<RootCertStore> {
     let native_root_loader = native_root_loader.unwrap_or_else(|| Arc::new(system_native_roots));
     let result = native_root_loader();
+    if !result.errors.is_empty() {
+        return Err(Error::tls(format!(
+            "platform certificate store reported {} loading error(s)",
+            result.errors.len()
+        )));
+    }
     root_store(result.certs, "platform certificate store")
 }
 
@@ -134,6 +140,14 @@ fn load_identity(
         &identity.certificate_chain,
         "client certificate chain",
     )?;
+    for (index, certificate) in certificates.iter().enumerate() {
+        rustls::server::ParsedCertificate::try_from(certificate).map_err(|_| {
+            Error::tls(format!(
+                "invalid client certificate at index {index} in {:?}",
+                identity.certificate_chain
+            ))
+        })?;
+    }
     let key_path = identity
         .private_key
         .as_deref()
