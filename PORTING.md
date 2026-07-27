@@ -579,6 +579,14 @@ Rules:
 - convert Rust panics to an internal failure before FFI, while treating any
   reachable panic as a bug.
 
+A synchronous `catch_unwind` probe proves only a direct same-thread FFI guard;
+it does not prove the blocking worker boundary. Worker-panic evidence must
+submit a panicking task to the actual shared `BlockingRuntimeDriver`, observe
+the submission's `WorkerStopped` result, map the fixed Python `RuntimeError`,
+and then prove a normal task and existing transport state reuse the same
+driver generation. The probe contains the boundary for testing; production
+code must still remove every reachable panic.
+
 ## Compatibility modules
 
 `requests.compat` and `requests.packages` are compatibility APIs even though
