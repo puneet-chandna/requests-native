@@ -110,6 +110,24 @@ fn internal_callable_is_pristine(
             .is_some_and(|value| value.is(state.builtin_isinstance.bind(py))))
 }
 
+fn callable_global_is(
+    py: Python<'_>,
+    proof: &CallableProof,
+    name: &str,
+    expected: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    let globals = proof.globals.bind(py).cast::<PyDict>()?;
+    if let Some(value) = globals.get_item(name)? {
+        return Ok(value.is(expected));
+    }
+    Ok(proof
+        .builtins
+        .bind(py)
+        .cast::<PyDict>()?
+        .get_item(name)?
+        .is_some_and(|value| value.is(expected)))
+}
+
 fn internal_utils_fallback(
     py: Python<'_>,
     state: &InternalUtilsState,
@@ -169,6 +187,12 @@ fn _internal_utils_trial(
                     state,
                     operation,
                     &state.unicode_is_ascii,
+                )?
+                && callable_global_is(
+                    py,
+                    &state.unicode_is_ascii,
+                    "str",
+                    state.builtin_str.bind(py),
                 )?
                 && !state
                     .module_dictionary

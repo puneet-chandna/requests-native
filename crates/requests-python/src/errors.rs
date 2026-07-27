@@ -1,8 +1,30 @@
 use pyo3::exceptions::{PyNameError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAny, PyDict, PyDictMethods, PyModule, PyModuleMethods};
 use pyo3::wrap_pyfunction;
 use requests::{Error, ErrorKind};
+
+struct ResponseErrorState {
+    protocol_error: Py<PyAny>,
+    decode_error: Py<PyAny>,
+    read_timeout_error: Py<PyAny>,
+    ssl_error: Py<PyAny>,
+}
+
+static RESPONSE_ERROR_STATE: PyOnceLock<ResponseErrorState> = PyOnceLock::new();
+
+fn response_error_state(py: Python<'_>) -> PyResult<&ResponseErrorState> {
+    RESPONSE_ERROR_STATE.get_or_try_init(py, || {
+        let models = PyModule::import(py, "requests.models")?;
+        Ok(ResponseErrorState {
+            protocol_error: models.getattr("ProtocolError")?.unbind(),
+            decode_error: models.getattr("DecodeError")?.unbind(),
+            read_timeout_error: models.getattr("ReadTimeoutError")?.unbind(),
+            ssl_error: models.getattr("SSLError")?.unbind(),
+        })
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MappingSite {
@@ -140,6 +162,33 @@ fn map_stream_error(py: Python<'_>, module: &Bound<'_, PyModule>, original: PyEr
     original
 }
 
+pub(crate) fn map_typed_response_error(py: Python<'_>, kind: ErrorKind, message: &str) -> PyErr {
+    let state = match response_error_state(py) {
+        Ok(state) => state,
+        Err(error) => return error,
+    };
+    let original = match kind {
+        ErrorKind::ContentDecoding => state.decode_error.bind(py).call1((message,)),
+        ErrorKind::ReadTimeout => {
+            state
+                .read_timeout_error
+                .bind(py)
+                .call1((py.None(), py.None(), message))
+        }
+        ErrorKind::Tls | ErrorKind::Handshake => state.ssl_error.bind(py).call1((message,)),
+        _ => state.protocol_error.bind(py).call1((message,)),
+    };
+    let original = match original {
+        Ok(value) => PyErr::from_value(value),
+        Err(error) => return error,
+    };
+    let models = match PyModule::import(py, "requests.models") {
+        Ok(models) => models,
+        Err(error) => return error,
+    };
+    map_stream_error(py, &models, original)
+}
+
 fn map_json_error(py: Python<'_>, module: &Bound<'_, PyModule>, original: PyErr) -> PyErr {
     let Some(source) = module.dict().get_item("JSONDecodeError").ok().flatten() else {
         return name_error_with_context(py, "JSONDecodeError", &original);
@@ -159,17 +208,19 @@ fn map_json_error(py: Python<'_>, module: &Bound<'_, PyModule>, original: PyErr)
         return name_error_with_context(py, "RequestsJSONDecodeError", &original);
     };
     let value = original.value(py);
-    let args = match (
-        value.getattr("msg"),
-        value.getattr("doc"),
-        value.getattr("pos"),
-    ) {
-        (Ok(msg), Ok(doc), Ok(pos)) => (msg, doc, pos),
-        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-            return error_with_context(py, error, &original);
-        }
+    let msg = match value.getattr("msg") {
+        Ok(value) => value,
+        Err(error) => return error_with_context(py, error, &original),
     };
-    let wrapped = match target.call1(args) {
+    let doc = match value.getattr("doc") {
+        Ok(value) => value,
+        Err(error) => return error_with_context(py, error, &original),
+    };
+    let pos = match value.getattr("pos") {
+        Ok(value) => value,
+        Err(error) => return error_with_context(py, error, &original),
+    };
+    let wrapped = match target.call1((msg, doc, pos)) {
         Ok(value) => PyErr::from_value(value),
         Err(error) => error,
     };
@@ -241,6 +292,7 @@ fn _error_mapping_trial(
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    let _ = response_error_state(module.py())?;
     module.add_function(wrap_pyfunction!(_error_mapping_trial, module)?)?;
     Ok(())
 }

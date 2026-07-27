@@ -1,6 +1,5 @@
 use std::cell::Cell;
 use std::future;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -218,17 +217,37 @@ fn task_error(error: BlockingTaskError) -> PyErr {
     }
 }
 
-fn catch_native_unwind<T>(operation: impl FnOnce() -> T) -> PyResult<T> {
-    catch_unwind(AssertUnwindSafe(operation))
-        .map_err(|_| PyRuntimeError::new_err("native requests worker stopped unexpectedly"))
+#[pyfunction]
+fn _runtime_generation_trial() -> PyResult<u64> {
+    Ok(driver()?.generation())
 }
 
 #[pyfunction]
-fn _panic_boundary_trial(should_panic: bool) -> PyResult<&'static str> {
-    catch_native_unwind(|| {
-        assert!(!should_panic, "intentional panic-boundary trial");
-        "ok"
-    })
+fn _panic_boundary_trial(py: Python<'_>, should_panic: bool) -> PyResult<&'static str> {
+    let runtime = driver()?;
+    if !should_panic {
+        return submit(&runtime, async { "ok" })?.wait().map_err(task_error);
+    }
+
+    let generation = runtime.generation();
+    let failure = submit(&runtime, async {
+        panic!("intentional panic-boundary trial");
+    })?
+    .wait()
+    .expect_err("a panicking runtime task must stop without a result");
+    let mapped = task_error(failure);
+
+    let recovery_runtime = driver()?;
+    let recovery_generation = recovery_runtime.generation();
+    let recovery = submit(&recovery_runtime, async { "ok" })?
+        .wait()
+        .map_err(task_error)?;
+    mapped.value(py).setattr("driver_generation", generation)?;
+    mapped
+        .value(py)
+        .setattr("recovery_generation", recovery_generation)?;
+    mapped.value(py).setattr("recovery_result", recovery)?;
+    Err(mapped)
 }
 
 pub(crate) fn run_with_actions<T, A, R, Fut, Build, Execute>(
@@ -591,6 +610,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_runtime_ready_error_probe, module)?)?;
     module.add_function(wrap_pyfunction!(_runtime_cancel_ownership_probe, module)?)?;
     module.add_function(wrap_pyfunction!(_runtime_signal_was_cancelled, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_generation_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_panic_boundary_trial, module)?)?;
     Ok(())
 }

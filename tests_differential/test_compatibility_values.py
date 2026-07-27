@@ -306,6 +306,76 @@ result = {"values": values, "failures": failures}
     )
 
 
+def test_unicode_is_ascii_uses_live_module_then_builtin_str_lookup() -> None:
+    _assert_trial_matches_oracle(
+        """
+import builtins
+from requests import _internal_utils as module
+
+
+def outcome(value):
+    try:
+        if _requests_rust is None:
+            returned = module.unicode_is_ascii(value)
+        else:
+            returned = _requests_rust._internal_utils_trial(
+                "unicode_is_ascii", (value,)
+            )
+        return ["return", returned]
+    except BaseException as error:
+        return [
+            "raise",
+            type(error).__module__,
+            type(error).__name__,
+            list(error.args),
+        ]
+
+
+canonical_str = builtins.str
+had_module_str = "str" in module.__dict__
+saved_module_str = module.__dict__.get("str")
+states = []
+try:
+    module.str = canonical_str
+    states.append(["inserted-canonical", outcome("ascii")])
+
+    module.str = bytes
+    states.append(["rebound-bytes", outcome("ascii")])
+
+    module.str = ()
+    states.append(["rebound-tuple", outcome("ascii")])
+
+    module.str = object()
+    states.append(["rebound-sentinel", outcome("ascii")])
+
+    del module.str
+    states.append(["deleted", outcome("ascii")])
+
+    module.str = canonical_str
+    builtins.str = bytes
+    try:
+        states.append(["module-shadows-rebound-builtin", outcome("ascii")])
+    finally:
+        builtins.str = canonical_str
+
+    del module.str
+    builtins.str = bytes
+    try:
+        states.append(["missing-module-rebound-builtin", outcome("ascii")])
+    finally:
+        builtins.str = canonical_str
+finally:
+    if had_module_str:
+        module.str = saved_module_str
+    else:
+        module.__dict__.pop("str", None)
+    builtins.str = canonical_str
+
+result = states
+"""
+    )
+
+
 def test_status_codes_exact_rows_alias_order_collisions_and_generated_doc() -> None:
     _assert_matches_oracle(
         """

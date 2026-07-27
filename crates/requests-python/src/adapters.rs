@@ -5,12 +5,12 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyBaseException, PyNameError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
     PyAny, PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyModule, PySet, PyString,
-    PyTuple,
+    PyTuple, PyType,
 };
 use pyo3::wrap_pyfunction;
 use requests::adapters::{AdapterPool, AdapterResponse, AdapterResponseBody};
@@ -23,7 +23,7 @@ use requests::{
     Proxy, Timeout, TlsConfig, Uri,
 };
 
-use crate::errors::{MappingSite, map_core_error, map_typed_message};
+use crate::errors::map_typed_response_error;
 
 #[derive(PartialEq)]
 struct RetrySnapshot {
@@ -65,6 +65,22 @@ struct AdapterState {
     socks_manager_behavior: BehaviorProof,
     methods: Vec<(String, BehaviorProof)>,
     globals: Vec<(String, BehaviorProof)>,
+    send_globals: Py<PyDict>,
+    send_builtins: Py<PyDict>,
+    exception_globals: Vec<AdapterGlobalProof>,
+}
+
+#[derive(Clone, Copy)]
+enum GlobalLocation {
+    Module,
+    Builtins,
+}
+
+struct AdapterGlobalProof {
+    name: String,
+    location: GlobalLocation,
+    value: Py<PyAny>,
+    behavior: BehaviorProof,
 }
 
 static ADAPTER_STATE: PyOnceLock<AdapterState> = PyOnceLock::new();
@@ -948,6 +964,9 @@ struct NativeSendInput {
 fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
     let adapters = PyModule::import(py, "requests.adapters")?;
     let adapter_type = adapters.getattr("HTTPAdapter")?;
+    let send = adapter_type.getattr("send")?;
+    let send_globals = send.getattr("__globals__")?.cast_into::<PyDict>()?;
+    let send_builtins = send.getattr("__builtins__")?.cast_into::<PyDict>()?;
     let prepared_request_type =
         PyModule::import(py, "requests.models")?.getattr("PreparedRequest")?;
     let methods = [
@@ -1002,6 +1021,49 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
     let proxy_manager_behavior = behavior_proof(py, &poolmanager_module.getattr("ProxyManager")?)?;
     let socks_manager_behavior = behavior_proof(py, &adapters.getattr("SOCKSProxyManager")?)?;
     let prepared_getattribute = prepared_request_type.getattr("__getattribute__")?.unbind();
+    let exception_globals = [
+        "LocationValueError",
+        "InvalidURL",
+        "ProtocolError",
+        "OSError",
+        "MaxRetryError",
+        "ConnectTimeoutError",
+        "NewConnectionError",
+        "ConnectTimeout",
+        "ResponseError",
+        "RetryError",
+        "_ProxyError",
+        "ProxyError",
+        "_SSLError",
+        "SSLError",
+        "ClosedPoolError",
+        "_HTTPError",
+        "ReadTimeoutError",
+        "ReadTimeout",
+        "_InvalidHeader",
+        "InvalidHeader",
+        "ConnectionError",
+        "isinstance",
+    ]
+    .into_iter()
+    .map(|name| {
+        let (location, value) = match send_globals.get_item(name)? {
+            Some(value) => (GlobalLocation::Module, value),
+            None => (
+                GlobalLocation::Builtins,
+                send_builtins
+                    .get_item(name)?
+                    .ok_or_else(|| PyNameError::new_err(format!("name '{name}' is not defined")))?,
+            ),
+        };
+        Ok(AdapterGlobalProof {
+            name: name.to_owned(),
+            location,
+            behavior: behavior_proof(py, &value)?,
+            value: value.unbind(),
+        })
+    })
+    .collect::<PyResult<Vec<_>>>()?;
     Ok(AdapterState {
         adapters_module: adapters.into_any().unbind(),
         adapter_type: adapter_type.unbind(),
@@ -1014,6 +1076,9 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
         socks_manager_behavior,
         methods,
         globals,
+        send_globals: send_globals.unbind(),
+        send_builtins: send_builtins.unbind(),
+        exception_globals,
     })
 }
 
@@ -1062,6 +1127,33 @@ fn adapter_identity_is_pristine(
     let module = state.adapters_module.bind(py);
     for (name, proof) in &state.globals {
         if !behavior_proof_is_pristine(py, &module.getattr(name.as_str())?, proof)? {
+            return Ok(false);
+        }
+    }
+    let send = adapter_type.getattr("send")?;
+    if !send.getattr("__globals__")?.is(state.send_globals.bind(py))
+        || !send
+            .getattr("__builtins__")?
+            .is(state.send_builtins.bind(py))
+    {
+        return Ok(false);
+    }
+    let module_dictionary = state.send_globals.bind(py);
+    let builtins = state.send_builtins.bind(py);
+    for proof in &state.exception_globals {
+        let current = match proof.location {
+            GlobalLocation::Module => module_dictionary.get_item(&proof.name)?,
+            GlobalLocation::Builtins if module_dictionary.contains(&proof.name)? => {
+                return Ok(false);
+            }
+            GlobalLocation::Builtins => builtins.get_item(&proof.name)?,
+        };
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if !current.is(proof.value.bind(py))
+            || !behavior_proof_is_pristine(py, &current, &proof.behavior)?
+        {
             return Ok(false);
         }
     }
@@ -1974,23 +2066,248 @@ fn redirect_location(status: u16, headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn canonical_adapter_global<'py>(
+    py: Python<'py>,
+    state: &AdapterState,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    state
+        .exception_globals
+        .iter()
+        .find(|proof| proof.name == name)
+        .map(|proof| proof.value.bind(py).clone())
+        .ok_or_else(|| PyNameError::new_err(format!("name '{name}' is not defined")))
+}
+
+fn live_adapter_global<'py>(
+    py: Python<'py>,
+    state: &AdapterState,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Some(value) = state.send_globals.bind(py).get_item(name)? {
+        return Ok(value);
+    }
+    state
+        .send_builtins
+        .bind(py)
+        .get_item(name)?
+        .ok_or_else(|| PyNameError::new_err(format!("name '{name}' is not defined")))
+}
+
+fn exception_matches(
+    py: Python<'_>,
+    error: &PyErr,
+    exception: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    if exception.is_instance_of::<PyTuple>() {
+        for candidate in exception.cast::<PyTuple>()?.iter() {
+            if exception_matches(py, error, &candidate)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    let Ok(exception_type) = exception.cast::<PyType>() else {
+        return Err(PyTypeError::new_err(
+            "catching classes that do not inherit from BaseException is not allowed",
+        ));
+    };
+    if !exception_type.is_subclass(&py.get_type::<PyBaseException>())? {
+        return Err(PyTypeError::new_err(
+            "catching classes that do not inherit from BaseException is not allowed",
+        ));
+    }
+    Ok(error.is_instance(py, exception))
+}
+
+fn live_isinstance(
+    py: Python<'_>,
+    state: &AdapterState,
+    value: &Bound<'_, PyAny>,
+    class: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    live_adapter_global(py, state, "isinstance")?
+        .call1((value, class))?
+        .is_truthy()
+}
+
+fn canonical_adapter_surrogate(
+    py: Python<'_>,
+    state: &AdapterState,
+    kind: ErrorKind,
+    message: &str,
+    url: &str,
+) -> PyResult<PyErr> {
+    let direct = |name: &str, arguments: &Bound<'_, PyTuple>| -> PyResult<PyErr> {
+        Ok(PyErr::from_value(
+            canonical_adapter_global(py, state, name)?.call1(arguments.clone())?,
+        ))
+    };
+    match kind {
+        ErrorKind::InvalidUrl | ErrorKind::MissingSchema => {
+            direct("LocationValueError", &PyTuple::new(py, [message])?)
+        }
+        ErrorKind::ReadTimeout => {
+            let class = canonical_adapter_global(py, state, "ReadTimeoutError")?;
+            Ok(PyErr::from_value(class.call1((py.None(), url, message))?))
+        }
+        ErrorKind::ConnectTimeout | ErrorKind::Proxy | ErrorKind::Tls | ErrorKind::Handshake => {
+            let (reason_name, reason) = match kind {
+                ErrorKind::ConnectTimeout => ("ConnectTimeoutError", message.to_owned()),
+                ErrorKind::Proxy => ("_ProxyError", message.to_owned()),
+                ErrorKind::Tls | ErrorKind::Handshake => ("_SSLError", message.to_owned()),
+                _ => unreachable!(),
+            };
+            let reason = if reason_name == "_ProxyError" {
+                let nested =
+                    canonical_adapter_global(py, state, "ProtocolError")?.call1((message,))?;
+                canonical_adapter_global(py, state, reason_name)?.call1((reason, nested))?
+            } else {
+                canonical_adapter_global(py, state, reason_name)?.call1((reason,))?
+            };
+            Ok(PyErr::from_value(
+                canonical_adapter_global(py, state, "MaxRetryError")?.call1((
+                    py.None(),
+                    url,
+                    reason,
+                ))?,
+            ))
+        }
+        _ => direct("ProtocolError", &PyTuple::new(py, [message])?),
+    }
+}
+
+fn canonical_retry_surrogate(
+    py: Python<'_>,
+    state: &AdapterState,
+    message: &str,
+    url: &str,
+) -> PyResult<PyErr> {
+    let reason = canonical_adapter_global(py, state, "ResponseError")?.call1((message,))?;
+    Ok(PyErr::from_value(
+        canonical_adapter_global(py, state, "MaxRetryError")?.call1((py.None(), url, reason))?,
+    ))
+}
+
+fn raised_adapter_target(
+    py: Python<'_>,
+    state: &AdapterState,
+    target_name: &str,
+    original: &PyErr,
+    request: Option<&Bound<'_, PyAny>>,
+) -> PyResult<PyErr> {
+    let target = live_adapter_global(py, state, target_name)?;
+    let value = match request {
+        Some(request) => {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("request", request)?;
+            target.call((original.value(py),), Some(&kwargs))?
+        }
+        None => target.call1((original.value(py),))?,
+    };
+    let mapped = PyErr::from_value(value);
+    mapped.set_context(py, Some(original.clone_ref(py)));
+    Ok(mapped)
+}
+
+fn simulate_adapter_handlers(
+    py: Python<'_>,
+    state: &AdapterState,
+    original: &PyErr,
+    request: &Bound<'_, PyAny>,
+) -> PyResult<PyErr> {
+    let protocol = live_adapter_global(py, state, "ProtocolError")?;
+    let os_error = live_adapter_global(py, state, "OSError")?;
+    let first = PyTuple::new(py, [protocol, os_error])?;
+    if exception_matches(py, original, first.as_any())? {
+        return raised_adapter_target(py, state, "ConnectionError", original, Some(request));
+    }
+
+    let max_retry = live_adapter_global(py, state, "MaxRetryError")?;
+    if exception_matches(py, original, &max_retry)? {
+        let reason = original.value(py).getattr("reason")?;
+        let connect_timeout = live_adapter_global(py, state, "ConnectTimeoutError")?;
+        if live_isinstance(py, state, &reason, &connect_timeout)? {
+            let new_connection = live_adapter_global(py, state, "NewConnectionError")?;
+            if !live_isinstance(py, state, &reason, &new_connection)? {
+                return raised_adapter_target(py, state, "ConnectTimeout", original, Some(request));
+            }
+        }
+        let response = live_adapter_global(py, state, "ResponseError")?;
+        if live_isinstance(py, state, &reason, &response)? {
+            return raised_adapter_target(py, state, "RetryError", original, Some(request));
+        }
+        let proxy = live_adapter_global(py, state, "_ProxyError")?;
+        if live_isinstance(py, state, &reason, &proxy)? {
+            return raised_adapter_target(py, state, "ProxyError", original, Some(request));
+        }
+        let ssl = live_adapter_global(py, state, "_SSLError")?;
+        if live_isinstance(py, state, &reason, &ssl)? {
+            return raised_adapter_target(py, state, "SSLError", original, Some(request));
+        }
+        return raised_adapter_target(py, state, "ConnectionError", original, Some(request));
+    }
+
+    let closed_pool = live_adapter_global(py, state, "ClosedPoolError")?;
+    if exception_matches(py, original, &closed_pool)? {
+        return raised_adapter_target(py, state, "ConnectionError", original, Some(request));
+    }
+
+    let proxy = live_adapter_global(py, state, "_ProxyError")?;
+    if exception_matches(py, original, &proxy)? {
+        return raised_adapter_target(py, state, "ProxyError", original, None);
+    }
+
+    let ssl = live_adapter_global(py, state, "_SSLError")?;
+    let http = live_adapter_global(py, state, "_HTTPError")?;
+    let last = PyTuple::new(py, [ssl.clone(), http])?;
+    if exception_matches(py, original, last.as_any())? {
+        if live_isinstance(py, state, original.value(py), &ssl)? {
+            return raised_adapter_target(py, state, "SSLError", original, Some(request));
+        }
+        let read_timeout = live_adapter_global(py, state, "ReadTimeoutError")?;
+        if live_isinstance(py, state, original.value(py), &read_timeout)? {
+            return raised_adapter_target(py, state, "ReadTimeout", original, Some(request));
+        }
+        let invalid_header = live_adapter_global(py, state, "_InvalidHeader")?;
+        if live_isinstance(py, state, original.value(py), &invalid_header)? {
+            return raised_adapter_target(py, state, "InvalidHeader", original, Some(request));
+        }
+    }
+    Ok(original.clone_ref(py))
+}
+
+fn map_adapter_surrogate(
+    py: Python<'_>,
+    state: &AdapterState,
+    original: PyErr,
+    request: &Bound<'_, PyAny>,
+) -> PyErr {
+    match simulate_adapter_handlers(py, state, &original, request) {
+        Ok(mapped) => mapped,
+        Err(error) => {
+            error.set_context(py, Some(original));
+            error
+        }
+    }
+}
+
 fn mapped_transport_error(
     py: Python<'_>,
     error: requests::Error,
     request: &Bound<'_, PyAny>,
+    url: &str,
 ) -> PyErr {
-    let module = match PyModule::import(py, "requests.exceptions") {
-        Ok(module) => module,
-        Err(import_error) => return import_error,
+    let state = match adapter_state(py) {
+        Ok(state) => state,
+        Err(error) => return error,
     };
-    map_core_error(
-        py,
-        &module,
-        MappingSite::AdapterTransport,
-        &error,
-        Some(request),
-        None,
-    )
+    let original =
+        match canonical_adapter_surrogate(py, state, error.kind(), &error.to_string(), url) {
+            Ok(original) => original,
+            Err(error) => return error,
+        };
+    map_adapter_surrogate(py, state, original, request)
 }
 
 fn retry_reason(error: &requests::Error) -> RetryReason {
@@ -2113,7 +2430,7 @@ fn _adapter_send_trial(
                 if matches!(reason, RetryReason::Read)
                     && !retry_state.allows_method(&input.method_name)
                 {
-                    return Err(mapped_transport_error(py, error, request));
+                    return Err(mapped_transport_error(py, error, request, &input.url));
                 }
                 match retry_state.increment(reason, &input.method_name, &input.url, None) {
                     Ok(next) => {
@@ -2121,7 +2438,9 @@ fn _adapter_send_trial(
                         sleep_before_retry(py, &retry_state, 0.0)?;
                         continue;
                     }
-                    Err(_) => return Err(mapped_transport_error(py, error, request)),
+                    Err(_) => {
+                        return Err(mapped_transport_error(py, error, request, &input.url));
+                    }
                 }
             }
         };
@@ -2145,16 +2464,9 @@ fn _adapter_send_trial(
             Err(_) if input.retry.policy.raise_on_status => {
                 drain_response(py, response);
                 let message = format!("too many {status} responses");
-                let module = PyModule::import(py, "requests.exceptions")?;
-                return Err(map_typed_message(
-                    py,
-                    &module,
-                    MappingSite::AdapterRetry,
-                    ErrorKind::Retry,
-                    &message,
-                    Some(request),
-                    None,
-                ));
+                let state = adapter_state(py)?;
+                let original = canonical_retry_surrogate(py, state, &message, &input.url)?;
+                return Err(map_adapter_surrogate(py, state, original, request));
             }
             Err(_) => return build_python_response(py, adapter, request, response),
         };
@@ -2220,6 +2532,27 @@ fn _adapter_pool_side_table_trial(py: Python<'_>) -> PyResult<usize> {
 }
 
 impl NativeAdapterRaw {
+    fn finish_body_failure(&mut self) {
+        self.body = None;
+        self.closed = true;
+        self.decoder_eof = true;
+        self.decoded.clear();
+        self.decoded_offset = 0;
+    }
+
+    fn map_io_failure(&mut self, py: Python<'_>, error: std::io::Error) -> PyErr {
+        let typed = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<requests::Error>())
+            .map(|source| (source.kind(), source.to_string()));
+        let message = error.to_string();
+        self.finish_body_failure();
+        match typed {
+            Some((kind, message)) => map_typed_response_error(py, kind, &message),
+            None => PyRuntimeError::new_err(message),
+        }
+    }
+
     fn decoder(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let Some(encoding) = self.content_encoding.as_deref() else {
             return Ok(None);
@@ -2288,11 +2621,13 @@ impl NativeAdapterRaw {
             let read = if has_tail {
                 0
             } else {
-                match self.body.as_mut() {
-                    Some(body) => py
-                        .detach(|| body.read(&mut wire))
-                        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
-                    None => 0,
+                let result = match self.body.as_mut() {
+                    Some(body) => py.detach(|| body.read(&mut wire)),
+                    None => Ok(0),
+                };
+                match result {
+                    Ok(read) => read,
+                    Err(error) => return Err(self.map_io_failure(py, error)),
                 }
             };
             wire.truncate(read);
@@ -2337,16 +2672,17 @@ impl NativeAdapterRaw {
         decoder: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<u8>> {
         let mut wire = Vec::new();
-        let read = match (self.body.as_mut(), amount) {
+        let result = match (self.body.as_mut(), amount) {
             (Some(body), Some(amount)) => {
                 wire.resize(amount, 0);
                 py.detach(|| body.read(&mut wire))
-                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
             }
-            (Some(body), None) => py
-                .detach(|| body.read_to_end(&mut wire))
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
-            (None, _) => 0,
+            (Some(body), None) => py.detach(|| body.read_to_end(&mut wire)),
+            (None, _) => Ok(0),
+        };
+        let read = match result {
+            Ok(read) => read,
+            Err(error) => return Err(self.map_io_failure(py, error)),
         };
         wire.truncate(read);
         if read == 0 {
@@ -2422,7 +2758,9 @@ impl NativeAdapterRaw {
             }
             None => py.detach(|| body.read_to_end(&mut bytes)).map(|_| ()),
         };
-        result.map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        if let Err(error) = result {
+            return Err(self.map_io_failure(py, error));
+        }
         if bytes.is_empty() {
             self.closed = true;
             self.body = None;
@@ -2498,8 +2836,15 @@ impl NativeAdapterRaw {
 
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(body) = self.body.take() {
-            py.detach(|| body.close())
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            self.closed = true;
+            self.decoder_eof = true;
+            if let Err(error) = py.detach(|| body.close()) {
+                return Err(map_typed_response_error(
+                    py,
+                    error.kind(),
+                    &error.to_string(),
+                ));
+            }
         }
         self.closed = true;
         Ok(())

@@ -812,6 +812,216 @@ result = {
     assert state["events"] == [["target", "bad", "document", 3]]
 
 
+def test_response_json_reads_error_fields_sequentially_at_the_real_call_site() -> None:
+    state = _run_plain_matching(
+        """
+import os
+
+import requests.models as models
+from requests.models import Response
+
+try:
+    from requests import _requests_rust
+except ImportError:
+    _requests_rust = None
+
+
+events = []
+last_source = None
+fail_at = None
+
+
+class FieldFailure(Exception):
+    pass
+
+
+class ObservedDecodeError(models.JSONDecodeError):
+    def __init__(self):
+        super().__init__("bad", "document", 3)
+
+    def observe(self, name, value):
+        events.append(name)
+        if fail_at == name:
+            raise FieldFailure(name)
+        return value
+
+    @property
+    def msg(self):
+        return self.observe("msg", self._msg)
+
+    @msg.setter
+    def msg(self, value):
+        self._msg = value
+
+    @property
+    def doc(self):
+        return self.observe("doc", self._doc)
+
+    @doc.setter
+    def doc(self, value):
+        self._doc = value
+
+    @property
+    def pos(self):
+        return self.observe("pos", self._pos)
+
+    @pos.setter
+    def pos(self, value):
+        self._pos = value
+
+
+def loads(*args, **kwargs):
+    global last_source
+    last_source = ObservedDecodeError()
+    raise last_source
+
+
+def call_json(response):
+    if _requests_rust is None:
+        return response.json()
+    return _requests_rust._response_json_trial(response, {})
+
+
+saved_loads = models.complexjson.loads
+records = []
+try:
+    models.complexjson.loads = loads
+    for selected in ("msg", "doc", "pos"):
+        fail_at = selected
+        events.clear()
+        response = Response()
+        response._content = b"{}"
+        response._content_consumed = True
+        try:
+            call_json(response)
+        except BaseException as error:
+            records.append(
+                {
+                    "field": selected,
+                    "events": list(events),
+                    "type": [type(error).__module__, type(error).__qualname__],
+                    "args": list(error.args),
+                    "context_identity": error.__context__ is last_source,
+                    "cause_is_none": error.__cause__ is None,
+                    "suppress_context": error.__suppress_context__,
+                }
+            )
+        else:
+            raise AssertionError("field failure was not propagated")
+finally:
+    models.complexjson.loads = saved_loads
+
+result = records
+"""
+    )
+
+    assert state == [
+        {
+            "field": "msg",
+            "events": ["msg"],
+            "type": ["__differential_case__", "FieldFailure"],
+            "args": ["msg"],
+            "context_identity": True,
+            "cause_is_none": True,
+            "suppress_context": False,
+        },
+        {
+            "field": "doc",
+            "events": ["msg", "doc"],
+            "type": ["__differential_case__", "FieldFailure"],
+            "args": ["doc"],
+            "context_identity": True,
+            "cause_is_none": True,
+            "suppress_context": False,
+        },
+        {
+            "field": "pos",
+            "events": ["msg", "doc", "pos"],
+            "type": ["__differential_case__", "FieldFailure"],
+            "args": ["pos"],
+            "context_identity": True,
+            "cause_is_none": True,
+            "suppress_context": False,
+        },
+    ]
+
+
+def test_response_json_live_target_constructor_failure_keeps_context() -> None:
+    state = _run_plain_matching(
+        """
+import requests.models as models
+from requests.models import Response
+
+try:
+    from requests import _requests_rust
+except ImportError:
+    _requests_rust = None
+
+
+events = []
+source = models.JSONDecodeError("bad", "document", 3)
+
+
+class ConstructorFailure(Exception):
+    pass
+
+
+failure = ConstructorFailure("constructor failed")
+
+
+class ExplodingTarget:
+    def __new__(cls, *args, **kwargs):
+        events.append(["construct", list(args), sorted(kwargs)])
+        raise failure
+
+
+saved_loads = models.complexjson.loads
+saved_target = models.RequestsJSONDecodeError
+
+
+def loads(*args, **kwargs):
+    models.RequestsJSONDecodeError = ExplodingTarget
+    raise source
+
+
+def call_json(response):
+    if _requests_rust is None:
+        return response.json()
+    return _requests_rust._response_json_trial(response, {})
+
+
+try:
+    models.complexjson.loads = loads
+    response = Response()
+    response._content = b"{}"
+    response._content_consumed = True
+    try:
+        call_json(response)
+    except BaseException as error:
+        result = {
+            "identity": error is failure,
+            "context_identity": error.__context__ is source,
+            "cause_is_none": error.__cause__ is None,
+            "suppress_context": error.__suppress_context__,
+            "events": events,
+        }
+    else:
+        raise AssertionError("target constructor failure was not propagated")
+finally:
+    models.complexjson.loads = saved_loads
+    models.RequestsJSONDecodeError = saved_target
+"""
+    )
+
+    assert state == {
+        "identity": True,
+        "context_identity": True,
+        "cause_is_none": True,
+        "suppress_context": False,
+        "events": [["construct", ["bad", "document", 3], []]],
+    }
+
+
 def test_json_mapper_preserves_instance_check_and_constructor_failures() -> None:
     state = _run_matching(
         """
@@ -1073,9 +1283,14 @@ def test_panic_boundary_is_stable_and_reusable() -> None:
             _HELPERS
             + """
 first = capture(lambda: _requests_rust._panic_boundary_trial(True))
+generation = _requests_rust._runtime_generation_trial()
 second = capture(lambda: _requests_rust._panic_boundary_trial(False))
 result = {
     "first": first["record"],
+    "driver_generation": first["error"].driver_generation,
+    "recovery_generation": first["error"].recovery_generation,
+    "recovery_result": first["error"].recovery_result,
+    "generation": generation,
     "second": second["returned"],
     "second_exception": second["record"],
 }
@@ -1096,6 +1311,10 @@ result = {
                 ["builtins", "object"],
             ],
         },
+        "driver_generation": state["generation"],
+        "recovery_generation": state["generation"],
+        "recovery_result": "ok",
+        "generation": state["generation"],
         "second": "ok",
         "second_exception": None,
     }

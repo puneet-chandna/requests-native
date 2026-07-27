@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import functools
 import gc
 import gzip
@@ -138,6 +139,34 @@ def socks5_loopback(*bodies):
     try:
         yield observed, f"socks5h://127.0.0.1:{listener.getsockname()[1]}"
     finally:
+        listener.close()
+        worker.join(timeout=5)
+
+
+@contextmanager
+def closing_loopback_barrier():
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    accepted = threading.Event()
+    release = threading.Event()
+
+    def serve():
+        connection, _ = listener.accept()
+        with connection:
+            accepted.set()
+            release.wait(2)
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        yield (
+            f"http://127.0.0.1:{listener.getsockname()[1]}/resource",
+            accepted,
+            release,
+        )
+    finally:
+        release.set()
         listener.close()
         worker.join(timeout=5)
 
@@ -1534,3 +1563,451 @@ def test_socks_manager_class_behavior_is_frozen_before_visible_creation(monkeypa
                 == b"restored-socks"
             )
         assert observed == {"connections": 1, "requests": 1}
+
+
+_ADAPTER_EXCEPTION_MODULE_GLOBALS = [
+    "LocationValueError",
+    "ProtocolError",
+    "MaxRetryError",
+    "ConnectTimeoutError",
+    "NewConnectionError",
+    "ResponseError",
+    "_ProxyError",
+    "_SSLError",
+    "ClosedPoolError",
+    "_HTTPError",
+    "ReadTimeoutError",
+    "_InvalidHeader",
+    "InvalidURL",
+    "ConnectionError",
+    "ConnectTimeout",
+    "RetryError",
+    "ProxyError",
+    "SSLError",
+    "ReadTimeout",
+    "InvalidHeader",
+]
+
+
+@pytest.mark.parametrize("name", _ADAPTER_EXCEPTION_MODULE_GLOBALS + ["OSError"])
+def test_adapter_exception_globals_are_frozen_before_native_effects(monkeypatch, name):
+    marker = object()
+    adapter = HTTPAdapter()
+    before = requests._requests_rust._adapter_pool_side_table_trial()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    owner = builtins if name == "OSError" else adapters
+    monkeypatch.setattr(owner, name, object(), raising=False)
+
+    with _rust_adapter_trial():
+        assert adapter.send(prepared("http://127.0.0.1:1/resource")) is marker
+
+    assert requests._requests_rust._adapter_pool_side_table_trial() == before
+    assert adapter.proxy_manager == {}
+
+
+@pytest.mark.parametrize("name", ["MaxRetryError", "ConnectionError"])
+def test_missing_adapter_exception_globals_fall_back_before_native_effects(
+    monkeypatch, name
+):
+    marker = object()
+    adapter = HTTPAdapter()
+    before = requests._requests_rust._adapter_pool_side_table_trial()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    monkeypatch.delattr(adapters, name)
+
+    with _rust_adapter_trial():
+        assert adapter.send(prepared("http://127.0.0.1:1/resource")) is marker
+
+    assert requests._requests_rust._adapter_pool_side_table_trial() == before
+
+
+def test_transport_mapping_uses_live_adapter_target_after_the_socket_effect(
+    monkeypatch,
+):
+    class LiveConnectionError(Exception):
+        pass
+
+    observed = []
+
+    class LiveTarget:
+        def __new__(cls, original, *, request):
+            observed.append((original, request))
+            return LiveConnectionError("live target")
+
+    result = {}
+    with closing_loopback_barrier() as (url, accepted, release):
+        request = prepared(url)
+
+        def send():
+            try:
+                with _rust_adapter_trial():
+                    HTTPAdapter(max_retries=Retry(total=0)).send(request)
+            except BaseException as error:
+                result["error"] = error
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert accepted.wait(2)
+        monkeypatch.setattr(adapters, "ConnectionError", LiveTarget)
+        release.set()
+        worker.join(timeout=5)
+
+    error = result["error"]
+    assert isinstance(error, LiveConnectionError)
+    assert len(observed) == 1
+    original, mapped_request = observed[0]
+    assert isinstance(original, urllib3.exceptions.ProtocolError)
+    assert mapped_request is request
+    assert error.__context__ is original
+
+
+def test_transport_mapping_uses_live_adapter_sources_after_the_socket_effect(
+    monkeypatch,
+):
+    class NonmatchingProtocolError(Exception):
+        pass
+
+    class ForbiddenTarget:
+        def __new__(cls, *args, **kwargs):
+            raise AssertionError("a nonmatching source must escape")
+
+    result = {}
+    with closing_loopback_barrier() as (url, accepted, release):
+        request = prepared(url)
+
+        def send():
+            try:
+                with _rust_adapter_trial():
+                    HTTPAdapter(max_retries=Retry(total=0)).send(request)
+            except BaseException as error:
+                result["error"] = error
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert accepted.wait(2)
+        monkeypatch.setattr(adapters, "ProtocolError", NonmatchingProtocolError)
+        monkeypatch.setattr(adapters, "ConnectionError", ForbiddenTarget)
+        release.set()
+        worker.join(timeout=5)
+
+    assert type(result["error"]) is urllib3.exceptions.ProtocolError
+
+
+def test_transport_live_target_failure_keeps_surrogate_context(monkeypatch):
+    class ConstructorFailure(BaseException):
+        pass
+
+    failure = ConstructorFailure("target failed")
+
+    class ExplodingTarget:
+        def __new__(cls, *args, **kwargs):
+            raise failure
+
+    result = {}
+    with closing_loopback_barrier() as (url, accepted, release):
+        request = prepared(url)
+
+        def send():
+            try:
+                with _rust_adapter_trial():
+                    HTTPAdapter(max_retries=Retry(total=0)).send(request)
+            except BaseException as error:
+                result["error"] = error
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert accepted.wait(2)
+        monkeypatch.setattr(adapters, "ConnectionError", ExplodingTarget)
+        release.set()
+        worker.join(timeout=5)
+
+    assert result["error"] is failure
+    assert isinstance(failure.__context__, urllib3.exceptions.ProtocolError)
+
+
+def test_transport_live_missing_source_keeps_surrogate_context(monkeypatch):
+    result = {}
+    with closing_loopback_barrier() as (url, accepted, release):
+        request = prepared(url)
+
+        def send():
+            try:
+                with _rust_adapter_trial():
+                    HTTPAdapter(max_retries=Retry(total=0)).send(request)
+            except BaseException as error:
+                result["error"] = error
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert accepted.wait(2)
+        monkeypatch.delattr(adapters, "ProtocolError")
+        release.set()
+        worker.join(timeout=5)
+
+    error = result["error"]
+    assert isinstance(error, NameError)
+    assert str(error) == "name 'ProtocolError' is not defined"
+    assert isinstance(error.__context__, urllib3.exceptions.ProtocolError)
+
+
+def test_transport_except_matching_ignores_source_instancecheck(monkeypatch):
+    class MatchFailure(BaseException):
+        pass
+
+    failure = MatchFailure("match failed")
+
+    class ExplodingMeta(type):
+        def __instancecheck__(cls, instance):
+            raise failure
+
+    class ExplodingSource(Exception, metaclass=ExplodingMeta):
+        pass
+
+    result = {}
+    with closing_loopback_barrier() as (url, accepted, release):
+        request = prepared(url)
+
+        def send():
+            try:
+                with _rust_adapter_trial():
+                    HTTPAdapter(max_retries=Retry(total=0)).send(request)
+            except BaseException as error:
+                result["error"] = error
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert accepted.wait(2)
+        monkeypatch.setattr(adapters, "ProtocolError", ExplodingSource)
+        release.set()
+        worker.join(timeout=5)
+
+    assert type(result["error"]) is urllib3.exceptions.ProtocolError
+    assert failure.__context__ is None
+
+
+def test_retry_exhaustion_uses_live_target_after_response_drain(monkeypatch):
+    class LiveRetryError(Exception):
+        pass
+
+    observed = []
+
+    class LiveTarget:
+        def __new__(cls, original, *, request):
+            observed.append((original, request))
+            return LiveRetryError("live retry target")
+
+    release = threading.Event()
+    retry = Retry(total=0, status=0, status_forcelist={503})
+    result = {}
+    with loopback((503, {}, (b"x", release, b"y"))) as (server, url):
+        request = prepared(url)
+
+        def send():
+            try:
+                with _rust_adapter_trial():
+                    HTTPAdapter(max_retries=retry).send(request)
+            except BaseException as error:
+                result["error"] = error
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert server.first_chunk_sent.wait(2)
+        monkeypatch.setattr(adapters, "RetryError", LiveTarget)
+        release.set()
+        worker.join(timeout=5)
+
+    error = result["error"]
+    assert isinstance(error, LiveRetryError)
+    assert len(observed) == 1
+    original, mapped_request = observed[0]
+    assert isinstance(original, urllib3.exceptions.MaxRetryError)
+    assert isinstance(original.reason, urllib3.exceptions.ResponseError)
+    assert mapped_request is request
+    assert error.__context__ is original
+
+
+def test_retry_exhaustion_live_nonclass_source_raises_handler_type_error(
+    monkeypatch,
+):
+    release = threading.Event()
+    retry = Retry(total=0, status=0, status_forcelist={503})
+    result = {}
+    with loopback((503, {}, (b"x", release, b"y"))) as (server, url):
+        request = prepared(url)
+
+        def send():
+            try:
+                with _rust_adapter_trial():
+                    HTTPAdapter(max_retries=retry).send(request)
+            except BaseException as error:
+                result["error"] = error
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert server.first_chunk_sent.wait(2)
+        monkeypatch.setattr(adapters, "ResponseError", object())
+        release.set()
+        worker.join(timeout=5)
+
+    error = result["error"]
+    assert isinstance(error, TypeError)
+    assert str(error) == (
+        "isinstance() arg 2 must be a type, a tuple of types, or a union"
+    )
+    assert isinstance(error.__context__, urllib3.exceptions.MaxRetryError)
+
+
+def test_retry_exhaustion_live_source_metaclass_failure_keeps_context(monkeypatch):
+    class MatchFailure(BaseException):
+        pass
+
+    failure = MatchFailure("match failed")
+
+    class ExplodingMeta(type):
+        def __instancecheck__(cls, instance):
+            raise failure
+
+    class ExplodingSource(Exception, metaclass=ExplodingMeta):
+        pass
+
+    release = threading.Event()
+    retry = Retry(total=0, status=0, status_forcelist={503})
+    result = {}
+    with loopback((503, {}, (b"x", release, b"y"))) as (server, url):
+        request = prepared(url)
+
+        def send():
+            try:
+                with _rust_adapter_trial():
+                    HTTPAdapter(max_retries=retry).send(request)
+            except BaseException as error:
+                result["error"] = error
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert server.first_chunk_sent.wait(2)
+        monkeypatch.setattr(adapters, "ResponseError", ExplodingSource)
+        release.set()
+        worker.join(timeout=5)
+
+    assert result["error"] is failure
+    assert isinstance(failure.__context__, urllib3.exceptions.MaxRetryError)
+
+
+def test_truncated_native_body_maps_to_chunked_error_and_releases_raw():
+    with loopback(
+        (200, {"Content-Length": "20"}, b"x", None, True),
+    ) as (server, url):
+        with _rust_adapter_trial():
+            response = HTTPAdapter().send(prepared(url), stream=True)
+            raw = response.raw
+            with pytest.raises(requests.exceptions.ChunkedEncodingError) as caught:
+                list(response.iter_content(2))
+
+        original = caught.value.args[0]
+        assert isinstance(original, urllib3.exceptions.ProtocolError)
+        assert caught.value.__context__ is original
+        assert raw.closed is True
+        assert server.requests == 1
+
+
+def test_truncated_native_body_uses_live_models_target_after_send(monkeypatch):
+    class LiveChunkedError(Exception):
+        pass
+
+    observed = []
+
+    class LiveTarget:
+        def __new__(cls, original):
+            observed.append(original)
+            return LiveChunkedError("live chunked target")
+
+    with loopback(
+        (200, {"Content-Length": "20"}, b"x", None, True),
+    ) as (server, url):
+        with _rust_adapter_trial():
+            response = HTTPAdapter().send(prepared(url), stream=True)
+            raw = response.raw
+            monkeypatch.setattr(requests.models, "ChunkedEncodingError", LiveTarget)
+            with pytest.raises(LiveChunkedError) as caught:
+                list(response.iter_content(2))
+
+        assert len(observed) == 1
+        assert isinstance(observed[0], urllib3.exceptions.ProtocolError)
+        assert caught.value.__context__ is observed[0]
+        assert raw.closed is True
+        assert server.requests == 1
+
+
+def test_native_stream_read_timeout_maps_and_releases_pool_capacity():
+    release = threading.Event()
+    with loopback(
+        (200, {}, (b"x", release, b"y")),
+        (200, {}, b"reused"),
+    ) as (server, url):
+        adapter = HTTPAdapter(pool_maxsize=1, pool_block=True)
+        try:
+            with _rust_adapter_trial():
+                response = adapter.send(prepared(url), stream=True, timeout=(1, 0.05))
+                raw = response.raw
+                iterator = response.iter_content(1)
+                assert next(iterator) == b"x"
+                with pytest.raises(requests.exceptions.ConnectionError) as caught:
+                    next(iterator)
+                original = caught.value.args[0]
+                assert isinstance(original, urllib3.exceptions.ReadTimeoutError)
+                assert caught.value.__context__ is original
+                assert raw.closed is True
+                assert adapter.send(prepared(url)).content == b"reused"
+        finally:
+            release.set()
+
+        assert server.requests == 2
+
+
+def test_native_decoder_python_error_is_passed_through_unchanged():
+    with loopback(
+        (200, {"Content-Encoding": "gzip"}, b"not-a-gzip-stream"),
+    ) as (server, url):
+        with _rust_adapter_trial():
+            raw = HTTPAdapter().send(prepared(url), stream=True).raw
+            with pytest.raises(zlib.error):
+                raw.read(decode_content=True)
+        assert server.requests == 1
+
+
+def test_real_tls_handshake_failure_uses_adapter_ssl_handler():
+    with loopback((200, {}, b"plaintext")) as (server, url):
+        secure_url = url.replace("http://", "https://", 1)
+        with _rust_adapter_trial():
+            with pytest.raises(requests.exceptions.SSLError) as caught:
+                HTTPAdapter(max_retries=Retry(total=0)).send(prepared(secure_url))
+
+        original = caught.value.args[0]
+        assert isinstance(original, urllib3.exceptions.MaxRetryError)
+        assert isinstance(original.reason, urllib3.exceptions.SSLError)
+        assert caught.value.__context__ is original
+        assert server.requests == 0
+
+
+def test_worker_panic_keeps_runtime_generation_and_native_pool_reusable():
+    with loopback(
+        (200, {}, b"before"),
+        (200, {}, b"after"),
+    ) as (server, url):
+        adapter = HTTPAdapter()
+        generation = requests._requests_rust._runtime_generation_trial()
+        with _rust_adapter_trial():
+            assert adapter.send(prepared(url)).content == b"before"
+            with pytest.raises(
+                RuntimeError, match="native requests worker stopped unexpectedly"
+            ) as caught:
+                requests._requests_rust._panic_boundary_trial(True)
+            assert caught.value.driver_generation == generation
+            assert caught.value.recovery_generation == generation
+            assert caught.value.recovery_result == "ok"
+            assert requests._requests_rust._runtime_generation_trial() == generation
+            assert adapter.send(prepared(url)).content == b"after"
+
+        assert server.requests == 2
+        assert len(server.clients) == 1
