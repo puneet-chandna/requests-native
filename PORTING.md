@@ -624,7 +624,7 @@ Task 14 proves these rules only through the private opt-in adapter/response
 trials. Public Session dispatch, default-backend selection, and the wider
 platform matrix remain later integration boundaries.
 
-The fifth Task 14 fix, the user-authorized recovery, and its first two recovery
+The fifth Task 14 fix, the user-authorized recovery, and its first three recovery
 fix rounds tighten the private adapter proof boundary:
 
 - registration owns the exact initially empty `proxy_manager` dict; a
@@ -662,9 +662,11 @@ fix rounds tighten the private adapter proof boundary:
   lets a later callback mutation self-authorize a new baseline.
 - a missing source or any exception raised while observing or validating these
   live sources before manager entry is incompatibility, not a Rust preflight
-  error. The retained Python send performs urllib3's authoritative lookup in
-  its original order and preserves its exception type and arguments. This does
-  not change the hard-error/no-replay rule after manager commitment.
+  error. This includes the live `requests.adapters.SOCKSProxyManager` global,
+  its behavior proof, and its pool-class mapping. The retained Python send
+  performs the authoritative lookup in its original order and preserves its
+  exception type and arguments. This does not change the hard-error/no-replay
+  rule after manager commitment.
 
 This evidence is for GIL-enabled CPython 3.14. It does not convert the
 free-threaded Python row into a completed claim.
