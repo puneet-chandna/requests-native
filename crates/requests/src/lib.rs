@@ -9,6 +9,8 @@ pub mod auth;
 pub mod blocking;
 mod body;
 mod client;
+#[doc(hidden)]
+pub mod cookies;
 mod error;
 #[doc(hidden)]
 pub mod hooks;

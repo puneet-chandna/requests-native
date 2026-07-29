@@ -8,6 +8,7 @@ mod auth;
 mod body;
 mod bridge;
 mod callbacks;
+mod cookies;
 mod errors;
 mod models;
 mod response;
@@ -26,6 +27,7 @@ fn _requests_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     auth::register(module)?;
     body::register(module)?;
     callbacks::register(module)?;
+    cookies::register(module)?;
     errors::register(module)?;
     models::register(module)?;
     response::register(module)?;
