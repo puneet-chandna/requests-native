@@ -329,6 +329,13 @@ Pickling omits Rust shadow state and recreates it lazily. `close()` clears both
 visible and Rust pool generations but does not make the adapter permanently
 unusable.
 
+The private adapter registry mutex protects only Rust-owned table state. Read
+Python attributes, mappings, weak references, descriptors, and manager proofs
+before taking that mutex. Direct/proxy manager refresh then reacquires it only
+to commit against the same adapter generation and manager identity. Move
+replaced Python proof handles and evicted pools out of the table before
+dropping or clearing them.
+
 ## Strings, URLs, and headers
 
 - Preserve leading whitespace removal and scheme case behavior.
@@ -495,8 +502,12 @@ Do not return a connection to the pool while a caller can still read the
 stream.
 
 Only clean protocol EOF makes a connection reusable. Explicit close, drop,
-cancellation, decode failure, or protocol failure before EOF closes the
-Rust-owned connection and releases the lease without returning it dirty.
+cancellation, or protocol failure before EOF closes the Rust-owned connection
+and releases the lease without returning it dirty. A decoder error follows
+urllib3's observable ownership lifecycle: the first error leaves the raw
+response open and retains its lease; a later read may observe EOF and release
+it, while explicit close releases it immediately. The failed connection is
+never returned dirty.
 Custom Python `raw` objects receive `close()` and optional `release_conn()` on
 explicit `Response.close()` exactly as today. Dropping the Response only
 releases its strong reference; do not add new close callbacks during wrapper
