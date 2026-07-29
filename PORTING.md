@@ -624,7 +624,8 @@ Task 14 proves these rules only through the private opt-in adapter/response
 trials. Public Session dispatch, default-backend selection, and the wider
 platform matrix remain later integration boundaries.
 
-The fifth Task 14 fix tightens the private adapter proof boundary:
+The fifth Task 14 fix and the subsequent user-authorized recovery tighten the
+private adapter proof boundary:
 
 - registration owns the exact initially empty `proxy_manager` dict; a
   replacement exact dict or any subclass is incompatible before manager entry,
@@ -636,18 +637,22 @@ The fifth Task 14 fix tightens the private adapter proof boundary:
   rather than a torn proof;
 - an unrecorded HTTP proxy manager is admissible only when its exact type,
   normalized map-key destination, pool sizing/blocking, proxy headers, alias
-  fields, and default proxy configuration match the admitted send snapshot;
+  fields, default proxy configuration, and exact routing-map identities match
+  the admitted send snapshot and independently frozen, still-pristine
+  `pool_classes_by_scheme` and `key_fn_by_scheme` sources;
 - SOCKS admission is separate: the exact map-key string must also be the
   manager's `proxy_url`, and the six `_socks_options` fields must match the
   parsed scheme, host, explicit-or-`None` port, Requests-decoded credentials,
-  version, and remote-DNS mode;
+  version, and remote-DNS mode; its exact routing maps must likewise match the
+  independently frozen SOCKS pool-class and shared key-function sources;
 - every manager observation and proof-revision retry is capped at eight
   attempts. Exhaustion before manager entry selects compatibility; exhaustion
   after manager entry raises the existing hard-commit error and never replays;
-- a private proxy realm created by a rejected hard-commit attempt permits only
-  that selected repaired manager to be revalidated later. It does not weaken
-  the existing rule that an arbitrary preused visible proxy manager selects
-  compatibility.
+- no rejected-attempt realm grants later re-admission. A visible proxy manager
+  without an already-recorded immutable proof—including repaired, replaced, or
+  independently preused state left after a rejected committed attempt—selects
+  compatibility. If removed, a later newly created manager may be considered
+  only through the complete canonical checks above.
 
 This evidence is for GIL-enabled CPython 3.14. It does not convert the
 free-threaded Python row into a completed claim.
