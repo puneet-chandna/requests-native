@@ -624,8 +624,8 @@ Task 14 proves these rules only through the private opt-in adapter/response
 trials. Public Session dispatch, default-backend selection, and the wider
 platform matrix remain later integration boundaries.
 
-The fifth Task 14 fix, the user-authorized recovery, and recovery fix round 1
-tighten the private adapter proof boundary:
+The fifth Task 14 fix, the user-authorized recovery, and its first two recovery
+fix rounds tighten the private adapter proof boundary:
 
 - registration owns the exact initially empty `proxy_manager` dict; a
   replacement exact dict or any subclass is incompatible before manager entry,
@@ -660,6 +660,11 @@ tighten the private adapter proof boundary:
   iteration with exact-string keys and compared to the canonical snapshot by
   key/value identity only, so preflight neither repeats user key equality nor
   lets a later callback mutation self-authorize a new baseline.
+- a missing source or any exception raised while observing or validating these
+  live sources before manager entry is incompatibility, not a Rust preflight
+  error. The retained Python send performs urllib3's authoritative lookup in
+  its original order and preserves its exception type and arguments. This does
+  not change the hard-error/no-replay rule after manager commitment.
 
 This evidence is for GIL-enabled CPython 3.14. It does not convert the
 free-threaded Python row into a completed claim.
