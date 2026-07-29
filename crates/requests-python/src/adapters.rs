@@ -1183,7 +1183,16 @@ fn adapter_identity_is_pristine(
     }
     let module = state.adapters_module.bind(py);
     for (name, proof) in &state.globals {
-        if !behavior_proof_is_pristine(py, &module.getattr(name.as_str())?, proof)? {
+        let current = match module.getattr(name.as_str()) {
+            Ok(current) => current,
+            Err(_) if name == "SOCKSProxyManager" => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if name == "SOCKSProxyManager" {
+            if !matches!(behavior_proof_is_pristine(py, &current, proof), Ok(true)) {
+                return Ok(false);
+            }
+        } else if !behavior_proof_is_pristine(py, &current, proof)? {
             return Ok(false);
         }
     }
@@ -1223,12 +1232,16 @@ fn adapter_identity_is_pristine(
             &poolmanager_module.getattr("ProxyManager")?,
             &state.proxy_manager_behavior,
         )?
-        || !behavior_proof_is_pristine(
-            py,
-            &module.getattr("SOCKSProxyManager")?,
-            &state.socks_manager_behavior,
-        )?
     {
+        return Ok(false);
+    }
+    let Ok(socks_manager) = module.getattr("SOCKSProxyManager") else {
+        return Ok(false);
+    };
+    if !matches!(
+        behavior_proof_is_pristine(py, &socks_manager, &state.socks_manager_behavior),
+        Ok(true)
+    ) {
         return Ok(false);
     }
     canonical_routing_sources_are_pristine(py, state, &poolmanager_module, module)
@@ -2042,10 +2055,10 @@ fn canonical_routing_sources_are_pristine(
     let Some(socks_pool_classes) = &state.socks_pool_classes_by_scheme else {
         return Ok(true);
     };
-    let Ok(socks_pool_classes_source) = adapters_module
-        .getattr("SOCKSProxyManager")?
-        .getattr("pool_classes_by_scheme")
-    else {
+    let Ok(socks_manager) = adapters_module.getattr("SOCKSProxyManager") else {
+        return Ok(false);
+    };
+    let Ok(socks_pool_classes_source) = socks_manager.getattr("pool_classes_by_scheme") else {
         return Ok(false);
     };
     Ok(matches!(

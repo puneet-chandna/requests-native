@@ -3572,6 +3572,156 @@ def test_missing_live_routing_source_preserves_authoritative_error_order(
     ]
 
 
+_MISSING_LIVE_SOCKS_MANAGER_CASE = r"""
+import os
+from contextlib import nullcontext
+
+from requests import adapters
+from requests.adapters import HTTPAdapter
+from requests.models import PreparedRequest
+
+
+adapter = HTTPAdapter()
+fallback_calls = 0
+events = []
+if os.environ.get("REQUESTS_DIFFERENTIAL_TARGET") == "rewrite":
+    from requests.adapters import _rust_adapter_trial
+
+    original_compat_send = adapters._HTTP_ADAPTER_COMPAT_SEND
+
+    def counted_compat_send(*args, **kwargs):
+        global fallback_calls
+        fallback_calls += 1
+        events.append("compat")
+        return original_compat_send(*args, **kwargs)
+
+    adapters._HTTP_ADAPTER_COMPAT_SEND = counted_compat_send
+
+    def trial():
+        return _rust_adapter_trial()
+else:
+
+    def trial():
+        return nullcontext()
+
+
+delattr(adapters, "SOCKSProxyManager")
+request = PreparedRequest()
+request.prepare(method="GET", url="http://origin.example/resource")
+try:
+    with trial():
+        adapter.send(
+            request,
+            proxies={"http": "socks5://127.0.0.1:1"},
+        )
+except BaseException as error:
+    events.append(type(error).__name__)
+    observed_error = {
+        "module": type(error).__module__,
+        "name": type(error).__name__,
+        "args": list(error.args),
+    }
+else:
+    observed_error = None
+
+side_effects.append(
+    {
+        "error": observed_error,
+        "events": events,
+        "fallback_calls": fallback_calls,
+        "proxy_managers": len(adapter.proxy_manager),
+        "main_pools": len(adapter.poolmanager.pools),
+    }
+)
+adapter.close()
+result = None
+"""
+
+_RAISING_LIVE_SOCKS_MANAGER_OBSERVATION_CASE = _MISSING_LIVE_SOCKS_MANAGER_CASE.replace(
+    'delattr(adapters, "SOCKSProxyManager")',
+    r"""
+class ObservationError(Exception):
+    pass
+
+
+def observe_missing_attribute(name):
+    if name == "SOCKSProxyManager":
+        events.append("observe")
+        raise ObservationError("SOCKS manager observation failed")
+    raise AttributeError(name)
+
+
+adapters.__getattr__ = observe_missing_attribute
+delattr(adapters, "SOCKSProxyManager")
+""",
+    1,
+)
+
+
+def test_missing_live_socks_manager_preserves_authoritative_error_order():
+    case = {"source": _MISSING_LIVE_SOCKS_MANAGER_CASE}
+    oracle = run_oracle_case(case)
+    rewrite = run_rewrite_case(case)
+    error = {
+        "module": "builtins",
+        "name": "NameError",
+        "args": ["name 'SOCKSProxyManager' is not defined"],
+    }
+
+    assert oracle.observations["exception"] is None
+    assert oracle.observations["side_effects"] == [
+        {
+            "error": error,
+            "events": ["NameError"],
+            "fallback_calls": 0,
+            "proxy_managers": 0,
+            "main_pools": 0,
+        }
+    ]
+    assert rewrite.observations["exception"] is None
+    assert rewrite.observations["side_effects"] == [
+        {
+            "error": error,
+            "events": ["compat", "NameError"],
+            "fallback_calls": 1,
+            "proxy_managers": 0,
+            "main_pools": 0,
+        }
+    ]
+
+
+def test_raising_live_socks_manager_observation_uses_authoritative_error():
+    case = {"source": _RAISING_LIVE_SOCKS_MANAGER_OBSERVATION_CASE}
+    oracle = run_oracle_case(case)
+    rewrite = run_rewrite_case(case)
+    error = {
+        "module": "builtins",
+        "name": "NameError",
+        "args": ["name 'SOCKSProxyManager' is not defined"],
+    }
+
+    assert oracle.observations["exception"] is None
+    assert oracle.observations["side_effects"] == [
+        {
+            "error": error,
+            "events": ["NameError"],
+            "fallback_calls": 0,
+            "proxy_managers": 0,
+            "main_pools": 0,
+        }
+    ]
+    assert rewrite.observations["exception"] is None
+    assert rewrite.observations["side_effects"] == [
+        {
+            "error": error,
+            "events": ["observe", "compat", "NameError"],
+            "fallback_calls": 1,
+            "proxy_managers": 0,
+            "main_pools": 0,
+        }
+    ]
+
+
 def test_rejected_proxy_attempt_does_not_admit_independently_preused_manager(
     monkeypatch,
 ):
