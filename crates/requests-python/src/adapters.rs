@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use pyo3::exceptions::{PyNameError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyNameError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -1067,13 +1067,13 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
     let socks_manager = adapters.getattr("SOCKSProxyManager")?;
     let socks_manager_behavior = behavior_proof(py, &socks_manager)?;
     let http_pool_classes_by_scheme =
-        mapping_proof(&poolmanager_module.getattr("pool_classes_by_scheme")?)?;
+        routing_mapping_proof(&poolmanager_module.getattr("pool_classes_by_scheme")?)?;
     let socks_pool_classes_by_scheme = socks_manager
         .getattr("pool_classes_by_scheme")
         .ok()
-        .map(|mapping| mapping_proof(&mapping))
+        .map(|mapping| routing_mapping_proof(&mapping))
         .transpose()?;
-    let key_fn_by_scheme = mapping_proof(&poolmanager_module.getattr("key_fn_by_scheme")?)?;
+    let key_fn_by_scheme = routing_mapping_proof(&poolmanager_module.getattr("key_fn_by_scheme")?)?;
     let prepared_getattribute = prepared_request_type.getattr("__getattribute__")?.unbind();
     let exception_globals = [
         "LocationValueError",
@@ -1231,7 +1231,7 @@ fn adapter_identity_is_pristine(
     {
         return Ok(false);
     }
-    Ok(true)
+    canonical_routing_sources_are_pristine(py, state, &poolmanager_module, module)
 }
 
 fn exact_usize(value: Bound<'_, PyAny>) -> Option<usize> {
@@ -1637,7 +1637,11 @@ fn stable_manager_pools_proof(
     Ok(None)
 }
 
-fn manager_proof(manager: &Bound<'_, PyAny>) -> PyResult<Option<ManagerRecord>> {
+fn manager_proof(
+    manager: &Bound<'_, PyAny>,
+    pool_classes_by_scheme: &MappingProof,
+    key_fn_by_scheme: &MappingProof,
+) -> PyResult<Option<ManagerRecord>> {
     let py = manager.py();
     for _ in 0..MANAGER_PROOF_ATTEMPTS {
         let mut mappings = Vec::new();
@@ -1649,8 +1653,35 @@ fn manager_proof(manager: &Bound<'_, PyAny>) -> PyResult<Option<ManagerRecord>> 
             "proxy_headers",
         ] {
             if let Ok(mapping) = manager.getattr(name) {
-                mappings.push((name.to_owned(), mapping_proof(&mapping)?));
+                let proof = if matches!(name, "pool_classes_by_scheme" | "key_fn_by_scheme") {
+                    let Some(proof) = routing_mapping_snapshot(&mapping)? else {
+                        return Ok(None);
+                    };
+                    proof
+                } else {
+                    mapping_proof(&mapping)?
+                };
+                mappings.push((name.to_owned(), proof));
             }
+        }
+        let Some(candidate_pool_classes) = mappings
+            .iter()
+            .find(|(name, _)| name == "pool_classes_by_scheme")
+            .map(|(_, proof)| proof)
+        else {
+            return Ok(None);
+        };
+        let Some(candidate_key_fns) = mappings
+            .iter()
+            .find(|(name, _)| name == "key_fn_by_scheme")
+            .map(|(_, proof)| proof)
+        else {
+            return Ok(None);
+        };
+        if !routing_mapping_matches_canonical(py, candidate_pool_classes, pool_classes_by_scheme)?
+            || !routing_mapping_matches_canonical(py, candidate_key_fns, key_fn_by_scheme)?
+        {
+            return Ok(None);
         }
         let pools = manager.getattr("pools")?;
         let proof = Arc::new(ManagerProof {
@@ -1713,6 +1744,75 @@ fn mapping_proof_inner(
 
 fn mapping_proof(value: &Bound<'_, PyAny>) -> PyResult<MappingProof> {
     mapping_proof_inner(value.py(), value, &mut HashSet::new())
+}
+
+fn routing_mapping_proof(value: &Bound<'_, PyAny>) -> PyResult<MappingProof> {
+    let dictionary = value.cast_exact::<PyDict>()?;
+    if dictionary
+        .iter()
+        .any(|(key, _)| !key.is_exact_instance_of::<PyString>())
+    {
+        return Err(PyTypeError::new_err(
+            "canonical routing mapping requires exact string keys",
+        ));
+    }
+    mapping_proof(value)
+}
+
+fn routing_mapping_snapshot(value: &Bound<'_, PyAny>) -> PyResult<Option<MappingProof>> {
+    let Ok(dictionary) = value.cast_exact::<PyDict>() else {
+        return Ok(None);
+    };
+    let mut items = Vec::with_capacity(dictionary.len());
+    for (key, value) in dictionary.iter() {
+        if !key.is_exact_instance_of::<PyString>() {
+            return Ok(None);
+        }
+        items.push((key.unbind(), value.unbind()));
+    }
+    Ok(Some(MappingProof {
+        mapping: dictionary.clone().into_any().unbind(),
+        items,
+        behaviors: Vec::new(),
+    }))
+}
+
+fn routing_mapping_proof_is_pristine(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    proof: &MappingProof,
+) -> PyResult<bool> {
+    if !value.is(proof.mapping.bind(py)) {
+        return Ok(false);
+    }
+    let Ok(dictionary) = value.cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    if dictionary
+        .iter()
+        .any(|(key, _)| !key.is_exact_instance_of::<PyString>())
+    {
+        return Ok(false);
+    }
+    mapping_proof_is_pristine(py, value, proof)
+}
+
+fn routing_mapping_matches_canonical(
+    py: Python<'_>,
+    candidate: &MappingProof,
+    canonical: &MappingProof,
+) -> PyResult<bool> {
+    if !routing_mapping_proof_is_pristine(py, canonical.mapping.bind(py), canonical)?
+        || !routing_mapping_proof_is_pristine(py, candidate.mapping.bind(py), candidate)?
+        || candidate.items.len() != canonical.items.len()
+    {
+        return Ok(false);
+    }
+    Ok(candidate.items.iter().zip(&canonical.items).all(
+        |((key, value), (expected_key, expected_value))| {
+            key.bind(py).is(expected_key.bind(py)) && value.bind(py).is(expected_value.bind(py))
+        },
+    ))
 }
 
 fn mapping_proof_is_pristine(
@@ -1905,16 +2005,39 @@ fn canonical_routing_mapping_is_pristine(
     current: &Bound<'_, PyAny>,
     canonical: &MappingProof,
 ) -> PyResult<bool> {
-    if !mapping_proof_is_pristine(py, canonical.mapping.bind(py), canonical)? {
+    let Some(current) = routing_mapping_snapshot(current)? else {
+        return Ok(false);
+    };
+    routing_mapping_matches_canonical(py, &current, canonical)
+}
+
+fn canonical_routing_sources_are_pristine(
+    py: Python<'_>,
+    state: &AdapterState,
+    poolmanager_module: &Bound<'_, PyModule>,
+    adapters_module: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    if !routing_mapping_proof_is_pristine(
+        py,
+        &poolmanager_module.getattr("pool_classes_by_scheme")?,
+        &state.http_pool_classes_by_scheme,
+    )? || !routing_mapping_proof_is_pristine(
+        py,
+        &poolmanager_module.getattr("key_fn_by_scheme")?,
+        &state.key_fn_by_scheme,
+    )? {
         return Ok(false);
     }
-    let Ok(current) = current.cast_exact::<PyDict>() else {
-        return Ok(false);
+    let Some(socks_pool_classes) = &state.socks_pool_classes_by_scheme else {
+        return Ok(true);
     };
-    let Ok(canonical) = canonical.mapping.bind(py).cast_exact::<PyDict>() else {
-        return Ok(false);
-    };
-    exact_dict_snapshot_is_current(canonical, current)
+    routing_mapping_proof_is_pristine(
+        py,
+        &adapters_module
+            .getattr("SOCKSProxyManager")?
+            .getattr("pool_classes_by_scheme")?,
+        socks_pool_classes,
+    )
 }
 
 fn canonical_http_proxy_manager_is_pristine(
@@ -2377,7 +2500,13 @@ fn _adapter_register_trial(
         .getattr("ref")?
         .call1((adapter, callback))?
         .unbind();
-    let Some(manager_proof) = manager_proof(&manager)? else {
+    let state = adapter_state(py)?;
+    let Some(manager_proof) = manager_proof(
+        &manager,
+        &state.http_pool_classes_by_scheme,
+        &state.key_fn_by_scheme,
+    )?
+    else {
         return Ok(false);
     };
     let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -2467,7 +2596,18 @@ fn record_visible_proxy_manager(
                 {
                     return Ok(false);
                 }
-                let Some(record) = manager_proof(&manager)? else {
+                let state = adapter_state(py)?;
+                let pool_classes_by_scheme = if url_text.to_ascii_lowercase().starts_with("socks") {
+                    let Some(proof) = &state.socks_pool_classes_by_scheme else {
+                        return Ok(false);
+                    };
+                    proof
+                } else {
+                    &state.http_pool_classes_by_scheme
+                };
+                let Some(record) =
+                    manager_proof(&manager, pool_classes_by_scheme, &state.key_fn_by_scheme)?
+                else {
                     return Ok(false);
                 };
                 record

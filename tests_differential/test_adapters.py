@@ -3147,10 +3147,12 @@ def test_new_http_proxy_manager_routing_mutation_is_not_recorded_after_commit(
             if (
                 "manager" not in observed
                 and event == "return"
-                and frame.f_code is HTTPAdapter.proxy_manager_for.__code__
+                and frame.f_code is HTTPAdapter.proxy_headers.__code__
+                and proxy_root in adapter.proxy_manager
             ):
-                observed["manager"] = arg
-                mapping = getattr(arg, mapping_name)
+                manager = adapter.proxy_manager[proxy_root]
+                observed["manager"] = manager
+                mapping = getattr(manager, mapping_name)
                 observed["original"] = mapping["http"]
                 mapping["http"] = mapping[replacement_key]
             return trace
@@ -3301,10 +3303,12 @@ def test_new_socks_proxy_manager_routing_mutation_is_not_recorded_after_commit(
             if (
                 "manager" not in observed_manager
                 and event == "return"
-                and frame.f_code is HTTPAdapter.proxy_manager_for.__code__
+                and frame.f_code is adapters.get_auth_from_url.__code__
+                and proxy_url in adapter.proxy_manager
             ):
-                observed_manager["manager"] = arg
-                mapping = getattr(arg, mapping_name)
+                manager = adapter.proxy_manager[proxy_url]
+                observed_manager["manager"] = manager
+                mapping = getattr(manager, mapping_name)
                 observed_manager["original"] = mapping["http"]
                 mapping["http"] = mapping[replacement_key]
             return trace
@@ -3343,6 +3347,121 @@ def test_new_socks_proxy_manager_routing_mutation_is_not_recorded_after_commit(
         restored.close()
         assert observed == {"connections": 1, "requests": 1}
         assert fallback_calls == 0
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "http_pool_classes_by_scheme",
+        "key_fn_by_scheme",
+        "socks_pool_classes_by_scheme",
+    ],
+)
+def test_replaced_live_routing_source_falls_back_before_native_effects(
+    monkeypatch, source
+):
+    import urllib3.poolmanager as poolmanager
+
+    if source == "socks_pool_classes_by_scheme" and not isinstance(
+        adapters.SOCKSProxyManager, type
+    ):
+        pytest.skip("PySocks is unavailable")
+
+    if source == "socks_pool_classes_by_scheme":
+        owner = adapters.SOCKSProxyManager
+        name = "pool_classes_by_scheme"
+        proxy = "socks5://127.0.0.1:1"
+    else:
+        owner = poolmanager
+        name = source.removeprefix("http_")
+        proxy = "http://127.0.0.1:1"
+    replacement = dict(getattr(owner, name))
+    replacement["http"] = replacement["https"]
+    monkeypatch.setattr(owner, name, replacement)
+
+    marker = object()
+    fallback_calls = 0
+
+    def compat_send(*args, **kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return marker
+
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", compat_send)
+    adapter = HTTPAdapter()
+    before = requests._requests_rust._adapter_pool_side_table_trial()
+
+    with _rust_adapter_trial():
+        response = adapter.send(
+            prepared("http://origin.example/"),
+            proxies={"http": proxy},
+        )
+
+    assert response is marker
+    assert fallback_calls == 1
+    assert adapter.proxy_manager == {}
+    assert len(adapter.poolmanager.pools) == 0
+    assert requests._requests_rust._adapter_pool_side_table_trial() == before
+    adapter.close()
+
+
+def test_replaced_live_routing_source_does_not_repeat_adversarial_key_equality(
+    monkeypatch,
+):
+    import urllib3.poolmanager as poolmanager
+
+    class ProbeError(Exception):
+        pass
+
+    comparisons = []
+
+    class HttpKey:
+        def __hash__(self):
+            return hash("http")
+
+        def __eq__(self, other):
+            comparisons.append(other)
+            if len(comparisons) > 1:
+                raise ProbeError("routing key compared more than once")
+            return other == "http"
+
+    canonical = poolmanager.pool_classes_by_scheme
+    replacement = {
+        HttpKey(): canonical["http"],
+        "https": canonical["https"],
+    }
+    monkeypatch.setattr(poolmanager, "pool_classes_by_scheme", replacement)
+
+    fallback_calls = 0
+    original_compat_send = adapters._HTTP_ADAPTER_COMPAT_SEND
+
+    def counted_compat_send(*args, **kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return original_compat_send(*args, **kwargs)
+
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", counted_compat_send)
+    with loopback((200, {}, b"compat-routing")) as (server, proxy_url):
+        proxy_root = proxy_url.rsplit("/", 1)[0]
+        adapter = HTTPAdapter()
+        before = requests._requests_rust._adapter_pool_side_table_trial()
+
+        with _rust_adapter_trial():
+            response = adapter.send(
+                prepared("http://origin.example/"),
+                proxies={"http": proxy_root},
+            )
+
+        assert response.content == b"compat-routing"
+        assert type(response.raw).__module__ == "urllib3.response"
+        assert comparisons == ["http"]
+        assert fallback_calls == 1
+        assert server.requests == 1
+        assert list(adapter.proxy_manager) == [proxy_root]
+        assert len(adapter.proxy_manager[proxy_root].pools) == 1
+        assert requests._requests_rust._adapter_pool_side_table_trial() == before
+        response.close()
+        adapter.close()
 
 
 def test_rejected_proxy_attempt_does_not_admit_independently_preused_manager(
