@@ -2017,27 +2017,41 @@ fn canonical_routing_sources_are_pristine(
     poolmanager_module: &Bound<'_, PyModule>,
     adapters_module: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
-    if !routing_mapping_proof_is_pristine(
-        py,
-        &poolmanager_module.getattr("pool_classes_by_scheme")?,
-        &state.http_pool_classes_by_scheme,
-    )? || !routing_mapping_proof_is_pristine(
-        py,
-        &poolmanager_module.getattr("key_fn_by_scheme")?,
-        &state.key_fn_by_scheme,
-    )? {
+    let Ok(http_pool_classes) = poolmanager_module.getattr("pool_classes_by_scheme") else {
+        return Ok(false);
+    };
+    if !matches!(
+        routing_mapping_proof_is_pristine(
+            py,
+            &http_pool_classes,
+            &state.http_pool_classes_by_scheme
+        ),
+        Ok(true)
+    ) {
+        return Ok(false);
+    }
+    let Ok(key_functions) = poolmanager_module.getattr("key_fn_by_scheme") else {
+        return Ok(false);
+    };
+    if !matches!(
+        routing_mapping_proof_is_pristine(py, &key_functions, &state.key_fn_by_scheme),
+        Ok(true)
+    ) {
         return Ok(false);
     }
     let Some(socks_pool_classes) = &state.socks_pool_classes_by_scheme else {
         return Ok(true);
     };
-    routing_mapping_proof_is_pristine(
-        py,
-        &adapters_module
-            .getattr("SOCKSProxyManager")?
-            .getattr("pool_classes_by_scheme")?,
-        socks_pool_classes,
-    )
+    let Ok(socks_pool_classes_source) = adapters_module
+        .getattr("SOCKSProxyManager")?
+        .getattr("pool_classes_by_scheme")
+    else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        routing_mapping_proof_is_pristine(py, &socks_pool_classes_source, socks_pool_classes),
+        Ok(true)
+    ))
 }
 
 fn canonical_http_proxy_manager_is_pristine(
