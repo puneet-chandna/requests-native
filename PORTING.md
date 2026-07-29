@@ -331,10 +331,17 @@ unusable.
 
 The private adapter registry mutex protects only Rust-owned table state. Read
 Python attributes, mappings, weak references, descriptors, and manager proofs
-before taking that mutex. Direct/proxy manager refresh then reacquires it only
-to commit against the same adapter generation and manager identity. Move
-replaced Python proof handles and evicted pools out of the table before
-dropping or clearing them.
+before taking that mutex. Keep destructive lifecycle epochs separate from
+ordinary admission revisions and manager-proof revisions: concurrent sends
+may merge native pool admissions without invalidating one another, while
+`close()` still rejects an admission made after its destructive snapshot.
+Direct/proxy manager refresh observes outside the mutex, then commits only
+when the lifecycle and proof revision still match. Proxy refresh must
+stable-copy the complete visible manager map, preserve and validate every
+recorded immutable manager proof, admit only canonical new manager types, and
+refresh mutable pool proofs without losing a concurrent manager. Move replaced
+Python proof handles and evicted pools out of the table before dropping or
+clearing them.
 
 ## Strings, URLs, and headers
 
