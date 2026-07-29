@@ -624,8 +624,8 @@ Task 14 proves these rules only through the private opt-in adapter/response
 trials. Public Session dispatch, default-backend selection, and the wider
 platform matrix remain later integration boundaries.
 
-The fifth Task 14 fix and the subsequent user-authorized recovery tighten the
-private adapter proof boundary:
+The fifth Task 14 fix, the user-authorized recovery, and recovery fix round 1
+tighten the private adapter proof boundary:
 
 - registration owns the exact initially empty `proxy_manager` dict; a
   replacement exact dict or any subclass is incompatible before manager entry,
@@ -653,6 +653,13 @@ private adapter proof boundary:
   independently preused state left after a rejected committed attempt—selects
   compatibility. If removed, a later newly created manager may be considered
   only through the complete canonical checks above.
+- every fallback-capable admission refetches the current live urllib3
+  `pool_classes_by_scheme` and `key_fn_by_scheme` sources and requires their
+  identity to match the process-frozen exact dictionaries before manager/cache
+  effects. Candidate routing maps are captured through native exact-dict
+  iteration with exact-string keys and compared to the canonical snapshot by
+  key/value identity only, so preflight neither repeats user key equality nor
+  lets a later callback mutation self-authorize a new baseline.
 
 This evidence is for GIL-enabled CPython 3.14. It does not convert the
 free-threaded Python row into a completed claim.
