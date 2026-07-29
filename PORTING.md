@@ -579,6 +579,33 @@ Rules:
 - convert Rust panics to an internal failure before FFI, while treating any
   reachable panic as a bug.
 
+For an admitted native adapter call, the Python-facing error graph is part of
+the compatibility contract, not just the outer Requests class. The core stays
+Python-free but retains typed phase data such as the OS error number and
+incomplete-body byte counts. The binding must then reconstruct the
+version-appropriate urllib3 graph with the actual visible pool and origin-form
+URL before running the live Requests handler:
+
+- use CPython exception-handler matching for `except` source globals, including
+  full outer-tuple validation and the exact invalid-target `TypeError`; do not
+  invoke source metaclass `__instancecheck__`;
+- reload live globals and attributes in Python bytecode order when lookup is
+  observable, including every `MaxRetryError.reason` access;
+- wrap only urllib3's current decoder error classes as
+  `DecodeError(message, original)` and terminalize the response body before
+  live `requests.models` target construction;
+- retain stable class, argument, pool/URL, cause, and context shape in both
+  supported urllib3 2.7 and 1.26 lanes while leaving OS/resolver prose as an
+  explicit platform boundary;
+- finish every fallback-selecting proof before entering a visible manager or
+  cache operation. Once manager entry begins, later proof or mapping failure
+  must propagate on the native path and must never replay the complete Python
+  send.
+
+Task 14 proves these rules only through the private opt-in adapter/response
+trials. Public Session dispatch, default-backend selection, and the wider
+platform matrix remain later integration boundaries.
+
 A synchronous `catch_unwind` probe proves only a direct same-thread FFI guard;
 it does not prove the blocking worker boundary. Worker-panic evidence must
 submit a panicking task to the actual shared `BlockingRuntimeDriver`, observe
