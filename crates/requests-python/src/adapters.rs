@@ -64,6 +64,9 @@ struct AdapterState {
     poolmanager_module: Py<PyAny>,
     proxy_manager_behavior: BehaviorProof,
     socks_manager_behavior: BehaviorProof,
+    http_pool_classes_by_scheme: MappingProof,
+    socks_pool_classes_by_scheme: Option<MappingProof>,
+    key_fn_by_scheme: MappingProof,
     methods: Vec<(String, BehaviorProof)>,
     globals: Vec<(String, BehaviorProof)>,
     send_globals: Py<PyDict>,
@@ -1061,7 +1064,16 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
     let poolmanager_module = PyModule::import(py, "urllib3.poolmanager")?;
     let poolmanager_behavior = behavior_proof(py, &poolmanager_type)?;
     let proxy_manager_behavior = behavior_proof(py, &poolmanager_module.getattr("ProxyManager")?)?;
-    let socks_manager_behavior = behavior_proof(py, &adapters.getattr("SOCKSProxyManager")?)?;
+    let socks_manager = adapters.getattr("SOCKSProxyManager")?;
+    let socks_manager_behavior = behavior_proof(py, &socks_manager)?;
+    let http_pool_classes_by_scheme =
+        mapping_proof(&poolmanager_module.getattr("pool_classes_by_scheme")?)?;
+    let socks_pool_classes_by_scheme = socks_manager
+        .getattr("pool_classes_by_scheme")
+        .ok()
+        .map(|mapping| mapping_proof(&mapping))
+        .transpose()?;
+    let key_fn_by_scheme = mapping_proof(&poolmanager_module.getattr("key_fn_by_scheme")?)?;
     let prepared_getattribute = prepared_request_type.getattr("__getattribute__")?.unbind();
     let exception_globals = [
         "LocationValueError",
@@ -1116,6 +1128,9 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
         poolmanager_module: poolmanager_module.into_any().unbind(),
         proxy_manager_behavior,
         socks_manager_behavior,
+        http_pool_classes_by_scheme,
+        socks_pool_classes_by_scheme,
+        key_fn_by_scheme,
         methods,
         globals,
         send_globals: send_globals.unbind(),
@@ -1530,16 +1545,8 @@ fn native_send_input(
             path_url.extract::<String>()?
         }
     };
-    let proxy_configuration = ProxyManagerConfiguration {
-        pool_connections,
-        pool_maxsize,
-        pool_block,
-    };
-    let recovery = selected_proxy
-        .as_deref()
-        .map(|proxy| (proxy, proxy_configuration));
     if !adapter_identity_is_pristine(py, adapter, request)?
-        || !registered_adapter_pristine(py, adapter, recovery)?
+        || !registered_adapter_pristine(py, adapter)?
     {
         return Ok(Err("adapter identities changed during admission".to_owned()));
     }
@@ -1893,6 +1900,23 @@ fn canonical_manager_pool_configuration(
     )
 }
 
+fn canonical_routing_mapping_is_pristine(
+    py: Python<'_>,
+    current: &Bound<'_, PyAny>,
+    canonical: &MappingProof,
+) -> PyResult<bool> {
+    if !mapping_proof_is_pristine(py, canonical.mapping.bind(py), canonical)? {
+        return Ok(false);
+    }
+    let Ok(current) = current.cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    let Ok(canonical) = canonical.mapping.bind(py).cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    exact_dict_snapshot_is_current(canonical, current)
+}
+
 fn canonical_http_proxy_manager_is_pristine(
     py: Python<'_>,
     adapter: &Bound<'_, PyAny>,
@@ -1905,6 +1929,16 @@ fn canonical_http_proxy_manager_is_pristine(
         .get_type()
         .as_any()
         .is(state.proxy_manager_behavior.object.bind(py))
+        || !canonical_routing_mapping_is_pristine(
+            py,
+            &manager.getattr("pool_classes_by_scheme")?,
+            &state.http_pool_classes_by_scheme,
+        )?
+        || !canonical_routing_mapping_is_pristine(
+            py,
+            &manager.getattr("key_fn_by_scheme")?,
+            &state.key_fn_by_scheme,
+        )?
         || !canonical_manager_pool_configuration(manager, configuration)?
     {
         return Ok(false);
@@ -1997,10 +2031,23 @@ fn canonical_socks_proxy_manager_is_pristine(
     configuration: ProxyManagerConfiguration,
 ) -> PyResult<bool> {
     let state = adapter_state(py)?;
+    let Some(pool_classes_by_scheme) = &state.socks_pool_classes_by_scheme else {
+        return Ok(false);
+    };
     if !manager
         .get_type()
         .as_any()
         .is(state.socks_manager_behavior.object.bind(py))
+        || !canonical_routing_mapping_is_pristine(
+            py,
+            &manager.getattr("pool_classes_by_scheme")?,
+            pool_classes_by_scheme,
+        )?
+        || !canonical_routing_mapping_is_pristine(
+            py,
+            &manager.getattr("key_fn_by_scheme")?,
+            &state.key_fn_by_scheme,
+        )?
         || !manager.getattr("proxy_url")?.is(proxy_url)
         || !canonical_manager_pool_configuration(manager, configuration)?
     {
@@ -2198,11 +2245,7 @@ fn exact_dict_snapshot_is_current(
     Ok(true)
 }
 
-fn registered_adapter_pristine(
-    py: Python<'_>,
-    adapter: &Bound<'_, PyAny>,
-    recovery: Option<(&str, ProxyManagerConfiguration)>,
-) -> PyResult<bool> {
+fn registered_adapter_pristine(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<bool> {
     let identity = adapter_id(py, adapter)?;
     let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     for _ in 0..MANAGER_PROOF_ATTEMPTS {
@@ -2213,7 +2256,6 @@ fn registered_adapter_pristine(
             proxy_mapping,
             direct_manager,
             proxy_proofs,
-            recovery_realm,
         ) = {
             let table = registry
                 .lock()
@@ -2228,7 +2270,6 @@ fn registered_adapter_pristine(
                 Arc::clone(&entry.proxy_mapping),
                 entry.manager.clone(),
                 entry.proxy_managers.clone(),
-                recovery.is_some_and(|(url, _)| entry.proxy_pools.contains_key(url)),
             )
         };
         let pristine = (|| -> PyResult<Option<bool>> {
@@ -2242,40 +2283,20 @@ fn registered_adapter_pristine(
                 return Ok(Some(false));
             }
             let snapshot = proxy_managers.copy()?;
-            let maximum_managers = proxy_proofs.len() + usize::from(recovery_realm);
-            if snapshot.len() < proxy_proofs.len() || snapshot.len() > maximum_managers {
+            if snapshot.len() != proxy_proofs.len() {
                 return Ok(Some(false));
             }
-            let mut recovered = false;
             for (url, current) in snapshot.iter() {
                 if !url.is_exact_instance_of::<PyString>() {
                     return Ok(Some(false));
                 }
                 let url_text = url.extract::<String>()?;
-                if let Some(expected) = proxy_proofs.get(&url_text) {
-                    if !manager_proof_is_pristine(py, &current, expected)? {
-                        return Ok(Some(false));
-                    }
-                    continue;
-                }
-                let Some((recovery_url, configuration)) = recovery else {
+                let Some(expected) = proxy_proofs.get(&url_text) else {
                     return Ok(Some(false));
                 };
-                if recovered
-                    || !recovery_realm
-                    || url_text != recovery_url
-                    || !canonical_proxy_manager_is_pristine(
-                        py,
-                        adapter,
-                        &url,
-                        &current,
-                        configuration,
-                    )?
-                    || manager_proof(&current)?.is_none()
-                {
+                if !manager_proof_is_pristine(py, &current, expected)? {
                     return Ok(Some(false));
                 }
-                recovered = true;
             }
             if !manager_proof_is_pristine(py, &manager, &direct_manager)? {
                 return Ok(Some(false));
