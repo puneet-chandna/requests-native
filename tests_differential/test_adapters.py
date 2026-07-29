@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import urllib3
+from tests_differential.runner import run_oracle_case, run_rewrite_case
 from urllib3.util.retry import Retry
 
 import requests
@@ -1995,7 +1996,7 @@ def test_native_stream_read_timeout_maps_and_releases_pool_capacity():
         assert server.requests == 2
 
 
-def test_malformed_native_gzip_uses_public_requests_decode_graph_and_closes_raw():
+def test_malformed_native_gzip_uses_public_requests_decode_graph_until_close():
     with loopback(
         (200, {"Content-Encoding": "gzip"}, b"not-a-gzip-stream"),
     ) as (server, url):
@@ -2020,10 +2021,196 @@ def test_malformed_native_gzip_uses_public_requests_decode_graph_and_closes_raw(
             else:
                 assert inner.__cause__ is inner.args[1]
                 assert inner.__suppress_context__ is True
-            assert raw.closed is True
+            assert raw.closed is False
             response.close()
             assert raw.closed is True
         assert server.requests == 1
+
+
+_MALFORMED_GZIP_LIFECYCLE_CASE = r"""
+import os
+import threading
+from contextlib import nullcontext
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import requests
+import urllib3
+from requests.adapters import HTTPAdapter
+from requests.models import PreparedRequest
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        with self.server.lock:
+            self.server.requests += 1
+            encoding, body = self.server.responses.pop(0)
+        self.send_response(200)
+        self.send_header("Content-Encoding", encoding)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def log_message(self, format, *args):
+        pass
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+server.requests = 0
+server.responses = [
+    ("gzip", b"not-a-gzip-stream"),
+    ("identity", b"second"),
+    ("gzip", b"not-a-gzip-stream"),
+]
+server.lock = threading.Lock()
+server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+server_thread.start()
+url = f"http://127.0.0.1:{server.server_port}/resource"
+
+
+def prepared():
+    request = PreparedRequest()
+    request.prepare(method="GET", url=url)
+    return request
+
+
+if os.environ.get("REQUESTS_DIFFERENTIAL_TARGET") == "rewrite":
+    from requests.adapters import _rust_adapter_trial
+
+    def trial():
+        return _rust_adapter_trial()
+else:
+
+    def trial():
+        return nullcontext()
+
+
+adapter = HTTPAdapter(pool_maxsize=1, pool_block=True)
+with trial():
+    response = adapter.send(prepared(), stream=True)
+    raw = response.raw
+    try:
+        list(response.iter_content(3))
+    except requests.exceptions.ContentDecodingError as error:
+        inner = error.args[0]
+        graph_matches = (
+            type(inner) is urllib3.exceptions.DecodeError
+            and len(inner.args) == 2
+            and inner.args[0]
+            == "Received response with content-encoding: gzip, but failed to decode it."
+            and type(inner.args[1]).__module__ == "zlib"
+            and type(inner.args[1]).__name__ == "error"
+            and error.__context__ is inner
+            and inner.__context__ is inner.args[1]
+        )
+        first_error = type(error).__name__
+    else:
+        graph_matches = False
+        first_error = None
+
+    closed_after_error = raw.closed
+    second = {}
+    second_started = threading.Event()
+    second_finished = threading.Event()
+
+    def send_second():
+        second_started.set()
+        try:
+            with trial():
+                other = adapter.send(prepared(), stream=True)
+                second["content"] = other.content.decode("ascii")
+                other.close()
+        except BaseException as error:
+            second["error"] = type(error).__name__
+        finally:
+            second_finished.set()
+
+    second_thread = threading.Thread(target=send_second)
+    second_thread.start()
+    second_started.wait(1)
+    completed_before_close = second_finished.wait(0.2)
+    requests_before_close = server.requests
+    response.close()
+    closed_after_close = raw.closed
+    second_finished_after_close = second_finished.wait(3)
+    second_thread.join(3)
+
+repeat_adapter = HTTPAdapter(pool_maxsize=1, pool_block=True)
+with trial():
+    repeated = repeat_adapter.send(prepared(), stream=True)
+    repeated_raw = repeated.raw
+    try:
+        next(repeated.iter_content(3))
+    except requests.exceptions.ContentDecodingError:
+        repeat_first_error = "ContentDecodingError"
+    else:
+        repeat_first_error = None
+    repeat_closed_after_error = repeated_raw.closed
+    try:
+        next(repeated.iter_content(3))
+    except StopIteration:
+        repeat_second_read = "StopIteration"
+    except BaseException as error:
+        repeat_second_read = type(error).__name__
+    else:
+        repeat_second_read = "value"
+    repeat_closed_after_read = repeated_raw.closed
+    repeated.close()
+    repeated.close()
+    repeat_closed_after_close = repeated_raw.closed
+
+side_effects.append(
+    {
+        "first_error": first_error,
+        "graph_matches": graph_matches,
+        "closed_after_error": closed_after_error,
+        "completed_before_close": completed_before_close,
+        "requests_before_close": requests_before_close,
+        "closed_after_close": closed_after_close,
+        "second_finished_after_close": second_finished_after_close,
+        "second_thread_alive": second_thread.is_alive(),
+        "second": second,
+        "requests_after_close": server.requests,
+        "repeat_first_error": repeat_first_error,
+        "repeat_closed_after_error": repeat_closed_after_error,
+        "repeat_second_read": repeat_second_read,
+        "repeat_closed_after_read": repeat_closed_after_read,
+        "repeat_closed_after_close": repeat_closed_after_close,
+    }
+)
+server.shutdown()
+server.server_close()
+server_thread.join(3)
+result = None
+"""
+
+
+def test_malformed_gzip_lifecycle_and_blocking_pool_match_frozen_oracle():
+    case = {"source": _MALFORMED_GZIP_LIFECYCLE_CASE}
+    oracle = run_oracle_case(case)
+    rewrite = run_rewrite_case(case)
+    expected = {
+        "first_error": "ContentDecodingError",
+        "graph_matches": True,
+        "closed_after_error": False,
+        "completed_before_close": False,
+        "requests_before_close": 1,
+        "closed_after_close": True,
+        "second_finished_after_close": True,
+        "second_thread_alive": False,
+        "second": {"content": "second"},
+        "requests_after_close": 3,
+        "repeat_first_error": "ContentDecodingError",
+        "repeat_closed_after_error": False,
+        "repeat_second_read": "StopIteration",
+        "repeat_closed_after_read": True,
+        "repeat_closed_after_close": True,
+    }
+    assert oracle.observations["exception"] is None
+    assert oracle.observations["side_effects"] == [expected]
+    assert rewrite.observations == oracle.observations
 
 
 def test_connection_refused_retains_max_retry_new_connection_graph():
@@ -2224,6 +2411,164 @@ def test_manager_entry_is_hard_native_commit_point(monkeypatch, route):
                 assert len(adapter.proxy_manager) == 1
     finally:
         adapters.ConnectionError = original_target
+
+
+_MANAGER_REFRESH_REENTRANCY_CASE = r"""
+import os
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import requests
+from requests.adapters import HTTPAdapter, _rust_adapter_trial
+from requests.models import PreparedRequest
+from urllib3 import PoolManager
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        with self.server.lock:
+            self.server.requests += 1
+            body = self.server.responses.pop(0)
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def log_message(self, format, *args):
+        pass
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+server.requests = 0
+server.responses = [b"first", b"restored"]
+server.lock = threading.Lock()
+server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+server_thread.start()
+url = f"http://127.0.0.1:{server.server_port}/resource"
+proxy_root = url.rsplit("/", 1)[0]
+route = ROUTE
+
+
+def prepared():
+    request = PreparedRequest()
+    request.prepare(
+        method="GET",
+        url=url if route == "direct" else "http://origin.example/resource",
+    )
+    return request
+
+
+adapter = HTTPAdapter()
+target_code = (
+    PoolManager.connection_from_pool_key.__code__
+    if route == "direct"
+    else HTTPAdapter.proxy_manager_for.__code__
+)
+original_getattribute = PoolManager.__dict__.get("__getattribute__")
+manager_entries = 0
+reentries = 0
+armed = False
+
+
+def reentrant_getattribute(self, name):
+    global reentries
+    if name == "pools":
+        reentries += 1
+        print("REENTERED_WHILE_REFRESHING", flush=True)
+        requests._requests_rust._adapter_pool_side_table_trial()
+    if original_getattribute is None:
+        return object.__getattribute__(self, name)
+    return original_getattribute(self, name)
+
+
+def trace(frame, event, arg):
+    global armed, manager_entries
+    if event == "call" and frame.f_code is target_code:
+        manager_entries += 1
+        if not armed:
+            armed = True
+            PoolManager.__getattribute__ = reentrant_getattribute
+    return trace
+
+
+kwargs = {} if route == "direct" else {"proxies": {"http": proxy_root}}
+sys.settrace(trace)
+try:
+    with _rust_adapter_trial():
+        response = adapter.send(prepared(), stream=True, **kwargs)
+finally:
+    sys.settrace(None)
+
+first_native = type(response.raw).__module__ == "requests._requests_rust"
+requests_after_first = server.requests
+visible_effects = (
+    len(adapter.poolmanager.pools)
+    if route == "direct"
+    else len(adapter.proxy_manager)
+)
+response.close()
+adapter.close()
+
+if original_getattribute is None:
+    del PoolManager.__getattribute__
+else:
+    PoolManager.__getattribute__ = original_getattribute
+restored = PoolManager.__dict__.get("__getattribute__") is original_getattribute
+
+restored_adapter = HTTPAdapter()
+with _rust_adapter_trial():
+    restored_response = restored_adapter.send(prepared(), stream=True, **kwargs)
+restored_native = (
+    type(restored_response.raw).__module__ == "requests._requests_rust"
+)
+restored_content = restored_response.content.decode("ascii")
+restored_response.close()
+restored_adapter.close()
+
+side_effects.append(
+    {
+        "route": route,
+        "manager_entries": manager_entries,
+        "reentries": reentries,
+        "first_native": first_native,
+        "requests_after_first": requests_after_first,
+        "visible_effects": visible_effects,
+        "restored": restored,
+        "restored_native": restored_native,
+        "restored_content": restored_content,
+        "requests_after_restored": server.requests,
+    }
+)
+server.shutdown()
+server.server_close()
+server_thread.join(3)
+result = None
+"""
+
+
+@pytest.mark.parametrize("route", ["direct", "proxy"])
+def test_manager_refresh_reentrancy_never_holds_adapter_registry_lock(
+    monkeypatch, route
+):
+    monkeypatch.setenv("REQUESTS_DIFFERENTIAL_TIMEOUT", "2")
+    source = _MANAGER_REFRESH_REENTRANCY_CASE.replace("ROUTE", repr(route), 1)
+    rewrite = run_rewrite_case({"source": source})
+    assert rewrite.observations["exception"] is None
+    [observed] = rewrite.observations["side_effects"]
+    assert observed["route"] == route
+    assert observed["manager_entries"] == 1
+    assert observed["reentries"] >= 1
+    assert observed["first_native"] is True
+    assert observed["requests_after_first"] == 1
+    assert observed["visible_effects"] == 1
+    assert observed["restored"] is True
+    assert observed["restored_native"] is True
+    assert observed["restored_content"] == "restored"
+    assert observed["requests_after_restored"] == 2
 
 
 def test_real_tls_handshake_failure_uses_adapter_ssl_handler():

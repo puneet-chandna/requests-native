@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -86,13 +87,12 @@ struct AdapterGlobalProof {
 static ADAPTER_STATE: PyOnceLock<AdapterState> = PyOnceLock::new();
 
 struct SideEntry {
-    weak_adapter: Py<PyAny>,
-    poolmanager: Py<PyAny>,
-    manager_proof: ManagerProof,
-    visible_pool_count: usize,
+    generation: u64,
+    weak_adapter: Arc<Py<PyAny>>,
+    manager: ManagerRecord,
     direct_pools: PoolRealm,
     proxy_pools: HashMap<String, PoolRealm>,
-    proxy_managers: HashMap<String, ManagerProof>,
+    proxy_managers: HashMap<String, ManagerRecord>,
 }
 
 #[derive(Default)]
@@ -168,12 +168,29 @@ struct ManagerProof {
     objects: DictProof,
     mappings: Vec<(String, MappingProof)>,
     pools_behavior: BehaviorProof,
+}
+
+struct ManagerPoolsProof {
     pools_dict: DictProof,
     pool_container: MappingProof,
     visible_pools: Vec<(Py<PyAny>, Py<PyAny>)>,
+    visible_pool_count: usize,
+}
+
+#[derive(Clone)]
+struct ManagerRecord {
+    proof: Arc<ManagerProof>,
+    pools: Arc<ManagerPoolsProof>,
+}
+
+struct AdapterPoolSelection {
+    pool: Arc<AdapterPool>,
+    identity: usize,
+    generation: u64,
 }
 
 static ADAPTER_POOLS: OnceLock<Mutex<HashMap<usize, SideEntry>>> = OnceLock::new();
+static NEXT_ADAPTER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[pyclass(module = "requests._requests_rust", unsendable)]
 struct NativeAdapterRaw {
@@ -185,6 +202,7 @@ struct NativeAdapterRaw {
     decoded_offset: usize,
     decoder_eof: bool,
     decode_started: bool,
+    decode_failed: bool,
     status: u16,
     reason: String,
     headers: Py<PyAny>,
@@ -1552,7 +1570,22 @@ fn manager_pool_count(manager: &Bound<'_, PyAny>) -> PyResult<usize> {
     manager.getattr("pools")?.len()
 }
 
-fn manager_proof(manager: &Bound<'_, PyAny>) -> PyResult<ManagerProof> {
+fn next_adapter_generation() -> u64 {
+    NEXT_ADAPTER_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+fn manager_pools_proof(manager: &Bound<'_, PyAny>) -> PyResult<ManagerPoolsProof> {
+    let py = manager.py();
+    let pools = manager.getattr("pools")?;
+    Ok(ManagerPoolsProof {
+        pools_dict: dict_proof(py, &pools.getattr("__dict__")?)?,
+        pool_container: mapping_proof(&pools.getattr("_container")?)?,
+        visible_pools: visible_pools(manager)?,
+        visible_pool_count: pools.len()?,
+    })
+}
+
+fn manager_proof(manager: &Bound<'_, PyAny>) -> PyResult<ManagerRecord> {
     let py = manager.py();
     let mut mappings = Vec::new();
     for name in [
@@ -1567,16 +1600,16 @@ fn manager_proof(manager: &Bound<'_, PyAny>) -> PyResult<ManagerProof> {
         }
     }
     let pools = manager.getattr("pools")?;
-    Ok(ManagerProof {
-        manager: manager.clone().unbind(),
-        manager_type: manager.get_type().into_any().unbind(),
-        class_behavior: behavior_proof(py, manager.get_type().as_any())?,
-        objects: dict_proof(py, &manager.getattr("__dict__")?)?,
-        mappings,
-        pools_behavior: behavior_proof(py, pools.get_type().as_any())?,
-        pools_dict: dict_proof(py, &pools.getattr("__dict__")?)?,
-        pool_container: mapping_proof(&pools.getattr("_container")?)?,
-        visible_pools: visible_pools(manager)?,
+    Ok(ManagerRecord {
+        proof: Arc::new(ManagerProof {
+            manager: manager.clone().unbind(),
+            manager_type: manager.get_type().into_any().unbind(),
+            class_behavior: behavior_proof(py, manager.get_type().as_any())?,
+            objects: dict_proof(py, &manager.getattr("__dict__")?)?,
+            mappings,
+            pools_behavior: behavior_proof(py, pools.get_type().as_any())?,
+        }),
+        pools: Arc::new(manager_pools_proof(manager)?),
     })
 }
 
@@ -1654,8 +1687,9 @@ fn mapping_proof_is_pristine(
 fn manager_proof_is_pristine(
     py: Python<'_>,
     manager: &Bound<'_, PyAny>,
-    proof: &ManagerProof,
+    record: &ManagerRecord,
 ) -> PyResult<bool> {
+    let proof = record.proof.as_ref();
     if !manager.is(proof.manager.bind(py))
         || !manager.get_type().as_any().is(proof.manager_type.bind(py))
         || !behavior_proof_is_pristine(py, manager.get_type().as_any(), &proof.class_behavior)?
@@ -1670,14 +1704,18 @@ fn manager_proof_is_pristine(
     }
     let pools = manager.getattr("pools")?;
     if !behavior_proof_is_pristine(py, pools.get_type().as_any(), &proof.pools_behavior)?
-        || !dict_proof_is_pristine(py, &pools.getattr("__dict__")?, &proof.pools_dict)?
-        || !mapping_proof_is_pristine(py, &pools.getattr("_container")?, &proof.pool_container)?
+        || !dict_proof_is_pristine(py, &pools.getattr("__dict__")?, &record.pools.pools_dict)?
+        || !mapping_proof_is_pristine(
+            py,
+            &pools.getattr("_container")?,
+            &record.pools.pool_container,
+        )?
     {
         return Ok(false);
     }
     let pools = visible_pools(manager)?;
-    Ok(pools.len() == proof.visible_pools.len()
-        && pools.iter().zip(&proof.visible_pools).all(
+    Ok(pools.len() == record.pools.visible_pools.len()
+        && pools.iter().zip(&record.pools.visible_pools).all(
             |((key, value), (expected_key, expected_value))| {
                 key.bind(py).is(expected_key.bind(py)) && value.bind(py).is(expected_value.bind(py))
             },
@@ -1696,15 +1734,6 @@ fn visible_pools(manager: &Bound<'_, PyAny>) -> PyResult<Vec<(Py<PyAny>, Py<PyAn
             Ok((pair.get_item(0)?.unbind(), pair.get_item(1)?.unbind()))
         })
         .collect()
-}
-
-fn refresh_manager_pools(py: Python<'_>, proof: &mut ManagerProof) -> PyResult<()> {
-    let manager = proof.manager.bind(py);
-    let pools = manager.getattr("pools")?;
-    proof.pools_dict = dict_proof(py, &pools.getattr("__dict__")?)?;
-    proof.pool_container = mapping_proof(&pools.getattr("_container")?)?;
-    proof.visible_pools = visible_pools(manager)?;
-    Ok(())
 }
 
 fn manager_identity_is_pristine(py: Python<'_>, manager: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -1764,22 +1793,30 @@ fn manager_configuration_is_pristine(
 fn registered_adapter_pristine(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<bool> {
     let identity = adapter_id(py, adapter)?;
     let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    let table = table
-        .lock()
-        .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
-    let Some(entry) = table.get(&identity) else {
-        return Ok(false);
+    let (generation, weak_adapter, manager_proof, proxy_proofs) = {
+        let table = table
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+        let Some(entry) = table.get(&identity) else {
+            return Ok(false);
+        };
+        (
+            entry.generation,
+            Arc::clone(&entry.weak_adapter),
+            entry.manager.clone(),
+            entry.proxy_managers.clone(),
+        )
     };
-    let referent = entry.weak_adapter.bind(py).call0()?;
+    let referent = weak_adapter.bind(py).call0()?;
     let manager = adapter.getattr("poolmanager")?;
     let proxy_managers = adapter.getattr("proxy_manager")?;
     let Ok(proxy_managers) = proxy_managers.cast::<PyDict>() else {
         return Ok(false);
     };
-    if proxy_managers.len() != entry.proxy_managers.len() {
+    if proxy_managers.len() != proxy_proofs.len() {
         return Ok(false);
     }
-    for (url, expected) in &entry.proxy_managers {
+    for (url, expected) in &proxy_proofs {
         let Some(current) = proxy_managers.get_item(url)? else {
             return Ok(false);
         };
@@ -1787,14 +1824,23 @@ fn registered_adapter_pristine(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> Py
             return Ok(false);
         }
     }
-    if !manager_proof_is_pristine(py, &manager, &entry.manager_proof)? {
+    if !manager_proof_is_pristine(py, &manager, &manager_proof)? {
         return Ok(false);
     }
-    Ok(referent.is(adapter)
-        && entry.poolmanager.bind(py).is(&manager)
+    if !(referent.is(adapter)
+        && manager_proof.proof.manager.bind(py).is(&manager)
         && manager_identity_is_pristine(py, &manager)?
         && manager_configuration_is_pristine(adapter, &manager)?
-        && manager_pool_count(&manager)? == entry.visible_pool_count)
+        && manager_pool_count(&manager)? == manager_proof.pools.visible_pool_count)
+    {
+        return Ok(false);
+    }
+    let table = table
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+    Ok(table
+        .get(&identity)
+        .is_some_and(|entry| entry.generation == generation))
 }
 
 #[pyfunction]
@@ -1821,27 +1867,28 @@ fn _adapter_register_trial(
     if !proxy_managers.is_exact_instance_of::<PyDict>() || !proxy_managers.is_empty()? {
         return Ok(false);
     }
-    let visible_pool_count = manager_pool_count(&manager)?;
     let weak_adapter = PyModule::import(py, "weakref")?
         .getattr("ref")?
         .call1((adapter, callback))?
         .unbind();
+    let manager_proof = manager_proof(&manager)?;
     let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut table = table
         .lock()
         .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
-    if let Some(previous) = table.insert(
+    let previous = table.insert(
         identity,
         SideEntry {
-            weak_adapter,
-            poolmanager: manager.clone().unbind(),
-            manager_proof: manager_proof(&manager)?,
-            visible_pool_count,
+            generation: next_adapter_generation(),
+            weak_adapter: Arc::new(weak_adapter),
+            manager: manager_proof,
             direct_pools: PoolRealm::default(),
             proxy_pools: HashMap::new(),
             proxy_managers: HashMap::new(),
         },
-    ) {
+    );
+    drop(table);
+    if let Some(previous) = previous {
         clear_realms(previous);
     }
     Ok(true)
@@ -1851,6 +1898,7 @@ fn record_visible_proxy_manager(
     py: Python<'_>,
     adapter: &Bound<'_, PyAny>,
     proxy_url: &str,
+    expected_generation: u64,
 ) -> PyResult<bool> {
     let proxy_managers = adapter.getattr("proxy_manager")?;
     let Ok(proxy_managers) = proxy_managers.cast::<PyDict>() else {
@@ -1860,6 +1908,8 @@ fn record_visible_proxy_manager(
         return Ok(false);
     };
     let identity = adapter_id(py, adapter)?;
+    let visible_manager_count = proxy_managers.len();
+    let manager_proof = manager_proof(&manager)?;
     let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut table = table
         .lock()
@@ -1867,22 +1917,48 @@ fn record_visible_proxy_manager(
     let Some(entry) = table.get_mut(&identity) else {
         return Ok(false);
     };
-    match entry.proxy_managers.get(proxy_url) {
-        Some(expected) if manager.is(expected.manager.bind(py)) => {
-            entry
-                .proxy_managers
-                .insert(proxy_url.to_owned(), manager_proof(&manager)?);
-            Ok(true)
-        }
-        Some(_) => Ok(false),
-        None if proxy_managers.len() == entry.proxy_managers.len() + 1 => {
-            entry
-                .proxy_managers
-                .insert(proxy_url.to_owned(), manager_proof(&manager)?);
-            Ok(true)
-        }
-        None => Ok(false),
+    if entry.generation != expected_generation {
+        return Ok(false);
     }
+    let eligible = match entry.proxy_managers.get(proxy_url) {
+        Some(expected) => expected.proof.manager.as_ptr() == manager.as_ptr(),
+        None => visible_manager_count == entry.proxy_managers.len() + 1,
+    };
+    if !eligible {
+        return Ok(false);
+    }
+    let previous = entry
+        .proxy_managers
+        .insert(proxy_url.to_owned(), manager_proof);
+    entry.generation = next_adapter_generation();
+    drop(table);
+    drop(previous);
+    Ok(true)
+}
+
+fn record_visible_direct_manager(
+    identity: usize,
+    expected_generation: u64,
+    manager: &Bound<'_, PyAny>,
+    pools: Arc<ManagerPoolsProof>,
+) -> PyResult<bool> {
+    let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut table = registry
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+    let Some(entry) = table.get_mut(&identity) else {
+        return Ok(false);
+    };
+    if entry.generation != expected_generation
+        || entry.manager.proof.manager.as_ptr() != manager.as_ptr()
+    {
+        return Ok(false);
+    }
+    let previous = std::mem::replace(&mut entry.manager.pools, pools);
+    entry.generation = next_adapter_generation();
+    drop(table);
+    drop(previous);
+    Ok(true)
 }
 
 #[pyfunction]
@@ -1895,6 +1971,7 @@ fn _adapter_drop_trial(identity: usize) -> PyResult<usize> {
         return Ok(0);
     };
     let count = realm_pool_count(&entry);
+    drop(table);
     clear_realms(entry);
     Ok(count)
 }
@@ -1909,25 +1986,51 @@ fn realm_pool_count(entry: &SideEntry) -> usize {
 }
 
 fn clear_realms(entry: SideEntry) {
-    for pool in entry.direct_pools.pools.values() {
-        pool.clear();
-    }
-    for realm in entry.proxy_pools.values() {
-        for pool in realm.pools.values() {
-            pool.clear();
-        }
+    clear_realm(entry.direct_pools);
+    for realm in entry.proxy_pools.into_values() {
+        clear_realm(realm);
     }
 }
 
-fn reap_adapter_pools(py: Python<'_>, table: &mut HashMap<usize, SideEntry>) -> PyResult<()> {
+fn clear_realm(realm: PoolRealm) {
+    for pool in realm.pools.values() {
+        pool.clear();
+    }
+}
+
+fn reap_adapter_pools(py: Python<'_>) -> PyResult<()> {
+    let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let candidates = {
+        let table = registry
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+        table
+            .iter()
+            .map(|(identity, entry)| (*identity, entry.generation, Arc::clone(&entry.weak_adapter)))
+            .collect::<Vec<_>>()
+    };
     let mut dead = Vec::new();
-    for (identity, entry) in table.iter() {
-        if entry.weak_adapter.bind(py).call0()?.is_none() {
-            dead.push(*identity);
+    for (identity, generation, weak_adapter) in candidates {
+        if weak_adapter.bind(py).call0()?.is_none() {
+            dead.push((identity, generation));
         }
     }
-    for identity in dead {
-        table.remove(&identity);
+    let mut removed = Vec::new();
+    let mut table = registry
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+    for (identity, generation) in dead {
+        if table
+            .get(&identity)
+            .is_some_and(|entry| entry.generation == generation)
+            && let Some(entry) = table.remove(&identity)
+        {
+            removed.push(entry);
+        }
+    }
+    drop(table);
+    for entry in removed {
+        clear_realms(entry);
     }
     Ok(())
 }
@@ -1936,30 +2039,39 @@ fn adapter_pool(
     py: Python<'_>,
     adapter: &Bound<'_, PyAny>,
     input: &NativeSendInput,
-) -> PyResult<Result<Arc<AdapterPool>, String>> {
+) -> PyResult<Result<AdapterPoolSelection, String>> {
+    reap_adapter_pools(py)?;
     let identity = adapter_id(py, adapter)?;
-    let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut table = table
-        .lock()
-        .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
-    reap_adapter_pools(py, &mut table)?;
-    if let Some(entry) = table.get_mut(&identity) {
-        let referent = entry.weak_adapter.bind(py).call0()?;
-        let poolmanager = adapter.getattr("poolmanager")?;
-        if !referent.is(adapter) || !entry.poolmanager.bind(py).is(&poolmanager) {
-            return Ok(Err("visible pool manager identity changed".to_owned()));
-        }
-        let realm = match input.selected_proxy.as_deref() {
-            Some(proxy) => entry.proxy_pools.entry(proxy.to_owned()).or_default(),
-            None => &mut entry.direct_pools,
+    let poolmanager = adapter.getattr("poolmanager")?;
+    let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let (generation, weak_adapter, manager_address, has_pool) = {
+        let table = registry
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+        let Some(entry) = table.get(&identity) else {
+            return Ok(Err(
+                "adapter was not registered at initialization".to_owned()
+            ));
         };
-        if let Some(pool) = realm.pools.get(&input.pool_key) {
-            let pool = Arc::clone(pool);
-            realm.order.retain(|key| key != &input.pool_key);
-            realm.order.push_back(input.pool_key.clone());
-            return Ok(Ok(pool));
-        }
-        let pool = Arc::new(
+        let realm = match input.selected_proxy.as_deref() {
+            Some(proxy) => entry.proxy_pools.get(proxy),
+            None => Some(&entry.direct_pools),
+        };
+        (
+            entry.generation,
+            Arc::clone(&entry.weak_adapter),
+            entry.manager.proof.manager.as_ptr(),
+            realm.is_some_and(|realm| realm.pools.contains_key(&input.pool_key)),
+        )
+    };
+    let referent = weak_adapter.bind(py).call0()?;
+    if !referent.is(adapter) || manager_address != poolmanager.as_ptr() {
+        return Ok(Err("visible pool manager identity changed".to_owned()));
+    }
+    let candidate = if has_pool {
+        None
+    } else {
+        Some(Arc::new(
             AdapterPool::new(
                 input.pool_maxsize,
                 input.pool_block,
@@ -1968,26 +2080,58 @@ fn adapter_pool(
                 input.timeout,
             )
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
-        );
+        ))
+    };
+    let mut evicted = Vec::new();
+    let mut table = registry
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+    let Some(entry) = table.get_mut(&identity) else {
+        return Ok(Err(
+            "adapter pool state disappeared during admission".to_owned()
+        ));
+    };
+    if entry.generation != generation || entry.manager.proof.manager.as_ptr() != manager_address {
+        return Ok(Err("adapter pool state changed during admission".to_owned()));
+    }
+    let realm = match input.selected_proxy.as_deref() {
+        Some(proxy) => entry.proxy_pools.entry(proxy.to_owned()).or_default(),
+        None => &mut entry.direct_pools,
+    };
+    let pool = if let Some(pool) = realm.pools.get(&input.pool_key) {
+        Arc::clone(pool)
+    } else {
+        let pool = candidate.expect("missing adapter pool candidate");
         while realm.pools.len() >= input.pool_connections && input.pool_connections > 0 {
             let Some(evicted_key) = realm.order.pop_front() else {
                 break;
             };
-            if let Some(evicted) = realm.pools.remove(&evicted_key) {
-                evicted.clear();
+            if let Some(pool) = realm.pools.remove(&evicted_key) {
+                evicted.push(pool);
             }
         }
         if input.pool_connections > 0 {
             realm
                 .pools
                 .insert(input.pool_key.clone(), Arc::clone(&pool));
-            realm.order.push_back(input.pool_key.clone());
         }
-        return Ok(Ok(pool));
+        pool
+    };
+    realm.order.retain(|key| key != &input.pool_key);
+    if input.pool_connections > 0 {
+        realm.order.push_back(input.pool_key.clone());
     }
-    Ok(Err(
-        "adapter was not registered at initialization".to_owned()
-    ))
+    entry.generation = next_adapter_generation();
+    let generation = entry.generation;
+    drop(table);
+    for pool in evicted {
+        pool.clear();
+    }
+    Ok(Ok(AdapterPoolSelection {
+        pool,
+        identity,
+        generation,
+    }))
 }
 
 fn core_history(snapshot: &[HistorySnapshot]) -> Vec<RetryHistory> {
@@ -2441,6 +2585,7 @@ fn build_python_response(
             decoded_offset: 0,
             decoder_eof: false,
             decode_started: false,
+            decode_failed: false,
             status,
             reason,
             headers,
@@ -2475,35 +2620,34 @@ fn _adapter_send_trial(
     // The native side table and pool must be usable before the first
     // manager/cache callback. From manager entry onward the send is committed
     // and must never replay through retained Python.
-    let pool = match adapter_pool(py, adapter, &input)? {
-        Ok(pool) => pool,
+    let selection = match adapter_pool(py, adapter, &input)? {
+        Ok(selection) => selection,
         Err(_) => return Ok(py.NotImplemented()),
     };
+    let pool = Arc::clone(&selection.pool);
     let python_pool = if let Some(proxy) = &input.selected_proxy {
         let manager = adapter.call_method1("proxy_manager_for", (proxy,))?;
         let python_pool = manager.call_method1("connection_from_url", (&input.url,))?;
-        if !record_visible_proxy_manager(py, adapter, proxy)? {
+        if !record_visible_proxy_manager(py, adapter, proxy, selection.generation)? {
             return Err(PyRuntimeError::new_err(
                 "proxy manager state changed after native send commitment",
             ));
         }
         python_pool
     } else {
-        let python_pool = adapter
-            .getattr("poolmanager")?
-            .call_method1("connection_from_url", (&input.url,))?;
-        let identity = adapter_id(py, adapter)?;
-        let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut table = table
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
-        let Some(entry) = table.get_mut(&identity) else {
+        let manager = adapter.getattr("poolmanager")?;
+        let python_pool = manager.call_method1("connection_from_url", (&input.url,))?;
+        let pools = Arc::new(manager_pools_proof(&manager)?);
+        if !record_visible_direct_manager(
+            selection.identity,
+            selection.generation,
+            &manager,
+            pools,
+        )? {
             return Err(PyRuntimeError::new_err(
-                "adapter pool state disappeared after native send commitment",
+                "adapter pool state changed after native send commitment",
             ));
-        };
-        entry.visible_pool_count = manager_pool_count(entry.poolmanager.bind(py))?;
-        refresh_manager_pools(py, &mut entry.manager_proof)?;
+        }
         python_pool
     };
     let retry_object = adapter.getattr("max_retries")?;
@@ -2614,29 +2758,70 @@ fn _adapter_close_trial(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<
         return Ok(0);
     }
     let identity = adapter_id(py, adapter)?;
-    let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut table = table
+    reap_adapter_pools(py)?;
+    let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let (generation, manager, proxy_managers) = {
+        let table = registry
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+        let Some(entry) = table.get(&identity) else {
+            return Ok(0);
+        };
+        (
+            entry.generation,
+            entry.manager.clone(),
+            entry.proxy_managers.clone(),
+        )
+    };
+    let manager_pools = Arc::new(manager_pools_proof(manager.proof.manager.bind(py))?);
+    let proxy_pools = proxy_managers
+        .iter()
+        .map(|(url, manager)| {
+            Ok((
+                url.clone(),
+                manager.proof.manager.as_ptr(),
+                Arc::new(manager_pools_proof(manager.proof.manager.bind(py))?),
+            ))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let mut table = registry
         .lock()
         .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
-    reap_adapter_pools(py, &mut table)?;
     let Some(entry) = table.get_mut(&identity) else {
         return Ok(0);
     };
+    if entry.generation != generation
+        || entry.manager.proof.manager.as_ptr() != manager.proof.manager.as_ptr()
+        || entry.proxy_managers.len() != proxy_pools.len()
+        || proxy_pools.iter().any(|(url, address, _)| {
+            entry
+                .proxy_managers
+                .get(url)
+                .is_none_or(|manager| manager.proof.manager.as_ptr() != *address)
+        })
+    {
+        return Err(PyRuntimeError::new_err(
+            "adapter pool state changed while closing",
+        ));
+    }
     let count = realm_pool_count(entry);
-    for pool in entry.direct_pools.pools.values() {
-        pool.clear();
+    let direct_pools = std::mem::take(&mut entry.direct_pools);
+    let proxy_realms = std::mem::take(&mut entry.proxy_pools);
+    let mut previous_proofs = vec![std::mem::replace(&mut entry.manager.pools, manager_pools)];
+    for (url, _, pools) in proxy_pools {
+        let manager = entry
+            .proxy_managers
+            .get_mut(&url)
+            .expect("validated proxy manager disappeared");
+        previous_proofs.push(std::mem::replace(&mut manager.pools, pools));
     }
-    entry.direct_pools.pools.clear();
-    entry.direct_pools.order.clear();
-    for realm in entry.proxy_pools.values_mut() {
-        for pool in realm.pools.values() {
-            pool.clear();
-        }
-        realm.pools.clear();
-        realm.order.clear();
+    entry.generation = next_adapter_generation();
+    drop(table);
+    drop(previous_proofs);
+    clear_realm(direct_pools);
+    for realm in proxy_realms.into_values() {
+        clear_realm(realm);
     }
-    entry.visible_pool_count = manager_pool_count(entry.poolmanager.bind(py))?;
-    refresh_manager_pools(py, &mut entry.manager_proof)?;
     Ok(count)
 }
 
@@ -2691,7 +2876,7 @@ impl NativeAdapterRaw {
             .as_deref()
             .unwrap_or("")
             .to_ascii_lowercase();
-        self.finish_body_failure();
+        self.decode_failed = true;
         map_decoder_error(py, &encoding, error)
     }
 
@@ -2779,6 +2964,10 @@ impl NativeAdapterRaw {
             wire.truncate(read);
             if read == 0 && !has_tail {
                 self.body = None;
+                if self.decode_failed {
+                    self.decoder_eof = true;
+                    break;
+                }
                 if let Some(decoder) = decoder {
                     let tail =
                         self.decode_result(py, Self::decompress(decoder.bind(py), py, b"", -1))?;
