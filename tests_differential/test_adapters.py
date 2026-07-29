@@ -2571,6 +2571,282 @@ def test_manager_refresh_reentrancy_never_holds_adapter_registry_lock(
     assert observed["requests_after_restored"] == 2
 
 
+_CONCURRENT_ADAPTER_ADMISSION_CASE = r"""
+import os
+import threading
+from contextlib import nullcontext
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import requests
+from requests import adapters
+from requests.adapters import HTTPAdapter
+from requests.models import PreparedRequest
+from urllib3 import PoolManager
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        with self.server.lock:
+            self.server.requests += 1
+            body = self.server.responses.pop(0)
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_server(*responses):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.requests = 0
+    server.responses = list(responses)
+    server.lock = threading.Lock()
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    return server, worker, f"http://127.0.0.1:{server.server_port}/resource"
+
+
+servers = [
+    start_server(b"first-0", b"restored"),
+    start_server(b"first-1"),
+]
+route = ROUTE
+mixed = MIXED
+adapter = HTTPAdapter()
+fallback_calls = 0
+
+if os.environ.get("REQUESTS_DIFFERENTIAL_TARGET") == "rewrite":
+    from requests.adapters import _rust_adapter_trial
+
+    def trial(index):
+        return nullcontext() if mixed and index == 1 else _rust_adapter_trial()
+
+    original_compat_send = adapters._HTTP_ADAPTER_COMPAT_SEND
+
+    def counted_compat_send(*args, **kwargs):
+        global fallback_calls
+        fallback_calls += 1
+        return original_compat_send(*args, **kwargs)
+
+    adapters._HTTP_ADAPTER_COMPAT_SEND = counted_compat_send
+else:
+
+    def trial(index):
+        return nullcontext()
+
+
+def prepared(index):
+    request = PreparedRequest()
+    request.prepare(
+        method="GET",
+        url=(
+            servers[index][2]
+            if route == "direct"
+            else f"http://origin-{index}.example/resource"
+        ),
+    )
+    return request
+
+
+def send_kwargs(index):
+    if route == "direct":
+        return {}
+    return {"proxies": {"http": servers[index][2].rsplit("/", 1)[0]}}
+
+
+target_code = (
+    PoolManager.connection_from_pool_key.__code__
+    if route == "direct" or mixed
+    else HTTPAdapter.proxy_manager_for.__code__
+)
+admission_barrier = threading.Barrier(2)
+manager_entries = 0
+requests_before_release = None
+trace_lock = threading.Lock()
+
+
+def trace(frame, event, arg):
+    global manager_entries, requests_before_release
+    barrier_event = "return" if mixed else "call"
+    if event == barrier_event and frame.f_code is target_code:
+        with trace_lock:
+            manager_entries += 1
+            entry = manager_entries
+            if entry == 2:
+                requests_before_release = sum(server.requests for server, _, _ in servers)
+        if entry <= 2:
+            admission_barrier.wait(3)
+    return trace
+
+
+successes = []
+errors = []
+result_lock = threading.Lock()
+
+
+def send(index):
+    try:
+        with trial(index):
+            response = adapter.send(
+                prepared(index),
+                stream=True,
+                **send_kwargs(index),
+            )
+        observed = (
+            index,
+            response.content.decode("ascii"),
+            type(response.raw).__module__ == "requests._requests_rust",
+        )
+        response.close()
+        with result_lock:
+            successes.append(observed)
+    except BaseException as error:
+        with result_lock:
+            errors.append((index, type(error).__name__, str(error)))
+
+
+threading.settrace(trace)
+workers = [threading.Thread(target=send, args=(index,)) for index in range(2)]
+for worker in workers:
+    worker.start()
+for worker in workers:
+    worker.join(5)
+threading.settrace(None)
+
+requests_after_concurrent = [server.requests for server, _, _ in servers]
+manager_effects = (
+    len(adapter.poolmanager.pools)
+    if route == "direct"
+    else len(adapter.proxy_manager)
+)
+with trial(0):
+    restored = adapter.send(
+        prepared(0),
+        stream=True,
+        **send_kwargs(0),
+    )
+restored_native = type(restored.raw).__module__ == "requests._requests_rust"
+restored_content = restored.content.decode("ascii")
+restored.close()
+adapter.close()
+
+side_effects.append(
+    {
+        "route": route,
+        "manager_entries": manager_entries,
+        "requests_before_release": requests_before_release,
+        "successes": sorted(successes),
+        "errors": sorted(errors),
+        "workers_alive": [worker.is_alive() for worker in workers],
+        "requests_after_concurrent": requests_after_concurrent,
+        "manager_effects": manager_effects,
+        "fallback_calls": fallback_calls,
+        "restored_native": restored_native,
+        "restored_content": restored_content,
+        "requests_after_restored": [
+            server.requests for server, _, _ in servers
+        ],
+    }
+)
+for server, worker, _ in servers:
+    server.shutdown()
+    server.server_close()
+    worker.join(3)
+result = None
+"""
+
+
+@pytest.mark.parametrize("route", ["direct", "proxy"])
+def test_concurrent_same_adapter_admissions_match_frozen_oracle(route):
+    source = _CONCURRENT_ADAPTER_ADMISSION_CASE.replace(
+        "ROUTE", repr(route), 1
+    ).replace("MIXED", "False", 1)
+    case = {"source": source}
+    oracle = run_oracle_case(case)
+    rewrite = run_rewrite_case(case)
+    common = {
+        "route": route,
+        "manager_entries": 2,
+        "requests_before_release": 0,
+        "errors": [],
+        "workers_alive": [False, False],
+        "requests_after_concurrent": [1, 1],
+        "manager_effects": 2,
+        "fallback_calls": 0,
+        "restored_content": "restored",
+        "requests_after_restored": [2, 1],
+    }
+    oracle_expected = {
+        **common,
+        "successes": [
+            [0, "first-0", False],
+            [1, "first-1", False],
+        ],
+        "restored_native": False,
+    }
+    rewrite_expected = {
+        **common,
+        "successes": [
+            [0, "first-0", True],
+            [1, "first-1", True],
+        ],
+        "restored_native": True,
+    }
+
+    assert oracle.observations["exception"] is None
+    assert oracle.observations["side_effects"] == [oracle_expected]
+    assert rewrite.observations["exception"] is None
+    assert rewrite.observations["side_effects"] == [rewrite_expected]
+
+
+def test_concurrent_native_and_python_proxy_admissions_restore_native_proof():
+    source = _CONCURRENT_ADAPTER_ADMISSION_CASE.replace(
+        "ROUTE", repr("proxy"), 1
+    ).replace("MIXED", "True", 1)
+    case = {"source": source}
+    oracle = run_oracle_case(case)
+    rewrite = run_rewrite_case(case)
+    common = {
+        "route": "proxy",
+        "manager_entries": 2,
+        "requests_before_release": 0,
+        "errors": [],
+        "workers_alive": [False, False],
+        "requests_after_concurrent": [1, 1],
+        "manager_effects": 2,
+        "restored_content": "restored",
+        "requests_after_restored": [2, 1],
+    }
+    oracle_expected = {
+        **common,
+        "successes": [
+            [0, "first-0", False],
+            [1, "first-1", False],
+        ],
+        "fallback_calls": 0,
+        "restored_native": False,
+    }
+    rewrite_expected = {
+        **common,
+        "successes": [
+            [0, "first-0", True],
+            [1, "first-1", False],
+        ],
+        "fallback_calls": 1,
+        "restored_native": True,
+    }
+
+    assert oracle.observations["exception"] is None
+    assert oracle.observations["side_effects"] == [oracle_expected]
+    assert rewrite.observations["exception"] is None
+    assert rewrite.observations["side_effects"] == [rewrite_expected]
+
+
 def test_real_tls_handshake_failure_uses_adapter_ssl_handler():
     with loopback((200, {}, b"plaintext")) as (server, url):
         secure_url = url.replace("http://", "https://", 1)
