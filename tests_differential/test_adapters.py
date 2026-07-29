@@ -1656,7 +1656,8 @@ def test_transport_mapping_uses_live_adapter_target_after_the_socket_effect(
     assert isinstance(error, LiveConnectionError)
     assert len(observed) == 1
     original, mapped_request = observed[0]
-    assert isinstance(original, urllib3.exceptions.ProtocolError)
+    assert isinstance(original, urllib3.exceptions.MaxRetryError)
+    assert isinstance(original.reason, urllib3.exceptions.ProtocolError)
     assert mapped_request is request
     assert error.__context__ is original
 
@@ -1664,7 +1665,7 @@ def test_transport_mapping_uses_live_adapter_target_after_the_socket_effect(
 def test_transport_mapping_uses_live_adapter_sources_after_the_socket_effect(
     monkeypatch,
 ):
-    class NonmatchingProtocolError(Exception):
+    class NonmatchingMaxRetryError(Exception):
         pass
 
     class ForbiddenTarget:
@@ -1685,12 +1686,13 @@ def test_transport_mapping_uses_live_adapter_sources_after_the_socket_effect(
         worker = threading.Thread(target=send)
         worker.start()
         assert accepted.wait(2)
-        monkeypatch.setattr(adapters, "ProtocolError", NonmatchingProtocolError)
+        monkeypatch.setattr(adapters, "MaxRetryError", NonmatchingMaxRetryError)
         monkeypatch.setattr(adapters, "ConnectionError", ForbiddenTarget)
         release.set()
         worker.join(timeout=5)
 
-    assert type(result["error"]) is urllib3.exceptions.ProtocolError
+    assert type(result["error"]) is urllib3.exceptions.MaxRetryError
+    assert isinstance(result["error"].reason, urllib3.exceptions.ProtocolError)
 
 
 def test_transport_live_target_failure_keeps_surrogate_context(monkeypatch):
@@ -1722,7 +1724,8 @@ def test_transport_live_target_failure_keeps_surrogate_context(monkeypatch):
         worker.join(timeout=5)
 
     assert result["error"] is failure
-    assert isinstance(failure.__context__, urllib3.exceptions.ProtocolError)
+    assert isinstance(failure.__context__, urllib3.exceptions.MaxRetryError)
+    assert isinstance(failure.__context__.reason, urllib3.exceptions.ProtocolError)
 
 
 def test_transport_live_missing_source_keeps_surrogate_context(monkeypatch):
@@ -1740,14 +1743,15 @@ def test_transport_live_missing_source_keeps_surrogate_context(monkeypatch):
         worker = threading.Thread(target=send)
         worker.start()
         assert accepted.wait(2)
-        monkeypatch.delattr(adapters, "ProtocolError")
+        monkeypatch.delattr(adapters, "MaxRetryError")
         release.set()
         worker.join(timeout=5)
 
     error = result["error"]
     assert isinstance(error, NameError)
-    assert str(error) == "name 'ProtocolError' is not defined"
-    assert isinstance(error.__context__, urllib3.exceptions.ProtocolError)
+    assert str(error) == "name 'MaxRetryError' is not defined"
+    assert isinstance(error.__context__, urllib3.exceptions.MaxRetryError)
+    assert isinstance(error.__context__.reason, urllib3.exceptions.ProtocolError)
 
 
 def test_transport_except_matching_ignores_source_instancecheck(monkeypatch):
@@ -1777,11 +1781,12 @@ def test_transport_except_matching_ignores_source_instancecheck(monkeypatch):
         worker = threading.Thread(target=send)
         worker.start()
         assert accepted.wait(2)
-        monkeypatch.setattr(adapters, "ProtocolError", ExplodingSource)
+        monkeypatch.setattr(adapters, "MaxRetryError", ExplodingSource)
         release.set()
         worker.join(timeout=5)
 
-    assert type(result["error"]) is urllib3.exceptions.ProtocolError
+    assert type(result["error"]) is urllib3.exceptions.MaxRetryError
+    assert isinstance(result["error"].reason, urllib3.exceptions.ProtocolError)
     assert failure.__context__ is None
 
 
@@ -1901,11 +1906,21 @@ def test_truncated_native_body_maps_to_chunked_error_and_releases_raw():
         with _rust_adapter_trial():
             response = HTTPAdapter().send(prepared(url), stream=True)
             raw = response.raw
+            if urllib3.__version__.startswith("1.26."):
+                assert list(response.iter_content(2)) == [b"x"]
+                assert raw.closed is True
+                assert server.requests == 1
+                return
             with pytest.raises(requests.exceptions.ChunkedEncodingError) as caught:
                 list(response.iter_content(2))
 
         original = caught.value.args[0]
         assert isinstance(original, urllib3.exceptions.ProtocolError)
+        assert len(original.args) == 2
+        assert original.args[1].__class__.__name__ == "IncompleteRead"
+        assert original.args[1].partial == 1
+        assert original.args[1].expected == 19
+        assert original.__context__ is original.args[1]
         assert caught.value.__context__ is original
         assert raw.closed is True
         assert server.requests == 1
@@ -1929,6 +1944,12 @@ def test_truncated_native_body_uses_live_models_target_after_send(monkeypatch):
             response = HTTPAdapter().send(prepared(url), stream=True)
             raw = response.raw
             monkeypatch.setattr(requests.models, "ChunkedEncodingError", LiveTarget)
+            if urllib3.__version__.startswith("1.26."):
+                assert list(response.iter_content(2)) == [b"x"]
+                assert observed == []
+                assert raw.closed is True
+                assert server.requests == 1
+                return
             with pytest.raises(LiveChunkedError) as caught:
                 list(response.iter_content(2))
 
@@ -1956,6 +1977,15 @@ def test_native_stream_read_timeout_maps_and_releases_pool_capacity():
                     next(iterator)
                 original = caught.value.args[0]
                 assert isinstance(original, urllib3.exceptions.ReadTimeoutError)
+                assert original.pool.host == "127.0.0.1"
+                assert original.pool.port == server.server_port
+                assert original.url is None
+                assert original.args == (f"{original.pool}: Read timed out.",)
+                assert isinstance(original.__context__, TimeoutError)
+                if urllib3.__version__.startswith("1.26."):
+                    assert original.__cause__ is None
+                else:
+                    assert original.__cause__ is original.__context__
                 assert caught.value.__context__ is original
                 assert raw.closed is True
                 assert adapter.send(prepared(url)).content == b"reused"
@@ -1965,15 +1995,235 @@ def test_native_stream_read_timeout_maps_and_releases_pool_capacity():
         assert server.requests == 2
 
 
-def test_native_decoder_python_error_is_passed_through_unchanged():
+def test_malformed_native_gzip_uses_public_requests_decode_graph_and_closes_raw():
     with loopback(
         (200, {"Content-Encoding": "gzip"}, b"not-a-gzip-stream"),
     ) as (server, url):
         with _rust_adapter_trial():
-            raw = HTTPAdapter().send(prepared(url), stream=True).raw
-            with pytest.raises(zlib.error):
-                raw.read(decode_content=True)
+            response = HTTPAdapter().send(prepared(url), stream=True)
+            raw = response.raw
+            with pytest.raises(requests.exceptions.ContentDecodingError) as caught:
+                list(response.iter_content(3))
+
+            inner = caught.value.args[0]
+            assert type(inner) is urllib3.exceptions.DecodeError
+            assert len(inner.args) == 2
+            assert inner.args[0] == (
+                "Received response with content-encoding: gzip, but failed to decode it."
+            )
+            assert type(inner.args[1]) is zlib.error
+            assert caught.value.__context__ is inner
+            assert inner.__context__ is inner.args[1]
+            if urllib3.__version__.startswith("1.26."):
+                assert inner.__cause__ is None
+                assert inner.__suppress_context__ is False
+            else:
+                assert inner.__cause__ is inner.args[1]
+                assert inner.__suppress_context__ is True
+            assert raw.closed is True
+            response.close()
+            assert raw.closed is True
         assert server.requests == 1
+
+
+def test_connection_refused_retains_max_retry_new_connection_graph():
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    listener.close()
+    url = f"http://127.0.0.1:{port}/resource"
+    adapter = HTTPAdapter(max_retries=Retry(total=0))
+    request = prepared(url)
+
+    with _rust_adapter_trial():
+        with pytest.raises(requests.exceptions.ConnectionError) as caught:
+            adapter.send(request)
+
+    outer = caught.value
+    exhausted = outer.args[0]
+    assert type(exhausted) is urllib3.exceptions.MaxRetryError
+    assert exhausted.pool.host == "127.0.0.1"
+    assert exhausted.pool.port == port
+    assert exhausted.url == "/resource"
+    assert type(exhausted.reason) is urllib3.exceptions.NewConnectionError
+    source = exhausted.reason.__context__
+    assert isinstance(source, ConnectionRefusedError)
+    assert exhausted.reason.args[0].endswith(
+        f"Failed to establish a new connection: {source}"
+    )
+    assert exhausted.reason.args[0].count(str(source)) == 1
+    assert exhausted.__context__ is exhausted.reason
+    if urllib3.__version__.startswith("1.26."):
+        assert exhausted.reason.__cause__ is None
+        assert exhausted.__cause__ is None
+    else:
+        assert exhausted.reason.__cause__ is source
+        assert exhausted.__cause__ is exhausted.reason
+    assert outer.__context__ is exhausted
+
+
+def test_dns_failure_retains_versioned_max_retry_reason_graph():
+    url = "http://task14-does-not-exist.invalid/resource"
+    request = prepared(url)
+
+    with _rust_adapter_trial():
+        with pytest.raises(requests.exceptions.ConnectionError) as caught:
+            HTTPAdapter(max_retries=Retry(total=0)).send(request)
+
+    outer = caught.value
+    exhausted = outer.args[0]
+    assert type(exhausted) is urllib3.exceptions.MaxRetryError
+    assert exhausted.pool.host == "task14-does-not-exist.invalid"
+    assert exhausted.url == "/resource"
+    source = exhausted.reason.__context__
+    assert isinstance(source, socket.gaierror)
+    assert source.errno == socket.EAI_NONAME
+    if urllib3.__version__.startswith("1.26."):
+        assert type(exhausted.reason) is urllib3.exceptions.NewConnectionError
+        assert exhausted.reason.args[0].endswith(
+            f"Failed to establish a new connection: {source}"
+        )
+        assert exhausted.reason.__cause__ is None
+        assert exhausted.__cause__ is None
+    else:
+        assert type(exhausted.reason) is urllib3.exceptions.NameResolutionError
+        assert (
+            "Failed to resolve 'task14-does-not-exist.invalid'"
+            in exhausted.reason.args[0]
+        )
+        assert exhausted.reason.__cause__ is source
+        assert exhausted.__cause__ is exhausted.reason
+    assert exhausted.__context__ is exhausted.reason
+    assert outer.__context__ is exhausted
+
+
+def test_connection_closed_during_send_retains_retry_protocol_os_graph():
+    with closing_loopback_barrier() as (url, accepted, release):
+        request = prepared(url)
+        result = {}
+
+        def send():
+            try:
+                with _rust_adapter_trial():
+                    HTTPAdapter(max_retries=Retry(total=0)).send(request)
+            except BaseException as error:
+                result["error"] = error
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert accepted.wait(2)
+        release.set()
+        worker.join(timeout=5)
+
+    outer = result["error"]
+    assert type(outer) is requests.exceptions.ConnectionError
+    exhausted = outer.args[0]
+    assert type(exhausted) is urllib3.exceptions.MaxRetryError
+    assert exhausted.pool.host == "127.0.0.1"
+    assert exhausted.url == "/resource"
+    protocol = exhausted.reason
+    assert type(protocol) is urllib3.exceptions.ProtocolError
+    assert protocol.args[0] == "Connection aborted."
+    assert isinstance(protocol.args[1], OSError)
+    assert protocol.__context__ is protocol.args[1]
+    assert exhausted.__context__ is protocol.args[1]
+    if urllib3.__version__.startswith("1.26."):
+        assert protocol.__cause__ is None
+        assert exhausted.__cause__ is None
+    else:
+        assert protocol.__cause__ is protocol.args[1]
+        assert exhausted.__cause__ is protocol
+    assert outer.__context__ is exhausted
+
+
+def test_retry_reason_descriptor_is_reloaded_in_python_bytecode_order(monkeypatch):
+    events = []
+
+    class ReasonDescriptor:
+        def __get__(self, instance, owner):
+            if instance is None:
+                return self
+            events.append("reason")
+            return instance.__dict__["reason"]
+
+        def __set__(self, instance, value):
+            instance.__dict__["reason"] = value
+
+    release = threading.Event()
+    retry = Retry(total=0, status=0, status_forcelist={503})
+    result = {}
+    with loopback((503, {}, (b"x", release, b"y"))) as (server, url):
+        request = prepared(url)
+
+        def send():
+            try:
+                with _rust_adapter_trial():
+                    HTTPAdapter(max_retries=retry).send(request)
+            except BaseException as error:
+                result["error"] = error
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert server.first_chunk_sent.wait(2)
+        monkeypatch.setattr(
+            urllib3.exceptions.MaxRetryError,
+            "reason",
+            ReasonDescriptor(),
+            raising=False,
+        )
+        release.set()
+        worker.join(timeout=5)
+
+    assert isinstance(result["error"], requests.exceptions.RetryError)
+    assert events == ["reason", "reason"]
+
+
+@pytest.mark.parametrize("route", ["direct", "proxy"])
+def test_manager_entry_is_hard_native_commit_point(monkeypatch, route):
+    calls = 0
+    original_target = adapters.ConnectionError
+
+    if route == "direct":
+        from urllib3 import PoolManager
+
+        target_code = PoolManager.connection_from_pool_key.__code__
+    else:
+        target_code = HTTPAdapter.proxy_manager_for.__code__
+
+    class LiveConnectionError(requests.exceptions.ConnectionError):
+        pass
+
+    def trace(frame, event, arg):
+        nonlocal calls
+        if event == "call" and frame.f_code is target_code:
+            calls += 1
+            if calls == 1:
+                adapters.ConnectionError = LiveConnectionError
+        return trace
+
+    try:
+        with loopback((200, {}, b"committed")) as (server, url):
+            adapter = HTTPAdapter()
+            kwargs = {} if route == "direct" else {"proxies": {"http": url}}
+            import sys
+
+            sys.settrace(trace)
+            try:
+                with _rust_adapter_trial():
+                    response = adapter.send(prepared(url), stream=True, **kwargs)
+            finally:
+                sys.settrace(None)
+
+            assert response.content == b"committed"
+            assert type(response.raw).__module__ == "requests._requests_rust"
+            assert calls == 1
+            assert server.requests == 1
+            if route == "direct":
+                assert len(adapter.poolmanager.pools) == 1
+            else:
+                assert len(adapter.proxy_manager) == 1
+    finally:
+        adapters.ConnectionError = original_target
 
 
 def test_real_tls_handshake_failure_uses_adapter_ssl_handler():

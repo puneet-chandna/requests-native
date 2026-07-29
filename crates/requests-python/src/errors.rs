@@ -1,29 +1,39 @@
-use pyo3::exceptions::{PyNameError, PyValueError};
+use pyo3::exceptions::{PyBaseException, PyNameError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyAny, PyDict, PyDictMethods, PyModule, PyModuleMethods};
+use pyo3::types::{
+    PyAny, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple, PyTupleMethods, PyType,
+};
 use pyo3::wrap_pyfunction;
 use requests::{Error, ErrorKind};
 
-struct ResponseErrorState {
-    protocol_error: Py<PyAny>,
-    decode_error: Py<PyAny>,
-    read_timeout_error: Py<PyAny>,
-    ssl_error: Py<PyAny>,
+const INVALID_EXCEPT_TARGET: &str =
+    "catching classes that do not inherit from BaseException is not allowed";
+
+fn validate_exception_class(py: Python<'_>, exception: &Bound<'_, PyAny>) -> PyResult<()> {
+    // CPython's CHECK_EXC_MATCH accepts one optional outer tuple. Nested tuple
+    // members are invalid targets, and metaclass hooks are not consulted.
+    let Ok(exception_type) = exception.cast::<PyType>() else {
+        return Err(PyTypeError::new_err(INVALID_EXCEPT_TARGET));
+    };
+    if !exception_type.is_subclass(&py.get_type::<PyBaseException>())? {
+        return Err(PyTypeError::new_err(INVALID_EXCEPT_TARGET));
+    }
+    Ok(())
 }
 
-static RESPONSE_ERROR_STATE: PyOnceLock<ResponseErrorState> = PyOnceLock::new();
-
-fn response_error_state(py: Python<'_>) -> PyResult<&ResponseErrorState> {
-    RESPONSE_ERROR_STATE.get_or_try_init(py, || {
-        let models = PyModule::import(py, "requests.models")?;
-        Ok(ResponseErrorState {
-            protocol_error: models.getattr("ProtocolError")?.unbind(),
-            decode_error: models.getattr("DecodeError")?.unbind(),
-            read_timeout_error: models.getattr("ReadTimeoutError")?.unbind(),
-            ssl_error: models.getattr("SSLError")?.unbind(),
-        })
-    })
+pub(crate) fn exception_matches(
+    py: Python<'_>,
+    error: &PyErr,
+    exception: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    if let Ok(tuple) = exception.cast::<PyTuple>() {
+        for candidate in tuple.iter() {
+            validate_exception_class(py, &candidate)?;
+        }
+    } else {
+        validate_exception_class(py, exception)?;
+    }
+    Ok(error.is_instance(py, exception))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,7 +153,7 @@ fn map_stream_error(py: Python<'_>, module: &Bound<'_, PyModule>, original: PyEr
         let Some(source) = module.dict().get_item(source_name).ok().flatten() else {
             return name_error_with_context(py, source_name, &original);
         };
-        match original.value(py).is_instance(&source) {
+        match exception_matches(py, &original, &source) {
             Ok(false) => continue,
             Ok(true) => {
                 let Some(target) = module.dict().get_item(target_name).ok().flatten() else {
@@ -162,24 +172,13 @@ fn map_stream_error(py: Python<'_>, module: &Bound<'_, PyModule>, original: PyEr
     original
 }
 
-pub(crate) fn map_typed_response_error(py: Python<'_>, kind: ErrorKind, message: &str) -> PyErr {
-    let state = match response_error_state(py) {
-        Ok(state) => state,
-        Err(error) => return error,
-    };
-    let original = match kind {
-        ErrorKind::ContentDecoding => state.decode_error.bind(py).call1((message,)),
-        ErrorKind::ReadTimeout => {
-            state
-                .read_timeout_error
-                .bind(py)
-                .call1((py.None(), py.None(), message))
-        }
-        ErrorKind::Tls | ErrorKind::Handshake => state.ssl_error.bind(py).call1((message,)),
-        _ => state.protocol_error.bind(py).call1((message,)),
-    };
-    let original = match original {
-        Ok(value) => PyErr::from_value(value),
+pub(crate) fn map_typed_response_error(
+    py: Python<'_>,
+    error: &Error,
+    pool: Option<&Bound<'_, PyAny>>,
+) -> PyErr {
+    let original = match canonical_response_error(py, error, pool) {
+        Ok(original) => original,
         Err(error) => return error,
     };
     let models = match PyModule::import(py, "requests.models") {
@@ -189,11 +188,110 @@ pub(crate) fn map_typed_response_error(py: Python<'_>, kind: ErrorKind, message:
     map_stream_error(py, &models, original)
 }
 
+fn urllib3_v2(py: Python<'_>) -> PyResult<bool> {
+    Ok(!PyModule::import(py, "urllib3")?
+        .getattr("__version__")?
+        .extract::<String>()?
+        .starts_with("1.26."))
+}
+
+fn error_with_source(py: Python<'_>, error: PyErr, source: &PyErr, explicit_cause: bool) -> PyErr {
+    error.set_context(py, Some(source.clone_ref(py)));
+    if explicit_cause {
+        error.set_cause(py, Some(source.clone_ref(py)));
+    }
+    error
+}
+
+fn canonical_response_error(
+    py: Python<'_>,
+    error: &Error,
+    pool: Option<&Bound<'_, PyAny>>,
+) -> PyResult<PyErr> {
+    let exceptions = PyModule::import(py, "urllib3.exceptions")?;
+    let v2 = urllib3_v2(py)?;
+    let pool = pool.map_or_else(|| py.None().into_bound(py), Bound::clone);
+    match error.kind() {
+        ErrorKind::ContentDecoding => Ok(PyErr::from_value(
+            exceptions
+                .getattr("DecodeError")?
+                .call1((error.to_string(),))?,
+        )),
+        ErrorKind::ReadTimeout => {
+            let timeout = PyErr::from_value(
+                PyModule::import(py, "builtins")?
+                    .getattr("TimeoutError")?
+                    .call1(("timed out",))?,
+            );
+            let mapped = PyErr::from_value(exceptions.getattr("ReadTimeoutError")?.call1((
+                pool,
+                py.None(),
+                "Read timed out.",
+            ))?);
+            Ok(error_with_source(py, mapped, &timeout, v2))
+        }
+        ErrorKind::Tls | ErrorKind::Handshake => Ok(PyErr::from_value(
+            exceptions
+                .getattr("SSLError")?
+                .call1((error.to_string(),))?,
+        )),
+        _ => {
+            if let Some((received, remaining)) = error.incomplete_body() {
+                let incomplete = PyErr::from_value(
+                    exceptions
+                        .getattr("IncompleteRead")?
+                        .call1((received, remaining))?,
+                );
+                let message = format!("Connection broken: {:?}", incomplete.value(py));
+                let protocol = PyErr::from_value(
+                    exceptions
+                        .getattr("ProtocolError")?
+                        .call1((message, incomplete.value(py)))?,
+                );
+                Ok(error_with_source(py, protocol, &incomplete, v2))
+            } else {
+                Ok(PyErr::from_value(
+                    exceptions
+                        .getattr("ProtocolError")?
+                        .call1((error.to_string(),))?,
+                ))
+            }
+        }
+    }
+}
+
+pub(crate) fn map_decoder_error(py: Python<'_>, encoding: &str, original: PyErr) -> PyErr {
+    let result = (|| -> PyResult<PyErr> {
+        let response = PyModule::import(py, "urllib3.response")?;
+        let classes = response
+            .getattr("HTTPResponse")?
+            .getattr("DECODER_ERROR_CLASSES")?;
+        if !exception_matches(py, &original, &classes)? {
+            return Ok(original.clone_ref(py));
+        }
+        let message = format!(
+            "Received response with content-encoding: {encoding}, but failed to decode it."
+        );
+        let decode = PyErr::from_value(
+            response
+                .getattr("DecodeError")?
+                .call1((message, original.value(py)))?,
+        );
+        let decode = error_with_source(py, decode, &original, urllib3_v2(py)?);
+        let models = PyModule::import(py, "requests.models")?;
+        Ok(map_stream_error(py, &models, decode))
+    })();
+    result.unwrap_or_else(|error| {
+        error.set_context(py, Some(original));
+        error
+    })
+}
+
 fn map_json_error(py: Python<'_>, module: &Bound<'_, PyModule>, original: PyErr) -> PyErr {
     let Some(source) = module.dict().get_item("JSONDecodeError").ok().flatten() else {
         return name_error_with_context(py, "JSONDecodeError", &original);
     };
-    match original.value(py).is_instance(&source) {
+    match exception_matches(py, &original, &source) {
         Ok(false) => return original,
         Ok(true) => {}
         Err(error) => return error_with_context(py, error, &original),
@@ -292,7 +390,6 @@ fn _error_mapping_trial(
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    let _ = response_error_state(module.py())?;
     module.add_function(wrap_pyfunction!(_error_mapping_trial, module)?)?;
     Ok(())
 }

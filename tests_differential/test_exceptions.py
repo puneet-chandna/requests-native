@@ -1022,29 +1022,14 @@ finally:
     }
 
 
-def test_json_mapper_preserves_instance_check_and_constructor_failures() -> None:
+def test_json_mapper_preserves_constructor_failures() -> None:
     state = _run_matching(
         """
-class InstanceFailure(BaseException):
-    pass
-
-
 class ConstructorFailure(BaseException):
     pass
 
 
-instance_failure = InstanceFailure("instance check failed")
 constructor_failure = ConstructorFailure("constructor failed")
-
-
-class ExplodingMeta(type):
-    def __instancecheck__(cls, value):
-        side_effects.append(["instance-check", value is first_original])
-        raise instance_failure
-
-
-class ExplodingSource(metaclass=ExplodingMeta):
-    pass
 
 
 class SelectedSource(ValueError):
@@ -1063,15 +1048,8 @@ class ExplodingTarget:
 
 saved_source = models.JSONDecodeError
 saved_target = models.RequestsJSONDecodeError
-first_original = ValueError("first")
 second_original = SelectedSource("bad", "document", 4)
 try:
-    models.JSONDecodeError = ExplodingSource
-    instance_failed = capture(
-        lambda: error_mapping_call(
-            models, "response_json", original=first_original
-        )
-    )
     models.JSONDecodeError = SelectedSource
     models.RequestsJSONDecodeError = ExplodingTarget
     constructor_failed = capture(
@@ -1084,11 +1062,6 @@ finally:
     models.RequestsJSONDecodeError = saved_target
 
 result = {
-    "instance": {
-        "identity": instance_failed["error"] is instance_failure,
-        "context_identity": instance_failed["error"].__context__
-        is first_original,
-    },
     "constructor": {
         "identity": constructor_failed["error"] is constructor_failure,
         "context_identity": constructor_failed["error"].__context__
@@ -1100,16 +1073,11 @@ result = {
     )
 
     assert state == {
-        "instance": {
-            "identity": True,
-            "context_identity": True,
-        },
         "constructor": {
             "identity": True,
             "context_identity": True,
         },
         "events": [
-            ["instance-check", True],
             ["construct", ["bad", "document", 4], []],
         ],
     }

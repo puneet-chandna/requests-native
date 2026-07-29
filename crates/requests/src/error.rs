@@ -28,6 +28,8 @@ pub enum ErrorKind {
 pub struct Error {
     kind: ErrorKind,
     message: String,
+    raw_os_error: Option<i32>,
+    incomplete_body: Option<(u64, u64)>,
 }
 
 impl Error {
@@ -36,56 +38,57 @@ impl Error {
     }
 
     #[doc(hidden)]
+    pub fn raw_os_error(&self) -> Option<i32> {
+        self.raw_os_error
+    }
+
+    #[doc(hidden)]
+    pub fn incomplete_body(&self) -> Option<(u64, u64)> {
+        self.incomplete_body
+    }
+
+    #[doc(hidden)]
     pub fn from_binding_parts(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
+        Self::plain(kind, message.into())
     }
 
     #[doc(hidden)]
     pub fn body_stream() -> Self {
-        Self {
-            kind: ErrorKind::Body,
-            message: "request body stream failed".to_owned(),
-        }
+        Self::plain(ErrorKind::Body, "request body stream failed".to_owned())
     }
 
     pub(crate) fn invalid_url(url: &str) -> Self {
-        Self {
-            kind: ErrorKind::InvalidUrl,
-            message: format!("invalid URL: {url}"),
-        }
+        Self::plain(ErrorKind::InvalidUrl, format!("invalid URL: {url}"))
     }
 
     #[cfg(feature = "blocking")]
     pub(crate) fn blocking(error: impl fmt::Display) -> Self {
-        Self {
-            kind: ErrorKind::Blocking,
-            message: format!("blocking runtime failed: {error}"),
-        }
+        Self::plain(
+            ErrorKind::Blocking,
+            format!("blocking runtime failed: {error}"),
+        )
     }
 
     pub(crate) fn unsupported_scheme(url: &str, scheme: Option<&str>) -> Self {
         let scheme = scheme.unwrap_or("<missing>");
-        Self {
-            kind: ErrorKind::InvalidUrl,
-            message: format!("unsupported URL scheme {scheme:?} for direct HTTP request: {url}"),
-        }
+        Self::plain(
+            ErrorKind::InvalidUrl,
+            format!("unsupported URL scheme {scheme:?} for direct HTTP request: {url}"),
+        )
     }
 
     pub(crate) fn unbound_builder() -> Self {
-        Self {
-            kind: ErrorKind::Builder,
-            message: "request builder is not bound to a Client".to_owned(),
-        }
+        Self::plain(
+            ErrorKind::Builder,
+            "request builder is not bound to a Client".to_owned(),
+        )
     }
 
     pub(crate) fn conflicting_content_length() -> Self {
-        Self {
-            kind: ErrorKind::Builder,
-            message: "conflicting Content-Length headers".to_owned(),
-        }
+        Self::plain(
+            ErrorKind::Builder,
+            "conflicting Content-Length headers".to_owned(),
+        )
     }
 
     pub(crate) fn invalid_proxy(message: impl fmt::Display) -> Self {
@@ -99,10 +102,19 @@ impl Error {
         Self::transport(ErrorKind::Proxy, format!("proxy transport failed: {error}"))
     }
 
+    #[cfg(test)]
     pub(crate) fn dns(target: &str, error: impl fmt::Display) -> Self {
         Self::transport(
             ErrorKind::Dns,
             format!("DNS resolution failed for {target}: {error}"),
+        )
+    }
+
+    pub(crate) fn dns_io(target: &str, error: std::io::Error) -> Self {
+        Self::transport_io(
+            ErrorKind::Dns,
+            format!("DNS resolution failed for {target}: {error}"),
+            &error,
         )
     }
 
@@ -117,6 +129,14 @@ impl Error {
         Self::transport(
             ErrorKind::Connect,
             format!("TCP connection failed for {target}: {error}"),
+        )
+    }
+
+    pub(crate) fn connect_io(target: &str, error: std::io::Error) -> Self {
+        Self::transport_io(
+            ErrorKind::Connect,
+            format!("TCP connection failed for {target}: {error}"),
+            &error,
         )
     }
 
@@ -146,10 +166,19 @@ impl Error {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn send(error: impl fmt::Display) -> Self {
         Self::transport(
             ErrorKind::Send,
             format!("HTTP/1.1 request send failed: {error}"),
+        )
+    }
+
+    pub(crate) fn send_hyper(error: hyper::Error) -> Self {
+        Self::transport_source(
+            ErrorKind::Send,
+            format!("HTTP/1.1 request send failed: {error}"),
+            &error,
         )
     }
 
@@ -160,10 +189,13 @@ impl Error {
 
     pub(crate) fn with_cleanup(primary: Self, cleanup: Self) -> Self {
         let kind = primary.kind;
-        Self::transport(
+        let message = format!("{primary}; connection cleanup also failed: {cleanup}");
+        Self {
             kind,
-            format!("{primary}; connection cleanup also failed: {cleanup}"),
-        )
+            message,
+            raw_os_error: primary.raw_os_error,
+            incomplete_body: primary.incomplete_body,
+        }
     }
 
     pub(crate) fn connection(error: impl fmt::Display) -> Self {
@@ -173,11 +205,32 @@ impl Error {
         )
     }
 
+    pub(crate) fn connection_hyper(error: hyper::Error) -> Self {
+        Self::transport_source(
+            ErrorKind::Connection,
+            format!("HTTP/1.1 connection driver failed: {error}"),
+            &error,
+        )
+    }
+
     pub(crate) fn response_body(error: impl fmt::Display) -> Self {
         Self::transport(
             ErrorKind::ResponseBody,
             format!("HTTP/1.1 response body failed: {error}"),
         )
+    }
+
+    pub(crate) fn response_body_hyper(
+        error: hyper::Error,
+        incomplete_body: Option<(u64, u64)>,
+    ) -> Self {
+        let mut mapped = Self::transport_source(
+            ErrorKind::ResponseBody,
+            format!("HTTP/1.1 response body failed: {error}"),
+            &error,
+        );
+        mapped.incomplete_body = incomplete_body;
+        mapped
     }
 
     pub(crate) fn chunked_encoding(error: impl fmt::Display) -> Self {
@@ -228,7 +281,40 @@ impl Error {
     }
 
     fn transport(kind: ErrorKind, message: String) -> Self {
-        Self { kind, message }
+        Self::plain(kind, message)
+    }
+
+    fn transport_io(kind: ErrorKind, message: String, source: &std::io::Error) -> Self {
+        Self {
+            kind,
+            message,
+            raw_os_error: source.raw_os_error(),
+            incomplete_body: None,
+        }
+    }
+
+    fn transport_source(
+        kind: ErrorKind,
+        message: String,
+        source: &(dyn std::error::Error + 'static),
+    ) -> Self {
+        let mut current = Some(source);
+        while let Some(error) = current {
+            if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+                return Self::transport_io(kind, message, io_error);
+            }
+            current = error.source();
+        }
+        Self::plain(kind, message)
+    }
+
+    fn plain(kind: ErrorKind, message: String) -> Self {
+        Self {
+            kind,
+            message,
+            raw_os_error: None,
+            incomplete_body: None,
+        }
     }
 }
 

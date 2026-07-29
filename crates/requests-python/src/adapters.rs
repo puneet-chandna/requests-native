@@ -5,12 +5,12 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use pyo3::exceptions::{PyBaseException, PyNameError, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyNameError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
     PyAny, PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyModule, PySet, PyString,
-    PyTuple, PyType,
+    PyTuple,
 };
 use pyo3::wrap_pyfunction;
 use requests::adapters::{AdapterPool, AdapterResponse, AdapterResponseBody};
@@ -23,7 +23,7 @@ use requests::{
     Proxy, Timeout, TlsConfig, Uri,
 };
 
-use crate::errors::map_typed_response_error;
+use crate::errors::{exception_matches, map_decoder_error, map_typed_response_error};
 
 #[derive(PartialEq)]
 struct RetrySnapshot {
@@ -178,6 +178,7 @@ static ADAPTER_POOLS: OnceLock<Mutex<HashMap<usize, SideEntry>>> = OnceLock::new
 #[pyclass(module = "requests._requests_rust", unsendable)]
 struct NativeAdapterRaw {
     body: Option<AdapterResponseBody>,
+    pool: Py<PyAny>,
     content_encoding: Option<String>,
     decoder: Option<Py<PyAny>>,
     decoded: Vec<u8>,
@@ -948,6 +949,7 @@ struct NativeSendInput {
     method: Method,
     method_name: String,
     url: String,
+    urllib3_url: String,
     headers: HeaderMap,
     body: Option<Vec<u8>>,
     timeout: Timeout,
@@ -1483,6 +1485,16 @@ fn native_send_input(
     let Some((proxy, selected_proxy)) = proxy_value(py, &url, proxies)? else {
         return Ok(Err("proxy settings are unsupported".to_owned()));
     };
+    let urllib3_url = match selected_proxy.as_ref() {
+        Some(_) => url.clone(),
+        None => {
+            let path_url = request.getattr("path_url")?;
+            if !path_url.is_exact_instance_of::<PyString>() {
+                return Ok(Err("request path URL is unsupported".to_owned()));
+            }
+            path_url.extract::<String>()?
+        }
+    };
     if !adapter_identity_is_pristine(py, adapter, request)?
         || !registered_adapter_pristine(py, adapter)?
     {
@@ -1514,6 +1526,7 @@ fn native_send_input(
         method,
         method_name,
         url,
+        urllib3_url,
         headers,
         body,
         timeout,
@@ -1855,7 +1868,13 @@ fn record_visible_proxy_manager(
         return Ok(false);
     };
     match entry.proxy_managers.get(proxy_url) {
-        Some(expected) => manager_proof_is_pristine(py, &manager, expected),
+        Some(expected) if manager.is(expected.manager.bind(py)) => {
+            entry
+                .proxy_managers
+                .insert(proxy_url.to_owned(), manager_proof(&manager)?);
+            Ok(true)
+        }
+        Some(_) => Ok(false),
         None if proxy_managers.len() == entry.proxy_managers.len() + 1 => {
             entry
                 .proxy_managers
@@ -2094,32 +2113,6 @@ fn live_adapter_global<'py>(
         .ok_or_else(|| PyNameError::new_err(format!("name '{name}' is not defined")))
 }
 
-fn exception_matches(
-    py: Python<'_>,
-    error: &PyErr,
-    exception: &Bound<'_, PyAny>,
-) -> PyResult<bool> {
-    if exception.is_instance_of::<PyTuple>() {
-        for candidate in exception.cast::<PyTuple>()?.iter() {
-            if exception_matches(py, error, &candidate)? {
-                return Ok(true);
-            }
-        }
-        return Ok(false);
-    }
-    let Ok(exception_type) = exception.cast::<PyType>() else {
-        return Err(PyTypeError::new_err(
-            "catching classes that do not inherit from BaseException is not allowed",
-        ));
-    };
-    if !exception_type.is_subclass(&py.get_type::<PyBaseException>())? {
-        return Err(PyTypeError::new_err(
-            "catching classes that do not inherit from BaseException is not allowed",
-        ));
-    }
-    Ok(error.is_instance(py, exception))
-}
-
 fn live_isinstance(
     py: Python<'_>,
     state: &AdapterState,
@@ -2131,17 +2124,69 @@ fn live_isinstance(
         .is_truthy()
 }
 
+fn live_reason_isinstance(
+    py: Python<'_>,
+    state: &AdapterState,
+    original: &PyErr,
+    class_name: &str,
+) -> PyResult<bool> {
+    let isinstance = live_adapter_global(py, state, "isinstance")?;
+    let reason = original.value(py).getattr("reason")?;
+    let class = live_adapter_global(py, state, class_name)?;
+    isinstance.call1((reason, class))?.is_truthy()
+}
+
 fn canonical_adapter_surrogate(
     py: Python<'_>,
     state: &AdapterState,
-    kind: ErrorKind,
-    message: &str,
+    error: &requests::Error,
+    pool: &Bound<'_, PyAny>,
     url: &str,
+    urllib3_version: &str,
 ) -> PyResult<PyErr> {
+    let kind = error.kind();
+    let message = error.to_string();
+    let urllib3_v2 = !urllib3_version.starts_with("1.26.");
     let direct = |name: &str, arguments: &Bound<'_, PyTuple>| -> PyResult<PyErr> {
         Ok(PyErr::from_value(
             canonical_adapter_global(py, state, name)?.call1(arguments.clone())?,
         ))
+    };
+    let with_source = |error: PyErr, source: &PyErr, explicit_cause: bool| {
+        error.set_context(py, Some(source.clone_ref(py)));
+        if explicit_cause {
+            error.set_cause(py, Some(source.clone_ref(py)));
+        }
+        error
+    };
+    let connection = || -> PyResult<Bound<'_, PyAny>> {
+        let class = pool.getattr("ConnectionCls")?;
+        let host = pool.getattr("host")?;
+        let port = pool.getattr("port")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("port", port)?;
+        class.call((host,), Some(&kwargs))
+    };
+    let os_error = || -> PyResult<PyErr> {
+        let errno = error.raw_os_error().unwrap_or(1);
+        let message = PyModule::import(py, "os")?
+            .getattr("strerror")?
+            .call1((errno,))?;
+        Ok(PyErr::from_value(
+            PyModule::import(py, "builtins")?
+                .getattr("OSError")?
+                .call1((errno, message))?,
+        ))
+    };
+    let max_retry = |reason: PyErr| -> PyResult<PyErr> {
+        let exhausted = PyErr::from_value(
+            canonical_adapter_global(py, state, "MaxRetryError")?.call1((
+                pool,
+                url,
+                reason.value(py),
+            ))?,
+        );
+        Ok(with_source(exhausted, &reason, urllib3_v2))
     };
     match kind {
         ErrorKind::InvalidUrl | ErrorKind::MissingSchema => {
@@ -2149,13 +2194,50 @@ fn canonical_adapter_surrogate(
         }
         ErrorKind::ReadTimeout => {
             let class = canonical_adapter_global(py, state, "ReadTimeoutError")?;
-            Ok(PyErr::from_value(class.call1((py.None(), url, message))?))
+            Ok(PyErr::from_value(class.call1((
+                pool,
+                py.None(),
+                "Read timed out.",
+            ))?))
+        }
+        ErrorKind::Connect | ErrorKind::Dns => {
+            let connection = connection()?;
+            let source = if kind == ErrorKind::Dns {
+                let errno = error.raw_os_error().unwrap_or(-2);
+                let message = PyModule::import(py, "os")?
+                    .getattr("strerror")?
+                    .call1((errno,))?;
+                PyErr::from_value(
+                    PyModule::import(py, "socket")?
+                        .getattr("gaierror")?
+                        .call1((errno, message))?,
+                )
+            } else {
+                os_error()?
+            };
+            let reason = if kind == ErrorKind::Dns && urllib3_v2 {
+                let host = pool.getattr("host")?;
+                let reason = PyErr::from_value(
+                    PyModule::import(py, "urllib3.exceptions")?
+                        .getattr("NameResolutionError")?
+                        .call1((host, connection, source.value(py)))?,
+                );
+                with_source(reason, &source, true)
+            } else {
+                let detail = format!("Failed to establish a new connection: {}", source.value(py));
+                let reason = PyErr::from_value(
+                    canonical_adapter_global(py, state, "NewConnectionError")?
+                        .call1((connection, detail))?,
+                );
+                with_source(reason, &source, urllib3_v2)
+            };
+            max_retry(reason)
         }
         ErrorKind::ConnectTimeout | ErrorKind::Proxy | ErrorKind::Tls | ErrorKind::Handshake => {
             let (reason_name, reason) = match kind {
-                ErrorKind::ConnectTimeout => ("ConnectTimeoutError", message.to_owned()),
-                ErrorKind::Proxy => ("_ProxyError", message.to_owned()),
-                ErrorKind::Tls | ErrorKind::Handshake => ("_SSLError", message.to_owned()),
+                ErrorKind::ConnectTimeout => ("ConnectTimeoutError", message.clone()),
+                ErrorKind::Proxy => ("_ProxyError", message.clone()),
+                ErrorKind::Tls | ErrorKind::Handshake => ("_SSLError", message.clone()),
                 _ => unreachable!(),
             };
             let reason = if reason_name == "_ProxyError" {
@@ -2165,13 +2247,27 @@ fn canonical_adapter_surrogate(
             } else {
                 canonical_adapter_global(py, state, reason_name)?.call1((reason,))?
             };
-            Ok(PyErr::from_value(
+            max_retry(PyErr::from_value(reason))
+        }
+        ErrorKind::Send | ErrorKind::Connection => {
+            let source = os_error()?;
+            let protocol = PyErr::from_value(
+                canonical_adapter_global(py, state, "ProtocolError")?
+                    .call1(("Connection aborted.", source.value(py)))?,
+            );
+            let protocol = with_source(protocol, &source, urllib3_v2);
+            let exhausted = PyErr::from_value(
                 canonical_adapter_global(py, state, "MaxRetryError")?.call1((
-                    py.None(),
+                    pool,
                     url,
-                    reason,
+                    protocol.value(py),
                 ))?,
-            ))
+            );
+            exhausted.set_context(py, Some(source));
+            if urllib3_v2 {
+                exhausted.set_cause(py, Some(protocol));
+            }
+            Ok(exhausted)
         }
         _ => direct("ProtocolError", &PyTuple::new(py, [message])?),
     }
@@ -2181,11 +2277,12 @@ fn canonical_retry_surrogate(
     py: Python<'_>,
     state: &AdapterState,
     message: &str,
+    pool: &Bound<'_, PyAny>,
     url: &str,
 ) -> PyResult<PyErr> {
     let reason = canonical_adapter_global(py, state, "ResponseError")?.call1((message,))?;
     Ok(PyErr::from_value(
-        canonical_adapter_global(py, state, "MaxRetryError")?.call1((py.None(), url, reason))?,
+        canonical_adapter_global(py, state, "MaxRetryError")?.call1((pool, url, reason))?,
     ))
 }
 
@@ -2225,24 +2322,18 @@ fn simulate_adapter_handlers(
 
     let max_retry = live_adapter_global(py, state, "MaxRetryError")?;
     if exception_matches(py, original, &max_retry)? {
-        let reason = original.value(py).getattr("reason")?;
-        let connect_timeout = live_adapter_global(py, state, "ConnectTimeoutError")?;
-        if live_isinstance(py, state, &reason, &connect_timeout)? {
-            let new_connection = live_adapter_global(py, state, "NewConnectionError")?;
-            if !live_isinstance(py, state, &reason, &new_connection)? {
-                return raised_adapter_target(py, state, "ConnectTimeout", original, Some(request));
-            }
+        if live_reason_isinstance(py, state, original, "ConnectTimeoutError")?
+            && !live_reason_isinstance(py, state, original, "NewConnectionError")?
+        {
+            return raised_adapter_target(py, state, "ConnectTimeout", original, Some(request));
         }
-        let response = live_adapter_global(py, state, "ResponseError")?;
-        if live_isinstance(py, state, &reason, &response)? {
+        if live_reason_isinstance(py, state, original, "ResponseError")? {
             return raised_adapter_target(py, state, "RetryError", original, Some(request));
         }
-        let proxy = live_adapter_global(py, state, "_ProxyError")?;
-        if live_isinstance(py, state, &reason, &proxy)? {
+        if live_reason_isinstance(py, state, original, "_ProxyError")? {
             return raised_adapter_target(py, state, "ProxyError", original, Some(request));
         }
-        let ssl = live_adapter_global(py, state, "_SSLError")?;
-        if live_isinstance(py, state, &reason, &ssl)? {
+        if live_reason_isinstance(py, state, original, "_SSLError")? {
             return raised_adapter_target(py, state, "SSLError", original, Some(request));
         }
         return raised_adapter_target(py, state, "ConnectionError", original, Some(request));
@@ -2296,17 +2387,19 @@ fn mapped_transport_error(
     py: Python<'_>,
     error: requests::Error,
     request: &Bound<'_, PyAny>,
+    pool: &Bound<'_, PyAny>,
     url: &str,
+    urllib3_version: &str,
 ) -> PyErr {
     let state = match adapter_state(py) {
         Ok(state) => state,
         Err(error) => return error,
     };
-    let original =
-        match canonical_adapter_surrogate(py, state, error.kind(), &error.to_string(), url) {
-            Ok(original) => original,
-            Err(error) => return error,
-        };
+    let original = match canonical_adapter_surrogate(py, state, &error, pool, url, urllib3_version)
+    {
+        Ok(original) => original,
+        Err(error) => return error,
+    };
     map_adapter_surrogate(py, state, original, request)
 }
 
@@ -2326,6 +2419,7 @@ fn build_python_response(
     py: Python<'_>,
     adapter: &Bound<'_, PyAny>,
     request: &Bound<'_, PyAny>,
+    pool: &Bound<'_, PyAny>,
     response: AdapterResponse,
 ) -> PyResult<Py<PyAny>> {
     let status = response.status().as_u16();
@@ -2340,6 +2434,7 @@ fn build_python_response(
         py,
         NativeAdapterRaw {
             body: Some(response.into_raw_body()),
+            pool: pool.clone().unbind(),
             content_encoding,
             decoder: None,
             decoded: Vec::new(),
@@ -2377,13 +2472,24 @@ fn _adapter_send_trial(
         Ok(input) => input,
         Err(_) => return Ok(py.NotImplemented()),
     };
-    if let Some(proxy) = &input.selected_proxy {
-        adapter.call_method1("proxy_manager_for", (proxy,))?;
+    // The native side table and pool must be usable before the first
+    // manager/cache callback. From manager entry onward the send is committed
+    // and must never replay through retained Python.
+    let pool = match adapter_pool(py, adapter, &input)? {
+        Ok(pool) => pool,
+        Err(_) => return Ok(py.NotImplemented()),
+    };
+    let python_pool = if let Some(proxy) = &input.selected_proxy {
+        let manager = adapter.call_method1("proxy_manager_for", (proxy,))?;
+        let python_pool = manager.call_method1("connection_from_url", (&input.url,))?;
         if !record_visible_proxy_manager(py, adapter, proxy)? {
-            return Ok(py.NotImplemented());
+            return Err(PyRuntimeError::new_err(
+                "proxy manager state changed after native send commitment",
+            ));
         }
+        python_pool
     } else {
-        adapter
+        let python_pool = adapter
             .getattr("poolmanager")?
             .call_method1("connection_from_url", (&input.url,))?;
         let identity = adapter_id(py, adapter)?;
@@ -2392,19 +2498,13 @@ fn _adapter_send_trial(
             .lock()
             .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
         let Some(entry) = table.get_mut(&identity) else {
-            return Ok(py.NotImplemented());
+            return Err(PyRuntimeError::new_err(
+                "adapter pool state disappeared after native send commitment",
+            ));
         };
         entry.visible_pool_count = manager_pool_count(entry.poolmanager.bind(py))?;
         refresh_manager_pools(py, &mut entry.manager_proof)?;
-    }
-    if !adapter_identity_is_pristine(py, adapter, request)?
-        || !registered_adapter_pristine(py, adapter)?
-    {
-        return Ok(py.NotImplemented());
-    }
-    let pool = match adapter_pool(py, adapter, &input)? {
-        Ok(pool) => pool,
-        Err(_) => return Ok(py.NotImplemented()),
+        python_pool
     };
     let retry_object = adapter.getattr("max_retries")?;
     let mut retry_state = RetryState::with_history(
@@ -2430,7 +2530,14 @@ fn _adapter_send_trial(
                 if matches!(reason, RetryReason::Read)
                     && !retry_state.allows_method(&input.method_name)
                 {
-                    return Err(mapped_transport_error(py, error, request, &input.url));
+                    return Err(mapped_transport_error(
+                        py,
+                        error,
+                        request,
+                        &python_pool,
+                        &input.urllib3_url,
+                        &input.retry.version,
+                    ));
                 }
                 match retry_state.increment(reason, &input.method_name, &input.url, None) {
                     Ok(next) => {
@@ -2439,7 +2546,14 @@ fn _adapter_send_trial(
                         continue;
                     }
                     Err(_) => {
-                        return Err(mapped_transport_error(py, error, request, &input.url));
+                        return Err(mapped_transport_error(
+                            py,
+                            error,
+                            request,
+                            &python_pool,
+                            &input.urllib3_url,
+                            &input.retry.version,
+                        ));
                     }
                 }
             }
@@ -2451,7 +2565,7 @@ fn _adapter_send_trial(
             .get("retry-after")
             .is_some_and(|value| !value.as_bytes().is_empty());
         if !retry_state.is_retry(&input.method_name, status, has_retry_after) {
-            return build_python_response(py, adapter, request, response);
+            return build_python_response(py, adapter, request, &python_pool, response);
         }
         let incremented = retry_state.increment(
             RetryReason::Status { status },
@@ -2465,10 +2579,18 @@ fn _adapter_send_trial(
                 drain_response(py, response);
                 let message = format!("too many {status} responses");
                 let state = adapter_state(py)?;
-                let original = canonical_retry_surrogate(py, state, &message, &input.url)?;
+                let original = canonical_retry_surrogate(
+                    py,
+                    state,
+                    &message,
+                    &python_pool,
+                    &input.urllib3_url,
+                )?;
                 return Err(map_adapter_surrogate(py, state, original, request));
             }
-            Err(_) => return build_python_response(py, adapter, request, response),
+            Err(_) => {
+                return build_python_response(py, adapter, request, &python_pool, response);
+            }
         };
         let headers = response.headers().clone();
         drain_response(py, response);
@@ -2541,16 +2663,40 @@ impl NativeAdapterRaw {
     }
 
     fn map_io_failure(&mut self, py: Python<'_>, error: std::io::Error) -> PyErr {
-        let typed = error
+        let mapped = error
             .get_ref()
             .and_then(|source| source.downcast_ref::<requests::Error>())
-            .map(|source| (source.kind(), source.to_string()));
-        let message = error.to_string();
+            .map_or_else(
+                || PyRuntimeError::new_err(error.to_string()),
+                |source| map_typed_response_error(py, source, Some(self.pool.bind(py))),
+            );
         self.finish_body_failure();
-        match typed {
-            Some((kind, message)) => map_typed_response_error(py, kind, &message),
-            None => PyRuntimeError::new_err(message),
-        }
+        mapped
+    }
+
+    fn suppresses_urllib3_126_incomplete(&self, py: Python<'_>, error: &std::io::Error) -> bool {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<requests::Error>())
+            .is_some_and(|source| source.incomplete_body().is_some())
+            && PyModule::import(py, "urllib3")
+                .and_then(|module| module.getattr("__version__"))
+                .and_then(|version| version.extract::<String>())
+                .is_ok_and(|version| version.starts_with("1.26."))
+    }
+
+    fn map_decode_failure(&mut self, py: Python<'_>, error: PyErr) -> PyErr {
+        let encoding = self
+            .content_encoding
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        self.finish_body_failure();
+        map_decoder_error(py, &encoding, error)
+    }
+
+    fn decode_result<T>(&mut self, py: Python<'_>, result: PyResult<T>) -> PyResult<T> {
+        result.map_err(|error| self.map_decode_failure(py, error))
     }
 
     fn decoder(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
@@ -2634,14 +2780,17 @@ impl NativeAdapterRaw {
             if read == 0 && !has_tail {
                 self.body = None;
                 if let Some(decoder) = decoder {
-                    self.decoded
-                        .extend(Self::decompress(decoder.bind(py), py, b"", -1)?);
-                    self.decoded.extend(
+                    let tail =
+                        self.decode_result(py, Self::decompress(decoder.bind(py), py, b"", -1))?;
+                    self.decoded.extend(tail);
+                    let flushed = self.decode_result(
+                        py,
                         decoder
                             .bind(py)
-                            .call_method0("flush")?
-                            .extract::<Vec<u8>>()?,
-                    );
+                            .call_method0("flush")
+                            .and_then(|value| value.extract::<Vec<u8>>()),
+                    )?;
+                    self.decoded.extend(flushed);
                 }
                 self.decoder_eof = true;
                 break;
@@ -2656,8 +2805,9 @@ impl NativeAdapterRaw {
                             .unwrap_or(isize::MAX)
                     })
                     .unwrap_or(-1);
-                self.decoded
-                    .extend(Self::decompress(decoder.bind(py), py, &wire, maximum)?);
+                let decoded =
+                    self.decode_result(py, Self::decompress(decoder.bind(py), py, &wire, maximum))?;
+                self.decoded.extend(decoded);
             } else {
                 self.decoded.extend(wire);
             }
@@ -2691,10 +2841,17 @@ impl NativeAdapterRaw {
             self.closed = true;
             return Ok(Vec::new());
         }
-        let mut decoded = Self::decompress(decoder, py, &wire, -1)?;
+        let mut decoded = self.decode_result(py, Self::decompress(decoder, py, &wire, -1))?;
         if amount.is_none() {
-            decoded.extend(Self::decompress(decoder, py, b"", -1)?);
-            decoded.extend(decoder.call_method0("flush")?.extract::<Vec<u8>>()?);
+            decoded.extend(self.decode_result(py, Self::decompress(decoder, py, b"", -1))?);
+            decoded.extend(
+                self.decode_result(
+                    py,
+                    decoder
+                        .call_method0("flush")
+                        .and_then(|value| value.extract::<Vec<u8>>()),
+                )?,
+            );
             self.body = None;
             self.decoder_eof = true;
             self.closed = true;
@@ -2759,6 +2916,10 @@ impl NativeAdapterRaw {
             None => py.detach(|| body.read_to_end(&mut bytes)).map(|_| ()),
         };
         if let Err(error) = result {
+            if self.suppresses_urllib3_126_incomplete(py, &error) {
+                self.finish_body_failure();
+                return Ok(PyBytes::new(py, b"").into_any().unbind());
+            }
             return Err(self.map_io_failure(py, error));
         }
         if bytes.is_empty() {
@@ -2841,8 +3002,8 @@ impl NativeAdapterRaw {
             if let Err(error) = py.detach(|| body.close()) {
                 return Err(map_typed_response_error(
                     py,
-                    error.kind(),
-                    &error.to_string(),
+                    &error,
+                    Some(self.pool.bind(py)),
                 ));
             }
         }

@@ -379,9 +379,29 @@ def test_concatenated_codec_streams_match_exact_oracle_snapshots() -> None:
         "deflate-zlib": _successful_iteration(b"first-member:", frames["deflate-zlib"]),
         "deflate-raw": _successful_iteration(b"first-member:", frames["deflate-raw"]),
         "zstd": _successful_iteration(both_members, frames["zstd"]),
-        "br": _failed_iteration(LARGE, raw_reads=75),
     }
-    assert state == expected
+    assert {name: state[name] for name in expected} == expected
+
+    # urllib3 may select either brotli or brotlicffi. They fail at different
+    # input boundaries for this concatenated stream, so exact differential
+    # equality is enforced by _snapshot while these portable invariants pin
+    # the shared public behavior.
+    brotli = state["br"]
+    joined = bytes.fromhex(brotli["joined"])
+    assert LARGE.startswith(joined)
+    assert len(LARGE) - 7 <= len(joined) <= len(LARGE)
+    assert brotli["chunks"] == _chunks(joined)
+    assert brotli["sizes"] == [len(bytes.fromhex(chunk)) for chunk in brotli["chunks"]]
+    assert brotli["error"] == DECODE_ERROR
+    assert brotli["lazy"] == {
+        "content_is_false": True,
+        "content_consumed": False,
+        "raw_reads": 0,
+    }
+    assert brotli["content_is_false"] is True
+    assert brotli["content_consumed"] is False
+    assert 1 < brotli["raw_reads"] <= (len(bytes.fromhex(frames["br"])) + 2) // 3 + 1
+    assert brotli["max_raw_read"] == 3
 
 
 def test_corrupt_codec_iteration_and_content_match_exact_oracle_snapshots() -> None:

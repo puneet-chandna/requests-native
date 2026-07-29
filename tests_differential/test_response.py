@@ -418,6 +418,142 @@ def _run_rewrite_only(source: str, *, before_extension: str = ""):
     return _normalize_literal(ast.literal_eval(rewrite.observations["result"]["repr"]))
 
 
+def test_response_handlers_use_cpython_except_matching_for_live_sources() -> None:
+    state = _run_matching(
+        """
+import requests.models as models
+import json.decoder
+import sys
+from urllib3.exceptions import ProtocolError as CanonicalProtocolError
+
+
+class InstanceCheckFailure(BaseException):
+    pass
+
+
+instance_check_failure = InstanceCheckFailure("instance check must not run")
+
+
+class ExplodingMeta(type):
+    def __instancecheck__(cls, value):
+        side_effects.append(["instance-check", type(value).__name__])
+        raise instance_check_failure
+
+
+class ExplodingJsonSource(Exception, metaclass=ExplodingMeta):
+    pass
+
+
+class ExplodingProtocolSource(Exception, metaclass=ExplodingMeta):
+    pass
+
+
+class FailingRaw:
+    def __init__(self, error, replacement):
+        self.error = error
+        self.replacement = replacement
+
+    def stream(self, chunk_size, decode_content=True):
+        models.ProtocolError = self.replacement
+        raise self.error
+        yield
+
+
+def error_shape(error, original):
+    context = error.__context__
+    return {
+        "type": [type(error).__module__, type(error).__qualname__],
+        "message": str(error),
+        "is_original": error is original,
+        "context_is_original": context is original,
+        "context_type": None
+        if context is None
+        else [type(context).__module__, type(context).__qualname__],
+    }
+
+
+saved_json_source = models.JSONDecodeError
+saved_protocol = models.ProtocolError
+rows = {}
+try:
+    def json_case(replacement):
+        subject = Response()
+        subject._content = b"document"
+        subject._content_consumed = True
+        subject.encoding = "utf-8"
+        original = None
+
+        def trace(frame, event, arg):
+            if event == "call" and frame.f_code is json.decoder.JSONDecoder.raw_decode.__code__:
+                models.JSONDecodeError = replacement
+            return trace
+
+        sys.settrace(trace)
+        try:
+            caught = capture(lambda: response_json_call(subject, {}))["error"]
+        finally:
+            sys.settrace(None)
+            models.JSONDecodeError = saved_json_source
+        return caught
+
+    caught = json_case(ExplodingJsonSource)
+    json_original = caught if type(caught) is saved_json_source else caught.__context__
+    rows["json-exploding"] = error_shape(caught, json_original)
+
+    caught = json_case(object)
+    json_original = caught.__context__
+    rows["json-object"] = error_shape(caught, json_original)
+
+    caught = json_case((saved_json_source, object))
+    json_original = caught.__context__
+    rows["json-late-invalid-tuple"] = error_shape(caught, json_original)
+
+    caught = json_case(((saved_json_source,),))
+    json_original = caught.__context__
+    rows["json-nested-tuple"] = error_shape(caught, json_original)
+
+    stream_original = CanonicalProtocolError("stream failed")
+    subject = Response()
+    subject.raw = FailingRaw(stream_original, ExplodingProtocolSource)
+    caught = capture(
+        lambda: next(response_iter_content_call(subject, 1))
+    )["error"]
+    rows["stream-exploding"] = error_shape(caught, stream_original)
+
+    subject = Response()
+    subject.raw = FailingRaw(stream_original, object)
+    caught = capture(
+        lambda: next(response_iter_content_call(subject, 1))
+    )["error"]
+    rows["stream-object"] = error_shape(caught, stream_original)
+finally:
+    models.JSONDecodeError = saved_json_source
+    models.ProtocolError = saved_protocol
+
+result = {"rows": rows, "events": side_effects}
+"""
+    )
+
+    assert state["events"] == []
+    assert state["rows"]["json-exploding"]["is_original"] is True
+    assert state["rows"]["stream-exploding"]["is_original"] is True
+    for name, context_type in (
+        ("json-object", ["json.decoder", "JSONDecodeError"]),
+        ("json-late-invalid-tuple", ["json.decoder", "JSONDecodeError"]),
+        ("json-nested-tuple", ["json.decoder", "JSONDecodeError"]),
+        ("stream-object", ["urllib3.exceptions", "ProtocolError"]),
+    ):
+        assert state["rows"][name] == {
+            "type": ["builtins", "TypeError"],
+            "message": (
+                "catching classes that do not inherit from BaseException is not allowed"
+            ),
+            "is_original": False,
+            "context_is_original": True,
+            "context_type": context_type,
+        }
+
+
 def _normalize_literal(value):
     if isinstance(value, (list, tuple)):
         return [_normalize_literal(item) for item in value]

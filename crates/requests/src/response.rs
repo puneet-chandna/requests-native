@@ -100,6 +100,7 @@ impl Response {
 
     fn take_body(&mut self, decoded: bool) -> ResponseBody {
         let chunked = has_chunked_transfer_encoding(&self.head.headers);
+        let expected_content_length = self.content_length();
         let encoding = if decoded {
             self.head
                 .headers
@@ -122,6 +123,8 @@ impl Response {
             total_timeout: self.total_timeout.take(),
             total_deadline: self.total_deadline.take().map(BodyDeadline::new),
             chunked,
+            expected_content_length,
+            received_body_bytes: 0,
             terminal: false,
             disposition: self
                 .disposition
@@ -213,6 +216,8 @@ pub struct ResponseBody {
     total_timeout: Option<Duration>,
     total_deadline: Option<BodyDeadline>,
     chunked: bool,
+    expected_content_length: Option<u64>,
+    received_body_bytes: u64,
     terminal: bool,
     disposition: ResponseDispositionState,
     #[cfg(test)]
@@ -309,7 +314,11 @@ impl ResponseBody {
                     let error = if self.chunked {
                         Error::chunked_encoding(error)
                     } else {
-                        Error::response_body(error)
+                        let incomplete_body = self.expected_content_length.and_then(|expected| {
+                            let remaining = expected.saturating_sub(self.received_body_bytes);
+                            (remaining != 0).then_some((self.received_body_bytes, remaining))
+                        });
+                        Error::response_body_hyper(error, incomplete_body)
                     };
                     return (Poll::Ready(Some(Err(error))), false);
                 }
@@ -374,6 +383,8 @@ impl ResponseBody {
                 total_timeout: None,
                 total_deadline: None,
                 chunked: false,
+                expected_content_length: None,
+                received_body_bytes: 0,
                 terminal: false,
                 disposition: ResponseDispositionState::without_native_lease(),
                 probe: Some(probe.clone()),
@@ -399,6 +410,9 @@ impl Stream for ResponseBody {
         let (source_poll, wire_progress) = self.poll_source(context);
         match source_poll {
             Poll::Ready(Some(Ok(bytes))) => {
+                self.received_body_bytes = self
+                    .received_body_bytes
+                    .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
                 drop(self.read_deadline.take());
                 self.disposition.apply(ResponseEvent::Partial);
                 return Poll::Ready(Some(Ok(bytes)));

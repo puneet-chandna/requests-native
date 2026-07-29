@@ -625,7 +625,7 @@ impl Transport {
                         };
                         break Err(error);
                     }
-                    ExchangeEvent::Response(result) => break result.map_err(Error::send),
+                    ExchangeEvent::Response(result) => break result.map_err(Error::send_hyper),
                     ExchangeEvent::UploadComplete(completed_at) => {
                         completion_pending = false;
                         body_completion.take();
@@ -877,7 +877,7 @@ where
     let (sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
         .map_err(Error::handshake)?;
-    driver.start(async move { connection.await.map_err(Error::connection) });
+    driver.start(async move { connection.await.map_err(Error::connection_hyper) });
     Ok(IdleConnection::network(sender, driver))
 }
 

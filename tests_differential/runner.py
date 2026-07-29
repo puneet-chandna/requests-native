@@ -27,6 +27,7 @@ _CHILD_ARGUMENT = "--child"
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 _TIMEOUT_ENVIRONMENT = "REQUESTS_DIFFERENTIAL_TIMEOUT"
 _TARGET_ENVIRONMENT = "REQUESTS_DIFFERENTIAL_TARGET"
+_DEPENDENCY_PATH_ENVIRONMENT = "REQUESTS_DIFFERENTIAL_DEPENDENCY_PATH"
 _MAX_DIAGNOSTIC_CHARS = 2048
 _PRESERVED_ENVIRONMENT = (
     "COMSPEC",
@@ -170,13 +171,16 @@ def _child_environment(package_root: Path, target: str) -> dict[str, str]:
     environment = {
         name: os.environ[name] for name in _PRESERVED_ENVIRONMENT if name in os.environ
     }
+    python_path = str(package_root)
+    if dependency_path := os.environ.get(_DEPENDENCY_PATH_ENVIRONMENT):
+        python_path = os.pathsep.join((python_path, dependency_path))
     environment.update(
         {
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
             "PYTHONIOENCODING": "utf-8",
             "PYTHONNOUSERSITE": "1",
-            "PYTHONPATH": str(package_root),
+            "PYTHONPATH": python_path,
             "PYTHONUTF8": "1",
             _TARGET_ENVIRONMENT: target,
         }
