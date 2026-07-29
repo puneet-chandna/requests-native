@@ -91,6 +91,7 @@ struct SideEntry {
     admission_revision: u64,
     proof_revision: u64,
     weak_adapter: Arc<Py<PyAny>>,
+    proxy_mapping: Arc<Py<PyAny>>,
     manager: ManagerRecord,
     direct_pools: PoolRealm,
     proxy_pools: HashMap<String, PoolRealm>,
@@ -173,6 +174,7 @@ struct ManagerProof {
 }
 
 struct ManagerPoolsProof {
+    pools: Py<PyAny>,
     pools_dict: DictProof,
     pool_container: MappingProof,
     visible_pools: Vec<(Py<PyAny>, Py<PyAny>)>,
@@ -193,6 +195,7 @@ struct AdapterPoolSelection {
 
 static ADAPTER_POOLS: OnceLock<Mutex<HashMap<usize, SideEntry>>> = OnceLock::new();
 static NEXT_ADAPTER_LIFECYCLE_EPOCH: AtomicU64 = AtomicU64::new(1);
+const MANAGER_PROOF_ATTEMPTS: usize = 8;
 
 #[pyclass(module = "requests._requests_rust", unsendable)]
 struct NativeAdapterRaw {
@@ -983,6 +986,23 @@ struct NativeSendInput {
     retry: RetrySnapshot,
 }
 
+#[derive(Clone, Copy)]
+struct ProxyManagerConfiguration {
+    pool_connections: usize,
+    pool_maxsize: usize,
+    pool_block: bool,
+}
+
+impl From<&NativeSendInput> for ProxyManagerConfiguration {
+    fn from(input: &NativeSendInput) -> Self {
+        Self {
+            pool_connections: input.pool_connections,
+            pool_maxsize: input.pool_maxsize,
+            pool_block: input.pool_block,
+        }
+    }
+}
+
 fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
     let adapters = PyModule::import(py, "requests.adapters")?;
     let adapter_type = adapters.getattr("HTTPAdapter")?;
@@ -1440,11 +1460,6 @@ fn native_send_input(
     if !adapter_identity_is_pristine(py, adapter, request)? {
         return Ok(Err("adapter identities are not pristine".to_owned()));
     }
-    if !registered_adapter_pristine(py, adapter)? {
-        return Ok(Err(
-            "adapter is not registered with its original pool manager".to_owned(),
-        ));
-    }
     let config = adapter.getattr("config")?;
     if !config.is_exact_instance_of::<PyDict>() || !config.is_empty()? {
         return Ok(Err("adapter config is not an empty exact dict".to_owned()));
@@ -1515,8 +1530,16 @@ fn native_send_input(
             path_url.extract::<String>()?
         }
     };
+    let proxy_configuration = ProxyManagerConfiguration {
+        pool_connections,
+        pool_maxsize,
+        pool_block,
+    };
+    let recovery = selected_proxy
+        .as_deref()
+        .map(|proxy| (proxy, proxy_configuration));
     if !adapter_identity_is_pristine(py, adapter, request)?
-        || !registered_adapter_pristine(py, adapter)?
+        || !registered_adapter_pristine(py, adapter, recovery)?
     {
         return Ok(Err("adapter identities changed during admission".to_owned()));
     }
@@ -1579,40 +1602,67 @@ fn next_adapter_lifecycle_epoch() -> u64 {
 fn manager_pools_proof(manager: &Bound<'_, PyAny>) -> PyResult<ManagerPoolsProof> {
     let py = manager.py();
     let pools = manager.getattr("pools")?;
+    let pool_container = mapping_proof(&pools.getattr("_container")?)?;
+    let visible_pools = pool_container
+        .items
+        .iter()
+        .map(|(key, value)| (key.clone_ref(py), value.clone_ref(py)))
+        .collect::<Vec<_>>();
+    let visible_pool_count = visible_pools.len();
     Ok(ManagerPoolsProof {
+        pools: pools.clone().unbind(),
         pools_dict: dict_proof(py, &pools.getattr("__dict__")?)?,
-        pool_container: mapping_proof(&pools.getattr("_container")?)?,
-        visible_pools: visible_pools(manager)?,
-        visible_pool_count: pools.len()?,
+        pool_container,
+        visible_pools,
+        visible_pool_count,
     })
 }
 
-fn manager_proof(manager: &Bound<'_, PyAny>) -> PyResult<ManagerRecord> {
-    let py = manager.py();
-    let mut mappings = Vec::new();
-    for name in [
-        "headers",
-        "connection_pool_kw",
-        "pool_classes_by_scheme",
-        "key_fn_by_scheme",
-        "proxy_headers",
-    ] {
-        if let Ok(mapping) = manager.getattr(name) {
-            mappings.push((name.to_owned(), mapping_proof(&mapping)?));
+fn stable_manager_pools_proof(
+    manager: &Bound<'_, PyAny>,
+) -> PyResult<Option<Arc<ManagerPoolsProof>>> {
+    for _ in 0..MANAGER_PROOF_ATTEMPTS {
+        let proof = Arc::new(manager_pools_proof(manager)?);
+        if manager_pools_proof_is_pristine(manager.py(), manager, proof.as_ref())? {
+            return Ok(Some(proof));
         }
     }
-    let pools = manager.getattr("pools")?;
-    Ok(ManagerRecord {
-        proof: Arc::new(ManagerProof {
+    Ok(None)
+}
+
+fn manager_proof(manager: &Bound<'_, PyAny>) -> PyResult<Option<ManagerRecord>> {
+    let py = manager.py();
+    for _ in 0..MANAGER_PROOF_ATTEMPTS {
+        let mut mappings = Vec::new();
+        for name in [
+            "headers",
+            "connection_pool_kw",
+            "pool_classes_by_scheme",
+            "key_fn_by_scheme",
+            "proxy_headers",
+        ] {
+            if let Ok(mapping) = manager.getattr(name) {
+                mappings.push((name.to_owned(), mapping_proof(&mapping)?));
+            }
+        }
+        let pools = manager.getattr("pools")?;
+        let proof = Arc::new(ManagerProof {
             manager: manager.clone().unbind(),
             manager_type: manager.get_type().into_any().unbind(),
             class_behavior: behavior_proof(py, manager.get_type().as_any())?,
             objects: dict_proof(py, &manager.getattr("__dict__")?)?,
             mappings,
             pools_behavior: behavior_proof(py, pools.get_type().as_any())?,
-        }),
-        pools: Arc::new(manager_pools_proof(manager)?),
-    })
+        });
+        let Some(pools) = stable_manager_pools_proof(manager)? else {
+            continue;
+        };
+        let record = ManagerRecord { proof, pools };
+        if manager_proof_is_pristine(py, manager, &record)? {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 fn object_items(value: &Bound<'_, PyAny>) -> PyResult<ObjectItems> {
@@ -1715,37 +1765,348 @@ fn manager_proof_is_pristine(
     if !manager_immutable_proof_is_pristine(py, manager, record.proof.as_ref())? {
         return Ok(false);
     }
+    manager_pools_proof_is_pristine(py, manager, record.pools.as_ref())
+}
+
+fn manager_pools_proof_is_pristine(
+    py: Python<'_>,
+    manager: &Bound<'_, PyAny>,
+    proof: &ManagerPoolsProof,
+) -> PyResult<bool> {
     let pools = manager.getattr("pools")?;
-    if !dict_proof_is_pristine(py, &pools.getattr("__dict__")?, &record.pools.pools_dict)?
-        || !mapping_proof_is_pristine(
-            py,
-            &pools.getattr("_container")?,
-            &record.pools.pool_container,
-        )?
+    if !pools.is(proof.pools.bind(py))
+        || !dict_proof_is_pristine(py, &pools.getattr("__dict__")?, &proof.pools_dict)?
+        || !mapping_proof_is_pristine(py, &pools.getattr("_container")?, &proof.pool_container)?
     {
         return Ok(false);
     }
     let pools = visible_pools(manager)?;
-    Ok(pools.len() == record.pools.visible_pools.len()
-        && pools.iter().zip(&record.pools.visible_pools).all(
+    Ok(pools.len() == proof.visible_pools.len()
+        && pools.iter().zip(&proof.visible_pools).all(
             |((key, value), (expected_key, expected_value))| {
                 key.bind(py).is(expected_key.bind(py)) && value.bind(py).is(expected_value.bind(py))
             },
-        ))
+        )
+        && manager_pool_count(manager)? == proof.visible_pool_count)
 }
 
-fn canonical_proxy_manager_type(
-    py: Python<'_>,
-    proxy_url: &str,
+fn frozen_adapter_method<'py>(
+    py: Python<'py>,
+    state: &'py AdapterState,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    state
+        .methods
+        .iter()
+        .find(|(candidate, _)| candidate == name)
+        .map(|(_, proof)| proof.object.bind(py).clone())
+        .ok_or_else(|| PyNameError::new_err(format!("name '{name}' is not defined")))
+}
+
+fn frozen_adapter_global<'py>(
+    py: Python<'py>,
+    state: &'py AdapterState,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    state
+        .globals
+        .iter()
+        .find(|(candidate, _)| candidate == name)
+        .map(|(_, proof)| proof.object.bind(py).clone())
+        .ok_or_else(|| PyNameError::new_err(format!("name '{name}' is not defined")))
+}
+
+fn exact_dict_has_keys(dictionary: &Bound<'_, PyDict>, expected: &[&str]) -> PyResult<bool> {
+    if dictionary.len() != expected.len() {
+        return Ok(false);
+    }
+    for (key, _) in dictionary.iter() {
+        if !key.is_exact_instance_of::<PyString>() {
+            return Ok(false);
+        }
+        let key = key.extract::<String>()?;
+        if !expected.iter().any(|expected| *expected == key) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn exact_python_value_equal(left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(left.get_type().as_any().is(right.get_type().as_any()) && left.eq(right)?)
+}
+
+fn exact_string_dict_equal(left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let Ok(left) = left.cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    let Ok(right) = right.cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (key, expected) in right.iter() {
+        if !key.is_exact_instance_of::<PyString>() || !expected.is_exact_instance_of::<PyString>() {
+            return Ok(false);
+        }
+        let Some(current) = left.get_item(&key)? else {
+            return Ok(false);
+        };
+        if !current.is_exact_instance_of::<PyString>() || !current.eq(&expected)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn canonical_manager_pool_configuration(
     manager: &Bound<'_, PyAny>,
+    configuration: ProxyManagerConfiguration,
+) -> PyResult<bool> {
+    let headers = manager.getattr("headers")?;
+    let Ok(headers) = headers.cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    if !headers.is_empty() {
+        return Ok(false);
+    }
+    let kwargs = manager.getattr("connection_pool_kw")?;
+    let Ok(kwargs) = kwargs.cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    let Some(maxsize) = kwargs.get_item("maxsize")? else {
+        return Ok(false);
+    };
+    let Some(block) = kwargs.get_item("block")? else {
+        return Ok(false);
+    };
+    if exact_usize(maxsize) != Some(configuration.pool_maxsize)
+        || exact_bool(block)? != Some(configuration.pool_block)
+    {
+        return Ok(false);
+    }
+    let pools = manager.getattr("pools")?;
+    Ok(
+        exact_usize(pools.getattr("_maxsize")?) == Some(configuration.pool_connections)
+            && pools.getattr("dispose_func")?.is_none(),
+    )
+}
+
+fn canonical_http_proxy_manager_is_pristine(
+    py: Python<'_>,
+    adapter: &Bound<'_, PyAny>,
+    proxy_url: &Bound<'_, PyAny>,
+    manager: &Bound<'_, PyAny>,
+    configuration: ProxyManagerConfiguration,
 ) -> PyResult<bool> {
     let state = adapter_state(py)?;
-    let expected = if proxy_url.to_ascii_lowercase().starts_with("socks") {
-        &state.socks_manager_behavior
+    if !manager
+        .get_type()
+        .as_any()
+        .is(state.proxy_manager_behavior.object.bind(py))
+        || !canonical_manager_pool_configuration(manager, configuration)?
+    {
+        return Ok(false);
+    }
+    let proxy = manager.getattr("proxy")?;
+    let expected = frozen_adapter_global(py, state, "parse_url")?.call1((proxy_url,))?;
+    if !proxy.get_type().as_any().is(expected.get_type().as_any()) {
+        return Ok(false);
+    }
+    for name in ["scheme", "auth", "host", "path", "query", "fragment"] {
+        if !exact_python_value_equal(&proxy.getattr(name)?, &expected.getattr(name)?)? {
+            return Ok(false);
+        }
+    }
+    let expected_scheme = expected.getattr("scheme")?;
+    if !expected_scheme.is_exact_instance_of::<PyString>() {
+        return Ok(false);
+    }
+    let expected_port = expected.getattr("port")?;
+    let expected_port = if expected_port.is_none() {
+        match expected_scheme
+            .extract::<String>()?
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        }
     } else {
-        &state.proxy_manager_behavior
+        exact_usize(expected_port)
     };
-    Ok(manager.get_type().as_any().is(expected.object.bind(py)))
+    if exact_usize(proxy.getattr("port")?) != expected_port {
+        return Ok(false);
+    }
+
+    let proxy_headers = manager.getattr("proxy_headers")?;
+    let expected_headers =
+        frozen_adapter_method(py, state, "proxy_headers")?.call1((adapter, proxy_url))?;
+    if !exact_string_dict_equal(&proxy_headers, &expected_headers)? {
+        return Ok(false);
+    }
+    let kwargs = manager.getattr("connection_pool_kw")?;
+    let Ok(kwargs) = kwargs.cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    if !exact_dict_has_keys(
+        kwargs,
+        &[
+            "maxsize",
+            "block",
+            "_proxy",
+            "_proxy_headers",
+            "_proxy_config",
+        ],
+    )? {
+        return Ok(false);
+    }
+    let Some(kw_proxy) = kwargs.get_item("_proxy")? else {
+        return Ok(false);
+    };
+    let Some(kw_headers) = kwargs.get_item("_proxy_headers")? else {
+        return Ok(false);
+    };
+    let Some(kw_config) = kwargs.get_item("_proxy_config")? else {
+        return Ok(false);
+    };
+    let proxy_config = manager.getattr("proxy_config")?;
+    if !kw_proxy.is(&proxy)
+        || !kw_headers.is(&proxy_headers)
+        || !kw_config.is(&proxy_config)
+        || !manager.getattr("proxy_ssl_context")?.is_none()
+        || !proxy_config.getattr("ssl_context")?.is_none()
+        || exact_bool(proxy_config.getattr("use_forwarding_for_https")?)? != Some(false)
+    {
+        return Ok(false);
+    }
+    for name in ["assert_hostname", "assert_fingerprint"] {
+        if proxy_config.hasattr(name)? && !proxy_config.getattr(name)?.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn canonical_socks_proxy_manager_is_pristine(
+    py: Python<'_>,
+    proxy_url: &Bound<'_, PyAny>,
+    manager: &Bound<'_, PyAny>,
+    configuration: ProxyManagerConfiguration,
+) -> PyResult<bool> {
+    let state = adapter_state(py)?;
+    if !manager
+        .get_type()
+        .as_any()
+        .is(state.socks_manager_behavior.object.bind(py))
+        || !manager.getattr("proxy_url")?.is(proxy_url)
+        || !canonical_manager_pool_configuration(manager, configuration)?
+    {
+        return Ok(false);
+    }
+    let parsed = frozen_adapter_global(py, state, "parse_url")?.call1((proxy_url,))?;
+    let scheme = parsed.getattr("scheme")?;
+    if !scheme.is_exact_instance_of::<PyString>() {
+        return Ok(false);
+    }
+    let (socks_version, rdns) = match scheme.extract::<String>()?.to_ascii_lowercase().as_str() {
+        "socks4" => (1, false),
+        "socks4a" => (1, true),
+        "socks5" => (2, false),
+        "socks5h" => (2, true),
+        _ => return Ok(false),
+    };
+    let authentication =
+        frozen_adapter_global(py, state, "get_auth_from_url")?.call1((proxy_url,))?;
+    let authentication = authentication.cast::<PyTuple>()?;
+    if authentication.len() != 2
+        || !authentication
+            .get_item(0)?
+            .is_exact_instance_of::<PyString>()
+        || !authentication
+            .get_item(1)?
+            .is_exact_instance_of::<PyString>()
+    {
+        return Ok(false);
+    }
+
+    let kwargs = manager.getattr("connection_pool_kw")?;
+    let Ok(kwargs) = kwargs.cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    if !exact_dict_has_keys(kwargs, &["maxsize", "block", "_socks_options"])? {
+        return Ok(false);
+    }
+    let Some(options) = kwargs.get_item("_socks_options")? else {
+        return Ok(false);
+    };
+    let Ok(options) = options.cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    if !exact_dict_has_keys(
+        options,
+        &[
+            "socks_version",
+            "proxy_host",
+            "proxy_port",
+            "username",
+            "password",
+            "rdns",
+        ],
+    )? {
+        return Ok(false);
+    }
+    let Some(version) = options.get_item("socks_version")? else {
+        return Ok(false);
+    };
+    let Some(host) = options.get_item("proxy_host")? else {
+        return Ok(false);
+    };
+    let Some(port) = options.get_item("proxy_port")? else {
+        return Ok(false);
+    };
+    let Some(username) = options.get_item("username")? else {
+        return Ok(false);
+    };
+    let Some(password) = options.get_item("password")? else {
+        return Ok(false);
+    };
+    let Some(current_rdns) = options.get_item("rdns")? else {
+        return Ok(false);
+    };
+    let parsed_host = parsed.getattr("host")?;
+    let parsed_port = parsed.getattr("port")?;
+    Ok(exact_usize(version) == Some(socks_version)
+        && host.is_exact_instance_of::<PyString>()
+        && exact_python_value_equal(&host, &parsed_host)?
+        && ((port.is_none() && parsed_port.is_none())
+            || (exact_usize(port.clone()).is_some()
+                && exact_python_value_equal(&port, &parsed_port)?))
+        && username.is_exact_instance_of::<PyString>()
+        && password.is_exact_instance_of::<PyString>()
+        && username.eq(&authentication.get_item(0)?)?
+        && password.eq(&authentication.get_item(1)?)?
+        && exact_bool(current_rdns)? == Some(rdns))
+}
+
+fn canonical_proxy_manager_is_pristine(
+    py: Python<'_>,
+    adapter: &Bound<'_, PyAny>,
+    proxy_url: &Bound<'_, PyAny>,
+    manager: &Bound<'_, PyAny>,
+    configuration: ProxyManagerConfiguration,
+) -> PyResult<bool> {
+    if !proxy_url.is_exact_instance_of::<PyString>() {
+        return Ok(false);
+    }
+    let proxy_url_text = proxy_url.extract::<String>()?;
+    if proxy_url_text.to_ascii_lowercase().starts_with("socks") {
+        canonical_socks_proxy_manager_is_pristine(py, proxy_url, manager, configuration)
+    } else {
+        canonical_http_proxy_manager_is_pristine(py, adapter, proxy_url, manager, configuration)
+    }
 }
 
 fn visible_pools(manager: &Bound<'_, PyAny>) -> PyResult<Vec<(Py<PyAny>, Py<PyAny>)>> {
@@ -1816,11 +2177,44 @@ fn manager_configuration_is_pristine(
     )
 }
 
-fn registered_adapter_pristine(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<bool> {
+fn exact_dict_snapshot_is_current(
+    snapshot: &Bound<'_, PyDict>,
+    current: &Bound<'_, PyDict>,
+) -> PyResult<bool> {
+    if snapshot.len() != current.len() {
+        return Ok(false);
+    }
+    for (key, value) in snapshot.iter() {
+        if !key.is_exact_instance_of::<PyString>() {
+            return Ok(false);
+        }
+        let Some(current_value) = current.get_item(&key)? else {
+            return Ok(false);
+        };
+        if !current_value.is(&value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn registered_adapter_pristine(
+    py: Python<'_>,
+    adapter: &Bound<'_, PyAny>,
+    recovery: Option<(&str, ProxyManagerConfiguration)>,
+) -> PyResult<bool> {
     let identity = adapter_id(py, adapter)?;
     let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    loop {
-        let (lifecycle_epoch, proof_revision, weak_adapter, manager_proof, proxy_proofs) = {
+    for _ in 0..MANAGER_PROOF_ATTEMPTS {
+        let (
+            lifecycle_epoch,
+            proof_revision,
+            weak_adapter,
+            proxy_mapping,
+            direct_manager,
+            proxy_proofs,
+            recovery_realm,
+        ) = {
             let table = registry
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
@@ -1831,37 +2225,83 @@ fn registered_adapter_pristine(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> Py
                 entry.lifecycle_epoch,
                 entry.proof_revision,
                 Arc::clone(&entry.weak_adapter),
+                Arc::clone(&entry.proxy_mapping),
                 entry.manager.clone(),
                 entry.proxy_managers.clone(),
+                recovery.is_some_and(|(url, _)| entry.proxy_pools.contains_key(url)),
             )
         };
-        let pristine = (|| -> PyResult<bool> {
+        let pristine = (|| -> PyResult<Option<bool>> {
             let referent = weak_adapter.bind(py).call0()?;
             let manager = adapter.getattr("poolmanager")?;
             let proxy_managers = adapter.getattr("proxy_manager")?;
-            let Ok(proxy_managers) = proxy_managers.cast::<PyDict>() else {
-                return Ok(false);
+            let Ok(proxy_managers) = proxy_managers.cast_exact::<PyDict>() else {
+                return Ok(Some(false));
             };
-            if proxy_managers.len() != proxy_proofs.len() {
-                return Ok(false);
+            if !proxy_managers.as_any().is(proxy_mapping.bind(py)) {
+                return Ok(Some(false));
             }
-            for (url, expected) in &proxy_proofs {
-                let Some(current) = proxy_managers.get_item(url)? else {
-                    return Ok(false);
-                };
-                if !manager_proof_is_pristine(py, &current, expected)? {
-                    return Ok(false);
+            let snapshot = proxy_managers.copy()?;
+            let maximum_managers = proxy_proofs.len() + usize::from(recovery_realm);
+            if snapshot.len() < proxy_proofs.len() || snapshot.len() > maximum_managers {
+                return Ok(Some(false));
+            }
+            let mut recovered = false;
+            for (url, current) in snapshot.iter() {
+                if !url.is_exact_instance_of::<PyString>() {
+                    return Ok(Some(false));
                 }
+                let url_text = url.extract::<String>()?;
+                if let Some(expected) = proxy_proofs.get(&url_text) {
+                    if !manager_proof_is_pristine(py, &current, expected)? {
+                        return Ok(Some(false));
+                    }
+                    continue;
+                }
+                let Some((recovery_url, configuration)) = recovery else {
+                    return Ok(Some(false));
+                };
+                if recovered
+                    || !recovery_realm
+                    || url_text != recovery_url
+                    || !canonical_proxy_manager_is_pristine(
+                        py,
+                        adapter,
+                        &url,
+                        &current,
+                        configuration,
+                    )?
+                    || manager_proof(&current)?.is_none()
+                {
+                    return Ok(Some(false));
+                }
+                recovered = true;
             }
-            if !manager_proof_is_pristine(py, &manager, &manager_proof)? {
-                return Ok(false);
+            if !manager_proof_is_pristine(py, &manager, &direct_manager)? {
+                return Ok(Some(false));
             }
-            Ok(referent.is(adapter)
-                && manager_proof.proof.manager.bind(py).is(&manager)
-                && manager_identity_is_pristine(py, &manager)?
-                && manager_configuration_is_pristine(adapter, &manager)?
-                && manager_pool_count(&manager)? == manager_proof.pools.visible_pool_count)
+            let current_proxy_managers = adapter.getattr("proxy_manager")?;
+            let Ok(current_proxy_managers) = current_proxy_managers.cast_exact::<PyDict>() else {
+                return Ok(Some(false));
+            };
+            if !current_proxy_managers.as_any().is(proxy_mapping.bind(py)) {
+                return Ok(Some(false));
+            }
+            let current_snapshot = current_proxy_managers.copy()?;
+            if !exact_dict_snapshot_is_current(&snapshot, &current_snapshot)? {
+                return Ok(None);
+            }
+            Ok(Some(
+                referent.is(adapter)
+                    && direct_manager.proof.manager.bind(py).is(&manager)
+                    && manager_identity_is_pristine(py, &manager)?
+                    && manager_configuration_is_pristine(adapter, &manager)?
+                    && manager_pool_count(&manager)? == direct_manager.pools.visible_pool_count,
+            ))
         })()?;
+        let Some(pristine) = pristine else {
+            continue;
+        };
         let table = registry
             .lock()
             .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
@@ -1875,8 +2315,13 @@ fn registered_adapter_pristine(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> Py
             drop(table);
             continue;
         }
+        if entry.proxy_mapping.as_ptr() != proxy_mapping.as_ptr() {
+            return Ok(false);
+        }
+        drop(table);
         return Ok(pristine);
     }
+    Ok(false)
 }
 
 #[pyfunction]
@@ -1900,14 +2345,20 @@ fn _adapter_register_trial(
         return Ok(false);
     }
     let proxy_managers = adapter.getattr("proxy_manager")?;
-    if !proxy_managers.is_exact_instance_of::<PyDict>() || !proxy_managers.is_empty()? {
+    let Ok(proxy_managers) = proxy_managers.cast_exact::<PyDict>() else {
+        return Ok(false);
+    };
+    if !proxy_managers.is_empty() {
         return Ok(false);
     }
+    let proxy_mapping = Arc::new(proxy_managers.clone().into_any().unbind());
     let weak_adapter = PyModule::import(py, "weakref")?
         .getattr("ref")?
         .call1((adapter, callback))?
         .unbind();
-    let manager_proof = manager_proof(&manager)?;
+    let Some(manager_proof) = manager_proof(&manager)? else {
+        return Ok(false);
+    };
     let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut table = table
         .lock()
@@ -1919,6 +2370,7 @@ fn _adapter_register_trial(
             admission_revision: 0,
             proof_revision: 0,
             weak_adapter: Arc::new(weak_adapter),
+            proxy_mapping,
             manager: manager_proof,
             direct_pools: PoolRealm::default(),
             proxy_pools: HashMap::new(),
@@ -1937,11 +2389,12 @@ fn record_visible_proxy_manager(
     adapter: &Bound<'_, PyAny>,
     proxy_url: &str,
     expected_lifecycle_epoch: u64,
+    configuration: ProxyManagerConfiguration,
 ) -> PyResult<bool> {
     let identity = adapter_id(py, adapter)?;
     let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    loop {
-        let (proof_revision, expected_managers) = {
+    for _ in 0..MANAGER_PROOF_ATTEMPTS {
+        let (proof_revision, proxy_mapping, expected_managers) = {
             let table = registry
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
@@ -1951,58 +2404,59 @@ fn record_visible_proxy_manager(
             if entry.lifecycle_epoch != expected_lifecycle_epoch {
                 return Ok(false);
             }
-            (entry.proof_revision, entry.proxy_managers.clone())
+            (
+                entry.proof_revision,
+                Arc::clone(&entry.proxy_mapping),
+                entry.proxy_managers.clone(),
+            )
         };
         let proxy_managers = adapter.getattr("proxy_manager")?;
-        let Ok(proxy_managers) = proxy_managers.cast::<PyDict>() else {
+        let Ok(proxy_managers) = proxy_managers.cast_exact::<PyDict>() else {
             return Ok(false);
         };
-        let visible_snapshot = proxy_managers.call_method0("copy")?;
-        let visible_snapshot = visible_snapshot.cast::<PyDict>()?;
-        let Some(manager) = visible_snapshot.get_item(proxy_url)? else {
+        if !proxy_managers.as_any().is(proxy_mapping.bind(py)) {
             return Ok(false);
-        };
-        let manager_address = manager.as_ptr();
+        }
+        let visible_snapshot = proxy_managers.copy()?;
+        let mut target_manager_address = None;
         let mut visible_managers = HashMap::with_capacity(visible_snapshot.len());
         for (url, manager) in visible_snapshot.iter() {
-            let Ok(url) = url.extract::<String>() else {
+            if !url.is_exact_instance_of::<PyString>() {
                 return Ok(false);
-            };
-            let record = if let Some(expected) = expected_managers.get(&url) {
+            }
+            let url_text = url.extract::<String>()?;
+            if url_text == proxy_url {
+                target_manager_address = Some(manager.as_ptr());
+            }
+            let record = if let Some(expected) = expected_managers.get(&url_text) {
                 if expected.proof.manager.as_ptr() != manager.as_ptr()
                     || !manager_immutable_proof_is_pristine(py, &manager, expected.proof.as_ref())?
                 {
                     return Ok(false);
                 }
+                let Some(pools) = stable_manager_pools_proof(&manager)? else {
+                    return Ok(false);
+                };
                 ManagerRecord {
                     proof: Arc::clone(&expected.proof),
-                    pools: Arc::new(manager_pools_proof(&manager)?),
+                    pools,
                 }
             } else {
-                if !canonical_proxy_manager_type(py, &url, &manager)? {
+                if !canonical_proxy_manager_is_pristine(py, adapter, &url, &manager, configuration)?
+                {
                     return Ok(false);
                 }
-                manager_proof(&manager)?
+                let Some(record) = manager_proof(&manager)? else {
+                    return Ok(false);
+                };
+                record
             };
-            visible_managers.insert(url, record);
+            visible_managers.insert(url_text, record);
         }
-        let current_snapshot = proxy_managers.call_method0("copy")?;
-        let current_snapshot = current_snapshot.cast::<PyDict>()?;
-        let stable_snapshot = visible_managers.len() == current_snapshot.len()
-            && visible_managers.iter().all(|(url, expected)| {
-                current_snapshot
-                    .get_item(url)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|manager| manager.as_ptr() == expected.proof.manager.as_ptr())
-            });
-        if !stable_snapshot {
-            drop(visible_managers);
-            continue;
-        }
-        if visible_managers
-            .get(proxy_url)
-            .is_none_or(|manager| manager.proof.manager.as_ptr() != manager_address)
+        if target_manager_address.is_none()
+            || visible_managers.get(proxy_url).is_none_or(|manager| {
+                Some(manager.proof.manager.as_ptr()) != target_manager_address
+            })
         {
             return Ok(false);
         }
@@ -2013,22 +2467,26 @@ fn record_visible_proxy_manager(
         }) {
             return Ok(false);
         }
-        let mut managers_stable = true;
         for (url, record) in &visible_managers {
-            let Some(manager) = current_snapshot.get_item(url)? else {
-                managers_stable = false;
-                break;
+            let Some(manager) = visible_snapshot.get_item(url)? else {
+                return Ok(false);
             };
             if !manager_immutable_proof_is_pristine(py, &manager, record.proof.as_ref())? {
                 return Ok(false);
             }
             if !manager_proof_is_pristine(py, &manager, record)? {
-                managers_stable = false;
-                break;
+                return Ok(false);
             }
         }
-        if !managers_stable {
-            drop(visible_managers);
+        let current_proxy_managers = adapter.getattr("proxy_manager")?;
+        let Ok(current_proxy_managers) = current_proxy_managers.cast_exact::<PyDict>() else {
+            return Ok(false);
+        };
+        if !current_proxy_managers.as_any().is(proxy_mapping.bind(py)) {
+            return Ok(false);
+        }
+        let current_snapshot = current_proxy_managers.copy()?;
+        if !exact_dict_snapshot_is_current(&visible_snapshot, &current_snapshot)? {
             continue;
         }
         let mut table = registry
@@ -2045,6 +2503,9 @@ fn record_visible_proxy_manager(
             drop(visible_managers);
             continue;
         }
+        if entry.proxy_mapping.as_ptr() != proxy_mapping.as_ptr() {
+            return Ok(false);
+        }
         if entry.proxy_managers.len() != expected_managers.len()
             || entry.proxy_managers.iter().any(|(url, current)| {
                 expected_managers.get(url).is_none_or(|expected| {
@@ -2060,6 +2521,7 @@ fn record_visible_proxy_manager(
         drop(previous);
         return Ok(true);
     }
+    Ok(false)
 }
 
 fn record_visible_direct_manager(
@@ -2068,7 +2530,7 @@ fn record_visible_direct_manager(
     manager: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
     let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    loop {
+    for _ in 0..MANAGER_PROOF_ATTEMPTS {
         let proof_revision = {
             let table = registry
                 .lock()
@@ -2083,7 +2545,9 @@ fn record_visible_direct_manager(
             }
             entry.proof_revision
         };
-        let pools = Arc::new(manager_pools_proof(manager)?);
+        let Some(pools) = stable_manager_pools_proof(manager)? else {
+            return Ok(false);
+        };
         let mut table = registry
             .lock()
             .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
@@ -2106,6 +2570,7 @@ fn record_visible_direct_manager(
         drop(previous);
         return Ok(true);
     }
+    Ok(false)
 }
 
 #[pyfunction]
@@ -2782,7 +3247,13 @@ fn _adapter_send_trial(
     let python_pool = if let Some(proxy) = &input.selected_proxy {
         let manager = adapter.call_method1("proxy_manager_for", (proxy,))?;
         let python_pool = manager.call_method1("connection_from_url", (&input.url,))?;
-        if !record_visible_proxy_manager(py, adapter, proxy, selection.lifecycle_epoch)? {
+        if !record_visible_proxy_manager(
+            py,
+            adapter,
+            proxy,
+            selection.lifecycle_epoch,
+            ProxyManagerConfiguration::from(&input),
+        )? {
             return Err(PyRuntimeError::new_err(
                 "proxy manager state changed after native send commitment",
             ));
@@ -2909,7 +3380,7 @@ fn _adapter_close_trial(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<
     let identity = adapter_id(py, adapter)?;
     reap_adapter_pools(py)?;
     let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    loop {
+    for _ in 0..MANAGER_PROOF_ATTEMPTS {
         let (lifecycle_epoch, admission_revision, proof_revision, manager, proxy_managers) = {
             let table = registry
                 .lock()
@@ -2925,17 +3396,21 @@ fn _adapter_close_trial(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<
                 entry.proxy_managers.clone(),
             )
         };
-        let manager_pools = Arc::new(manager_pools_proof(manager.proof.manager.bind(py))?);
-        let proxy_pools = proxy_managers
-            .iter()
-            .map(|(url, manager)| {
-                Ok((
-                    url.clone(),
-                    manager.proof.manager.as_ptr(),
-                    Arc::new(manager_pools_proof(manager.proof.manager.bind(py))?),
-                ))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let Some(manager_pools) = stable_manager_pools_proof(manager.proof.manager.bind(py))?
+        else {
+            return Err(PyRuntimeError::new_err(
+                "adapter pool state changed while closing",
+            ));
+        };
+        let mut proxy_pools = Vec::with_capacity(proxy_managers.len());
+        for (url, manager) in &proxy_managers {
+            let Some(pools) = stable_manager_pools_proof(manager.proof.manager.bind(py))? else {
+                return Err(PyRuntimeError::new_err(
+                    "adapter pool state changed while closing",
+                ));
+            };
+            proxy_pools.push((url.clone(), manager.proof.manager.as_ptr(), pools));
+        }
         let mut table = registry
             .lock()
             .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
@@ -2992,6 +3467,9 @@ fn _adapter_close_trial(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<
         }
         return Ok(count);
     }
+    Err(PyRuntimeError::new_err(
+        "adapter pool state changed while closing",
+    ))
 }
 
 #[pyfunction]

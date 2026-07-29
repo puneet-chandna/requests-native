@@ -2847,6 +2847,456 @@ def test_concurrent_native_and_python_proxy_admissions_restore_native_proof():
     assert rewrite.observations["side_effects"] == [rewrite_expected]
 
 
+def test_concurrent_native_and_python_direct_admissions_restore_native_proof():
+    source = _CONCURRENT_ADAPTER_ADMISSION_CASE.replace(
+        "ROUTE", repr("direct"), 1
+    ).replace("MIXED", "True", 1)
+    case = {"source": source}
+    oracle = run_oracle_case(case)
+    rewrite = run_rewrite_case(case)
+    common = {
+        "route": "direct",
+        "manager_entries": 2,
+        "requests_before_release": 0,
+        "errors": [],
+        "workers_alive": [False, False],
+        "requests_after_concurrent": [1, 1],
+        "manager_effects": 2,
+        "restored_content": "restored",
+        "requests_after_restored": [2, 1],
+    }
+    oracle_expected = {
+        **common,
+        "successes": [
+            [0, "first-0", False],
+            [1, "first-1", False],
+        ],
+        "fallback_calls": 0,
+        "restored_native": False,
+    }
+    rewrite_expected = {
+        **common,
+        "successes": [
+            [0, "first-0", True],
+            [1, "first-1", False],
+        ],
+        "fallback_calls": 1,
+        "restored_native": True,
+    }
+
+    assert oracle.observations["exception"] is None
+    assert oracle.observations["side_effects"] == [oracle_expected]
+    assert rewrite.observations["exception"] is None
+    assert rewrite.observations["side_effects"] == [rewrite_expected]
+
+
+def test_mixed_direct_manager_pool_refresh_retries_torn_observation_and_restores(
+    monkeypatch,
+):
+    import sys
+
+    from urllib3 import PoolManager
+
+    fallback_calls = 0
+    original_compat_send = adapters._HTTP_ADAPTER_COMPAT_SEND
+
+    def counted_compat_send(*args, **kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return original_compat_send(*args, **kwargs)
+
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", counted_compat_send)
+    with loopback(
+        (200, {}, b"first"),
+        (200, {}, b"restored"),
+    ) as (server, url):
+        adapter = HTTPAdapter()
+        original_getattribute = PoolManager.__dict__.get("__getattribute__")
+        pool_reads = 0
+        injected = 0
+        armed = False
+
+        def restore_getattribute():
+            if original_getattribute is None:
+                del PoolManager.__getattribute__
+            else:
+                PoolManager.__getattribute__ = original_getattribute
+
+        def getattribute(manager, name):
+            nonlocal injected, pool_reads
+            value = (
+                object.__getattribute__(manager, name)
+                if original_getattribute is None
+                else original_getattribute(manager, name)
+            )
+            if manager is adapter.poolmanager and name == "pools":
+                pool_reads += 1
+                if pool_reads == 2:
+                    restore_getattribute()
+                    injected += 1
+                    manager.connection_from_url("http://mixed-direct.example/resource")
+            return value
+
+        target_code = PoolManager.connection_from_pool_key.__code__
+
+        def trace(frame, event, arg):
+            nonlocal armed
+            if not armed and event == "return" and frame.f_code is target_code:
+                armed = True
+                PoolManager.__getattribute__ = getattribute
+            return trace
+
+        sys.settrace(trace)
+        try:
+            with _rust_adapter_trial():
+                first = adapter.send(prepared(url), stream=True)
+        finally:
+            sys.settrace(None)
+            if PoolManager.__dict__.get("__getattribute__") is getattribute:
+                restore_getattribute()
+
+        assert first.content == b"first"
+        assert type(first.raw).__module__ == "requests._requests_rust"
+        first.close()
+        assert injected == 1
+        assert pool_reads == 2
+        assert len(adapter.poolmanager.pools) == 2
+
+        with _rust_adapter_trial():
+            restored = adapter.send(prepared(url), stream=True)
+
+        assert restored.content == b"restored"
+        assert type(restored.raw).__module__ == "requests._requests_rust"
+        restored.close()
+        assert fallback_calls == 0
+        assert server.requests == 2
+
+
+def test_new_proxy_manager_wrong_destination_is_not_recorded_after_commit(
+    monkeypatch,
+):
+    import sys
+
+    fallback_calls = 0
+    original_compat_send = adapters._HTTP_ADAPTER_COMPAT_SEND
+
+    def counted_compat_send(*args, **kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return original_compat_send(*args, **kwargs)
+
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", counted_compat_send)
+    with (
+        loopback((200, {}, b"restored")) as (selected_server, selected_url),
+        loopback((200, {}, b"wrong")) as (wrong_server, wrong_url),
+    ):
+        selected_proxy = selected_url.rsplit("/", 1)[0]
+        wrong_proxy = wrong_url.rsplit("/", 1)[0]
+        adapter = HTTPAdapter()
+        wrong_manager = urllib3.ProxyManager(
+            wrong_proxy,
+            num_pools=adapter._pool_connections,
+            maxsize=adapter._pool_maxsize,
+            block=adapter._pool_block,
+        )
+        observed = {}
+
+        def trace(frame, event, arg):
+            if (
+                "canonical" not in observed
+                and event == "return"
+                and frame.f_code is HTTPAdapter.proxy_manager_for.__code__
+            ):
+                observed["canonical"] = arg
+                adapter.proxy_manager[selected_proxy] = wrong_manager
+            return trace
+
+        sys.settrace(trace)
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="proxy manager state changed after native send commitment",
+            ):
+                with _rust_adapter_trial():
+                    adapter.send(
+                        prepared("http://origin.example/"),
+                        proxies={"http": selected_proxy},
+                    )
+        finally:
+            sys.settrace(None)
+
+        assert selected_server.requests == 0
+        assert wrong_server.requests == 0
+        assert fallback_calls == 0
+
+        adapter.proxy_manager[selected_proxy] = observed["canonical"]
+        with _rust_adapter_trial():
+            restored = adapter.send(
+                prepared("http://origin.example/"),
+                proxies={"http": selected_proxy},
+            )
+        assert restored.content == b"restored"
+        assert type(restored.raw).__module__ == "requests._requests_rust"
+        assert selected_server.requests == 1
+        assert wrong_server.requests == 0
+        assert fallback_calls == 0
+        restored.close()
+        adapter.close()
+
+
+@pytest.mark.parametrize("mutation", ["connection_pool_kw", "proxy_headers"])
+def test_new_proxy_manager_immutable_mutation_is_not_recorded_after_commit(
+    monkeypatch, mutation
+):
+    import sys
+
+    fallback_calls = 0
+    original_compat_send = adapters._HTTP_ADAPTER_COMPAT_SEND
+
+    def counted_compat_send(*args, **kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return original_compat_send(*args, **kwargs)
+
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", counted_compat_send)
+    with loopback((200, {}, b"restored")) as (server, proxy_url):
+        proxy_root = proxy_url.rsplit("/", 1)[0]
+        adapter = HTTPAdapter()
+        observed = {}
+
+        def trace(frame, event, arg):
+            if (
+                "manager" not in observed
+                and event == "return"
+                and frame.f_code is HTTPAdapter.proxy_manager_for.__code__
+            ):
+                observed["manager"] = arg
+                if mutation == "connection_pool_kw":
+                    observed["original"] = arg.connection_pool_kw["maxsize"]
+                    arg.connection_pool_kw["maxsize"] += 1
+                else:
+                    arg.proxy_headers["X-Mutated"] = "yes"
+            return trace
+
+        sys.settrace(trace)
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="proxy manager state changed after native send commitment",
+            ):
+                with _rust_adapter_trial():
+                    adapter.send(
+                        prepared("http://origin.example/"),
+                        proxies={"http": proxy_root},
+                    )
+        finally:
+            sys.settrace(None)
+
+        assert server.requests == 0
+        assert fallback_calls == 0
+        manager = observed["manager"]
+        if mutation == "connection_pool_kw":
+            manager.connection_pool_kw["maxsize"] = observed["original"]
+        else:
+            del manager.proxy_headers["X-Mutated"]
+
+        with _rust_adapter_trial():
+            restored = adapter.send(
+                prepared("http://origin.example/"),
+                proxies={"http": proxy_root},
+            )
+        assert restored.content == b"restored"
+        assert type(restored.raw).__module__ == "requests._requests_rust"
+        assert server.requests == 1
+        assert fallback_calls == 0
+        restored.close()
+        adapter.close()
+
+
+@pytest.mark.parametrize("mutation", ["proxy_url", "_socks_options"])
+def test_new_socks_manager_provenance_mutation_is_not_recorded_after_commit(
+    monkeypatch, mutation
+):
+    import sys
+
+    if not isinstance(adapters.SOCKSProxyManager, type):
+        pytest.skip("PySocks is unavailable")
+
+    fallback_calls = 0
+    original_compat_send = adapters._HTTP_ADAPTER_COMPAT_SEND
+
+    def counted_compat_send(*args, **kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return original_compat_send(*args, **kwargs)
+
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", counted_compat_send)
+    with socks5_loopback(b"restored-socks") as (observed, proxy_url):
+        adapter = HTTPAdapter()
+        request = prepared("http://origin.example/")
+        observed_manager = {}
+
+        def trace(frame, event, arg):
+            if (
+                "manager" not in observed_manager
+                and event == "return"
+                and frame.f_code is HTTPAdapter.proxy_manager_for.__code__
+            ):
+                observed_manager["manager"] = arg
+                if mutation == "proxy_url":
+                    observed_manager["original"] = arg.proxy_url
+                    arg.proxy_url = "socks5h://wrong.example:1"
+                else:
+                    options = arg.connection_pool_kw["_socks_options"]
+                    observed_manager["original"] = options["proxy_host"]
+                    options["proxy_host"] = "wrong.example"
+            return trace
+
+        sys.settrace(trace)
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="proxy manager state changed after native send commitment",
+            ):
+                with _rust_adapter_trial():
+                    adapter.send(
+                        request,
+                        stream=True,
+                        proxies={"http": proxy_url},
+                    )
+        finally:
+            sys.settrace(None)
+
+        assert observed == {"connections": 0, "requests": 0}
+        assert fallback_calls == 0
+        manager = observed_manager["manager"]
+        if mutation == "proxy_url":
+            manager.proxy_url = observed_manager["original"]
+        else:
+            manager.connection_pool_kw["_socks_options"]["proxy_host"] = (
+                observed_manager["original"]
+            )
+
+        with _rust_adapter_trial():
+            restored = adapter.send(
+                request,
+                stream=True,
+                proxies={"http": proxy_url},
+            )
+
+        assert restored.content == b"restored-socks"
+        assert type(restored.raw).__module__ == "requests._requests_rust"
+        restored.close()
+        assert observed == {"connections": 1, "requests": 1}
+        assert fallback_calls == 0
+
+
+_REPLACED_PROXY_MANAGER_MAPPING_CASE = r"""
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from requests import adapters
+from requests.adapters import HTTPAdapter, _rust_adapter_trial
+from requests.models import PreparedRequest
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self.server.requests += 1
+        body = b"python"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def log_message(self, format, *args):
+        pass
+
+
+class AlternatingCopyDict(dict):
+    def __init__(self):
+        super().__init__()
+        self.copy_calls = 0
+
+    def copy(self):
+        self.copy_calls += 1
+        return dict(self) if self.copy_calls % 2 else {}
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+server.requests = 0
+server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+server_thread.start()
+proxy_url = f"http://127.0.0.1:{server.server_port}"
+adapter = HTTPAdapter()
+mapping_kind = MAPPING_KIND
+adapter.proxy_manager = (
+    {} if mapping_kind == "exact replacement" else AlternatingCopyDict()
+)
+fallback_calls = 0
+original_compat_send = adapters._HTTP_ADAPTER_COMPAT_SEND
+
+
+def counted_compat_send(*args, **kwargs):
+    global fallback_calls
+    fallback_calls += 1
+    return original_compat_send(*args, **kwargs)
+
+
+adapters._HTTP_ADAPTER_COMPAT_SEND = counted_compat_send
+request = PreparedRequest()
+request.prepare(method="GET", url="http://origin.example/resource")
+with _rust_adapter_trial():
+    response = adapter.send(request, proxies={"http": proxy_url})
+
+side_effects.append(
+    {
+        "mapping_kind": mapping_kind,
+        "content": response.content.decode("ascii"),
+        "native": type(response.raw).__module__ == "requests._requests_rust",
+        "fallback_calls": fallback_calls,
+        "requests": server.requests,
+        "copy_calls": getattr(adapter.proxy_manager, "copy_calls", None),
+    }
+)
+response.close()
+adapter.close()
+server.shutdown()
+server.server_close()
+server_thread.join(3)
+result = None
+"""
+
+
+@pytest.mark.parametrize(
+    ("mapping_kind", "copy_calls"),
+    [("exact replacement", None), ("alternating subclass", 0)],
+)
+def test_replaced_proxy_manager_mapping_falls_back_promptly(
+    monkeypatch, mapping_kind, copy_calls
+):
+    monkeypatch.setenv("REQUESTS_DIFFERENTIAL_TIMEOUT", "3")
+    source = _REPLACED_PROXY_MANAGER_MAPPING_CASE.replace(
+        "MAPPING_KIND", repr(mapping_kind), 1
+    )
+    rewrite = run_rewrite_case({"source": source})
+    assert rewrite.observations["exception"] is None
+    assert rewrite.observations["side_effects"] == [
+        {
+            "mapping_kind": mapping_kind,
+            "content": "python",
+            "native": False,
+            "fallback_calls": 1,
+            "requests": 1,
+            "copy_calls": copy_calls,
+        }
+    ]
+
+
 def test_real_tls_handshake_failure_uses_adapter_ssl_handler():
     with loopback((200, {}, b"plaintext")) as (server, url):
         secure_url = url.replace("http://", "https://", 1)
