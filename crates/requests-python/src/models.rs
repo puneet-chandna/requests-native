@@ -3058,10 +3058,21 @@ fn _prepared_fields_snapshot(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyRe
     Ok(snapshot.into_any().unbind())
 }
 
+#[pyfunction]
+fn _prepare_auth_trial(
+    compat: &Bound<'_, PyAny>,
+    _subject: &Bound<'_, PyAny>,
+    _auth: &Bound<'_, PyAny>,
+    _url: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    Ok(compat.call0()?.unbind())
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_prepare_method_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_prepare_url_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_prepare_headers_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_prepared_fields_snapshot, module)?)?;
+    module.add_function(wrap_pyfunction!(_prepare_auth_trial, module)?)?;
     Ok(())
 }

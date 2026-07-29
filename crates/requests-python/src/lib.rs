@@ -4,8 +4,10 @@ use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 
 mod adapters;
+mod auth;
 mod body;
 mod bridge;
+mod callbacks;
 mod errors;
 mod models;
 mod response;
@@ -21,7 +23,9 @@ fn backend_name() -> &'static str {
 fn _requests_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(backend_name, module)?)?;
     adapters::register(module)?;
+    auth::register(module)?;
     body::register(module)?;
+    callbacks::register(module)?;
     errors::register(module)?;
     models::register(module)?;
     response::register(module)?;

@@ -3,11 +3,15 @@
 #[cfg(feature = "blocking")]
 #[doc(hidden)]
 pub mod adapters;
+#[doc(hidden)]
+pub mod auth;
 #[cfg(feature = "blocking")]
 pub mod blocking;
 mod body;
 mod client;
 mod error;
+#[doc(hidden)]
+pub mod hooks;
 mod models;
 mod response;
 #[doc(hidden)]
