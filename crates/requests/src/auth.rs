@@ -260,7 +260,26 @@ pub fn digest_request_target(url: &str) -> Option<String> {
         path.push('?');
         path.push_str(query);
     }
-    (path == lexical_target).then_some(lexical_target)
+    if path != lexical_target {
+        return None;
+    }
+
+    let (path, query) = lexical_target
+        .split_once('?')
+        .map_or((lexical_target.as_str(), None), |(path, query)| {
+            (path, Some(query))
+        });
+    let path = if path.is_empty() { "/" } else { path };
+    let final_segment = path.rsplit_once('/').map_or(path, |(_, segment)| segment);
+    let path = final_segment.find(';').map_or_else(
+        || path.to_owned(),
+        |params| path[..path.len() - final_segment.len() + params].to_owned(),
+    );
+    if query.is_none_or(str::is_empty) {
+        Some(path)
+    } else {
+        Some(format!("{path}?{}", query.expect("nonempty query")))
+    }
 }
 
 #[must_use]
@@ -314,7 +333,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BasicCredentials, DigestChallenge, DigestRequest, DigestState, prepare_digest};
+    use super::{
+        BasicCredentials, DigestChallenge, DigestRequest, DigestState, digest_request_target,
+        prepare_digest,
+    };
 
     #[test]
     fn basic_header_matches_the_rfc_example() {
@@ -322,6 +344,26 @@ mod tests {
         assert_eq!(
             credentials.authorization(),
             "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
+    }
+
+    #[test]
+    fn digest_target_matches_python_urlparse_path_params_and_query() {
+        assert_eq!(
+            digest_request_target("http://example.test/path?"),
+            Some("/path".to_owned())
+        );
+        assert_eq!(
+            digest_request_target("http://example.test?"),
+            Some("/".to_owned())
+        );
+        assert_eq!(
+            digest_request_target("http://[::1]/a;b?x=1#f"),
+            Some("/a?x=1".to_owned())
+        );
+        assert_eq!(
+            digest_request_target("http://example.test/a;b/c;d?x=1"),
+            Some("/a;b/c?x=1".to_owned())
         );
     }
 

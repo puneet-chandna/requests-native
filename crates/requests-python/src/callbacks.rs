@@ -138,12 +138,14 @@ fn _dispatch_hook_trial(py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<P
     if !selected.is_truthy()? {
         return Ok(hook_data.unbind());
     }
-    let callable = state
-        .module
-        .bind(py)
-        .dict()
-        .get_item("Callable")?
-        .ok_or_else(|| PyNameError::new_err("name 'Callable' is not defined"))?;
+    let Some(callable) = state.module.bind(py).dict().get_item("Callable")? else {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("name", "Callable")?;
+        return Err(PyErr::from_value(
+            py.get_type::<PyNameError>()
+                .call(("name 'Callable' is not defined",), Some(&kwargs))?,
+        ));
+    };
     let iterable = if selected.is_instance(&callable)? {
         PyList::new(py, [selected])?.into_any()
     } else {
