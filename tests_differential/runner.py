@@ -223,12 +223,7 @@ def _execute_case(case: object) -> dict[str, Any]:
             }
             for item in caught_warnings
         ],
-        "exception": None
-        if error is None
-        else {
-            "mro": [_type_record(cls) for cls in type(error).__mro__],
-            "args": _normalize(error.args),
-        },
+        "exception": None if error is None else _exception_record(error, namespace),
         "side_effects": _normalize(namespace.get("side_effects", [])),
     }
 
@@ -248,6 +243,46 @@ def _isolated_protocol_stdout() -> Iterator[int]:
 
 def _type_record(cls: type) -> dict[str, str]:
     return {"module": cls.__module__, "name": cls.__qualname__}
+
+
+def _exception_record(
+    error: BaseException, namespace: dict[str, Any]
+) -> dict[str, Any]:
+    cause = error.__cause__
+    context = error.__context__
+    identities = namespace.get("exception_identities")
+    return {
+        "mro": [_type_record(cls) for cls in type(error).__mro__],
+        "args": _normalize(error.args),
+        "cause": _linked_exception_record(cause),
+        "context": _linked_exception_record(context),
+        "suppress_context": error.__suppress_context__,
+        "traceback_present": error.__traceback__ is not None,
+        "identity": _matching_identity_names(error, identities),
+        "cause_identity": _matching_identity_names(cause, identities),
+        "context_identity": _matching_identity_names(context, identities),
+        "cause_is_context": cause is not None and cause is context,
+    }
+
+
+def _linked_exception_record(error: BaseException | None) -> dict[str, Any] | None:
+    if error is None:
+        return None
+    return {
+        "type": _type_record(type(error)),
+        "args": _normalize(error.args),
+        "traceback_present": error.__traceback__ is not None,
+    }
+
+
+def _matching_identity_names(value: object, identities: object) -> list[str]:
+    if type(identities) is not dict:
+        return []
+    return [
+        name
+        for name, candidate in dict.items(identities)
+        if type(name) is str and value is candidate
+    ]
 
 
 def _public_state(value: object) -> dict[str, Any]:

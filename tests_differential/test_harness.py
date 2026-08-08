@@ -126,6 +126,14 @@ def test_captures_exception_mro_args_warnings_and_prior_side_effects(
                     {"module": "builtins", "name": "object"},
                 ],
                 "args": ["boom", 7],
+                "cause": None,
+                "context": None,
+                "suppress_context": False,
+                "traceback_present": True,
+                "identity": [],
+                "cause_identity": [],
+                "context_identity": [],
+                "cause_is_context": False,
             },
             "side_effects": ["before warning", "before error"],
         }
@@ -550,3 +558,37 @@ def test_configured_source_roots_cannot_cross_contaminate(
     assert not oracle_module.is_relative_to(rewrite_root)
     assert rewrite_module.is_relative_to(rewrite_root)
     assert not rewrite_module.is_relative_to(oracle_root)
+
+
+def test_exception_record_exposes_graph_traceback_and_same_process_identity(
+    oracle_root,
+) -> None:
+    case = {
+        "source": dedent(
+            """
+            cause = RuntimeError("cause")
+            context = ValueError("context")
+            outer = LookupError("outer")
+            exception_identities = {
+                "outer": outer,
+                "cause": cause,
+                "context": context,
+            }
+            try:
+                raise context
+            except ValueError:
+                raise outer from cause
+            """
+        )
+    }
+
+    for run in (runner.run_oracle_case(case), runner.run_rewrite_case(case)):
+        record = run.observations["exception"]
+        assert record["cause"]["args"] == ["cause"]
+        assert record["context"]["args"] == ["context"]
+        assert record["suppress_context"] is True
+        assert record["traceback_present"] is True
+        assert record["identity"] == ["outer"]
+        assert record["cause_identity"] == ["cause"]
+        assert record["context_identity"] == ["context"]
+        assert record["cause_is_context"] is False

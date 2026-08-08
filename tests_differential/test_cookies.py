@@ -608,7 +608,7 @@ def digest(value, authoritative_jar):
 result = pipeline_once(
     jar, request, response, hook, digest, audit
 )
-assert_counts()
+assert_counts(1)
 """
     )
 

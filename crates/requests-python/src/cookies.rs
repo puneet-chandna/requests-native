@@ -9,7 +9,7 @@ use requests::cookies::{
 };
 
 use crate::bridge::{BridgeClosed, WorkerPayload};
-use crate::runtime::run_with_actions;
+use crate::runtime::run_with_owned_actions;
 
 struct CookieState {
     module: Py<PyModule>,
@@ -17,6 +17,8 @@ struct CookieState {
     std_jar_type: Py<PyType>,
     default_policy_type: Py<PyType>,
     cookie_type: Py<PyType>,
+    cookielib: Py<PyAny>,
+    cookie_constructor: Py<PyAny>,
     morsel_type: Py<PyType>,
     prepared_type: Py<PyType>,
     response_type: Py<PyType>,
@@ -29,6 +31,7 @@ struct CookieState {
     jar_getstate: Py<PyAny>,
     jar_setstate: Py<PyAny>,
     jar_get_policy: Py<PyAny>,
+    jar_inspect_methods: Vec<(&'static str, Py<PyAny>)>,
     std_set_cookie: Py<PyAny>,
     std_clear: Py<PyAny>,
     std_add_header: Py<PyAny>,
@@ -57,6 +60,8 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
         .getattr("DefaultCookiePolicy")?
         .cast_into::<PyType>()?;
     let cookie_type = cookiejar.getattr("Cookie")?.cast_into::<PyType>()?;
+    let cookielib = module.getattr("cookielib")?;
+    let cookie_constructor = cookielib.getattr("Cookie")?;
     let morsel_type = PyModule::import(py, "http.cookies")?
         .getattr("Morsel")?
         .cast_into::<PyType>()?;
@@ -76,6 +81,21 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
         jar_getstate: jar_type.getattr("__getstate__")?.unbind(),
         jar_setstate: jar_type.getattr("__setstate__")?.unbind(),
         jar_get_policy: jar_type.getattr("get_policy")?.unbind(),
+        jar_inspect_methods: [
+            "keys",
+            "values",
+            "items",
+            "list_domains",
+            "list_paths",
+            "multiple_domains",
+            "get_dict",
+            "__getitem__",
+            "get",
+            "_find_no_duplicates",
+        ]
+        .into_iter()
+        .map(|name| Ok((name, jar_type.getattr(name)?.unbind())))
+        .collect::<PyResult<Vec<_>>>()?,
         std_set_cookie: std_jar_type.getattr("set_cookie")?.unbind(),
         std_clear: std_jar_type.getattr("clear")?.unbind(),
         std_add_header: std_jar_type.getattr("add_cookie_header")?.unbind(),
@@ -105,6 +125,8 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
         std_jar_type: std_jar_type.unbind(),
         default_policy_type: default_policy_type.unbind(),
         cookie_type: cookie_type.unbind(),
+        cookielib: cookielib.unbind(),
+        cookie_constructor: cookie_constructor.unbind(),
         morsel_type: morsel_type.unbind(),
         prepared_type: prepared_type.unbind(),
         response_type: response_type.unbind(),
@@ -139,6 +161,12 @@ fn cookie_module_is_pristine(py: Python<'_>, state: &CookieState) -> PyResult<bo
         && morsel_to_cookie
             .getattr("__code__")?
             .is(state.morsel_to_cookie_code.bind(py))
+        && module_entry_is(module, "cookielib", &state.cookielib)?
+        && state
+            .cookielib
+            .bind(py)
+            .getattr("Cookie")?
+            .is(state.cookie_constructor.bind(py))
         && module_entry_is(module, "time", &state.time_module)?
         && state
             .time_module
@@ -171,6 +199,32 @@ fn exact_requests_jar_is_pristine(
         && method_is(jar_type, "__getstate__", &state.jar_getstate)?
         && method_is(jar_type, "__setstate__", &state.jar_setstate)?
         && method_is(jar_type, "get_policy", &state.jar_get_policy)?)
+}
+
+fn inspect_methods_are_pristine(py: Python<'_>, state: &CookieState) -> PyResult<bool> {
+    let jar_type = state.jar_type.bind(py);
+    for (name, expected) in &state.jar_inspect_methods {
+        if !method_is(jar_type, name, expected)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn snapshot_shape_is_supported(state: &CookieState, jar: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let domains = jar.getattr("_cookies")?.cast_into::<PyDict>()?;
+    for (_, paths) in domains.iter() {
+        let paths = paths.cast_into::<PyDict>()?;
+        for (_, names) in paths.iter() {
+            let names = names.cast_into::<PyDict>()?;
+            for (_, cookie) in names.iter() {
+                if !cookie.get_type().is(state.cookie_type.bind(jar.py())) {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn scalar_from_python(value: &Bound<'_, PyAny>) -> PyResult<CookieScalar> {
@@ -709,7 +763,20 @@ fn _cookie_jar_trial(
     arguments: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let state = cookie_state(py)?;
-    if !exact_requests_jar_is_pristine(py, state, jar)? {
+    let operation_is_pristine = || -> PyResult<bool> {
+        if !exact_requests_jar_is_pristine(py, state, jar)? {
+            return Ok(false);
+        }
+        match operation {
+            "inspect" => Ok(inspect_methods_are_pristine(py, state)?
+                && snapshot_shape_is_supported(state, jar)?),
+            "mutate" | "bad-create" | "morsel" | "copy-pickle" => {
+                snapshot_shape_is_supported(state, jar)
+            }
+            _ => Ok(false),
+        }
+    };
+    if !matches!(operation_is_pristine(), Ok(true)) {
         return Ok(compat.call0()?.unbind());
     }
     match operation {
@@ -731,7 +798,7 @@ fn _cookie_jar_trial(
                 .unbind())
         }
         "copy-pickle" => copy_pickle_result(py, state, jar),
-        _ => Ok(compat.call0()?.unbind()),
+        _ => unreachable!("unsupported cookie operations select compatibility"),
     }
 }
 
@@ -837,7 +904,8 @@ fn _cookie_bridge_trial(
 ) -> PyResult<Py<PyAny>> {
     let state = cookie_state(py)?;
     if !matches!(operation, "header" | "extract-header")
-        || !exact_bridge_is_pristine(py, state, jar, request)?
+        || !matches!(exact_bridge_is_pristine(py, state, jar, request), Ok(true))
+        || !matches!(snapshot_shape_is_supported(state, jar), Ok(true))
     {
         return Ok(compat.call0()?.unbind());
     }
@@ -865,6 +933,7 @@ impl WorkerPayload for CookiePipelineReply {}
 enum CookiePipelineOutcome {
     Complete {
         response: usize,
+        hook_response: usize,
         snapshot: JarSnapshot,
         snapshots: Vec<JarSnapshot>,
         header: Option<String>,
@@ -880,6 +949,7 @@ struct OriginCookiePipelineOwner {
     hook: Py<PyAny>,
     digest: Py<PyAny>,
     audit: Py<PyAny>,
+    handler_error: Option<PyErr>,
 }
 
 fn append_audit(owner: &OriginCookiePipelineOwner, py: Python<'_>, value: &str) -> PyResult<()> {
@@ -966,6 +1036,7 @@ async fn pipeline_worker(
     actions: crate::bridge::ActionSender<CookiePipelineAction, CookiePipelineReply>,
 ) -> CookiePipelineOutcome {
     let mut response = 0;
+    let mut hook_response = 0;
     let mut snapshot = JarSnapshot::new(Vec::new());
     let mut snapshots = Vec::new();
     let mut header = None;
@@ -976,7 +1047,12 @@ async fn pipeline_worker(
         };
         match reply {
             CookiePipelineReply::Ack => {}
-            CookiePipelineReply::Response(value) => response = value,
+            CookiePipelineReply::Response(value) => {
+                response = value;
+                if stage == CookiePipelineStage::Hook {
+                    hook_response = value;
+                }
+            }
             CookiePipelineReply::Snapshot(value) => {
                 snapshot = value.clone();
                 snapshots.push(value);
@@ -987,6 +1063,7 @@ async fn pipeline_worker(
     }
     CookiePipelineOutcome::Complete {
         response,
+        hook_response,
         snapshot,
         snapshots,
         header,
@@ -1001,6 +1078,11 @@ fn pipeline_is_pristine(
     response: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
     Ok(exact_requests_jar_is_pristine(py, state, jar)?
+        && snapshot_shape_is_supported(state, jar)?
+        && jar
+            .getattr("_policy")?
+            .get_type()
+            .is(state.default_policy_type.bind(py))
         && request.get_type().is(state.prepared_type.bind(py))
         && response.get_type().is(state.response_type.bind(py))
         && method_is(
@@ -1023,37 +1105,40 @@ fn _cookie_pipeline_trial(
     audit: Py<PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let state = cookie_state(py)?;
-    if !pipeline_is_pristine(py, state, jar.bind(py), request.bind(py), response.bind(py))? {
+    if !matches!(
+        pipeline_is_pristine(py, state, jar.bind(py), request.bind(py), response.bind(py)),
+        Ok(true)
+    ) {
         return Ok(compat.call0()?.unbind());
     }
-    let mut owner = OriginCookiePipelineOwner {
+    let owner = OriginCookiePipelineOwner {
         jar,
         request,
         responses: vec![response],
         hook,
         digest,
         audit,
+        handler_error: None,
     };
-    let mut handler_error = None;
-    let outcome = run_with_actions(
-        py,
-        pipeline_worker,
-        |py, action| match execute_pipeline_action(py, state, &mut owner, action) {
-            Ok(reply) => reply,
-            Err(error) => {
-                if handler_error.is_none() {
-                    handler_error = Some(error);
+    let (outcome, mut owner) =
+        run_with_owned_actions(py, owner, pipeline_worker, |py, action, owner| {
+            match execute_pipeline_action(py, state, owner, action) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    if owner.handler_error.is_none() {
+                        owner.handler_error = Some(error);
+                    }
+                    CookiePipelineReply::Failed
                 }
-                CookiePipelineReply::Failed
             }
-        },
-    )?;
-    if let Some(error) = handler_error {
+        })?;
+    if let Some(error) = owner.handler_error.take() {
         return Err(error);
     }
     match outcome {
         CookiePipelineOutcome::Complete {
             response,
+            hook_response,
             snapshot,
             snapshots,
             header,
@@ -1061,10 +1146,11 @@ fn _cookie_pipeline_trial(
             let final_response = owner.responses.get(response).ok_or_else(|| {
                 PyRuntimeError::new_err("cookie pipeline lost its final response")
             })?;
-            let replacement = owner.responses.get(1).map_or_else(
-                || final_response.is(owner.responses[0].bind(py)),
-                |hooked| final_response.is(hooked.bind(py)),
-            );
+            let hook_response = owner
+                .responses
+                .get(hook_response)
+                .ok_or_else(|| PyRuntimeError::new_err("cookie pipeline lost its hook response"))?;
+            let replacement = final_response.is(hook_response.bind(py));
             let request_jar = owner
                 .request
                 .bind(py)

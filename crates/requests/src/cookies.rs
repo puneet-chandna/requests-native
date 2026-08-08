@@ -103,13 +103,10 @@ impl JarSnapshot {
     pub fn find_no_duplicates(&self, query: &LookupQuery) -> LookupValue {
         let mut selected: Option<&str> = None;
         for cookie in self.matching(query) {
-            let Some(value) = cookie.value.as_deref() else {
-                continue;
-            };
             if selected.is_some() {
                 return LookupValue::Conflict;
             }
-            selected = Some(value);
+            selected = cookie.value.as_deref();
         }
         selected
             .map(|value| LookupValue::Value(value.to_owned()))
@@ -267,15 +264,32 @@ mod tests {
     }
 
     #[test]
-    fn none_does_not_count_as_a_found_no_duplicate_value() {
-        let snapshot = JarSnapshot::new(vec![cookie("empty", None, Some("a.test"), Some("/"))]);
+    fn no_duplicate_lookup_preserves_requests_none_sentinel_ordering() {
+        let query = LookupQuery {
+            name: "value".to_owned(),
+            domain: Some("a.test".to_owned()),
+            path: Some("/".to_owned()),
+            default: "missing".to_owned(),
+        };
         assert_eq!(
-            snapshot.find_no_duplicates(&LookupQuery {
-                name: "empty".to_owned(),
-                domain: Some("a.test".to_owned()),
-                path: Some("/".to_owned()),
-                default: "missing".to_owned(),
-            }),
+            JarSnapshot::new(vec![
+                cookie("value", Some("first"), Some("a.test"), Some("/")),
+                cookie("value", None, Some("a.test"), Some("/"))
+            ])
+            .find_no_duplicates(&query),
+            LookupValue::Conflict
+        );
+        assert_eq!(
+            JarSnapshot::new(vec![
+                cookie("value", None, Some("a.test"), Some("/")),
+                cookie("value", Some("second"), Some("a.test"), Some("/"))
+            ])
+            .find_no_duplicates(&query),
+            LookupValue::Value("second".to_owned())
+        );
+        assert_eq!(
+            JarSnapshot::new(vec![cookie("value", None, Some("a.test"), Some("/"))])
+                .find_no_duplicates(&query),
             LookupValue::Missing
         );
     }

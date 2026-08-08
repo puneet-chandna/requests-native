@@ -19,7 +19,7 @@ use requests::AsyncBody;
 
 use crate::bridge::{ActionReceiver, ActionSender, BridgeClosed, WorkerPayload, action_channel};
 use crate::models::{PreparedBodyMethod, trusted_prepared_body_method, trusted_rewind_body};
-use crate::runtime::{run_with_actions, run_with_actions_and_signal_checker};
+use crate::runtime::{run_with_actions_and_signal_checker, run_with_owned_actions};
 
 const BODY_BLOCK_SIZE: usize = 4;
 
@@ -76,6 +76,12 @@ impl AdapterFailure {
 
 struct OriginBodyOwner {
     body: Py<PyAny>,
+}
+
+struct OriginBodyRunOwner {
+    owner: OriginBodyOwner,
+    source: OriginBodySource,
+    handler_error: Option<PyErr>,
 }
 
 struct PythonBodyAdapter {
@@ -502,17 +508,21 @@ fn _body_stream_collect_trial(
     limit: usize,
 ) -> PyResult<Vec<Vec<u8>>> {
     let body = subject.getattr("body")?;
-    let Some(mut selection) = select_body_source(py, &body)? else {
+    let Some(selection) = select_body_source(py, &body)? else {
         return Ok(Vec::new());
     };
-    let owner = OriginBodyOwner {
-        body: body.unbind(),
+    let owner = OriginBodyRunOwner {
+        source: selection.source,
+        handler_error: None,
+        owner: OriginBodyOwner {
+            body: body.unbind(),
+        },
     };
     let failure = Arc::new(AtomicU8::new(AdapterFailure::None as u8));
     let worker_failure = Arc::clone(&failure);
-    let mut handler_error = None;
-    let chunks = run_with_actions(
+    let (chunks, mut owner) = run_with_owned_actions(
         py,
+        owner,
         move |actions| {
             let adapter = Box::pin(PythonBodyAdapter::new(
                 actions,
@@ -522,17 +532,17 @@ fn _body_stream_collect_trial(
             ));
             async move { collect_adapter(adapter, limit).await }
         },
-        |py, action| {
+        |py, action, owner| {
             body_action(
                 py,
                 action,
-                &owner,
-                &mut selection.source,
-                &mut handler_error,
+                &owner.owner,
+                &mut owner.source,
+                &mut owner.handler_error,
             )
         },
     )?;
-    if let Some(error) = handler_error {
+    if let Some(error) = owner.handler_error.take() {
         return Err(error);
     }
     let failure = body_failure(&failure);

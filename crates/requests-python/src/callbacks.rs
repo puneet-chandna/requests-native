@@ -1,11 +1,31 @@
-use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyTuple};
 use pyo3::wrap_pyfunction;
 use requests::hooks::{HookCall, HookRegistry, HookValueId};
 
 use crate::bridge::{BridgeClosed, WorkerPayload};
-use crate::runtime::run_with_actions;
+use crate::runtime::run_with_owned_actions;
+
+struct HookState {
+    module: Py<PyModule>,
+    callable: Py<PyAny>,
+}
+
+static HOOK_STATE: PyOnceLock<HookState> = PyOnceLock::new();
+
+fn initialize_hook_state(py: Python<'_>) -> PyResult<HookState> {
+    let module = PyModule::import(py, "requests.hooks")?;
+    Ok(HookState {
+        callable: module.getattr("Callable")?.unbind(),
+        module: module.unbind(),
+    })
+}
+
+fn hook_state(py: Python<'_>) -> PyResult<&HookState> {
+    HOOK_STATE.get_or_try_init(py, || initialize_hook_state(py))
+}
 
 #[derive(Debug)]
 enum HookAction {
@@ -34,6 +54,7 @@ struct OriginHookOwner {
     iterator: Py<PyAny>,
     values: Vec<Py<PyAny>>,
     kwargs: Py<PyDict>,
+    handler_error: Option<PyErr>,
 }
 
 fn store_handler_error(slot: &mut Option<PyErr>, error: PyErr) -> HookReply {
@@ -63,18 +84,13 @@ fn call_hook(py: Python<'_>, owner: &mut OriginHookOwner, call: HookCall) -> PyR
     Ok(HookReply::Replaced(replacement_id))
 }
 
-fn execute_action(
-    py: Python<'_>,
-    action: HookAction,
-    owner: &mut OriginHookOwner,
-    handler_error: &mut Option<PyErr>,
-) -> HookReply {
+fn execute_action(py: Python<'_>, action: HookAction, owner: &mut OriginHookOwner) -> HookReply {
     let result = match action {
         HookAction::Call(call) => call_hook(py, owner, call),
     };
     match result {
         Ok(reply) => reply,
-        Err(error) => store_handler_error(handler_error, error),
+        Err(error) => store_handler_error(&mut owner.handler_error, error),
     }
 }
 
@@ -98,40 +114,65 @@ fn bridge_error(error: BridgeClosed) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
-#[pyfunction]
-fn _dispatch_hook_trial(
-    py: Python<'_>,
-    key: &str,
-    hooks: &Bound<'_, PyAny>,
-    hook_data: Py<PyAny>,
-    kwargs: Py<PyDict>,
-) -> PyResult<Py<PyAny>> {
+#[pyfunction(signature = (*args))]
+fn _dispatch_hook_trial(py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
+    let state = hook_state(py)?;
+    let (compat, key_index) = match args.len() {
+        4 => (None, 0),
+        5 => (Some(args.get_item(0)?), 1),
+        count => {
+            return Err(PyTypeError::new_err(format!(
+                "_dispatch_hook_trial expected 4 or 5 arguments, got {count}"
+            )));
+        }
+    };
+    let key = args.get_item(key_index)?.extract::<String>()?;
+    let hooks = args.get_item(key_index + 1)?;
+    let hook_data = args.get_item(key_index + 2)?;
+    let kwargs = args.get_item(key_index + 3)?.cast_into::<PyDict>()?;
+    let callable_is_pristine = state
+        .module
+        .bind(py)
+        .getattr("Callable")
+        .is_ok_and(|live| live.is(state.callable.bind(py)));
+    if !callable_is_pristine {
+        if let Some(compat) = compat {
+            return Ok(compat.call0()?.unbind());
+        }
+        return Ok(state
+            .module
+            .bind(py)
+            .getattr("dispatch_hook")?
+            .call((key.as_str(), &hooks, &hook_data), Some(&kwargs))?
+            .unbind());
+    }
     let empty_hooks = PyDict::new(py);
     let hook_map = if hooks.is_truthy()? {
         hooks.clone()
     } else {
         empty_hooks.into_any()
     };
-    let selected = hook_map.call_method1("get", (key,))?;
+    let selected = hook_map.call_method1("get", (key.as_str(),))?;
     if !selected.is_truthy()? {
-        return Ok(hook_data);
+        return Ok(hook_data.unbind());
     }
-    let iterable = if selected.hasattr("__call__")? {
+    let iterable = if selected.is_instance(state.callable.bind(py))? {
         PyList::new(py, [selected])?.into_any()
     } else {
         selected
     };
     let iterator = iterable.try_iter()?.into_any().unbind();
-    let mut owner = OriginHookOwner {
+    let owner = OriginHookOwner {
         iterator,
-        values: vec![hook_data],
-        kwargs,
+        values: vec![hook_data.unbind()],
+        kwargs: kwargs.unbind(),
+        handler_error: None,
     };
-    let mut handler_error = None;
-    let outcome = run_with_actions(py, dispatch_worker, |py, action| {
-        execute_action(py, action, &mut owner, &mut handler_error)
-    })?;
-    if let Some(error) = handler_error {
+    let (outcome, mut owner) =
+        run_with_owned_actions(py, owner, dispatch_worker, |py, action, owner| {
+            execute_action(py, action, owner)
+        })?;
+    if let Some(error) = owner.handler_error.take() {
         return Err(error);
     }
     match outcome {
@@ -163,6 +204,7 @@ fn _deregister_hook_trial(
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    HOOK_STATE.get_or_try_init(module.py(), || initialize_hook_state(module.py()))?;
     module.add_function(wrap_pyfunction!(_dispatch_hook_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_deregister_hook_trial, module)?)?;
     Ok(())

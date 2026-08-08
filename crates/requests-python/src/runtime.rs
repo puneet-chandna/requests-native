@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -16,6 +16,83 @@ use crate::bridge::{ActionReceiver, ActionSender, BridgeClosed, WorkerPayload, a
 
 const WAKE_INTERVAL: Duration = Duration::from_millis(10);
 const CANCEL_WAIT: Duration = Duration::from_millis(500);
+
+thread_local! {
+    static ORIGIN_QUARANTINE: RefCell<Vec<Box<dyn OriginQuarantineEntry>>> = RefCell::new(Vec::new());
+}
+
+trait OriginQuarantineEntry {
+    fn is_terminal(&self) -> bool;
+}
+
+struct QuarantinedOrigin<A, R, O> {
+    terminal: std::sync::Arc<AtomicBool>,
+    _actions: ActionReceiver<A, R>,
+    _owner: O,
+}
+
+impl<A, R, O> OriginQuarantineEntry for QuarantinedOrigin<A, R, O> {
+    fn is_terminal(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+}
+
+impl<A, R, O> Drop for QuarantinedOrigin<A, R, O> {
+    fn drop(&mut self) {
+        while !self.terminal.load(Ordering::Acquire) {
+            thread::sleep(WAKE_INTERVAL);
+        }
+    }
+}
+
+fn reap_origin_quarantine() {
+    ORIGIN_QUARANTINE.with(|entries| {
+        entries.borrow_mut().retain(|entry| !entry.is_terminal());
+    });
+}
+
+fn quarantine_origin_until_terminal<T, A, R, O>(
+    submission: BlockingSubmission<T>,
+    actions: ActionReceiver<A, R>,
+    owner: O,
+) where
+    T: Send + 'static,
+    A: Send + 'static,
+    R: Send + 'static,
+    O: 'static,
+{
+    let terminal = std::sync::Arc::new(AtomicBool::new(false));
+    let waiter_terminal = std::sync::Arc::clone(&terminal);
+    thread::spawn(move || {
+        let _ = submission.wait();
+        waiter_terminal.store(true, Ordering::Release);
+    });
+    ORIGIN_QUARANTINE.with(|entries| {
+        entries.borrow_mut().push(Box::new(QuarantinedOrigin {
+            terminal,
+            _actions: actions,
+            _owner: owner,
+        }));
+    });
+}
+
+fn cancel_with_bounded_wait<T, S>(
+    mut submission: BlockingSubmission<T>,
+    mut wait: S,
+) -> Result<Option<BlockingSubmission<T>>, BlockingTaskError>
+where
+    S: FnMut(),
+{
+    submission.cancel()?;
+    let deadline = Instant::now() + CANCEL_WAIT;
+    loop {
+        match submission.try_wait() {
+            Ok(None) if Instant::now() < deadline => wait(),
+            Ok(None) => return Ok(Some(submission)),
+            Ok(Some(_)) | Err(_) => return Ok(None),
+        }
+    }
+}
 
 static SIGNAL_FUTURE_CANCELLED: AtomicBool = AtomicBool::new(false);
 
@@ -110,6 +187,7 @@ impl PythonCallContext {
         S: for<'py> FnMut(Python<'py>) -> PyResult<()>,
     {
         self.ensure_affinity(py)?;
+        reap_origin_quarantine();
         loop {
             let task_state =
                 match signal_before_task_state(py, &mut check_signals, || submission.try_wait()) {
@@ -139,6 +217,60 @@ impl PythonCallContext {
         }
     }
 
+    fn drive_owned_with_signal_checker<T, A, R, O, F, S>(
+        &self,
+        py: Python<'_>,
+        mut submission: BlockingSubmission<T>,
+        mut actions: ActionReceiver<A, R>,
+        mut owner: O,
+        mut execute: F,
+        mut check_signals: S,
+    ) -> PyResult<(T, O)>
+    where
+        T: Send + 'static,
+        A: Send + 'static,
+        R: Send + 'static,
+        O: 'static,
+        F: for<'py> FnMut(Python<'py>, A, &mut O) -> R,
+        S: for<'py> FnMut(Python<'py>) -> PyResult<()>,
+    {
+        self.ensure_affinity(py)?;
+        reap_origin_quarantine();
+        loop {
+            let task_state =
+                match signal_before_task_state(py, &mut check_signals, || submission.try_wait()) {
+                    Ok(task_state) => task_state,
+                    Err(signal) => {
+                        if let Some(submission) = cancel_with_bounded_wait(submission, || {
+                            py.detach(|| thread::sleep(WAKE_INTERVAL));
+                        })
+                        .map_err(task_error)?
+                        {
+                            quarantine_origin_until_terminal(submission, actions, owner);
+                        }
+                        return Err(signal);
+                    }
+                };
+            match task_state {
+                Ok(Some(output)) => return Ok((output, owner)),
+                Ok(None) => {}
+                Err(error) => return Err(task_error(error)),
+            }
+
+            match py.detach(|| actions.recv_timeout(WAKE_INTERVAL)) {
+                Ok(request) => {
+                    self.ensure_affinity(py)?;
+                    let (action, reply) = request.into_parts();
+                    let _ = reply.send(execute(py, action, &mut owner));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    py.detach(|| thread::sleep(WAKE_INTERVAL));
+                }
+            }
+        }
+    }
+
     fn ensure_affinity(&self, py: Python<'_>) -> PyResult<()> {
         if thread::current().id() != self.origin_thread {
             return Err(PyRuntimeError::new_err(
@@ -158,6 +290,19 @@ impl PythonCallContext {
     }
 }
 
+fn cancel_and_wait<T>(
+    py: Python<'_>,
+    submission: &mut BlockingSubmission<T>,
+) -> Result<(), BlockingTaskError> {
+    submission.cancel()?;
+    loop {
+        match submission.try_wait() {
+            Ok(None) => py.detach(|| thread::sleep(WAKE_INTERVAL)),
+            _ => return Ok(()),
+        }
+    }
+}
+
 fn signal_before_task_state<T, S, W>(
     py: Python<'_>,
     check_signals: &mut S,
@@ -169,22 +314,6 @@ where
 {
     check_signals(py)?;
     Ok(task_state())
-}
-
-fn cancel_and_wait<T>(
-    py: Python<'_>,
-    submission: &mut BlockingSubmission<T>,
-) -> Result<(), BlockingTaskError> {
-    submission.cancel()?;
-    let deadline = Instant::now() + CANCEL_WAIT;
-    loop {
-        match submission.try_wait() {
-            Ok(None) if Instant::now() < deadline => {
-                py.detach(|| thread::sleep(WAKE_INTERVAL));
-            }
-            _ => return Ok(()),
-        }
-    }
 }
 
 fn interpreter_identity(py: Python<'_>) -> PyResult<usize> {
@@ -250,26 +379,6 @@ fn _panic_boundary_trial(py: Python<'_>, should_panic: bool) -> PyResult<&'stati
     Err(mapped)
 }
 
-pub(crate) fn run_with_actions<T, A, R, Fut, Build, Execute>(
-    py: Python<'_>,
-    build: Build,
-    execute: Execute,
-) -> PyResult<T>
-where
-    T: Send + 'static,
-    A: WorkerPayload,
-    R: WorkerPayload,
-    Fut: Future<Output = T> + Send + 'static,
-    Build: FnOnce(ActionSender<A, R>) -> Fut,
-    Execute: for<'py> FnMut(Python<'py>, A) -> R,
-{
-    let context = PythonCallContext::capture(py)?;
-    let runtime = driver()?;
-    let (actions, receiver) = action_channel();
-    let submission = submit(&runtime, build(actions))?;
-    context.drive(py, submission, receiver, execute)
-}
-
 pub(crate) fn run_with_actions_and_signal_checker<T, A, R, Fut, Build, Execute, CheckSignals>(
     py: Python<'_>,
     build: Build,
@@ -290,6 +399,57 @@ where
     let (actions, receiver) = action_channel();
     let submission = submit(&runtime, build(actions))?;
     context.drive_with_signal_checker(py, submission, receiver, execute, check_signals)
+}
+
+pub(crate) fn run_with_owned_actions<T, A, R, O, Fut, Build, Execute>(
+    py: Python<'_>,
+    owner: O,
+    build: Build,
+    execute: Execute,
+) -> PyResult<(T, O)>
+where
+    T: Send + 'static,
+    A: WorkerPayload,
+    R: WorkerPayload,
+    O: 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    Build: FnOnce(ActionSender<A, R>) -> Fut,
+    Execute: for<'py> FnMut(Python<'py>, A, &mut O) -> R,
+{
+    run_with_owned_actions_and_signal_checker(py, owner, build, execute, |py| py.check_signals())
+}
+
+pub(crate) fn run_with_owned_actions_and_signal_checker<
+    T,
+    A,
+    R,
+    O,
+    Fut,
+    Build,
+    Execute,
+    CheckSignals,
+>(
+    py: Python<'_>,
+    owner: O,
+    build: Build,
+    execute: Execute,
+    check_signals: CheckSignals,
+) -> PyResult<(T, O)>
+where
+    T: Send + 'static,
+    A: WorkerPayload,
+    R: WorkerPayload,
+    O: 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    Build: FnOnce(ActionSender<A, R>) -> Fut,
+    Execute: for<'py> FnMut(Python<'py>, A, &mut O) -> R,
+    CheckSignals: for<'py> FnMut(Python<'py>) -> PyResult<()>,
+{
+    let context = PythonCallContext::capture(py)?;
+    let runtime = driver()?;
+    let (actions, receiver) = action_channel();
+    let submission = submit(&runtime, build(actions))?;
+    context.drive_owned_with_signal_checker(py, submission, receiver, owner, execute, check_signals)
 }
 
 fn bridge_error(error: BridgeClosed) -> PyErr {
@@ -617,8 +777,32 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbeAction, ProbeReply};
-    use crate::bridge::WorkerPayload;
+    use std::hint::black_box;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        ProbeAction, ProbeReply, cancel_with_bounded_wait, quarantine_origin_until_terminal,
+        reap_origin_quarantine,
+    };
+    use crate::bridge::{WorkerPayload, action_channel};
+    use requests::blocking::BlockingRuntimeDriver;
+
+    struct TestAction;
+    struct TestReply;
+
+    impl WorkerPayload for TestAction {}
+    impl WorkerPayload for TestReply {}
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     fn assert_worker_payload<T: WorkerPayload>() {}
 
@@ -626,5 +810,55 @@ mod tests {
     fn probe_payloads_are_explicit_worker_payloads() {
         assert_worker_payload::<ProbeAction>();
         assert_worker_payload::<ProbeReply>();
+    }
+
+    #[test]
+    fn bounded_cancel_quarantines_origin_owner_until_terminal_origin_reap() {
+        let started = Arc::new(AtomicBool::new(false));
+        let worker_done = Arc::new(AtomicBool::new(false));
+        let owner_dropped = Arc::new(AtomicBool::new(false));
+        let worker_started = Arc::clone(&started);
+        let worker_finished = Arc::clone(&worker_done);
+        let owner = DropMarker(Arc::clone(&owner_dropped));
+        let runtime = BlockingRuntimeDriver::process_local().expect("runtime");
+        let (actions, receiver) = action_channel::<TestAction, TestReply>();
+        let submission = runtime
+            .submit(async move {
+                let _keep_actions_open = actions;
+                worker_started.store(true, Ordering::Release);
+                thread::sleep(Duration::from_millis(1_200));
+                worker_finished.store(true, Ordering::Release);
+            })
+            .expect("submission");
+
+        let start_deadline = Instant::now() + Duration::from_secs(1);
+        while !started.load(Ordering::Acquire) && Instant::now() < start_deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(started.load(Ordering::Acquire));
+
+        let before = Instant::now();
+        let live_submission = cancel_with_bounded_wait(submission, || {
+            thread::sleep(Duration::from_millis(10));
+        })
+        .expect("cancel")
+        .expect("non-cooperative worker should remain live");
+        assert!(before.elapsed() < Duration::from_millis(900));
+        assert!(!worker_done.load(Ordering::Acquire));
+        assert!(!owner_dropped.load(Ordering::Acquire));
+
+        black_box(&owner);
+        quarantine_origin_until_terminal(live_submission, receiver, owner);
+        assert!(!owner_dropped.load(Ordering::Acquire));
+
+        let terminal_deadline = Instant::now() + Duration::from_secs(2);
+        while !worker_done.load(Ordering::Acquire) && Instant::now() < terminal_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(worker_done.load(Ordering::Acquire));
+        assert!(!owner_dropped.load(Ordering::Acquire));
+
+        reap_origin_quarantine();
+        assert!(owner_dropped.load(Ordering::Acquire));
     }
 }

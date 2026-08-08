@@ -9,7 +9,7 @@ use requests::auth::{
 };
 
 use crate::bridge::{ActionSender, BridgeClosed, WorkerPayload};
-use crate::runtime::run_with_actions;
+use crate::runtime::run_with_owned_actions;
 
 struct AuthState {
     module: Py<PyModule>,
@@ -22,6 +22,10 @@ struct AuthState {
     to_native_string_code: Py<PyAny>,
     warnings: Py<PyAny>,
     warn: Py<PyAny>,
+    basic_type: Py<PyType>,
+    basic_call: Py<PyAny>,
+    proxy_type: Py<PyType>,
+    proxy_call: Py<PyAny>,
     digest_type: Py<PyType>,
     digest_build_code: Py<PyAny>,
     digest_401_code: Py<PyAny>,
@@ -50,6 +54,8 @@ fn initialize_auth_state(py: Python<'_>) -> PyResult<AuthState> {
     let basic_function = module.getattr("_basic_auth_str")?;
     let to_native_string = module.getattr("to_native_string")?;
     let warnings = module.getattr("warnings")?;
+    let basic_type = module.getattr("HTTPBasicAuth")?.cast_into::<PyType>()?;
+    let proxy_type = module.getattr("HTTPProxyAuth")?.cast_into::<PyType>()?;
     let digest_type = module.getattr("HTTPDigestAuth")?.cast_into::<PyType>()?;
     let digest_build = digest_type.getattr("build_digest_header")?;
     let digest_401 = digest_type.getattr("handle_401")?;
@@ -80,6 +86,10 @@ fn initialize_auth_state(py: Python<'_>) -> PyResult<AuthState> {
         to_native_string: to_native_string.unbind(),
         warn: warnings.getattr("warn")?.unbind(),
         warnings: warnings.unbind(),
+        basic_call: basic_type.getattr("__call__")?.unbind(),
+        basic_type: basic_type.unbind(),
+        proxy_call: proxy_type.getattr("__call__")?.unbind(),
+        proxy_type: proxy_type.unbind(),
         digest_type: digest_type.unbind(),
         digest_build_code: digest_build.getattr("__code__")?.unbind(),
         digest_401_code: digest_401.getattr("__code__")?.unbind(),
@@ -142,6 +152,16 @@ fn is_exact_string_or_bytes(value: &Bound<'_, PyAny>) -> bool {
     value.is_exact_instance_of::<PyString>() || value.is_exact_instance_of::<PyBytes>()
 }
 
+fn is_non_exact_string_or_bytes_subclass(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if is_exact_string_or_bytes(value) {
+        return Ok(false);
+    }
+    let py = value.py();
+    let value_type = value.get_type();
+    Ok(value_type.is_subclass(&py.get_type::<PyString>())?
+        || value_type.is_subclass(&py.get_type::<PyBytes>())?)
+}
+
 fn warn_deprecated(py: Python<'_>, state: &AuthState, message: String) -> PyResult<()> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("category", py.get_type::<PyDeprecationWarning>())?;
@@ -153,13 +173,13 @@ fn warn_deprecated(py: Python<'_>, state: &AuthState, message: String) -> PyResu
     Ok(())
 }
 
-fn coerce_credential(
+fn coerce_credential_after_check(
     py: Python<'_>,
     state: &AuthState,
     value: &Bound<'_, PyAny>,
     username: bool,
+    is_basestring: bool,
 ) -> PyResult<Vec<u8>> {
-    let is_basestring = value.is_instance(state.basestring.bind(py))?;
     let owned = if is_basestring {
         value.clone()
     } else {
@@ -197,16 +217,20 @@ fn _basic_auth_trial(
     password: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let state = auth_state(py)?;
-    let username_is_basestring = username.is_instance(state.basestring.bind(py))?;
-    let password_is_basestring = password.is_instance(state.basestring.bind(py))?;
-    if !basic_is_pristine(py, state)?
-        || (username_is_basestring && !is_exact_string_or_bytes(username))
-        || (password_is_basestring && !is_exact_string_or_bytes(password))
+    if !matches!(basic_is_pristine(py, state), Ok(true)) {
+        return Ok(compat.call1((username, password))?.unbind());
+    }
+    if is_non_exact_string_or_bytes_subclass(username)?
+        || is_non_exact_string_or_bytes_subclass(password)?
     {
         return Ok(compat.call1((username, password))?.unbind());
     }
-    let username = coerce_credential(py, state, username, true)?;
-    let password = coerce_credential(py, state, password, false)?;
+    let username_is_basestring = username.is_instance(state.basestring.bind(py))?;
+    let username =
+        coerce_credential_after_check(py, state, username, true, username_is_basestring)?;
+    let password_is_basestring = password.is_instance(state.basestring.bind(py))?;
+    let password =
+        coerce_credential_after_check(py, state, password, false, password_is_basestring)?;
     Ok(BasicCredentials::new(username, password)
         .authorization()
         .into_pyobject(py)?
@@ -245,16 +269,40 @@ fn _basic_auth_apply_trial(
     proxy: bool,
 ) -> PyResult<Py<PyAny>> {
     let state = auth_state(py)?;
-    let username_is_basestring = username.is_instance(state.basestring.bind(py))?;
-    let password_is_basestring = password.is_instance(state.basestring.bind(py))?;
-    if !basic_is_pristine(py, state)?
-        || (username_is_basestring && !is_exact_string_or_bytes(username))
-        || (password_is_basestring && !is_exact_string_or_bytes(password))
+    let (auth_type, expected_call) = if proxy {
+        (&state.proxy_type, &state.proxy_call)
+    } else {
+        (&state.basic_type, &state.basic_call)
+    };
+    let class_name = if proxy {
+        "HTTPProxyAuth"
+    } else {
+        "HTTPBasicAuth"
+    };
+    let apply_is_pristine = || -> PyResult<bool> {
+        let live_type = state
+            .module
+            .bind(py)
+            .getattr(class_name)?
+            .cast_into::<PyType>()?;
+        Ok(live_type.is(auth_type.bind(py))
+            && live_type.getattr("__call__")?.is(expected_call.bind(py)))
+    };
+    if !matches!(basic_is_pristine(py, state), Ok(true)) || !matches!(apply_is_pristine(), Ok(true))
     {
         return fallback_basic_apply(state, py, subject, username, password, proxy);
     }
-    let username = coerce_credential(py, state, username, true)?;
-    let password = coerce_credential(py, state, password, false)?;
+    if is_non_exact_string_or_bytes_subclass(username)?
+        || is_non_exact_string_or_bytes_subclass(password)?
+    {
+        return fallback_basic_apply(state, py, subject, username, password, proxy);
+    }
+    let username_is_basestring = username.is_instance(state.basestring.bind(py))?;
+    let username =
+        coerce_credential_after_check(py, state, username, true, username_is_basestring)?;
+    let password_is_basestring = password.is_instance(state.basestring.bind(py))?;
+    let password =
+        coerce_credential_after_check(py, state, password, false, password_is_basestring)?;
     let authorization = BasicCredentials::new(username, password).authorization();
     let header = if proxy {
         "Proxy-Authorization"
@@ -291,6 +339,7 @@ enum DigestOutcome {
 
 struct OriginDigestOwner {
     module: Py<PyModule>,
+    handler_error: Option<PyErr>,
 }
 
 fn store_digest_error(slot: &mut Option<PyErr>, error: PyErr) -> DigestReply {
@@ -363,6 +412,7 @@ fn digest_is_pristine(
         || !module_entry_is(module, "os", &state.os)?
         || !module_entry_is(module, "time", &state.time)?
         || !module_entry_is(module, "urlparse", &state.urlparse)?
+        || !module_entry_is(module, "str", &state.compat_str)?
     {
         return Ok(false);
     }
@@ -422,7 +472,7 @@ fn _digest_auth_trial(
     let state = auth_state(py)?;
     if operation != "build_digest_header"
         || arguments.len() != 2
-        || !digest_is_pristine(py, state, subject)?
+        || !matches!(digest_is_pristine(py, state, subject), Ok(true))
     {
         return Ok(compat.call0()?.unbind());
     }
@@ -432,6 +482,9 @@ fn _digest_auth_trial(
     let Some(url) = exact_string(arguments.get_item(1)?)? else {
         return Ok(compat.call0()?.unbind());
     };
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Ok(compat.call0()?.unbind());
+    }
     let Some(username) = exact_string(subject.getattr("username")?)? else {
         return Ok(compat.call0()?.unbind());
     };
@@ -493,17 +546,18 @@ fn _digest_auth_trial(
     thread_local.setattr("nonce_count", plan.state().nonce_count)?;
     let owner = OriginDigestOwner {
         module: state.module.clone_ref(py),
+        handler_error: None,
     };
-    let mut handler_error = None;
-    let outcome = run_with_actions(
+    let (outcome, mut owner) = run_with_owned_actions(
         py,
+        owner,
         move |actions| digest_worker(actions, *plan),
-        |py, action| match digest_action(py, action, &owner) {
+        |py, action, owner| match digest_action(py, action, owner) {
             Ok(reply) => reply,
-            Err(error) => store_digest_error(&mut handler_error, error),
+            Err(error) => store_digest_error(&mut owner.handler_error, error),
         },
     )?;
-    if let Some(error) = handler_error {
+    if let Some(error) = owner.handler_error.take() {
         return Err(error);
     }
     match outcome {
@@ -535,12 +589,7 @@ enum Digest401Action {
     Copy,
     ExtractCookies,
     PrepareCookies,
-    PreparedParts,
-    SetNonceCount { value: u32 },
-    Ctime,
-    Random { size: usize },
-    SetLastNonce { value: String },
-    SetHeader { value: String },
+    BuildDigestHeader,
     Send,
     AppendHistory,
     ReplaceRequest,
@@ -550,9 +599,6 @@ enum Digest401Action {
 enum Digest401Reply {
     Ack,
     Header(String),
-    Challenge(DigestChallenge),
-    PreparedParts { method: String, url: String },
-    Bytes(Vec<u8>),
     Failed,
 }
 
@@ -568,9 +614,6 @@ enum Digest401Outcome {
 }
 
 struct Digest401Input {
-    username: String,
-    password: String,
-    state: DigestState,
     num_401_calls: u32,
 }
 
@@ -582,6 +625,7 @@ struct OriginDigest401Owner {
     audit: Py<PyList>,
     prepared: Option<Py<PyAny>>,
     sent: Option<Py<PyAny>>,
+    handler_error: Option<PyErr>,
 }
 
 fn digest_401_audit(owner: &OriginDigest401Owner, py: Python<'_>, label: &str) -> PyResult<()> {
@@ -592,7 +636,7 @@ fn digest_401_parse_challenge(
     py: Python<'_>,
     owner: &OriginDigest401Owner,
     header: &str,
-) -> PyResult<DigestChallenge> {
+) -> PyResult<Py<PyDict>> {
     let module = owner.module.bind(py);
     let compile_kwargs = PyDict::new(py);
     compile_kwargs.set_item("flags", module.getattr("re")?.getattr("IGNORECASE")?)?;
@@ -603,20 +647,11 @@ fn digest_401_parse_challenge(
     let sub_kwargs = PyDict::new(py);
     sub_kwargs.set_item("count", 1)?;
     let stripped = pattern.call_method("sub", ("", header), Some(&sub_kwargs))?;
-    let parsed = module
+    Ok(module
         .getattr("parse_dict_header")?
         .call1((stripped,))?
-        .cast_into::<PyDict>()?;
-    Ok(DigestChallenge {
-        realm: required_challenge_string(&parsed, "realm")?,
-        nonce: required_challenge_string(&parsed, "nonce")?,
-        qop: optional_exact_string(parsed.get_item("qop")?)?
-            .ok_or_else(|| PyRuntimeError::new_err("digest qop must be an exact string"))?,
-        algorithm: optional_exact_string(parsed.get_item("algorithm")?)?
-            .ok_or_else(|| PyRuntimeError::new_err("digest algorithm must be an exact string"))?,
-        opaque: optional_exact_string(parsed.get_item("opaque")?)?
-            .ok_or_else(|| PyRuntimeError::new_err("digest opaque must be an exact string"))?,
-    })
+        .cast_into::<PyDict>()?
+        .unbind())
 }
 
 fn digest_401_action(
@@ -656,9 +691,11 @@ fn digest_401_action(
             thread_local.setattr("num_401_calls", value)?;
             Ok(Digest401Reply::Ack)
         }
-        Digest401Action::Parse { header } => Ok(Digest401Reply::Challenge(
-            digest_401_parse_challenge(py, owner, &header)?,
-        )),
+        Digest401Action::Parse { header } => {
+            let challenge = digest_401_parse_challenge(py, owner, &header)?;
+            thread_local.setattr("chal", challenge.bind(py))?;
+            Ok(Digest401Reply::Ack)
+        }
         Digest401Action::Consume => {
             digest_401_audit(owner, py, "content")?;
             response.getattr("content")?;
@@ -703,59 +740,20 @@ fn digest_401_action(
             prepared.call_method1("prepare_cookies", (jar,))?;
             Ok(Digest401Reply::Ack)
         }
-        Digest401Action::PreparedParts => {
+        Digest401Action::BuildDigestHeader => {
             digest_401_audit(owner, py, "build")?;
             let prepared = owner
                 .prepared
                 .as_ref()
                 .ok_or_else(|| PyRuntimeError::new_err("digest resend has no prepared request"))?
                 .bind(py);
-            Ok(Digest401Reply::PreparedParts {
-                method: prepared.getattr("method")?.extract::<String>()?,
-                url: prepared.getattr("url")?.extract::<String>()?,
-            })
-        }
-        Digest401Action::SetNonceCount { value } => {
-            thread_local.setattr("nonce_count", value)?;
-            Ok(Digest401Reply::Ack)
-        }
-        Digest401Action::Ctime => {
-            let value = owner
-                .module
-                .bind(py)
-                .getattr("time")?
-                .getattr("ctime")?
-                .call0()?
-                .call_method1("encode", ("utf-8",))?;
-            Ok(Digest401Reply::Bytes(
-                value.cast::<PyBytes>()?.as_bytes().to_vec(),
-            ))
-        }
-        Digest401Action::Random { size } => {
-            let value = owner
-                .module
-                .bind(py)
-                .getattr("os")?
-                .getattr("urandom")?
-                .call1((size,))?;
-            Ok(Digest401Reply::Bytes(
-                value.cast::<PyBytes>()?.as_bytes().to_vec(),
-            ))
-        }
-        Digest401Action::SetLastNonce { value } => {
-            thread_local.setattr("last_nonce", value)?;
-            Ok(Digest401Reply::Ack)
-        }
-        Digest401Action::SetHeader { value } => {
+            let header = subject
+                .getattr("build_digest_header")?
+                .call1((prepared.getattr("method")?, prepared.getattr("url")?))?;
             digest_401_audit(owner, py, "header")?;
-            let prepared = owner
-                .prepared
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("digest resend has no prepared request"))?
-                .bind(py);
             prepared
                 .getattr("headers")?
-                .set_item("Authorization", value)?;
+                .set_item("Authorization", header)?;
             Ok(Digest401Reply::Ack)
         }
         Digest401Action::Send => {
@@ -818,11 +816,6 @@ async fn digest_401_worker(
     input: Digest401Input,
 ) -> Digest401Outcome {
     let mut header = None;
-    let mut challenge = None;
-    let mut prepared_parts = None;
-    let mut digest_plan = None;
-    let mut digest_output = None;
-    let mut ctime = None;
     for step in Digest401Machine::new() {
         match step {
             Digest401Step::Seek => {
@@ -874,7 +867,7 @@ async fn digest_401_worker(
                 )
                 .await
                 {
-                    Ok(Digest401Reply::Challenge(value)) => challenge = Some(value),
+                    Ok(Digest401Reply::Ack) => {}
                     Ok(Digest401Reply::Failed) => return Digest401Outcome::HandlerFailed,
                     Ok(_) => return Digest401Outcome::HandlerFailed,
                     Err(outcome) => return outcome,
@@ -901,107 +894,18 @@ async fn digest_401_worker(
                 }
             }
             Digest401Step::PreparedParts => {
-                match request_digest_401(&actions, Digest401Action::PreparedParts).await {
-                    Ok(Digest401Reply::PreparedParts { method, url }) => {
-                        prepared_parts = Some((method, url));
-                    }
-                    Ok(Digest401Reply::Failed) => return Digest401Outcome::HandlerFailed,
-                    Ok(_) => return Digest401Outcome::HandlerFailed,
-                    Err(outcome) => return outcome,
-                }
-            }
-            Digest401Step::UpdateNonceCount => {
-                let (method, url) = prepared_parts
-                    .take()
-                    .expect("prepared parts precede digest state");
-                let preparation = prepare_digest(
-                    DigestRequest {
-                        username: input.username.clone(),
-                        password: input.password.clone(),
-                        method,
-                        url,
-                        challenge: challenge
-                            .take()
-                            .expect("parsed challenge precedes prepared parts"),
-                    },
-                    input.state.clone(),
-                );
-                let DigestPreparation::Ready(plan) = preparation else {
-                    continue;
-                };
-                let nonce_count = plan.state().nonce_count;
-                match request_digest_401(
-                    &actions,
-                    Digest401Action::SetNonceCount { value: nonce_count },
-                )
-                .await
-                {
-                    Ok(Digest401Reply::Ack) => digest_plan = Some(*plan),
-                    Ok(Digest401Reply::Failed) => return Digest401Outcome::HandlerFailed,
-                    Ok(_) => return Digest401Outcome::HandlerFailed,
-                    Err(outcome) => return outcome,
-                }
-            }
-            Digest401Step::Ctime => {
-                if digest_plan.is_none() {
-                    continue;
-                }
-                match request_digest_401(&actions, Digest401Action::Ctime).await {
-                    Ok(Digest401Reply::Bytes(value)) => ctime = Some(value),
-                    Ok(Digest401Reply::Failed) => return Digest401Outcome::HandlerFailed,
-                    Ok(_) => return Digest401Outcome::HandlerFailed,
-                    Err(outcome) => return outcome,
-                }
-            }
-            Digest401Step::Random => {
-                if digest_plan.is_none() {
-                    continue;
-                }
-                match request_digest_401(&actions, Digest401Action::Random { size: 8 }).await {
-                    Ok(Digest401Reply::Bytes(random)) => {
-                        digest_output = Some(
-                            digest_plan
-                                .take()
-                                .expect("digest plan precedes entropy")
-                                .finish(ctime.as_deref().expect("ctime precedes random"), &random),
-                        );
-                    }
-                    Ok(Digest401Reply::Failed) => return Digest401Outcome::HandlerFailed,
-                    Ok(_) => return Digest401Outcome::HandlerFailed,
-                    Err(outcome) => return outcome,
-                }
-            }
-            Digest401Step::UpdateLastNonce => {
-                let Some(output) = digest_output.as_ref() else {
-                    continue;
-                };
-                if output.header.is_some() {
-                    match request_digest_401(
-                        &actions,
-                        Digest401Action::SetLastNonce {
-                            value: output.state.last_nonce.clone(),
-                        },
-                    )
-                    .await
-                    {
-                        Ok(Digest401Reply::Ack) => {}
-                        Ok(Digest401Reply::Failed) => return Digest401Outcome::HandlerFailed,
-                        Ok(_) => return Digest401Outcome::HandlerFailed,
-                        Err(outcome) => return outcome,
-                    }
-                }
-            }
-            Digest401Step::SetHeader => {
-                let Some(value) = digest_output.take().and_then(|output| output.header) else {
-                    continue;
-                };
-                match request_digest_401(&actions, Digest401Action::SetHeader { value }).await {
+                match request_digest_401(&actions, Digest401Action::BuildDigestHeader).await {
                     Ok(Digest401Reply::Ack) => {}
                     Ok(Digest401Reply::Failed) => return Digest401Outcome::HandlerFailed,
                     Ok(_) => return Digest401Outcome::HandlerFailed,
                     Err(outcome) => return outcome,
                 }
             }
+            Digest401Step::UpdateNonceCount
+            | Digest401Step::Ctime
+            | Digest401Step::Random
+            | Digest401Step::UpdateLastNonce
+            | Digest401Step::SetHeader => {}
             Digest401Step::Send | Digest401Step::AppendHistory | Digest401Step::ReplaceRequest => {
                 let action = match step {
                     Digest401Step::Send => Digest401Action::Send,
@@ -1092,39 +996,22 @@ fn _digest_401_trial(
     audit: Py<PyList>,
 ) -> PyResult<Py<PyAny>> {
     let state = auth_state(py)?;
-    if !digest_401_is_pristine(py, state, subject, response)? {
+    if !matches!(
+        digest_401_is_pristine(py, state, subject, response),
+        Ok(true)
+    ) {
         return Ok(compat.call0()?.unbind());
     }
     let status = response.getattr("status_code")?;
     if !status.is_exact_instance_of::<pyo3::types::PyInt>() || status.extract::<i64>()? != 401 {
         return Ok(compat.call0()?.unbind());
     }
-    let Some(username) = exact_string(subject.getattr("username")?)? else {
-        return Ok(compat.call0()?.unbind());
-    };
-    let Some(password) = exact_string(subject.getattr("password")?)? else {
-        return Ok(compat.call0()?.unbind());
-    };
     let thread_local = subject.getattr("_thread_local")?;
-    let Some(last_nonce) = exact_string(thread_local.getattr("last_nonce")?)? else {
-        return Ok(compat.call0()?.unbind());
-    };
-    let Ok(nonce_count) = thread_local.getattr("nonce_count")?.extract::<u32>() else {
-        return Ok(compat.call0()?.unbind());
-    };
     let Ok(num_401_calls) = thread_local.getattr("num_401_calls")?.extract::<u32>() else {
         return Ok(compat.call0()?.unbind());
     };
-    let input = Digest401Input {
-        username,
-        password,
-        state: DigestState {
-            last_nonce,
-            nonce_count,
-        },
-        num_401_calls,
-    };
-    let mut owner = OriginDigest401Owner {
+    let input = Digest401Input { num_401_calls };
+    let owner = OriginDigest401Owner {
         module: state.module.clone_ref(py),
         subject: subject.clone().unbind(),
         response: response.clone().unbind(),
@@ -1132,17 +1019,18 @@ fn _digest_401_trial(
         audit,
         prepared: None,
         sent: None,
+        handler_error: None,
     };
-    let mut handler_error = None;
-    let outcome = run_with_actions(
+    let (outcome, mut owner) = run_with_owned_actions(
         py,
+        owner,
         move |actions| digest_401_worker(actions, input),
-        |py, action| match digest_401_action(py, action, &mut owner) {
+        |py, action, owner| match digest_401_action(py, action, owner) {
             Ok(reply) => reply,
-            Err(error) => store_digest_401_error(&mut handler_error, error),
+            Err(error) => store_digest_401_error(&mut owner.handler_error, error),
         },
     )?;
-    if let Some(error) = handler_error {
+    if let Some(error) = owner.handler_error.take() {
         return Err(error);
     }
     match outcome {
