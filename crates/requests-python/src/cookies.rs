@@ -82,8 +82,12 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
         jar_setstate: jar_type.getattr("__setstate__")?.unbind(),
         jar_get_policy: jar_type.getattr("get_policy")?.unbind(),
         jar_inspect_methods: [
+            "__iter__",
+            "iterkeys",
             "keys",
+            "itervalues",
             "values",
+            "iteritems",
             "items",
             "list_domains",
             "list_paths",
@@ -218,7 +222,9 @@ fn snapshot_shape_is_supported(state: &CookieState, jar: &Bound<'_, PyAny>) -> P
         for (_, names) in paths.iter() {
             let names = names.cast_into::<PyDict>()?;
             for (_, cookie) in names.iter() {
-                if !cookie.get_type().is(state.cookie_type.bind(jar.py())) {
+                if !cookie.get_type().is(state.cookie_type.bind(jar.py()))
+                    || cookie_snapshot(&cookie).is_err()
+                {
                     return Ok(false);
                 }
             }
@@ -255,25 +261,61 @@ fn optional_string(value: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
     }
 }
 
+fn required_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    if value.is_exact_instance_of::<pyo3::types::PyString>() {
+        value.extract()
+    } else {
+        Err(PyTypeError::new_err(
+            "cookie snapshot requires exact string fields",
+        ))
+    }
+}
+
+fn optional_integer(value: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
+    if value.is_none() {
+        Ok(None)
+    } else if value.is_exact_instance_of::<pyo3::types::PyInt>() {
+        Ok(Some(value.extract()?))
+    } else {
+        Err(PyTypeError::new_err(
+            "cookie snapshot requires an exact integer or None expiry",
+        ))
+    }
+}
+
+fn required_bool(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if value.is_exact_instance_of::<pyo3::types::PyBool>() {
+        value.extract()
+    } else {
+        Err(PyTypeError::new_err(
+            "cookie snapshot requires exact bool fields",
+        ))
+    }
+}
+
+fn cookie_snapshot(cookie: &Bound<'_, PyAny>) -> PyResult<CookieSnapshot> {
+    let rest = cookie.getattr("_rest")?.cast_into::<PyDict>()?;
+    let mut rest_values = Vec::with_capacity(rest.len());
+    for (key, value) in rest.iter() {
+        rest_values.push((required_string(&key)?, scalar_from_python(&value)?));
+    }
+    Ok(CookieSnapshot {
+        name: required_string(&cookie.getattr("name")?)?,
+        value: optional_string(&cookie.getattr("value")?)?,
+        domain: optional_string(&cookie.getattr("domain")?)?,
+        path: optional_string(&cookie.getattr("path")?)?,
+        secure: required_bool(&cookie.getattr("secure")?)?,
+        expires: optional_integer(&cookie.getattr("expires")?)?,
+        discard: required_bool(&cookie.getattr("discard")?)?,
+        rest: rest_values,
+    })
+}
+
 fn snapshot_jar(jar: &Bound<'_, PyAny>) -> PyResult<JarSnapshot> {
     let mut cookies = Vec::new();
     for item in jar.try_iter()? {
         let cookie = item?;
-        let rest = cookie.getattr("_rest")?.cast_into::<PyDict>()?;
-        let mut rest_values = Vec::with_capacity(rest.len());
-        for (key, value) in rest.iter() {
-            rest_values.push((key.extract()?, scalar_from_python(&value)?));
-        }
-        cookies.push(CookieSnapshot {
-            name: cookie.getattr("name")?.extract()?,
-            value: optional_string(&cookie.getattr("value")?)?,
-            domain: optional_string(&cookie.getattr("domain")?)?,
-            path: optional_string(&cookie.getattr("path")?)?,
-            secure: cookie.getattr("secure")?.extract()?,
-            expires: cookie.getattr("expires")?.extract()?,
-            discard: cookie.getattr("discard")?.extract()?,
-            rest: rest_values,
-        });
+        cookies.push(cookie_snapshot(&cookie)?);
     }
     Ok(JarSnapshot::new(cookies))
 }

@@ -5,7 +5,7 @@ use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule, PyString, PyTuple, P
 use pyo3::wrap_pyfunction;
 use requests::auth::{
     BasicCredentials, Digest401Machine, Digest401Step, DigestChallenge, DigestOutput,
-    DigestPreparation, DigestRequest, DigestState, prepare_digest,
+    DigestPreparation, DigestRequest, DigestState, digest_request_target, prepare_digest,
 };
 
 use crate::bridge::{ActionSender, BridgeClosed, WorkerPayload};
@@ -152,16 +152,6 @@ fn is_exact_string_or_bytes(value: &Bound<'_, PyAny>) -> bool {
     value.is_exact_instance_of::<PyString>() || value.is_exact_instance_of::<PyBytes>()
 }
 
-fn is_non_exact_string_or_bytes_subclass(value: &Bound<'_, PyAny>) -> PyResult<bool> {
-    if is_exact_string_or_bytes(value) {
-        return Ok(false);
-    }
-    let py = value.py();
-    let value_type = value.get_type();
-    Ok(value_type.is_subclass(&py.get_type::<PyString>())?
-        || value_type.is_subclass(&py.get_type::<PyBytes>())?)
-}
-
 fn warn_deprecated(py: Python<'_>, state: &AuthState, message: String) -> PyResult<()> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("category", py.get_type::<PyDeprecationWarning>())?;
@@ -220,9 +210,7 @@ fn _basic_auth_trial(
     if !matches!(basic_is_pristine(py, state), Ok(true)) {
         return Ok(compat.call1((username, password))?.unbind());
     }
-    if is_non_exact_string_or_bytes_subclass(username)?
-        || is_non_exact_string_or_bytes_subclass(password)?
-    {
+    if !is_exact_string_or_bytes(username) || !is_exact_string_or_bytes(password) {
         return Ok(compat.call1((username, password))?.unbind());
     }
     let username_is_basestring = username.is_instance(state.basestring.bind(py))?;
@@ -292,9 +280,7 @@ fn _basic_auth_apply_trial(
     {
         return fallback_basic_apply(state, py, subject, username, password, proxy);
     }
-    if is_non_exact_string_or_bytes_subclass(username)?
-        || is_non_exact_string_or_bytes_subclass(password)?
-    {
+    if !is_exact_string_or_bytes(username) || !is_exact_string_or_bytes(password) {
         return fallback_basic_apply(state, py, subject, username, password, proxy);
     }
     let username_is_basestring = username.is_instance(state.basestring.bind(py))?;
@@ -482,7 +468,7 @@ fn _digest_auth_trial(
     let Some(url) = exact_string(arguments.get_item(1)?)? else {
         return Ok(compat.call0()?.unbind());
     };
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    if digest_request_target(&url).is_none() {
         return Ok(compat.call0()?.unbind());
     }
     let Some(username) = exact_string(subject.getattr("username")?)? else {
@@ -751,9 +737,11 @@ fn digest_401_action(
                 .getattr("build_digest_header")?
                 .call1((prepared.getattr("method")?, prepared.getattr("url")?))?;
             digest_401_audit(owner, py, "header")?;
-            prepared
-                .getattr("headers")?
-                .set_item("Authorization", header)?;
+            if header.is_truthy()? {
+                prepared
+                    .getattr("headers")?
+                    .set_item("Authorization", header)?;
+            }
             Ok(Digest401Reply::Ack)
         }
         Digest401Action::Send => {

@@ -1,4 +1,4 @@
-use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyNameError, PyRuntimeError, PyStopIteration, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyTuple};
@@ -10,7 +10,6 @@ use crate::runtime::run_with_owned_actions;
 
 struct HookState {
     module: Py<PyModule>,
-    callable: Py<PyAny>,
 }
 
 static HOOK_STATE: PyOnceLock<HookState> = PyOnceLock::new();
@@ -18,7 +17,6 @@ static HOOK_STATE: PyOnceLock<HookState> = PyOnceLock::new();
 fn initialize_hook_state(py: Python<'_>) -> PyResult<HookState> {
     let module = PyModule::import(py, "requests.hooks")?;
     Ok(HookState {
-        callable: module.getattr("Callable")?.unbind(),
         module: module.unbind(),
     })
 }
@@ -117,9 +115,9 @@ fn bridge_error(error: BridgeClosed) -> PyErr {
 #[pyfunction(signature = (*args))]
 fn _dispatch_hook_trial(py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
     let state = hook_state(py)?;
-    let (compat, key_index) = match args.len() {
-        4 => (None, 0),
-        5 => (Some(args.get_item(0)?), 1),
+    let key_index = match args.len() {
+        4 => 0,
+        5 => 1,
         count => {
             return Err(PyTypeError::new_err(format!(
                 "_dispatch_hook_trial expected 4 or 5 arguments, got {count}"
@@ -130,22 +128,6 @@ fn _dispatch_hook_trial(py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<P
     let hooks = args.get_item(key_index + 1)?;
     let hook_data = args.get_item(key_index + 2)?;
     let kwargs = args.get_item(key_index + 3)?.cast_into::<PyDict>()?;
-    let callable_is_pristine = state
-        .module
-        .bind(py)
-        .getattr("Callable")
-        .is_ok_and(|live| live.is(state.callable.bind(py)));
-    if !callable_is_pristine {
-        if let Some(compat) = compat {
-            return Ok(compat.call0()?.unbind());
-        }
-        return Ok(state
-            .module
-            .bind(py)
-            .getattr("dispatch_hook")?
-            .call((key.as_str(), &hooks, &hook_data), Some(&kwargs))?
-            .unbind());
-    }
     let empty_hooks = PyDict::new(py);
     let hook_map = if hooks.is_truthy()? {
         hooks.clone()
@@ -156,7 +138,13 @@ fn _dispatch_hook_trial(py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<P
     if !selected.is_truthy()? {
         return Ok(hook_data.unbind());
     }
-    let iterable = if selected.is_instance(state.callable.bind(py))? {
+    let callable = state
+        .module
+        .bind(py)
+        .dict()
+        .get_item("Callable")?
+        .ok_or_else(|| PyNameError::new_err("name 'Callable' is not defined"))?;
+    let iterable = if selected.is_instance(&callable)? {
         PyList::new(py, [selected])?.into_any()
     } else {
         selected

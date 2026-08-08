@@ -231,6 +231,39 @@ impl DigestPlan {
 }
 
 #[must_use]
+pub fn digest_request_target(url: &str) -> Option<String> {
+    let remainder = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let boundary = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let (authority, suffix) = remainder.split_at(boundary);
+    if authority.is_empty() {
+        return None;
+    }
+    let lexical_suffix = suffix.split('#').next()?;
+    let lexical_target = if lexical_suffix.is_empty() {
+        "/".to_owned()
+    } else if lexical_suffix.starts_with('?') {
+        format!("/{lexical_suffix}")
+    } else {
+        lexical_suffix.to_owned()
+    };
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+        return None;
+    }
+    let mut path = parsed.path().to_owned();
+    if path.is_empty() {
+        path.push('/');
+    }
+    if let Some(query) = parsed.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    (path == lexical_target).then_some(lexical_target)
+}
+
+#[must_use]
 pub fn prepare_digest(request: DigestRequest, mut state: DigestState) -> DigestPreparation {
     let algorithm_name = request.challenge.algorithm.as_deref().unwrap_or("MD5");
     let algorithm = match algorithm_name.to_uppercase().as_str() {
@@ -241,17 +274,9 @@ pub fn prepare_digest(request: DigestRequest, mut state: DigestState) -> DigestP
         "SHA-512" => DigestAlgorithm::Sha512,
         _ => return DigestPreparation::Unsupported(state),
     };
-    let Ok(parsed) = url::Url::parse(&request.url) else {
+    let Some(path) = digest_request_target(&request.url) else {
         return DigestPreparation::Unsupported(state);
     };
-    let mut path = parsed.path().to_owned();
-    if path.is_empty() {
-        path.push('/');
-    }
-    if let Some(query) = parsed.query() {
-        path.push('?');
-        path.push_str(query);
-    }
 
     if request.challenge.nonce == state.last_nonce {
         state.nonce_count += 1;

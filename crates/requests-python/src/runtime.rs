@@ -27,8 +27,8 @@ trait OriginQuarantineEntry {
 
 struct QuarantinedOrigin<A, R, O> {
     terminal: std::sync::Arc<AtomicBool>,
-    _actions: ActionReceiver<A, R>,
-    _owner: O,
+    actions: Option<ActionReceiver<A, R>>,
+    owner: Option<O>,
 }
 
 impl<A, R, O> OriginQuarantineEntry for QuarantinedOrigin<A, R, O> {
@@ -39,8 +39,9 @@ impl<A, R, O> OriginQuarantineEntry for QuarantinedOrigin<A, R, O> {
 
 impl<A, R, O> Drop for QuarantinedOrigin<A, R, O> {
     fn drop(&mut self) {
-        while !self.terminal.load(Ordering::Acquire) {
-            thread::sleep(WAKE_INTERVAL);
+        if !self.terminal.load(Ordering::Acquire) {
+            std::mem::forget(self.actions.take());
+            std::mem::forget(self.owner.take());
         }
     }
 }
@@ -70,8 +71,8 @@ fn quarantine_origin_until_terminal<T, A, R, O>(
     ORIGIN_QUARANTINE.with(|entries| {
         entries.borrow_mut().push(Box::new(QuarantinedOrigin {
             terminal,
-            _actions: actions,
-            _owner: owner,
+            actions: Some(actions),
+            owner: Some(owner),
         }));
     });
 }
@@ -804,6 +805,21 @@ mod tests {
         }
     }
 
+    struct AffineDropMarker {
+        dropped: Arc<AtomicBool>,
+        dropped_off_origin: Arc<AtomicBool>,
+        origin: thread::ThreadId,
+    }
+
+    impl Drop for AffineDropMarker {
+        fn drop(&mut self) {
+            if thread::current().id() != self.origin {
+                self.dropped_off_origin.store(true, Ordering::Release);
+            }
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
     fn assert_worker_payload<T: WorkerPayload>() {}
 
     #[test]
@@ -858,7 +874,74 @@ mod tests {
         assert!(worker_done.load(Ordering::Acquire));
         assert!(!owner_dropped.load(Ordering::Acquire));
 
-        reap_origin_quarantine();
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while !owner_dropped.load(Ordering::Acquire) && Instant::now() < reap_deadline {
+            reap_origin_quarantine();
+            thread::sleep(Duration::from_millis(1));
+        }
         assert!(owner_dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn nonterminal_quarantine_does_not_block_origin_thread_teardown() {
+        let worker_started = Arc::new(AtomicBool::new(false));
+        let worker_done = Arc::new(AtomicBool::new(false));
+        let owner_dropped = Arc::new(AtomicBool::new(false));
+        let owner_dropped_off_origin = Arc::new(AtomicBool::new(false));
+        let thread_worker_started = Arc::clone(&worker_started);
+        let thread_worker_done = Arc::clone(&worker_done);
+        let thread_owner_dropped = Arc::clone(&owner_dropped);
+        let thread_owner_dropped_off_origin = Arc::clone(&owner_dropped_off_origin);
+        let (quarantined_sender, quarantined_receiver) = std::sync::mpsc::channel();
+
+        let origin = thread::spawn(move || {
+            let owner = AffineDropMarker {
+                dropped: thread_owner_dropped,
+                dropped_off_origin: thread_owner_dropped_off_origin,
+                origin: thread::current().id(),
+            };
+            let runtime = BlockingRuntimeDriver::process_local().expect("runtime");
+            let (actions, receiver) = action_channel::<TestAction, TestReply>();
+            let submission = runtime
+                .submit(async move {
+                    let _keep_actions_open = actions;
+                    thread_worker_started.store(true, Ordering::Release);
+                    thread::park();
+                    thread_worker_done.store(true, Ordering::Release);
+                })
+                .expect("submission");
+
+            let start_deadline = Instant::now() + Duration::from_secs(1);
+            while !worker_started.load(Ordering::Acquire) && Instant::now() < start_deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(worker_started.load(Ordering::Acquire));
+
+            let live_submission = cancel_with_bounded_wait(submission, || {
+                thread::sleep(Duration::from_millis(10));
+            })
+            .expect("cancel")
+            .expect("permanently blocked worker must remain nonterminal");
+            quarantine_origin_until_terminal(live_submission, receiver, owner);
+            quarantined_sender.send(()).expect("quarantine ready");
+        });
+
+        quarantined_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("origin thread must install the quarantine");
+        let (teardown_sender, teardown_receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = teardown_sender.send(origin.join().is_ok());
+        });
+
+        let teardown = teardown_receiver.recv_timeout(Duration::from_millis(300));
+        assert!(!worker_done.load(Ordering::Acquire));
+        assert!(!owner_dropped.load(Ordering::Acquire));
+        assert!(!owner_dropped_off_origin.load(Ordering::Acquire));
+        assert_eq!(
+            teardown,
+            Ok(true),
+            "origin thread teardown must remain bounded for a permanently nonterminal quarantine",
+        );
     }
 }

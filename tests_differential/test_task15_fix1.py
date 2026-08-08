@@ -39,7 +39,7 @@ if target == "rewrite":
     )
 
 
-def test_basic_coercion_observes_username_completely_before_password() -> None:
+def test_basic_non_exact_credentials_select_compatibility_once() -> None:
     _assert_equal(
         _AUTH_TRIAL,
         """
@@ -72,7 +72,7 @@ class Password:
 result = basic_once(Username(), Password())
 if target == "rewrite":
     assert candidate_calls == 1
-    assert compat_calls == 0
+    assert compat_calls == 1
 """,
     )
 
@@ -313,7 +313,7 @@ result = (result is replacement, side_effects)
     _assert_equal("", source)
 
 
-def test_missing_live_hook_callable_selects_compatibility_once() -> None:
+def test_missing_live_hook_callable_is_authoritative_without_replay() -> None:
     source = """
 import os
 import requests.hooks as hooks_module
@@ -335,7 +335,6 @@ def hook(value):
 def compat():
     global compat_calls
     compat_calls += 1
-    side_effects.append("compat")
     return hooks_module.dispatch_hook(
         "response", {"response": hook}, object()
     )
@@ -351,6 +350,10 @@ try:
         compat()
 finally:
     hooks_module.Callable = original_callable
+    if target == "rewrite":
+        assert compat_calls == 0
+    else:
+        assert compat_calls == 1
 """
     _assert_equal("", source)
 
