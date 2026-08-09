@@ -1,14 +1,17 @@
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
+use std::marker::PhantomData;
+use std::rc::Rc;
+
+use pyo3::exceptions::{PyNameError, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyAny, PyDict, PyList, PyModule, PySet, PyTuple, PyType};
+use pyo3::types::{PyAny, PyDict, PyFunction, PyList, PyModule, PySet, PyTuple, PyType};
 use pyo3::wrap_pyfunction;
 use requests::cookies::{
-    CookiePipelineStage, CookieScalar, CookieSnapshot, JarSnapshot, LookupQuery, LookupValue,
-    SnapshotDelta, private_pipeline_stages,
+    CookiePipelineStage, CookieScalar, CookieSnapshot, private_pipeline_stages,
 };
 
 use crate::bridge::{BridgeClosed, WorkerPayload};
+use crate::errors::exception_matches;
 use crate::runtime::run_with_owned_actions;
 
 struct CookieState {
@@ -19,6 +22,9 @@ struct CookieState {
     cookie_type: Py<PyType>,
     cookielib: Py<PyAny>,
     cookie_constructor: Py<PyAny>,
+    create_cookie_builtins: Py<PyDict>,
+    deepvalues: Py<PyAny>,
+    deepvalues_code: Py<PyAny>,
     morsel_type: Py<PyType>,
     morsel_mro: Vec<Py<PyType>>,
     morsel_getitem: Py<PyAny>,
@@ -26,13 +32,10 @@ struct CookieState {
     morsel_value: Py<PyAny>,
     prepared_type: Py<PyType>,
     response_type: Py<PyType>,
-    jar_getstate: Py<PyAny>,
     jar_inspect_methods: Vec<(&'static str, Py<PyAny>)>,
     jar_operation_methods: Vec<(&'static str, Py<PyAny>)>,
     std_operation_methods: Vec<(&'static str, Py<PyAny>)>,
     module_functions: Vec<(&'static str, Py<PyAny>, Py<PyAny>)>,
-    std_set_cookie: Py<PyAny>,
-    std_clear: Py<PyAny>,
     std_add_header: Py<PyAny>,
     std_extract: Py<PyAny>,
     prepared_cookies: Py<PyAny>,
@@ -48,12 +51,47 @@ struct CookieState {
     pickle_dumps: Py<PyAny>,
     pickle_loads: Py<PyAny>,
     pickle_module: Py<PyModule>,
+    threading_module: Py<PyModule>,
+    threading_rlock: Py<PyAny>,
+    threading_rlock_code: Py<PyAny>,
+    rlock_type: Py<PyType>,
     object_getattribute: Py<PyAny>,
     cookie_mro: Vec<Py<PyType>>,
     jar_mro: Vec<Py<PyType>>,
     std_jar_mro: Vec<Py<PyType>>,
     prepared_mro: Vec<Py<PyType>>,
     response_mro: Vec<Py<PyType>>,
+}
+
+struct FunctionGlobalOwner {
+    globals: Py<PyDict>,
+    builtins: Py<PyDict>,
+}
+
+#[allow(unsafe_code)]
+fn exact_function_global_owner(
+    py: Python<'_>,
+    callable: &Bound<'_, PyAny>,
+) -> PyResult<Option<FunctionGlobalOwner>> {
+    if !callable.is_exact_instance_of::<PyFunction>() {
+        return Ok(None);
+    }
+    let function = callable.cast::<PyFunction>()?;
+    // SAFETY: PyFunction_GetGlobals returns a borrowed reference owned by the
+    // exact PyFunction while both the function and returned Bound stay under
+    // the attached interpreter token.
+    let globals = unsafe {
+        Bound::from_borrowed_ptr(py, pyo3::ffi::PyFunction_GetGlobals(function.as_ptr()))
+            .cast_into::<PyDict>()?
+    };
+    let builtins = function.getattr("__builtins__")?;
+    if !builtins.is_exact_instance_of::<PyDict>() {
+        return Ok(None);
+    }
+    Ok(Some(FunctionGlobalOwner {
+        globals: globals.unbind(),
+        builtins: builtins.cast_into::<PyDict>()?.unbind(),
+    }))
 }
 
 static COOKIE_STATE: PyOnceLock<CookieState> = PyOnceLock::new();
@@ -69,6 +107,12 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
     let cookie_type = cookiejar.getattr("Cookie")?.cast_into::<PyType>()?;
     let cookielib = module.getattr("cookielib")?;
     let cookie_constructor = cookielib.getattr("Cookie")?;
+    let create_cookie_builtins = module
+        .getattr("create_cookie")?
+        .getattr("__builtins__")?
+        .cast_into::<PyDict>()?;
+    let deepvalues = cookielib.getattr("deepvalues")?;
+    let deepvalues_code = deepvalues.getattr("__code__")?;
     let morsel_type = PyModule::import(py, "http.cookies")?
         .getattr("Morsel")?
         .cast_into::<PyType>()?;
@@ -79,6 +123,10 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
     let calendar_module = module.getattr("calendar")?;
     let copy_module = PyModule::import(py, "copy")?;
     let pickle = PyModule::import(py, "pickle")?;
+    let threading = module.getattr("threading")?.cast_into::<PyModule>()?;
+    let threading_rlock = threading.getattr("RLock")?;
+    let threading_rlock_code = threading_rlock.getattr("__code__")?;
+    let rlock_type = threading_rlock.call0()?.get_type().unbind();
     let module_functions = [
         "create_cookie",
         "morsel_to_cookie",
@@ -131,7 +179,6 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
     };
     Ok(CookieState {
         module: module.clone().unbind(),
-        jar_getstate: jar_type.getattr("__getstate__")?.unbind(),
         jar_inspect_methods: [
             "__iter__",
             "iterkeys",
@@ -154,8 +201,6 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
         jar_operation_methods,
         std_operation_methods,
         module_functions,
-        std_set_cookie: std_jar_type.getattr("set_cookie")?.unbind(),
-        std_clear: std_jar_type.getattr("clear")?.unbind(),
         std_add_header: std_jar_type.getattr("add_cookie_header")?.unbind(),
         std_extract: std_jar_type.getattr("extract_cookies")?.unbind(),
         prepared_cookies: prepared_type.getattr("prepare_cookies")?.unbind(),
@@ -177,6 +222,10 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
         pickle_dumps: pickle.getattr("dumps")?.unbind(),
         pickle_loads: pickle.getattr("loads")?.unbind(),
         pickle_module: pickle.clone().unbind(),
+        threading_module: threading.clone().unbind(),
+        threading_rlock: threading_rlock.clone().unbind(),
+        threading_rlock_code: threading_rlock_code.unbind(),
+        rlock_type,
         object_getattribute: py.get_type::<PyAny>().getattr("__getattribute__")?.unbind(),
         cookie_mro: mro(&cookie_type)?,
         jar_mro: mro(&jar_type)?,
@@ -193,6 +242,9 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
         cookie_type: cookie_type.unbind(),
         cookielib: cookielib.unbind(),
         cookie_constructor: cookie_constructor.unbind(),
+        create_cookie_builtins: create_cookie_builtins.unbind(),
+        deepvalues: deepvalues.unbind(),
+        deepvalues_code: deepvalues_code.unbind(),
         morsel_type: morsel_type.unbind(),
         prepared_type: prepared_type.unbind(),
         response_type: response_type.unbind(),
@@ -203,15 +255,14 @@ fn cookie_state(py: Python<'_>) -> PyResult<&CookieState> {
     COOKIE_STATE.get_or_try_init(py, || initialize_cookie_state(py))
 }
 
-fn method_is(ty: &Bound<'_, PyType>, name: &str, expected: &Py<PyAny>) -> PyResult<bool> {
-    Ok(ty.getattr(name)?.is(expected.bind(ty.py())))
-}
-
 fn module_entry_is(
     module: &Bound<'_, PyModule>,
     name: &str,
     expected: &Py<PyAny>,
 ) -> PyResult<bool> {
+    if !exact_builtin_string_keys(&module.dict()) {
+        return Ok(false);
+    }
     Ok(module
         .dict()
         .get_item(name)?
@@ -240,8 +291,29 @@ fn raw_mro_type_entry<'py>(
     Ok(None)
 }
 
+fn method_is(ty: &Bound<'_, PyType>, name: &str, expected: &Py<PyAny>) -> PyResult<bool> {
+    Ok(raw_mro_type_entry(ty, name)?.is_some_and(|value| value.is(expected.bind(ty.py()))))
+}
+
+fn exact_builtin_string_keys(dictionary: &Bound<'_, PyDict>) -> bool {
+    dictionary.keys().iter().all(|key| exact_string_item(&key))
+}
+
 fn raw_instance_dict<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyDict>> {
     Ok(value.getattr("__dict__")?.cast_into::<PyDict>()?)
+}
+
+fn instance_methods_are_unshadowed(value: &Bound<'_, PyAny>, names: &[&str]) -> PyResult<bool> {
+    let dictionary = raw_instance_dict(value)?;
+    if !exact_builtin_string_keys(&dictionary) {
+        return Ok(false);
+    }
+    for name in names {
+        if dictionary.contains(name)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn expected_method<'a>(methods: &'a [(&'static str, Py<PyAny>)], name: &str) -> &'a Py<PyAny> {
@@ -270,6 +342,9 @@ fn module_functions_are_pristine(
     state: &CookieState,
     names: &[&str],
 ) -> PyResult<bool> {
+    if !exact_builtin_string_keys(&state.module.bind(py).dict()) {
+        return Ok(false);
+    }
     let module = state.module.bind(py);
     for name in names {
         let (_, expected, code) = state
@@ -285,6 +360,69 @@ fn module_functions_are_pristine(
         }
     }
     Ok(true)
+}
+
+fn source_module_function_lookup_is_callback_free(
+    py: Python<'_>,
+    state: &CookieState,
+    globals: &FunctionGlobalOwner,
+    name: &str,
+) -> PyResult<bool> {
+    if !exact_builtin_string_keys(globals.globals.bind(py))
+        || !exact_builtin_string_keys(globals.builtins.bind(py))
+    {
+        return Ok(false);
+    }
+    let source_module = match globals.globals.bind(py).get_item("cookies_module")? {
+        Some(value) => value,
+        None => match globals.builtins.bind(py).get_item("cookies_module")? {
+            Some(value) => value,
+            None => return Ok(false),
+        },
+    };
+    if !source_module.is(state.module.bind(py)) {
+        return Ok(false);
+    }
+    if !source_module.get_type().is(py.get_type::<PyModule>()) {
+        return Ok(false);
+    }
+    let source_module = source_module.cast::<PyModule>()?;
+    if !exact_builtin_string_keys(&source_module.dict()) {
+        return Ok(false);
+    }
+    let (_, expected, code) = state
+        .module_functions
+        .iter()
+        .find(|(candidate, _, _)| *candidate == name)
+        .unwrap_or_else(|| panic!("missing cached cookie function {name}"));
+    let Some(function) = source_module.dict().get_item(name)? else {
+        return Ok(false);
+    };
+    Ok(function.is(expected.bind(py)) && function.getattr("__code__")?.is(code.bind(py)))
+}
+
+fn deepvalues_is_pristine(py: Python<'_>, state: &CookieState) -> PyResult<bool> {
+    let module = state.module.bind(py);
+    if !exact_builtin_string_keys(&module.dict()) {
+        return Ok(false);
+    }
+    let Some(cookielib) = module.dict().get_item("cookielib")? else {
+        return Ok(false);
+    };
+    if !cookielib.is(state.cookielib.bind(py)) {
+        return Ok(false);
+    }
+    let cookielib = cookielib.cast_into::<PyModule>()?;
+    if !exact_builtin_string_keys(&cookielib.dict()) {
+        return Ok(false);
+    }
+    let Some(current) = cookielib.dict().get_item("deepvalues")? else {
+        return Ok(false);
+    };
+    Ok(current.is(state.deepvalues.bind(py))
+        && current
+            .getattr("__code__")?
+            .is(state.deepvalues_code.bind(py)))
 }
 
 fn inspect_methods_are_pristine(py: Python<'_>, state: &CookieState) -> PyResult<bool> {
@@ -308,9 +446,7 @@ fn type_layout_is_pristine(
     shadowable_fields: &[&str],
 ) -> PyResult<bool> {
     if !mro_is(class, expected_mro)?
-        || !class
-            .getattr("__getattribute__")?
-            .is(state.object_getattribute.bind(class.py()))
+        || !method_is(class, "__getattribute__", &state.object_getattribute)?
     {
         return Ok(false);
     }
@@ -331,12 +467,16 @@ fn jar_layout_is_pristine(state: &CookieState, jar: &Bound<'_, PyAny>) -> PyResu
     } else {
         return Ok(false);
     };
-    Ok(
-        type_layout_is_pristine(state, &class, expected_mro, &["_cookies", "_policy"])?
-            && raw_instance_dict(jar)?
-                .get_item("_cookies")?
-                .is_some_and(|value| value.is_exact_instance_of::<PyDict>()),
-    )
+    if !type_layout_is_pristine(state, &class, expected_mro, &["_cookies", "_policy"])? {
+        return Ok(false);
+    }
+    let dictionary = raw_instance_dict(jar)?;
+    if !exact_builtin_string_keys(&dictionary) {
+        return Ok(false);
+    }
+    Ok(dictionary
+        .get_item("_cookies")?
+        .is_some_and(|value| value.is_exact_instance_of::<PyDict>()))
 }
 
 fn cookie_layout_is_pristine(state: &CookieState, cookie: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -349,12 +489,8 @@ fn morsel_layout_is_pristine(state: &CookieState, morsel: &Bound<'_, PyAny>) -> 
     let class = morsel.get_type();
     Ok(class.is(state.morsel_type.bind(morsel.py()))
         && mro_is(&class, &state.morsel_mro)?
-        && class
-            .getattr("__getattribute__")?
-            .is(state.object_getattribute.bind(morsel.py()))
-        && class
-            .getattr("__getitem__")?
-            .is(state.morsel_getitem.bind(morsel.py()))
+        && method_is(&class, "__getattribute__", &state.object_getattribute)?
+        && method_is(&class, "__getitem__", &state.morsel_getitem)?
         && raw_mro_type_entry(&class, "key")?
             .is_some_and(|value| value.is(state.morsel_key.bind(morsel.py())))
         && raw_mro_type_entry(&class, "value")?
@@ -367,6 +503,10 @@ fn exact_string_item(value: &Bound<'_, PyAny>) -> bool {
 
 fn morsel_shape_is_supported(state: &CookieState, morsel: &Bound<'_, PyAny>) -> PyResult<bool> {
     if !morsel_layout_is_pristine(state, morsel)? {
+        return Ok(false);
+    }
+    let dictionary = morsel.cast::<PyDict>()?;
+    if !exact_builtin_string_keys(dictionary) {
         return Ok(false);
     }
     for name in ["max-age", "expires", "version", "domain", "path", "comment"] {
@@ -399,6 +539,11 @@ fn raw_cookie_snapshot(state: &CookieState, cookie: &Bound<'_, PyAny>) -> PyResu
         return Err(PyTypeError::new_err("cookie layout is not pristine"));
     }
     let dictionary = raw_instance_dict(cookie)?;
+    if !exact_builtin_string_keys(&dictionary) {
+        return Err(PyTypeError::new_err(
+            "cookie instance dictionary has a non-string key",
+        ));
+    }
     let rest = raw_required_field(&dictionary, "_rest")?.cast_into::<PyDict>()?;
     let mut rest_values = Vec::with_capacity(rest.len());
     for (key, value) in rest.iter() {
@@ -422,11 +567,20 @@ fn snapshot_shape_is_supported(state: &CookieState, jar: &Bound<'_, PyAny>) -> P
     }
     let jar_dictionary = raw_instance_dict(jar)?;
     let domains = raw_required_field(&jar_dictionary, "_cookies")?.cast_into::<PyDict>()?;
-    for (_, paths) in domains.iter() {
+    for (domain, paths) in domains.iter() {
+        if !exact_string_item(&domain) || !paths.is_exact_instance_of::<PyDict>() {
+            return Ok(false);
+        }
         let paths = paths.cast_into::<PyDict>()?;
-        for (_, names) in paths.iter() {
+        for (path, names) in paths.iter() {
+            if !exact_string_item(&path) || !names.is_exact_instance_of::<PyDict>() {
+                return Ok(false);
+            }
             let names = names.cast_into::<PyDict>()?;
-            for (_, cookie) in names.iter() {
+            for (name, cookie) in names.iter() {
+                if !exact_string_item(&name) {
+                    return Ok(false);
+                }
                 if raw_cookie_snapshot(state, &cookie).is_err() {
                     return Ok(false);
                 }
@@ -496,180 +650,114 @@ fn required_bool(value: &Bound<'_, PyAny>) -> PyResult<bool> {
     }
 }
 
-fn cookie_snapshot(cookie: &Bound<'_, PyAny>) -> PyResult<CookieSnapshot> {
-    let rest = cookie.getattr("_rest")?.cast_into::<PyDict>()?;
-    let mut rest_values = Vec::with_capacity(rest.len());
-    for (key, value) in rest.iter() {
-        rest_values.push((required_string(&key)?, scalar_from_python(&value)?));
-    }
-    Ok(CookieSnapshot {
-        name: required_string(&cookie.getattr("name")?)?,
-        value: optional_string(&cookie.getattr("value")?)?,
-        domain: optional_string(&cookie.getattr("domain")?)?,
-        path: optional_string(&cookie.getattr("path")?)?,
-        secure: required_bool(&cookie.getattr("secure")?)?,
-        expires: optional_integer(&cookie.getattr("expires")?)?,
-        discard: required_bool(&cookie.getattr("discard")?)?,
-        rest: rest_values,
-    })
-}
-
-fn snapshot_jar(jar: &Bound<'_, PyAny>) -> PyResult<JarSnapshot> {
-    let mut cookies = Vec::new();
-    for item in jar.try_iter()? {
-        let cookie = item?;
-        cookies.push(cookie_snapshot(&cookie)?);
-    }
-    Ok(JarSnapshot::new(cookies))
-}
-
-fn simple_cookie_rows(py: Python<'_>, snapshot: &JarSnapshot) -> PyResult<Py<PyList>> {
-    let rows = PyList::empty(py);
-    for cookie in snapshot.cookies() {
-        rows.append((
-            cookie.name.as_str(),
-            cookie.value.as_deref(),
-            cookie.domain.as_deref(),
-            cookie.path.as_deref(),
-        ))?;
-    }
-    Ok(rows.unbind())
-}
-
-fn detailed_cookie_rows(
-    py: Python<'_>,
-    state: &CookieState,
-    jar: &Bound<'_, PyAny>,
-) -> PyResult<Py<PyList>> {
+fn live_simple_cookie_rows(py: Python<'_>, jar: &Bound<'_, PyAny>) -> PyResult<Py<PyList>> {
     let rows = PyList::empty(py);
     for cookie in jar.try_iter()? {
         let cookie = cookie?;
-        if !cookie_layout_is_pristine(state, &cookie)? {
-            return Err(PyTypeError::new_err(
-                "cookie layout changed after native mutation committed",
-            ));
-        }
-        let dictionary = raw_instance_dict(&cookie)?;
-        rows.append((
-            raw_required_field(&dictionary, "name")?,
-            raw_required_field(&dictionary, "value")?,
-            raw_required_field(&dictionary, "domain")?,
-            raw_required_field(&dictionary, "path")?,
-            raw_required_field(&dictionary, "secure")?,
-            raw_required_field(&dictionary, "expires")?,
-            raw_required_field(&dictionary, "discard")?,
-            raw_required_field(&dictionary, "_rest")?,
-        ))?;
+        let name = cookie.getattr("name")?;
+        let value = cookie.getattr("value")?;
+        let domain = cookie.getattr("domain")?;
+        let path = cookie.getattr("path")?;
+        rows.append((name, value, domain, path))?;
     }
     Ok(rows.unbind())
 }
 
-fn snapshot_history_rows(py: Python<'_>, snapshots: &[JarSnapshot]) -> PyResult<Py<PyList>> {
+fn detailed_cookie_rows(py: Python<'_>, jar: &Bound<'_, PyAny>) -> PyResult<Py<PyList>> {
     let rows = PyList::empty(py);
-    for snapshot in snapshots {
-        rows.append(simple_cookie_rows(py, snapshot)?)?;
+    for cookie in jar.try_iter()? {
+        let cookie = cookie?;
+        let name = cookie.getattr("name")?;
+        let value = cookie.getattr("value")?;
+        let domain = cookie.getattr("domain")?;
+        let path = cookie.getattr("path")?;
+        let secure = cookie.getattr("secure")?;
+        let expires = cookie.getattr("expires")?;
+        let discard = cookie.getattr("discard")?;
+        let rest = cookie.getattr("_rest")?;
+        rows.append((name, value, domain, path, secure, expires, discard, rest))?;
     }
     Ok(rows.unbind())
 }
 
-fn dict_from_pairs(py: Python<'_>, values: Vec<(String, Option<String>)>) -> PyResult<Py<PyDict>> {
-    let dictionary = PyDict::new(py);
-    for (name, value) in values {
-        dictionary.set_item(name, value)?;
-    }
-    Ok(dictionary.unbind())
-}
-
-fn lookup_result(
+fn value_or_error_tuple(
     py: Python<'_>,
-    query: &LookupQuery,
-    value: LookupValue,
-    item: bool,
+    globals: &FunctionGlobalOwner,
+    result: PyResult<Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
-    match value {
-        LookupValue::Value(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
-        LookupValue::Missing if !item => {
-            Ok(query.default.clone().into_pyobject(py)?.into_any().unbind())
-        }
-        LookupValue::Missing => {
-            let name_repr = query
-                .name
-                .as_str()
-                .into_pyobject(py)?
-                .repr()?
-                .extract::<String>()?;
-            let message = format!("name={name_repr}, domain=None, path=None");
-            Ok(("KeyError", (message,))
-                .into_pyobject(py)?
-                .into_any()
-                .unbind())
-        }
-        LookupValue::Conflict => {
-            let name_repr = query
-                .name
-                .as_str()
-                .into_pyobject(py)?
-                .repr()?
-                .extract::<String>()?;
-            let message = format!("There are multiple cookies with name, {name_repr}");
-            Ok(("CookieConflictError", (message,))
-                .into_pyobject(py)?
-                .into_any()
-                .unbind())
+    match result {
+        Ok(value) => Ok(value.unbind()),
+        Err(original) => {
+            let handled = (|| -> PyResult<Option<Py<PyAny>>> {
+                let base_exception = load_live_function_global(py, globals, "BaseException")?;
+                if !exception_matches(py, &original, base_exception.bind(py))? {
+                    return Ok(None);
+                }
+                let type_function = load_live_function_global(py, globals, "type")?;
+                let value = original.value(py);
+                Ok(Some(
+                    (
+                        type_function
+                            .bind(py)
+                            .call1((value,))?
+                            .getattr("__name__")?,
+                        value.getattr("args")?,
+                    )
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind(),
+                ))
+            })();
+            match handled {
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => Err(original),
+                Err(error) => {
+                    error.set_context(py, Some(original));
+                    Err(error)
+                }
+            }
         }
     }
 }
 
 fn inspect_result(
     py: Python<'_>,
-    snapshot: &JarSnapshot,
+    jar: &Bound<'_, PyAny>,
     arguments: &Bound<'_, PyAny>,
+    globals: &FunctionGlobalOwner,
 ) -> PyResult<Py<PyAny>> {
-    let record = PyDict::new(py);
-    record.set_item("cookies", simple_cookie_rows(py, snapshot)?)?;
-    record.set_item("keys", snapshot.keys())?;
-    record.set_item("values", snapshot.values())?;
-    record.set_item("items", snapshot.items())?;
     let lookups = PyList::empty(py);
     for item in arguments.try_iter()? {
         let row = item?.cast_into::<PyTuple>()?;
-        let query = LookupQuery {
-            name: row.get_item(0)?.extract()?,
-            domain: row.get_item(1)?.extract()?,
-            path: row.get_item(2)?.extract()?,
-            default: row.get_item(3)?.extract()?,
-        };
-        let selected = snapshot.find_no_duplicates(&query);
-        let item_query = LookupQuery {
-            name: query.name.clone(),
-            domain: None,
-            path: None,
-            default: query.default.clone(),
-        };
-        let item_value = lookup_result(
+        let name = row.get_item(0)?;
+        let domain = row.get_item(1)?;
+        let path = row.get_item(2)?;
+        let default = row.get_item(3)?;
+        let item_value = value_or_error_tuple(py, globals, jar.get_item(&name))?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("domain", &domain)?;
+        kwargs.set_item("path", &path)?;
+        let selected_value = value_or_error_tuple(
             py,
-            &item_query,
-            snapshot.find_no_duplicates(&item_query),
-            true,
+            globals,
+            jar.call_method("get", (&name, &default), Some(&kwargs)),
         )?;
-        let selected_value = lookup_result(py, &query, selected, false)?;
-        lookups.append((
-            query.name,
-            query.domain,
-            query.path,
-            item_value,
-            selected_value,
-        ))?;
+        lookups.append((name, domain, path, item_value, selected_value))?;
     }
+    let record = PyDict::new(py);
+    record.set_item("cookies", live_simple_cookie_rows(py, jar)?)?;
+    record.set_item("keys", jar.call_method0("keys")?)?;
+    record.set_item("values", jar.call_method0("values")?)?;
+    record.set_item("items", jar.call_method0("items")?)?;
     record.set_item("lookups", lookups)?;
-    record.set_item("dict", dict_from_pairs(py, snapshot.get_dict(None, None))?)?;
-    record.set_item(
-        "a-root",
-        dict_from_pairs(py, snapshot.get_dict(Some("a.test"), Some("/")))?,
-    )?;
-    record.set_item("domains", snapshot.domains())?;
-    record.set_item("paths", snapshot.paths())?;
-    record.set_item("multiple", snapshot.multiple_domains())?;
+    record.set_item("dict", jar.call_method0("get_dict")?)?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("domain", "a.test")?;
+    kwargs.set_item("path", "/")?;
+    record.set_item("a-root", jar.call_method("get_dict", (), Some(&kwargs))?)?;
+    record.set_item("domains", jar.call_method0("list_domains")?)?;
+    record.set_item("paths", jar.call_method0("list_paths")?)?;
+    record.set_item("multiple", jar.call_method0("multiple_domains")?)?;
     Ok(record.into_any().unbind())
 }
 
@@ -711,7 +799,44 @@ fn cookie_constructor(
         domain.extract::<String>()?.starts_with('.'),
     )?;
     kwargs.set_item("path_specified", path.is_truthy()?)?;
-    Ok(state.cookie_type.bind(py).call((), Some(&kwargs))?.unbind())
+    Ok(load_live_cookielib_global(py, state)?
+        .bind(py)
+        .getattr("Cookie")?
+        .call((), Some(&kwargs))?
+        .unbind())
+}
+
+fn load_live_cookielib_global(py: Python<'_>, state: &CookieState) -> PyResult<Py<PyAny>> {
+    let globals = state.module.bind(py).dict();
+    if let Some(cookielib) = globals.get_item("cookielib")? {
+        return Ok(cookielib.unbind());
+    }
+    if let Some(cookielib) = state
+        .create_cookie_builtins
+        .bind(py)
+        .get_item("cookielib")?
+    {
+        return Ok(cookielib.unbind());
+    }
+    let error = PyNameError::new_err("name 'cookielib' is not defined");
+    error.value(py).setattr("name", "cookielib")?;
+    Err(error)
+}
+
+fn load_live_function_global(
+    py: Python<'_>,
+    owner: &FunctionGlobalOwner,
+    name: &str,
+) -> PyResult<Py<PyAny>> {
+    if let Some(value) = owner.globals.bind(py).get_item(name)? {
+        return Ok(value.unbind());
+    }
+    if let Some(value) = owner.builtins.bind(py).get_item(name)? {
+        return Ok(value.unbind());
+    }
+    let error = PyNameError::new_err(format!("name '{name}' is not defined"));
+    error.value(py).setattr("name", name)?;
+    Err(error)
 }
 
 fn allowed_create_keys() -> [&'static str; 12] {
@@ -814,45 +939,27 @@ fn morsel_cookie(
     )
 }
 
-fn base_set_cookie(
+fn source_morsel_cookie(
     py: Python<'_>,
     state: &CookieState,
+    globals: &FunctionGlobalOwner,
+    morsel: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    if source_module_function_lookup_is_callback_free(py, state, globals, "morsel_to_cookie")? {
+        return morsel_cookie(py, state, morsel);
+    }
+    let cookies_module = load_live_function_global(py, globals, "cookies_module")?;
+    let converter = cookies_module.bind(py).getattr("morsel_to_cookie")?;
+    Ok(converter.call1((morsel,))?.unbind())
+}
+
+fn base_set_cookie(
+    _py: Python<'_>,
+    _state: &CookieState,
     jar: &Bound<'_, PyAny>,
     cookie: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
-    if let Some(value) = optional_string(&cookie.getattr("value")?)?
-        && value.starts_with('"')
-        && value.ends_with('"')
-    {
-        cookie.setattr("value", value.replace("\\\"", ""))?;
-    }
-    state.std_set_cookie.bind(py).call1((jar, cookie))?;
-    Ok(())
-}
-
-fn remove_cookie(
-    py: Python<'_>,
-    state: &CookieState,
-    jar: &Bound<'_, PyAny>,
-    name: &str,
-    domain: Option<&str>,
-    path: Option<&str>,
-) -> PyResult<()> {
-    let snapshot = snapshot_jar(jar)?;
-    for cookie in snapshot.cookies() {
-        if cookie.name != name
-            || domain.is_some_and(|value| cookie.domain.as_deref() != Some(value))
-            || path.is_some_and(|value| cookie.path.as_deref() != Some(value))
-        {
-            continue;
-        }
-        state.std_clear.bind(py).call1((
-            jar,
-            cookie.domain.as_deref(),
-            cookie.path.as_deref(),
-            cookie.name.as_str(),
-        ))?;
-    }
+    jar.call_method1("set_cookie", (cookie,))?;
     Ok(())
 }
 
@@ -861,54 +968,29 @@ fn mutate_jar(
     state: &CookieState,
     jar: &Bound<'_, PyAny>,
     arguments: &Bound<'_, PyAny>,
+    globals: &FunctionGlobalOwner,
 ) -> PyResult<Py<PyAny>> {
     let arguments = arguments.cast::<PyTuple>()?;
-    let morsel = morsel_cookie(py, state, &arguments.get_item(0)?)?;
+    let morsel = source_morsel_cookie(py, state, globals, &arguments.get_item(0)?)?;
     base_set_cookie(py, state, jar, morsel.bind(py))?;
     base_set_cookie(py, state, jar, &arguments.get_item(1)?)?;
 
     let overrides = PyDict::new(py);
     overrides.set_item("domain", "a.test")?;
     overrides.set_item("path", "/")?;
-    let replace_name = "replace".into_pyobject(py)?;
-    let old = "old".into_pyobject(py)?;
-    let old_cookie = cookie_constructor(
-        py,
-        state,
-        replace_name.as_any(),
-        old.as_any(),
-        Some(&overrides),
-    )?;
-    base_set_cookie(py, state, jar, old_cookie.bind(py))?;
+    jar.call_method("set", ("replace", "old"), Some(&overrides))?;
     let replacement = arguments.get_item(2)?;
-    let replacement_cookie = cookie_constructor(
-        py,
-        state,
-        replace_name.as_any(),
-        &replacement,
-        Some(&overrides),
-    )?;
-    base_set_cookie(py, state, jar, replacement_cookie.bind(py))?;
-
-    let remove_name = "remove".into_pyobject(py)?;
-    let gone = "gone".into_pyobject(py)?;
-    let remove_cookie_value = cookie_constructor(
-        py,
-        state,
-        remove_name.as_any(),
-        gone.as_any(),
-        Some(&overrides),
-    )?;
-    base_set_cookie(py, state, jar, remove_cookie_value.bind(py))?;
-    remove_cookie(py, state, jar, "remove", Some("a.test"), Some("/"))?;
+    jar.call_method("set", ("replace", replacement), Some(&overrides))?;
+    jar.call_method("set", ("remove", "gone"), Some(&overrides))?;
+    jar.call_method("set", ("remove", py.None()), Some(&overrides))?;
 
     let record = PyDict::new(py);
-    record.set_item("cookies", detailed_cookie_rows(py, state, jar)?)?;
+    record.set_item("cookies", detailed_cookie_rows(py, jar)?)?;
     record.set_item("dict", jar.call_method0("get_dict")?)?;
     Ok(record.into_any().unbind())
 }
 
-fn bad_create(
+fn native_bad_create(
     py: Python<'_>,
     state: &CookieState,
     arguments: &Bound<'_, PyAny>,
@@ -925,74 +1007,75 @@ fn bad_create(
     )
 }
 
-fn copy_pickle_result(
+fn source_bad_create(
     py: Python<'_>,
     state: &CookieState,
-    jar: &Bound<'_, PyAny>,
+    arguments: &Bound<'_, PyAny>,
+    globals: &FunctionGlobalOwner,
 ) -> PyResult<Py<PyAny>> {
-    let copied = state.jar_type.bind(py).call0()?;
-    let policy = jar.getattr("_policy")?;
-    copied.call_method1("set_policy", (&policy,))?;
-    let originals: Vec<Py<PyAny>> = jar
-        .try_iter()?
-        .map(|item| item.map(Bound::unbind))
-        .collect::<PyResult<_>>()?;
-    for cookie in &originals {
-        let copied_cookie = state.copy_function.bind(py).call1((cookie.bind(py),))?;
-        base_set_cookie(py, state, &copied, &copied_cookie)?;
+    let arguments = arguments.cast::<PyTuple>()?;
+    let kwargs = arguments.get_item(2)?.cast_into::<PyDict>()?;
+    if source_module_function_lookup_is_callback_free(py, state, globals, "create_cookie")? {
+        return native_bad_create(py, state, arguments.as_any());
     }
-    let copied_first =
-        copied.try_iter()?.next().transpose()?.ok_or_else(|| {
-            PyRuntimeError::new_err("cookie copy unexpectedly lost its first cookie")
-        })?;
-    let copy_cookie_object = copied_first.is(originals[0].bind(py));
+    let cookies_module = load_live_function_global(py, globals, "cookies_module")?;
+    let create_cookie = cookies_module.bind(py).getattr("create_cookie")?;
+    Ok(create_cookie
+        .call(
+            (&arguments.get_item(0)?, &arguments.get_item(1)?),
+            Some(&kwargs),
+        )?
+        .unbind())
+}
 
-    let copy_only_name = "copy-only".into_pyobject(py)?;
-    let copy_only_value = "yes".into_pyobject(py)?;
-    let copy_only = cookie_constructor(
-        py,
-        state,
-        copy_only_name.as_any(),
-        copy_only_value.as_any(),
-        None,
-    )?;
-    base_set_cookie(py, state, &copied, copy_only.bind(py))?;
-    let original_after = snapshot_jar(jar)?;
-    let copied_after = snapshot_jar(&copied)?;
+fn copy_pickle_result(
+    py: Python<'_>,
+    jar: &Bound<'_, PyAny>,
+    globals: &FunctionGlobalOwner,
+) -> PyResult<Py<PyAny>> {
+    let copied = jar.call_method0("copy")?;
+    let next_function = load_live_function_global(py, globals, "next")?;
+    let iter_function = load_live_function_global(py, globals, "iter")?;
+    let original_iterator = iter_function.bind(py).call1((jar,))?;
+    let original_cookie = next_function.bind(py).call1((original_iterator,))?;
+    let next_function = load_live_function_global(py, globals, "next")?;
+    let iter_function = load_live_function_global(py, globals, "iter")?;
+    let copied_iterator = iter_function.bind(py).call1((&copied,))?;
+    let copied_cookie = next_function.bind(py).call1((copied_iterator,))?;
+    let copy_cookie_object = copied_cookie.is(&original_cookie);
 
-    let state_dict = state
-        .jar_getstate
-        .bind(py)
-        .call1((jar,))?
-        .cast_into::<PyDict>()?;
-    let data = state.pickle_dumps.bind(py).call1((jar,))?;
-    let restored = state.pickle_loads.bind(py).call1((data,))?;
-    let restored_snapshot = snapshot_jar(&restored)?;
-    let restored_policy_type = restored.getattr("_policy")?.get_type().qualname()?;
-
+    copied.call_method1("set", ("copy-only", "yes"))?;
+    let state_object = jar.call_method0("__getstate__")?;
+    let outer_pickle = load_live_function_global(py, globals, "pickle")?;
+    let loads = outer_pickle.bind(py).getattr("loads")?;
+    let inner_pickle = load_live_function_global(py, globals, "pickle")?;
+    let dumps = inner_pickle.bind(py).getattr("dumps")?;
+    let data = dumps.call1((jar,))?;
+    let restored = loads.call1((data,))?;
     let record = PyDict::new(py);
-    record.set_item("copy-policy", copied.getattr("_policy")?.is(&policy))?;
+    let copied_policy = copied.call_method0("get_policy")?;
+    let original_policy = jar.call_method0("get_policy")?;
+    record.set_item("copy-policy", copied_policy.is(&original_policy))?;
     record.set_item("copy-cookie-object", copy_cookie_object)?;
     record.set_item(
         "copy-isolation",
-        !original_after
-            .cookies()
-            .iter()
-            .any(|cookie| cookie.name == "copy-only")
-            && copied_after
-                .cookies()
-                .iter()
-                .any(|cookie| cookie.name == "copy-only"),
+        !jar.contains("copy-only")? && copied.contains("copy-only")?,
     )?;
-    record.set_item("lock-omitted", !state_dict.contains("_cookies_lock")?)?;
+    record.set_item("lock-omitted", !state_object.contains("_cookies_lock")?)?;
     record.set_item(
         "restored-lock-new",
         !restored
             .getattr("_cookies_lock")?
             .is(&jar.getattr("_cookies_lock")?),
     )?;
+    let type_function = load_live_function_global(py, globals, "type")?;
+    let restored_policy = restored.call_method0("get_policy")?;
+    let restored_policy_type = type_function
+        .bind(py)
+        .call1((restored_policy,))?
+        .getattr("__qualname__")?;
     record.set_item("restored-policy-type", restored_policy_type)?;
-    record.set_item("restored", simple_cookie_rows(py, &restored_snapshot)?)?;
+    record.set_item("restored", live_simple_cookie_rows(py, &restored)?)?;
     Ok(record.into_any().unbind())
 }
 
@@ -1010,13 +1093,21 @@ fn conversion_globals_are_pristine(
     functions: &[&str],
 ) -> PyResult<bool> {
     let module = state.module.bind(py);
-    if !module_functions_are_pristine(py, state, functions)?
-        || !module_entry_is(module, "cookielib", &state.cookielib)?
-        || !state
-            .cookielib
-            .bind(py)
-            .getattr("Cookie")?
-            .is(state.cookie_constructor.bind(py))
+    if !module_functions_are_pristine(py, state, functions)? {
+        return Ok(false);
+    }
+    let Some(cookielib) = module.dict().get_item("cookielib")? else {
+        return Ok(false);
+    };
+    if !cookielib.is(state.cookielib.bind(py)) {
+        return Ok(false);
+    }
+    let cookielib = cookielib.cast_into::<PyModule>()?;
+    if !exact_builtin_string_keys(&cookielib.dict())
+        || !cookielib
+            .dict()
+            .get_item("Cookie")?
+            .is_some_and(|value| value.is(state.cookie_constructor.bind(py)))
     {
         return Ok(false);
     }
@@ -1046,19 +1137,76 @@ fn mutate_arguments_are_supported(
     state: &CookieState,
     arguments: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
-    let Ok(arguments) = arguments.cast::<PyTuple>() else {
+    if !arguments.is_exact_instance_of::<PyTuple>() {
         return Ok(false);
-    };
+    }
+    let arguments = arguments.cast::<PyTuple>()?;
     Ok(arguments.len() == 3
         && morsel_shape_is_supported(state, &arguments.get_item(0)?)?
         && raw_cookie_snapshot(state, &arguments.get_item(1)?).is_ok()
         && exact_string_item(&arguments.get_item(2)?))
 }
 
-fn bad_create_arguments_are_supported(arguments: &Bound<'_, PyAny>) -> PyResult<bool> {
-    let Ok(arguments) = arguments.cast::<PyTuple>() else {
+fn inspect_arguments_are_supported(arguments: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if !arguments.is_exact_instance_of::<PyTuple>() {
         return Ok(false);
-    };
+    }
+    let arguments = arguments.cast::<PyTuple>()?;
+    for row in arguments.iter() {
+        if !row.is_exact_instance_of::<PyTuple>() {
+            return Ok(false);
+        }
+        let row = row.cast_into::<PyTuple>()?;
+        if row.len() != 4
+            || !exact_string_item(&row.get_item(0)?)
+            || !matches_exact_optional_string(&row.get_item(1)?)
+            || !matches_exact_optional_string(&row.get_item(2)?)
+            || scalar_from_python(&row.get_item(3)?).is_err()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn matches_exact_optional_string(value: &Bound<'_, PyAny>) -> bool {
+    value.is_none() || exact_string_item(value)
+}
+
+fn exact_rest_shape(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if !value.is_exact_instance_of::<PyDict>() {
+        return Ok(false);
+    }
+    for (key, value) in value.cast::<PyDict>()? {
+        if !exact_string_item(&key) || scalar_from_python(&value).is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn create_value_is_supported(key: &str, value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(match key {
+        "version" => value.is_exact_instance_of::<pyo3::types::PyInt>(),
+        "port" => {
+            value.is_none()
+                || exact_string_item(value)
+                || value.is_exact_instance_of::<pyo3::types::PyInt>()
+        }
+        "domain" | "path" => exact_string_item(value),
+        "secure" | "discard" | "rfc2109" => value.is_exact_instance_of::<pyo3::types::PyBool>(),
+        "expires" => value.is_none() || value.is_exact_instance_of::<pyo3::types::PyInt>(),
+        "comment" | "comment_url" | "value" => value.is_none() || exact_string_item(value),
+        "rest" => exact_rest_shape(value)?,
+        _ => scalar_from_python(value).is_ok(),
+    })
+}
+
+fn bad_create_arguments_are_supported(arguments: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if !arguments.is_exact_instance_of::<PyTuple>() {
+        return Ok(false);
+    }
+    let arguments = arguments.cast::<PyTuple>()?;
     if arguments.len() != 3
         || !exact_string_item(&arguments.get_item(0)?)
         || !exact_string_item(&arguments.get_item(1)?)
@@ -1067,7 +1215,16 @@ fn bad_create_arguments_are_supported(arguments: &Bound<'_, PyAny>) -> PyResult<
         return Ok(false);
     }
     let kwargs = arguments.get_item(2)?.cast_into::<PyDict>()?;
-    Ok(kwargs.iter().all(|(key, _)| exact_string_item(&key)))
+    for (key, value) in kwargs.iter() {
+        if !exact_string_item(&key) {
+            return Ok(false);
+        }
+        let key_name: String = key.extract()?;
+        if !create_value_is_supported(&key_name, &value)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn copy_pickle_dependencies_are_pristine(py: Python<'_>, state: &CookieState) -> PyResult<bool> {
@@ -1096,6 +1253,93 @@ fn copy_pickle_dependencies_are_pristine(py: Python<'_>, state: &CookieState) ->
         && module_entry_is(state.pickle_module.bind(py), "loads", &state.pickle_loads)?)
 }
 
+fn exact_lock_is_pristine(state: &CookieState, jar: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let dictionary = raw_instance_dict(jar)?;
+    if !exact_builtin_string_keys(&dictionary) {
+        return Ok(false);
+    }
+    Ok(dictionary
+        .get_item("_cookies_lock")?
+        .is_some_and(|lock| lock.get_type().is(state.rlock_type.bind(jar.py()))))
+}
+
+fn callback_free_policy_value(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if value.is_none()
+        || value.is_exact_instance_of::<pyo3::types::PyBool>()
+        || value.is_exact_instance_of::<pyo3::types::PyInt>()
+        || exact_string_item(value)
+    {
+        return Ok(true);
+    }
+    if !value.is_exact_instance_of::<PyTuple>() {
+        return Ok(false);
+    }
+    Ok(value
+        .cast::<PyTuple>()?
+        .iter()
+        .all(|item| exact_string_item(&item)))
+}
+
+fn exact_default_policy_is_pristine(
+    py: Python<'_>,
+    state: &CookieState,
+    jar: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    let jar_dictionary = raw_instance_dict(jar)?;
+    if !exact_builtin_string_keys(&jar_dictionary) {
+        return Ok(false);
+    }
+    let Some(policy) = jar_dictionary.get_item("_policy")? else {
+        return Ok(false);
+    };
+    if !policy.get_type().is(state.default_policy_type.bind(py))
+        || !method_is(
+            &policy.get_type(),
+            "__getattribute__",
+            &state.object_getattribute,
+        )?
+    {
+        return Ok(false);
+    }
+    let dictionary = raw_instance_dict(&policy)?;
+    if !exact_builtin_string_keys(&dictionary) {
+        return Ok(false);
+    }
+    for (_, value) in dictionary.iter() {
+        if !callback_free_policy_value(&value)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn threading_rlock_is_pristine(py: Python<'_>, state: &CookieState) -> PyResult<bool> {
+    let module = state.module.bind(py);
+    if !exact_builtin_string_keys(&module.dict())
+        || !module
+            .dict()
+            .get_item("threading")?
+            .is_some_and(|value| value.is(state.threading_module.bind(py)))
+    {
+        return Ok(false);
+    }
+    let threading = state.threading_module.bind(py);
+    if !exact_builtin_string_keys(&threading.dict()) {
+        return Ok(false);
+    }
+    let Some(rlock) = threading.dict().get_item("RLock")? else {
+        return Ok(false);
+    };
+    Ok(rlock.is(state.threading_rlock.bind(py))
+        && rlock
+            .getattr("__code__")?
+            .is(state.threading_rlock_code.bind(py)))
+}
+
+fn empty_arguments_are_supported(arguments: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(arguments.is_exact_instance_of::<PyTuple>() && arguments.cast::<PyTuple>()?.is_empty())
+}
+
 fn cookie_operation_is_pristine(
     py: Python<'_>,
     state: &CookieState,
@@ -1107,9 +1351,27 @@ fn cookie_operation_is_pristine(
         return Ok(false);
     }
     match operation {
-        "inspect" => Ok(
-            inspect_methods_are_pristine(py, state)? && snapshot_shape_is_supported(state, jar)?
-        ),
+        "inspect" => Ok(inspect_methods_are_pristine(py, state)?
+            && instance_methods_are_unshadowed(
+                jar,
+                &[
+                    "get",
+                    "_find_no_duplicates",
+                    "keys",
+                    "iterkeys",
+                    "values",
+                    "itervalues",
+                    "items",
+                    "iteritems",
+                    "get_dict",
+                    "list_domains",
+                    "list_paths",
+                    "multiple_domains",
+                ],
+            )?
+            && deepvalues_is_pristine(py, state)?
+            && snapshot_shape_is_supported(state, jar)?
+            && inspect_arguments_are_supported(arguments)?),
         "mutate" => Ok(conversion_globals_are_pristine(
             py,
             state,
@@ -1128,7 +1390,12 @@ fn cookie_operation_is_pristine(
             state.std_jar_type.bind(py),
             &state.std_operation_methods,
             &["set_cookie", "clear"],
-        )? && snapshot_shape_is_supported(state, jar)?
+        )? && instance_methods_are_unshadowed(
+            jar,
+            &["set_cookie", "set", "clear", "get_dict"],
+        )? && exact_lock_is_pristine(state, jar)?
+            && deepvalues_is_pristine(py, state)?
+            && snapshot_shape_is_supported(state, jar)?
             && mutate_arguments_are_supported(state, arguments)?),
         "bad-create" => Ok(
             conversion_globals_are_pristine(py, state, &["create_cookie"])?
@@ -1136,9 +1403,10 @@ fn cookie_operation_is_pristine(
                 && bad_create_arguments_are_supported(arguments)?,
         ),
         "morsel" => {
-            let Ok(arguments) = arguments.cast::<PyTuple>() else {
+            if !arguments.is_exact_instance_of::<PyTuple>() {
                 return Ok(false);
-            };
+            }
+            let arguments = arguments.cast::<PyTuple>()?;
             Ok(arguments.len() == 1
                 && conversion_globals_are_pristine(
                     py,
@@ -1151,7 +1419,13 @@ fn cookie_operation_is_pristine(
         "copy-pickle" => Ok(
             conversion_globals_are_pristine(py, state, &["create_cookie"])?
                 && copy_pickle_dependencies_are_pristine(py, state)?
-                && snapshot_shape_is_supported(state, jar)?,
+                && instance_methods_are_unshadowed(jar, &["copy", "get_policy", "__getstate__"])?
+                && exact_lock_is_pristine(state, jar)?
+                && exact_default_policy_is_pristine(py, state, jar)?
+                && threading_rlock_is_pristine(py, state)?
+                && deepvalues_is_pristine(py, state)?
+                && snapshot_shape_is_supported(state, jar)?
+                && empty_arguments_are_supported(arguments)?,
         ),
         _ => Ok(false),
     }
@@ -1172,13 +1446,17 @@ fn _cookie_jar_trial(
     ) {
         return Ok(compat.call0()?.unbind());
     }
+    let Some(function_globals) = exact_function_global_owner(py, compat)? else {
+        return Ok(compat.call0()?.unbind());
+    };
     match operation {
-        "inspect" => inspect_result(py, &snapshot_jar(jar)?, arguments),
-        "mutate" => mutate_jar(py, state, jar, arguments),
-        "bad-create" => bad_create(py, state, arguments),
+        "inspect" => inspect_result(py, jar, arguments, &function_globals),
+        "mutate" => mutate_jar(py, state, jar, arguments, &function_globals),
+        "bad-create" => source_bad_create(py, state, arguments, &function_globals),
         "morsel" => {
             let arguments = arguments.cast::<PyTuple>()?;
-            let cookie = morsel_cookie(py, state, &arguments.get_item(0)?)?;
+            let cookie =
+                source_morsel_cookie(py, state, &function_globals, &arguments.get_item(0)?)?;
             let cookie = cookie.bind(py);
             Ok((
                 cookie.getattr("name")?,
@@ -1190,7 +1468,7 @@ fn _cookie_jar_trial(
                 .into_any()
                 .unbind())
         }
-        "copy-pickle" => copy_pickle_result(py, state, jar),
+        "copy-pickle" => copy_pickle_result(py, jar, &function_globals),
         _ => unreachable!("unsupported cookie operations select compatibility"),
     }
 }
@@ -1226,6 +1504,9 @@ fn exact_bridge_is_pristine(
     {
         return Ok(false);
     }
+    if !exact_builtin_string_keys(&raw_instance_dict(request)?) {
+        return Ok(false);
+    }
     let module = state.module.bind(py);
     if !module
         .dict()
@@ -1251,9 +1532,15 @@ fn exact_bridge_is_pristine(
             &["__getattribute__", "__iter__"],
         )?
     };
-    let policy = jar.getattr("_policy")?;
+    let instance_methods = if operation == "extract-header" {
+        &["add_cookie_header", "extract_cookies"][..]
+    } else {
+        &["add_cookie_header"][..]
+    };
     Ok(iterator_is_pristine
-        && policy.get_type().is(state.default_policy_type.bind(py))
+        && exact_lock_is_pristine(state, jar)?
+        && exact_default_policy_is_pristine(py, state, jar)?
+        && instance_methods_are_unshadowed(jar, instance_methods)?
         && method_is(
             state.std_jar_type.bind(py),
             "add_cookie_header",
@@ -1269,63 +1556,45 @@ fn exact_bridge_is_pristine(
 
 fn cookie_header(
     py: Python<'_>,
-    state: &CookieState,
+    globals: &FunctionGlobalOwner,
     jar: &Bound<'_, PyAny>,
     request: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let wrapper = state.mock_request_type.bind(py).call1((request,))?;
-    state.std_add_header.bind(py).call1((jar, &wrapper))?;
-    let headers = wrapper.call_method0("get_new_headers")?;
-    Ok(headers.call_method1("get", ("Cookie",))?.unbind())
+    Ok(load_live_function_global(py, globals, "cookies_module")?
+        .bind(py)
+        .getattr("get_cookie_header")?
+        .call1((jar, request))?
+        .unbind())
 }
 
 fn extract_cookies(
     py: Python<'_>,
-    state: &CookieState,
+    globals: &FunctionGlobalOwner,
     jar: &Bound<'_, PyAny>,
     request: &Bound<'_, PyAny>,
     response: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
-    let has_original = response.hasattr("_original_response")?;
-    if !has_original {
-        return Ok(());
-    }
-    let original = response.getattr("_original_response")?;
-    if !original.is_truthy()? {
-        return Ok(());
-    }
-    let request_wrapper = state.mock_request_type.bind(py).call1((request,))?;
-    let response_wrapper = state
-        .mock_response_type
+    load_live_function_global(py, globals, "cookies_module")?
         .bind(py)
-        .call1((original.getattr("msg")?,))?;
-    state
-        .std_extract
-        .bind(py)
-        .call1((jar, response_wrapper, request_wrapper))?;
+        .getattr("extract_cookies_to_jar")?
+        .call1((jar, request, response))?;
     Ok(())
 }
 
 fn bridge_result(
     py: Python<'_>,
-    state: &CookieState,
+    globals: &FunctionGlobalOwner,
     jar: &Bound<'_, PyAny>,
     request: &Bound<'_, PyAny>,
     response: &Bound<'_, PyAny>,
     operation: &str,
 ) -> PyResult<Py<PyAny>> {
     if operation == "extract-header" {
-        let before = snapshot_jar(jar)?;
-        extract_cookies(py, state, jar, request, response)?;
-        let after = snapshot_jar(jar)?;
-        let _delta = SnapshotDelta::new(before, after);
+        extract_cookies(py, globals, jar, request, response)?;
     }
-    let header = cookie_header(py, state, jar, request)?;
-    let snapshot = snapshot_jar(jar)?;
-    Ok((header, simple_cookie_rows(py, &snapshot)?)
-        .into_pyobject(py)?
-        .into_any()
-        .unbind())
+    let header = cookie_header(py, globals, jar, request)?;
+    let rows = live_simple_cookie_rows(py, jar)?;
+    Ok((header, rows).into_pyobject(py)?.into_any().unbind())
 }
 
 #[pyfunction]
@@ -1348,7 +1617,10 @@ fn _cookie_bridge_trial(
     {
         return Ok(compat.call0()?.unbind());
     }
-    bridge_result(py, state, jar, request, response, operation)
+    let Some(function_globals) = exact_function_global_owner(py, compat)? else {
+        return Ok(compat.call0()?.unbind());
+    };
+    bridge_result(py, &function_globals, jar, request, response, operation)
 }
 
 #[derive(Clone, Debug)]
@@ -1356,12 +1628,21 @@ enum CookiePipelineAction {
     Execute(CookiePipelineStage),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResponseId(usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnapshotId(usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeaderId(usize);
+
 #[derive(Debug)]
 enum CookiePipelineReply {
     Ack,
-    Response(usize),
-    Snapshot(JarSnapshot),
-    Header(Option<String>),
+    Response(ResponseId),
+    Snapshot(SnapshotId),
+    Header(HeaderId),
     Failed,
 }
 
@@ -1371,11 +1652,10 @@ impl WorkerPayload for CookiePipelineReply {}
 #[derive(Debug)]
 enum CookiePipelineOutcome {
     Complete {
-        response: usize,
-        hook_response: usize,
-        snapshot: JarSnapshot,
-        snapshots: Vec<JarSnapshot>,
-        header: Option<String>,
+        response: ResponseId,
+        hook_response: ResponseId,
+        snapshots: Vec<SnapshotId>,
+        header: Option<HeaderId>,
     },
     HandlerFailed,
     BridgeClosed(BridgeClosed),
@@ -1385,10 +1665,64 @@ struct OriginCookiePipelineOwner {
     jar: Py<PyAny>,
     request: Py<PyAny>,
     responses: Vec<Py<PyAny>>,
+    snapshots: Vec<Py<PyList>>,
+    headers: Vec<Py<PyAny>>,
     hook: Py<PyAny>,
     digest: Py<PyAny>,
     audit: Py<PyAny>,
+    function_globals: FunctionGlobalOwner,
     handler_error: Option<PyErr>,
+    origin_only: PhantomData<Rc<()>>,
+}
+
+fn response_index(id: ResponseId, len: usize) -> Option<usize> {
+    (id.0 < len).then_some(id.0)
+}
+
+fn snapshot_index(id: SnapshotId, len: usize) -> Option<usize> {
+    (id.0 < len).then_some(id.0)
+}
+
+fn header_index(id: HeaderId, len: usize) -> Option<usize> {
+    (id.0 < len).then_some(id.0)
+}
+
+impl OriginCookiePipelineOwner {
+    fn store_response(&mut self, value: Py<PyAny>) -> ResponseId {
+        let id = ResponseId(self.responses.len());
+        self.responses.push(value);
+        id
+    }
+
+    fn response(&self, id: ResponseId) -> PyResult<&Py<PyAny>> {
+        response_index(id, self.responses.len())
+            .and_then(|index| self.responses.get(index))
+            .ok_or_else(|| PyRuntimeError::new_err("cookie pipeline response ID is out of range"))
+    }
+
+    fn store_snapshot(&mut self, value: Py<PyList>) -> SnapshotId {
+        let id = SnapshotId(self.snapshots.len());
+        self.snapshots.push(value);
+        id
+    }
+
+    fn snapshot(&self, id: SnapshotId) -> PyResult<&Py<PyList>> {
+        snapshot_index(id, self.snapshots.len())
+            .and_then(|index| self.snapshots.get(index))
+            .ok_or_else(|| PyRuntimeError::new_err("cookie pipeline snapshot ID is out of range"))
+    }
+
+    fn store_header(&mut self, value: Py<PyAny>) -> HeaderId {
+        let id = HeaderId(self.headers.len());
+        self.headers.push(value);
+        id
+    }
+
+    fn header(&self, id: HeaderId) -> PyResult<&Py<PyAny>> {
+        header_index(id, self.headers.len())
+            .and_then(|index| self.headers.get(index))
+            .ok_or_else(|| PyRuntimeError::new_err("cookie pipeline header ID is out of range"))
+    }
 }
 
 fn append_audit(owner: &OriginCookiePipelineOwner, py: Python<'_>, value: &str) -> PyResult<()> {
@@ -1398,7 +1732,6 @@ fn append_audit(owner: &OriginCookiePipelineOwner, py: Python<'_>, value: &str) 
 
 fn execute_pipeline_action(
     py: Python<'_>,
-    state: &CookieState,
     owner: &mut OriginCookiePipelineOwner,
     action: CookiePipelineAction,
 ) -> PyResult<CookiePipelineReply> {
@@ -1406,20 +1739,19 @@ fn execute_pipeline_action(
     match stage {
         CookiePipelineStage::Prepare => {
             append_audit(owner, py, "prepare")?;
-            state
-                .prepared_cookies
+            owner
+                .request
                 .bind(py)
-                .call1((owner.request.bind(py), owner.jar.bind(py)))?;
+                .call_method1("prepare_cookies", (owner.jar.bind(py),))?;
             Ok(CookiePipelineReply::Ack)
         }
         CookiePipelineStage::Hook => {
             append_audit(owner, py, "hook")?;
             let replacement = owner.hook.bind(py).call1((owner.responses[0].bind(py),))?;
             if replacement.is_none() {
-                Ok(CookiePipelineReply::Response(0))
+                Ok(CookiePipelineReply::Response(ResponseId(0)))
             } else {
-                let id = owner.responses.len();
-                owner.responses.push(replacement.unbind());
+                let id = owner.store_response(replacement.unbind());
                 Ok(CookiePipelineReply::Response(id))
             }
         }
@@ -1427,22 +1759,23 @@ fn execute_pipeline_action(
         | CookiePipelineStage::SnapshotAfterHook
         | CookiePipelineStage::SnapshotAfterExtract
         | CookiePipelineStage::SnapshotAfterDigest
-        | CookiePipelineStage::SnapshotAfterHeader => Ok(CookiePipelineReply::Snapshot(
-            snapshot_jar(owner.jar.bind(py))?,
-        )),
+        | CookiePipelineStage::SnapshotAfterHeader => {
+            let snapshot = live_simple_cookie_rows(py, owner.jar.bind(py))?;
+            Ok(CookiePipelineReply::Snapshot(
+                owner.store_snapshot(snapshot),
+            ))
+        }
         CookiePipelineStage::Extract => {
             append_audit(owner, py, "extract")?;
             let response = owner
                 .responses
                 .last()
                 .ok_or_else(|| PyRuntimeError::new_err("cookie pipeline lost its response"))?;
-            extract_cookies(
-                py,
-                state,
-                owner.jar.bind(py),
-                owner.request.bind(py),
-                &response.bind(py).getattr("raw")?,
-            )?;
+            let cookies_module =
+                load_live_function_global(py, &owner.function_globals, "cookies_module")?;
+            let extract = cookies_module.bind(py).getattr("extract_cookies_to_jar")?;
+            let raw = response.bind(py).getattr("raw")?;
+            extract.call1((owner.jar.bind(py), owner.request.bind(py), raw))?;
             Ok(CookiePipelineReply::Ack)
         }
         CookiePipelineStage::Digest => {
@@ -1456,17 +1789,23 @@ fn execute_pipeline_action(
                 .bind(py)
                 .call1((response.bind(py), owner.jar.bind(py)))?;
             if replacement.is(response.bind(py)) {
-                Ok(CookiePipelineReply::Response(owner.responses.len() - 1))
+                Ok(CookiePipelineReply::Response(ResponseId(
+                    owner.responses.len() - 1,
+                )))
             } else {
-                let id = owner.responses.len();
-                owner.responses.push(replacement.unbind());
+                let id = owner.store_response(replacement.unbind());
                 Ok(CookiePipelineReply::Response(id))
             }
         }
         CookiePipelineStage::Header => {
             append_audit(owner, py, "header")?;
-            let header = cookie_header(py, state, owner.jar.bind(py), owner.request.bind(py))?;
-            Ok(CookiePipelineReply::Header(header.bind(py).extract()?))
+            let header = cookie_header(
+                py,
+                &owner.function_globals,
+                owner.jar.bind(py),
+                owner.request.bind(py),
+            )?;
+            Ok(CookiePipelineReply::Header(owner.store_header(header)))
         }
     }
 }
@@ -1474,9 +1813,8 @@ fn execute_pipeline_action(
 async fn pipeline_worker(
     actions: crate::bridge::ActionSender<CookiePipelineAction, CookiePipelineReply>,
 ) -> CookiePipelineOutcome {
-    let mut response = 0;
-    let mut hook_response = 0;
-    let mut snapshot = JarSnapshot::new(Vec::new());
+    let mut response = ResponseId(0);
+    let mut hook_response = ResponseId(0);
     let mut snapshots = Vec::new();
     let mut header = None;
     for stage in private_pipeline_stages() {
@@ -1493,17 +1831,15 @@ async fn pipeline_worker(
                 }
             }
             CookiePipelineReply::Snapshot(value) => {
-                snapshot = value.clone();
                 snapshots.push(value);
             }
-            CookiePipelineReply::Header(value) => header = value,
+            CookiePipelineReply::Header(value) => header = Some(value),
             CookiePipelineReply::Failed => return CookiePipelineOutcome::HandlerFailed,
         }
     }
     CookiePipelineOutcome::Complete {
         response,
         hook_response,
-        snapshot,
         snapshots,
         header,
     }
@@ -1530,7 +1866,8 @@ fn pipeline_is_pristine(
                 state.prepared_type.bind(py),
                 "prepare_cookies",
                 &state.prepared_cookies,
-            )?,
+            )?
+            && instance_methods_are_unshadowed(request, &["prepare_cookies"])?,
     )
 }
 
@@ -1553,18 +1890,25 @@ fn _cookie_pipeline_trial(
     ) {
         return Ok(compat.call0()?.unbind());
     }
+    let Some(function_globals) = exact_function_global_owner(py, compat)? else {
+        return Ok(compat.call0()?.unbind());
+    };
     let owner = OriginCookiePipelineOwner {
         jar,
         request,
         responses: vec![response],
+        snapshots: Vec::new(),
+        headers: Vec::new(),
         hook,
         digest,
         audit,
+        function_globals,
         handler_error: None,
+        origin_only: PhantomData,
     };
     let (outcome, mut owner) =
         run_with_owned_actions(py, owner, pipeline_worker, |py, action, owner| {
-            match execute_pipeline_action(py, state, owner, action) {
+            match execute_pipeline_action(py, owner, action) {
                 Ok(reply) => reply,
                 Err(error) => {
                     if owner.handler_error.is_none() {
@@ -1581,17 +1925,15 @@ fn _cookie_pipeline_trial(
         CookiePipelineOutcome::Complete {
             response,
             hook_response,
-            snapshot,
             snapshots,
             header,
         } => {
-            let final_response = owner.responses.get(response).ok_or_else(|| {
-                PyRuntimeError::new_err("cookie pipeline lost its final response")
+            let final_response = owner.response(response)?;
+            let hook_response = owner.response(hook_response)?;
+            let header = header.ok_or_else(|| {
+                PyRuntimeError::new_err("cookie pipeline lost its header object ID")
             })?;
-            let hook_response = owner
-                .responses
-                .get(hook_response)
-                .ok_or_else(|| PyRuntimeError::new_err("cookie pipeline lost its hook response"))?;
+            let header = owner.header(header)?;
             let replacement = final_response.is(hook_response.bind(py));
             let request_jar = owner
                 .request
@@ -1601,10 +1943,18 @@ fn _cookie_pipeline_trial(
             let record = PyDict::new(py);
             record.set_item("replacement", replacement)?;
             record.set_item("request-jar", request_jar)?;
-            record.set_item("header", header)?;
-            record.set_item("cookies", simple_cookie_rows(py, &snapshot)?)?;
-            record.set_item("audit", owner.audit.bind(py).call_method0("copy")?)?;
-            record.set_item("snapshots", snapshot_history_rows(py, &snapshots)?)?;
+            record.set_item("header", header.bind(py))?;
+            record.set_item("cookies", live_simple_cookie_rows(py, owner.jar.bind(py))?)?;
+            let list_function = load_live_function_global(py, &owner.function_globals, "list")?;
+            record.set_item(
+                "audit",
+                list_function.bind(py).call1((owner.audit.bind(py),))?,
+            )?;
+            let history = PyList::empty(py);
+            for snapshot in snapshots {
+                history.append(owner.snapshot(snapshot)?.bind(py))?;
+            }
+            record.set_item("snapshots", history)?;
             Ok(record.into_any().unbind())
         }
         CookiePipelineOutcome::HandlerFailed => Err(PyRuntimeError::new_err(
@@ -1626,7 +1976,10 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CookiePipelineAction, CookiePipelineReply, OriginCookiePipelineOwner};
+    use super::{
+        CookiePipelineAction, CookiePipelineReply, HeaderId, OriginCookiePipelineOwner, ResponseId,
+        SnapshotId, header_index, response_index, snapshot_index,
+    };
     use crate::bridge::WorkerPayload;
 
     fn assert_worker_payload<T: WorkerPayload>() {}
@@ -1638,6 +1991,20 @@ mod tests {
     impl<T: ?Sized> AmbiguousIfWorkerPayload<()> for T {}
     impl<T: ?Sized + WorkerPayload> AmbiguousIfWorkerPayload<u8> for T {}
 
+    trait AmbiguousIfSend<A> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+
+    trait AmbiguousIfSync<A> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
     #[test]
     fn cookie_pipeline_payloads_are_worker_safe() {
         assert_worker_payload::<CookiePipelineAction>();
@@ -1647,5 +2014,21 @@ mod tests {
     #[test]
     fn cookie_origin_owner_is_not_a_worker_payload() {
         let _ = <OriginCookiePipelineOwner as AmbiguousIfWorkerPayload<_>>::marker;
+    }
+
+    #[test]
+    fn cookie_origin_owner_is_not_send_or_sync() {
+        let _ = <OriginCookiePipelineOwner as AmbiguousIfSend<_>>::marker;
+        let _ = <OriginCookiePipelineOwner as AmbiguousIfSync<_>>::marker;
+    }
+
+    #[test]
+    fn cookie_pipeline_ids_are_category_specific_and_range_checked() {
+        assert_eq!(response_index(ResponseId(0), 1), Some(0));
+        assert_eq!(response_index(ResponseId(1), 1), None);
+        assert_eq!(snapshot_index(SnapshotId(0), 1), Some(0));
+        assert_eq!(snapshot_index(SnapshotId(1), 1), None);
+        assert_eq!(header_index(HeaderId(0), 1), Some(0));
+        assert_eq!(header_index(HeaderId(1), 1), None);
     }
 }
