@@ -13,6 +13,10 @@ use http::uri::{Authority, Scheme};
 use hyper::client::conn::http1::SendRequest;
 
 use super::{ConnectionDriver, OutgoingBody};
+use crate::session_runtime::{
+    SessionConnectionIdentity, SessionExchangeIdentity, SessionLeaseIdentity,
+    SessionRuntimeHarness,
+};
 use crate::{CertificateSource, Identity, Proxy, TlsConfig};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -177,6 +181,7 @@ pub(super) enum LeaseTerminal {
 
 pub(super) struct IdleConnection {
     inner: IdleConnectionInner,
+    session_identity: Option<SessionConnectionIdentity>,
 }
 
 enum IdleConnectionInner {
@@ -216,10 +221,19 @@ impl fmt::Debug for IdleConnection {
 }
 
 impl IdleConnection {
-    pub(super) fn network(sender: SendRequest<OutgoingBody>, driver: ConnectionDriver) -> Self {
+    pub(super) fn network(
+        sender: SendRequest<OutgoingBody>,
+        driver: ConnectionDriver,
+        session_identity: Option<SessionConnectionIdentity>,
+    ) -> Self {
         Self {
             inner: IdleConnectionInner::Network { sender, driver },
+            session_identity,
         }
+    }
+
+    pub(super) fn session_identity(&self) -> Option<SessionConnectionIdentity> {
+        self.session_identity
     }
 
     pub(super) fn is_live(&self) -> bool {
@@ -264,6 +278,7 @@ impl IdleConnection {
                 readable: readable.into_iter().collect(),
                 closes,
             }),
+            session_identity: None,
         }
     }
 
@@ -297,17 +312,96 @@ pub(super) struct ConnectionLease {
     key: Box<PoolKey>,
     generation: u64,
     terminal: LeaseTerminal,
+    dirty_identity: Option<DirtyLeaseIdentity>,
     connection: Option<IdleConnection>,
+    session_lease_identity: Option<SessionLeaseIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DirtyLeaseIdentity {
+    generation: u64,
+    cause: DirtyLeaseCause,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct IncompleteBodyLeaseIdentity(DirtyLeaseIdentity);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DirtyUploadLeaseIdentity(DirtyLeaseIdentity);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DirtyLeaseCause {
+    Cancellation,
+    IncompleteBody,
+    Upload,
 }
 
 impl ConnectionLease {
     pub(super) fn new(key: PoolKey, generation: u64, connection: IdleConnection) -> Self {
+        Self::new_with_session_runtime(key, generation, connection, None)
+    }
+
+    pub(super) fn new_with_session_runtime(
+        key: PoolKey,
+        generation: u64,
+        connection: IdleConnection,
+        session_runtime: Option<&SessionRuntimeHarness>,
+    ) -> Self {
+        let session_lease_identity = session_runtime
+            .map(SessionRuntimeHarness::allocate_lease_identity);
+        Self::with_session_lease_identity(
+            key,
+            generation,
+            connection,
+            session_lease_identity,
+        )
+    }
+
+    pub(super) fn new_with_exchange_identity(
+        key: PoolKey,
+        generation: u64,
+        connection: IdleConnection,
+        identity: SessionExchangeIdentity,
+    ) -> Self {
+        debug_assert_eq!(connection.session_identity(), Some(identity.connection));
+        Self::with_session_lease_identity(key, generation, connection, Some(identity.lease))
+    }
+
+    fn with_session_lease_identity(
+        key: PoolKey,
+        generation: u64,
+        connection: IdleConnection,
+        session_lease_identity: Option<SessionLeaseIdentity>,
+    ) -> Self {
         Self {
             key: Box::new(key),
             generation,
             terminal: LeaseTerminal::Active,
+            dirty_identity: None,
             connection: Some(connection),
+            session_lease_identity,
         }
+    }
+
+    pub(super) fn session_connection_identity(&self) -> Option<SessionConnectionIdentity> {
+        self.connection
+            .as_ref()
+            .and_then(IdleConnection::session_identity)
+    }
+
+    pub(super) fn session_lease_identity(&self) -> Option<SessionLeaseIdentity> {
+        self.session_lease_identity
+    }
+
+    pub(super) fn session_exchange_identity(
+        &self,
+        correlation: u64,
+    ) -> Option<SessionExchangeIdentity> {
+        Some(SessionExchangeIdentity {
+            connection: self.session_connection_identity()?,
+            lease: self.session_lease_identity?,
+            correlation,
+        })
     }
 
     #[cfg(test)]
@@ -353,6 +447,35 @@ impl ConnectionLease {
     pub(super) fn complete(mut self, terminal: LeaseTerminal) -> Self {
         if self.terminal == LeaseTerminal::Active && terminal != LeaseTerminal::Active {
             self.terminal = terminal;
+            if terminal == LeaseTerminal::Dirty {
+                self.dirty_identity = Some(DirtyLeaseIdentity {
+                    generation: self.generation,
+                    cause: DirtyLeaseCause::Cancellation,
+                });
+            }
+        }
+        self
+    }
+
+    pub(super) fn complete_dirty(mut self, cause: DirtyLeaseCause) -> Self {
+        let base = DirtyLeaseIdentity {
+            generation: self.generation,
+            cause,
+        };
+        let identity = match cause {
+            DirtyLeaseCause::Cancellation => base,
+            DirtyLeaseCause::IncompleteBody => {
+                let incomplete = IncompleteBodyLeaseIdentity(base);
+                incomplete.0
+            }
+            DirtyLeaseCause::Upload => {
+                let upload = DirtyUploadLeaseIdentity(base);
+                upload.0
+            }
+        };
+        if self.terminal == LeaseTerminal::Active {
+            self.terminal = LeaseTerminal::Dirty;
+            self.dirty_identity = Some(identity);
         }
         self
     }
@@ -363,14 +486,23 @@ pub(super) struct Pool {
     max_idle_per_key: usize,
     generation_number: u64,
     generations: HashMap<PoolKey, PoolGeneration>,
+    session_runtime: Option<SessionRuntimeHarness>,
 }
 
 impl Pool {
     pub(super) fn new(max_idle_per_key: usize) -> Self {
+        Self::new_with_session_runtime(max_idle_per_key, None)
+    }
+
+    pub(super) fn new_with_session_runtime(
+        max_idle_per_key: usize,
+        session_runtime: Option<SessionRuntimeHarness>,
+    ) -> Self {
         Self {
             max_idle_per_key,
             generation_number: 0,
             generations: HashMap::new(),
+            session_runtime,
         }
     }
 
@@ -398,15 +530,17 @@ impl Pool {
     pub(super) fn acquire(&mut self, key: &PoolKey) -> Option<ConnectionLease> {
         let generation = self.generations.get_mut(key)?;
         let connection = generation.idle.pop()?;
-        Some(ConnectionLease::new(
+        Some(ConnectionLease::new_with_session_runtime(
             key.clone(),
             self.generation_number,
             connection,
+            self.session_runtime.as_ref(),
         ))
     }
 
     pub(super) fn release(&mut self, mut lease: ConnectionLease) -> Option<ConnectionLease> {
         let reusable = lease.terminal == LeaseTerminal::CleanEof
+            && lease.dirty_identity.is_none()
             && lease.generation == self.generation_number
             && lease.is_live();
         if !reusable {

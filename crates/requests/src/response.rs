@@ -24,6 +24,37 @@ use crate::transport::decode::{ContentEncoding, DecodedBody};
 use crate::transport::{DeadlineSource, TransportLease, TransportResponse, select_deadline_source};
 use crate::{ContentCodecs, Error, Result};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ResponseHeadWaitEntered {
+    entered: bool,
+}
+
+impl ResponseHeadWaitEntered {
+    pub(crate) fn enter(&mut self) {
+        self.entered = true;
+    }
+
+    pub(crate) fn permits_post_head(self) -> bool {
+        self.entered
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResponseRemainderWaitEntered {
+    declared: u64,
+    received: u64,
+}
+
+impl ResponseRemainderWaitEntered {
+    pub(crate) fn checked(declared: u64, received: u64) -> Option<Self> {
+        (received < declared).then_some(Self { declared, received })
+    }
+
+    pub(crate) fn remaining(self) -> u64 {
+        self.declared - self.received
+    }
+}
+
 pub struct Response {
     head: http::response::Parts,
     body: Option<Incoming>,
@@ -125,6 +156,7 @@ impl Response {
             chunked,
             expected_content_length,
             received_body_bytes: 0,
+            remainder_wait: None,
             terminal: false,
             disposition: self
                 .disposition
@@ -155,7 +187,7 @@ impl Drop for Response {
             disposition.apply(ResponseEvent::Drop);
         }
         if let Some(driver) = self.driver.take() {
-            driver.finish_now(false);
+            driver.finish_now(false, false);
         }
     }
 }
@@ -199,11 +231,20 @@ impl ResponseBodyDriver {
         }
     }
 
-    fn finish_now(self, reusable: bool) {
+    fn finish_now(self, reusable: bool, incomplete_body: bool) {
         match self {
+            Self::Network(lease) if incomplete_body => lease.finish_incomplete_body_now(),
             Self::Network(lease) => lease.finish_now(reusable),
             #[cfg(test)]
             Self::Controlled(_) => {}
+        }
+    }
+
+    fn poll_response_remainder(&mut self, context: &mut Context<'_>) -> Poll<()> {
+        match self {
+            Self::Network(lease) => lease.poll_response_remainder(context),
+            #[cfg(test)]
+            Self::Controlled(_) => Poll::Ready(()),
         }
     }
 }
@@ -218,6 +259,7 @@ pub struct ResponseBody {
     chunked: bool,
     expected_content_length: Option<u64>,
     received_body_bytes: u64,
+    remainder_wait: Option<ResponseRemainderWaitEntered>,
     terminal: bool,
     disposition: ResponseDispositionState,
     #[cfg(test)]
@@ -272,8 +314,15 @@ impl ResponseBody {
     }
 
     fn finish_now(&mut self, event: ResponseEvent) {
+        let incomplete_body = event != ResponseEvent::CleanEof
+            && self.expected_content_length.is_some_and(|declared| {
+                ResponseRemainderWaitEntered::checked(declared, self.received_body_bytes).is_some()
+            });
         if let Some(driver) = self.begin_terminal(event) {
-            driver.finish_now(self.disposition.decision() == Some(ResponseDecision::Reusable));
+            driver.finish_now(
+                self.disposition.decision() == Some(ResponseDecision::Reusable),
+                incomplete_body,
+            );
         }
     }
 
@@ -385,6 +434,7 @@ impl ResponseBody {
                 chunked: false,
                 expected_content_length: None,
                 received_body_bytes: 0,
+                remainder_wait: None,
                 terminal: false,
                 disposition: ResponseDispositionState::without_native_lease(),
                 probe: Some(probe.clone()),
@@ -413,6 +463,9 @@ impl Stream for ResponseBody {
                 self.received_body_bytes = self
                     .received_body_bytes
                     .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                self.remainder_wait = self.expected_content_length.and_then(|declared| {
+                    ResponseRemainderWaitEntered::checked(declared, self.received_body_bytes)
+                });
                 drop(self.read_deadline.take());
                 self.disposition.apply(ResponseEvent::Partial);
                 return Poll::Ready(Some(Ok(bytes)));
@@ -428,12 +481,24 @@ impl Stream for ResponseBody {
                 return self.finish_error(event, error);
             }
             Poll::Ready(None) => {
+                self.remainder_wait = None;
                 self.finish_now(ResponseEvent::CleanEof);
                 return Poll::Ready(None);
             }
             Poll::Pending => {
+                self.remainder_wait = self.expected_content_length.and_then(|declared| {
+                    ResponseRemainderWaitEntered::checked(declared, self.received_body_bytes)
+                });
+                debug_assert!(self
+                    .remainder_wait
+                    .is_none_or(|wait| wait.remaining() > 0));
                 if wire_progress {
                     drop(self.read_deadline.take());
+                }
+                if let Some(driver) = self.driver.as_mut()
+                    && driver.poll_response_remainder(context).is_pending()
+                {
+                    return Poll::Pending;
                 }
             }
         }

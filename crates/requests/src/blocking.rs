@@ -40,6 +40,13 @@ impl BlockingRuntimeDriver {
         self.inner.generation
     }
 
+    #[doc(hidden)]
+    pub fn quiesce_process_local() -> bool {
+        PROCESS_RUNTIME
+            .get_or_init(DriverRegistry::default)
+            .clear_for_process(std::process::id())
+    }
+
     pub fn is_same_runtime(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -282,6 +289,20 @@ impl Default for DriverRegistry {
 }
 
 impl DriverRegistry {
+    fn clear_for_process(&self, process_id: u32) -> bool {
+        let Ok(mut current) = self.current.lock() else {
+            return false;
+        };
+        if current
+            .as_ref()
+            .is_none_or(|driver| driver.process_id != process_id)
+        {
+            return false;
+        }
+        drop(current.take());
+        true
+    }
+
     fn driver_for(&self, process_id: u32) -> io::Result<BlockingRuntimeDriver> {
         let mut current = self
             .current
@@ -303,7 +324,9 @@ impl DriverRegistry {
             .enable_time()
             .thread_name("requests-runtime")
             .build()?;
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let generation = (u64::from(process_id) << 32)
+            | ((self.next_generation.fetch_add(1, Ordering::Relaxed) + 1)
+                & u64::from(u32::MAX));
         let driver = Arc::new(DriverInner {
             process_id,
             generation,

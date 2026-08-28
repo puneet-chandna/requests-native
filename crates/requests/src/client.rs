@@ -4,7 +4,48 @@ use std::sync::Arc;
 use http::{Method, Uri};
 
 use crate::transport::{DEFAULT_MAX_IDLE_PER_HOST, Transport};
+use crate::session_runtime::SessionRuntimeHarness;
 use crate::{Error, Request, RequestBuilder, Response, Result, Timeout};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OriginUploadActionEntered {
+    entered: bool,
+}
+
+impl OriginUploadActionEntered {
+    pub(crate) fn enter(&mut self) {
+        self.entered = true;
+    }
+
+    pub(crate) fn is_entered(self) -> bool {
+        self.entered
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UploadQueuedExecutedReplyCounts {
+    queued: u64,
+    executed: u64,
+    replies: u64,
+}
+
+impl UploadQueuedExecutedReplyCounts {
+    pub(crate) fn queued(&mut self) {
+        self.queued = self.queued.saturating_add(1);
+    }
+
+    pub(crate) fn executed(&mut self) {
+        self.executed = self.executed.saturating_add(1);
+    }
+
+    pub(crate) fn reply_observed(&mut self) {
+        self.replies = self.replies.saturating_add(1);
+    }
+
+    pub(crate) fn is_consistent(self) -> bool {
+        self.replies <= self.executed && self.executed <= self.queued
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContentCodecs {
@@ -80,6 +121,7 @@ pub struct ClientBuilder {
     timeout: Timeout,
     pool_max_idle_per_host: usize,
     content_codecs: ContentCodecs,
+    session_runtime: Option<SessionRuntimeHarness>,
 }
 
 impl Default for ClientBuilder {
@@ -90,6 +132,7 @@ impl Default for ClientBuilder {
             timeout: Timeout::default(),
             pool_max_idle_per_host: DEFAULT_MAX_IDLE_PER_HOST,
             content_codecs: ContentCodecs::new(true, true),
+            session_runtime: None,
         }
     }
 }
@@ -120,17 +163,24 @@ impl ClientBuilder {
         self
     }
 
+    #[doc(hidden)]
+    pub fn session_runtime_harness(mut self, harness: SessionRuntimeHarness) -> Self {
+        self.session_runtime = Some(harness);
+        self
+    }
+
     pub fn build(self) -> Result<Client> {
         if let Some(proxy) = &self.proxy {
             validate_proxy(proxy)?;
         }
         Ok(Client {
-            transport: Arc::new(Transport::configured(
+            transport: Arc::new(Transport::configured_with_session_runtime(
                 self.proxy,
                 self.tls,
                 self.timeout,
                 self.pool_max_idle_per_host,
                 self.content_codecs,
+                self.session_runtime,
             )),
         })
     }

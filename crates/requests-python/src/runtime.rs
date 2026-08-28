@@ -1,6 +1,7 @@
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,23 +18,100 @@ use crate::bridge::{ActionReceiver, ActionSender, BridgeClosed, WorkerPayload, a
 const WAKE_INTERVAL: Duration = Duration::from_millis(10);
 const CANCEL_WAIT: Duration = Duration::from_millis(500);
 
-thread_local! {
-    static ORIGIN_QUARANTINE: RefCell<Vec<Box<dyn OriginQuarantineEntry>>> = RefCell::new(Vec::new());
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionCancellationPhase {
+    CancelBeforePoll,
+    CancelQueuedBeforeDequeue,
+    CancelReplyObserved,
+    CancelTerminalAfterTimeout,
+    CancelPermanentlyNonterminal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OriginQuarantineRetentionAudit {
+    phase: SessionCancellationPhase,
+    observed_phase: SessionCancellationPhase,
+    terminal: bool,
+}
+
+impl OriginQuarantineRetentionAudit {
+    pub(crate) fn retain(phase: SessionCancellationPhase, terminal: bool) -> Self {
+        Self {
+            phase,
+            observed_phase: phase,
+            terminal,
+        }
+    }
+
+    pub(crate) fn can_reap(self) -> bool {
+        self.terminal
+            && self.phase != SessionCancellationPhase::CancelPermanentlyNonterminal
+            && self.observed_phase != SessionCancellationPhase::CancelPermanentlyNonterminal
+    }
+
+    fn with_observed_phase(mut self, observed_phase: SessionCancellationPhase) -> Self {
+        self.observed_phase = observed_phase;
+        self
+    }
+}
+
+pub(crate) fn OriginQuarantineReapAudit(audit: OriginQuarantineRetentionAudit) -> bool {
+    audit.can_reap()
+}
+
+pub(crate) fn signal_wins_ready_result(py: Python<'_>) -> PyResult<()> {
+    py.check_signals()
+}
+
+thread_local! {
+    static ORIGIN_QUARANTINE: RefCell<Vec<Box<dyn OriginQuarantineEntry>>> = RefCell::new(Vec::new());
+    static LAST_ORIGIN_QUARANTINE_TOKEN: Cell<Option<OriginQuarantineToken>> = const { Cell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OriginQuarantineToken(u64);
+
+static NEXT_ORIGIN_QUARANTINE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 trait OriginQuarantineEntry {
-    fn is_terminal(&self) -> bool;
+    fn retention_audit(&self) -> OriginQuarantineRetentionAudit;
+    fn token(&self) -> OriginQuarantineToken;
+    fn take_owner(&mut self) -> Option<Box<dyn Any>>;
+    fn retains_owner(&self) -> bool;
 }
 
 struct QuarantinedOrigin<A, R, O> {
+    token: OriginQuarantineToken,
     terminal: std::sync::Arc<AtomicBool>,
+    phase: SessionCancellationPhase,
     actions: Option<ActionReceiver<A, R>>,
     owner: Option<O>,
 }
 
-impl<A, R, O> OriginQuarantineEntry for QuarantinedOrigin<A, R, O> {
-    fn is_terminal(&self) -> bool {
-        self.terminal.load(Ordering::Acquire)
+impl<A, R, O: 'static> OriginQuarantineEntry for QuarantinedOrigin<A, R, O> {
+    fn retention_audit(&self) -> OriginQuarantineRetentionAudit {
+        let terminal = self.terminal.load(Ordering::Acquire);
+        OriginQuarantineRetentionAudit::retain(
+            if terminal {
+                SessionCancellationPhase::CancelTerminalAfterTimeout
+            } else {
+                SessionCancellationPhase::CancelPermanentlyNonterminal
+            },
+            terminal,
+        )
+        .with_observed_phase(self.phase)
+    }
+
+    fn token(&self) -> OriginQuarantineToken {
+        self.token
+    }
+
+    fn take_owner(&mut self) -> Option<Box<dyn Any>> {
+        self.owner.take().map(|owner| Box::new(owner) as Box<dyn Any>)
+    }
+
+    fn retains_owner(&self) -> bool {
+        self.owner.is_some()
     }
 }
 
@@ -48,7 +126,9 @@ impl<A, R, O> Drop for QuarantinedOrigin<A, R, O> {
 
 fn reap_origin_quarantine() {
     ORIGIN_QUARANTINE.with(|entries| {
-        entries.borrow_mut().retain(|entry| !entry.is_terminal());
+        entries.borrow_mut().retain(|entry| {
+            !OriginQuarantineReapAudit(entry.retention_audit())
+        });
     });
 }
 
@@ -56,25 +136,121 @@ fn quarantine_origin_until_terminal<T, A, R, O>(
     submission: BlockingSubmission<T>,
     actions: ActionReceiver<A, R>,
     owner: O,
+    phase: SessionCancellationPhase,
 ) where
     T: Send + 'static,
     A: Send + 'static,
     R: Send + 'static,
     O: 'static,
 {
+    retain_origin_after_cancellation(Some(submission), actions, owner, phase);
+}
+
+fn retain_origin_after_cancellation<T, A, R, O>(
+    submission: Option<BlockingSubmission<T>>,
+    actions: ActionReceiver<A, R>,
+    owner: O,
+    phase: SessionCancellationPhase,
+) -> OriginQuarantineToken
+where
+    T: Send + 'static,
+    A: Send + 'static,
+    R: Send + 'static,
+    O: 'static,
+{
+    let token = OriginQuarantineToken(
+        NEXT_ORIGIN_QUARANTINE_TOKEN.fetch_add(1, Ordering::Relaxed),
+    );
     let terminal = std::sync::Arc::new(AtomicBool::new(false));
-    let waiter_terminal = std::sync::Arc::clone(&terminal);
-    thread::spawn(move || {
-        let _ = submission.wait();
-        waiter_terminal.store(true, Ordering::Release);
-    });
+    match submission {
+        Some(submission) => {
+            let waiter_terminal = std::sync::Arc::clone(&terminal);
+            thread::spawn(move || {
+                let _ = submission.wait();
+                waiter_terminal.store(true, Ordering::Release);
+            });
+        }
+        None => terminal.store(true, Ordering::Release),
+    }
     ORIGIN_QUARANTINE.with(|entries| {
         entries.borrow_mut().push(Box::new(QuarantinedOrigin {
+            token,
             terminal,
+            phase,
             actions: Some(actions),
             owner: Some(owner),
         }));
     });
+    LAST_ORIGIN_QUARANTINE_TOKEN.with(|slot| slot.set(Some(token)));
+    token
+}
+
+pub(crate) fn take_last_origin_quarantine_token() -> Option<OriginQuarantineToken> {
+    LAST_ORIGIN_QUARANTINE_TOKEN.with(Cell::take)
+}
+
+pub(crate) fn last_origin_quarantine_token() -> Option<OriginQuarantineToken> {
+    LAST_ORIGIN_QUARANTINE_TOKEN.with(Cell::get)
+}
+
+pub(crate) fn origin_quarantine_is_terminal(token: OriginQuarantineToken) -> Option<bool> {
+    ORIGIN_QUARANTINE.with(|entries| {
+        entries
+            .borrow()
+            .iter()
+            .find(|entry| entry.token() == token)
+            .map(|entry| entry.retention_audit().can_reap())
+    })
+}
+
+pub(crate) fn origin_quarantine_retains_owner(token: OriginQuarantineToken) -> bool {
+    ORIGIN_QUARANTINE.with(|entries| {
+        entries
+            .borrow()
+            .iter()
+            .find(|entry| entry.token() == token)
+            .is_some_and(|entry| entry.retains_owner())
+    })
+}
+
+pub(crate) fn reap_origin_quarantine_token(token: OriginQuarantineToken) -> bool {
+    ORIGIN_QUARANTINE.with(|entries| {
+        let mut entries = entries.borrow_mut();
+        let Some(index) = entries.iter().position(|entry| entry.token() == token) else {
+            return false;
+        };
+        if !entries[index].retention_audit().can_reap() {
+            return false;
+        }
+        drop(entries.remove(index));
+        LAST_ORIGIN_QUARANTINE_TOKEN.with(|slot| {
+            if slot.get() == Some(token) {
+                slot.set(None);
+            }
+        });
+        true
+    })
+}
+
+pub(crate) fn take_origin_quarantine_owner<O: 'static>(
+    token: OriginQuarantineToken,
+) -> Option<O> {
+    ORIGIN_QUARANTINE.with(|entries| {
+        let mut entries = entries.borrow_mut();
+        let index = entries.iter().position(|entry| entry.token() == token)?;
+        if !entries[index].retention_audit().can_reap() {
+            return None;
+        }
+        let mut entry = entries.remove(index);
+        let owner = entry.take_owner()?.downcast::<O>().ok().map(|owner| *owner);
+        drop(entry);
+        LAST_ORIGIN_QUARANTINE_TOKEN.with(|slot| {
+            if slot.get() == Some(token) {
+                slot.set(None);
+            }
+        });
+        owner
+    })
 }
 
 fn cancel_with_bounded_wait<T, S>(
@@ -237,24 +413,30 @@ impl PythonCallContext {
     {
         self.ensure_affinity(py)?;
         reap_origin_quarantine();
+        let mut cancellation_phase = SessionCancellationPhase::CancelBeforePoll;
         loop {
             let task_state =
                 match signal_before_task_state(py, &mut check_signals, || submission.try_wait()) {
                     Ok(task_state) => task_state,
                     Err(signal) => {
-                        if let Some(submission) = cancel_with_bounded_wait(submission, || {
+                        let submission = cancel_with_bounded_wait(submission, || {
                             py.detach(|| thread::sleep(WAKE_INTERVAL));
                         })
-                        .map_err(task_error)?
-                        {
-                            quarantine_origin_until_terminal(submission, actions, owner);
-                        }
+                        .map_err(task_error)?;
+                        retain_origin_after_cancellation(
+                            submission,
+                            actions,
+                            owner,
+                            cancellation_phase,
+                        );
                         return Err(signal);
                     }
                 };
             match task_state {
                 Ok(Some(output)) => return Ok((output, owner)),
-                Ok(None) => {}
+                Ok(None) => {
+                    cancellation_phase = SessionCancellationPhase::CancelQueuedBeforeDequeue;
+                }
                 Err(error) => return Err(task_error(error)),
             }
 
@@ -263,6 +445,7 @@ impl PythonCallContext {
                     self.ensure_affinity(py)?;
                     let (action, reply) = request.into_parts();
                     let _ = reply.send(execute(py, action, &mut owner));
+                    cancellation_phase = SessionCancellationPhase::CancelReplyObserved;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -785,8 +968,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ProbeAction, ProbeReply, cancel_with_bounded_wait, quarantine_origin_until_terminal,
-        reap_origin_quarantine,
+        ProbeAction, ProbeReply, SessionCancellationPhase, cancel_with_bounded_wait,
+        quarantine_origin_until_terminal, reap_origin_quarantine,
     };
     use crate::bridge::{WorkerPayload, action_channel};
     use requests::blocking::BlockingRuntimeDriver;
@@ -864,7 +1047,12 @@ mod tests {
         assert!(!owner_dropped.load(Ordering::Acquire));
 
         black_box(&owner);
-        quarantine_origin_until_terminal(live_submission, receiver, owner);
+        quarantine_origin_until_terminal(
+            live_submission,
+            receiver,
+            owner,
+            SessionCancellationPhase::CancelQueuedBeforeDequeue,
+        );
         assert!(!owner_dropped.load(Ordering::Acquire));
 
         let terminal_deadline = Instant::now() + Duration::from_secs(2);
@@ -922,7 +1110,12 @@ mod tests {
             })
             .expect("cancel")
             .expect("permanently blocked worker must remain nonterminal");
-            quarantine_origin_until_terminal(live_submission, receiver, owner);
+            quarantine_origin_until_terminal(
+                live_submission,
+                receiver,
+                owner,
+                SessionCancellationPhase::CancelPermanentlyNonterminal,
+            );
             quarantined_sender.send(()).expect("quarantine ready");
         });
 

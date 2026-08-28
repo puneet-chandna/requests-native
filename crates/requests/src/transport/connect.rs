@@ -1,6 +1,41 @@
 use tokio::net::TcpStream;
 
+use crate::session_runtime::{SessionCheckpoint, SessionRuntimeHarness};
 use crate::{Error, Result};
+
+pub(super) struct ConnectDialEntered {
+    checkpoint: SessionCheckpoint,
+}
+
+pub(super) struct SessionInjectedConnectorGate {
+    harness: SessionRuntimeHarness,
+    entered: ConnectDialEntered,
+}
+
+impl SessionInjectedConnectorGate {
+    pub(super) fn new(harness: SessionRuntimeHarness, checkpoint: SessionCheckpoint) -> Self {
+        Self {
+            harness,
+            entered: ConnectDialEntered { checkpoint },
+        }
+    }
+
+    async fn wait(self) {
+        self.harness.wait(self.entered.checkpoint).await;
+    }
+}
+
+pub(super) async fn connect_with_gate(
+    host: &str,
+    port: u16,
+    target: &str,
+    gate: Option<SessionInjectedConnectorGate>,
+) -> Result<TcpStream> {
+    if let Some(gate) = gate {
+        gate.wait().await;
+    }
+    connect(host, port, target).await
+}
 
 pub(super) async fn connect(host: &str, port: u16, target: &str) -> Result<TcpStream> {
     let addresses = tokio::net::lookup_host((host, port))

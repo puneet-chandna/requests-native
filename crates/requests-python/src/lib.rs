@@ -13,6 +13,7 @@ mod errors;
 mod models;
 mod response;
 mod runtime;
+mod sessions;
 mod structures;
 
 #[pyfunction]
@@ -32,6 +33,7 @@ fn _requests_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     models::register(module)?;
     response::register(module)?;
     runtime::register(module)?;
+    sessions::register(module)?;
     structures::register(module)?;
     Ok(())
 }

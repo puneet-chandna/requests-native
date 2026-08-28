@@ -28,10 +28,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinHandle;
 
 use self::pool::{
-    ConnectionLease, IdentityKey, IdleConnection, LeaseTerminal, Pool, PoolKey, ProxyKey,
+    ConnectionLease, DirtyLeaseCause, IdentityKey, IdleConnection, Pool, PoolKey, ProxyKey,
     TlsPoolKey,
 };
+use crate::client::{OriginUploadActionEntered, UploadQueuedExecutedReplyCounts};
 use crate::models::RequestParts;
+use crate::response::ResponseHeadWaitEntered;
+use crate::session_runtime::{
+    SessionCheckpoint, SessionConnectionIdentity, SessionExchangeIdentity, SessionLeaseIdentity,
+    SessionPhase, SessionRuntimeHarness,
+};
 use crate::{BodySource, ContentCodecs, Error, Proxy, Request, Result, Timeout, TlsConfig};
 
 pub(crate) const DEFAULT_MAX_IDLE_PER_HOST: usize = 10;
@@ -48,6 +54,7 @@ pub(crate) struct Transport {
     tls: TlsConfig,
     default_timeout: Timeout,
     content_codecs: ContentCodecs,
+    session_runtime: Option<SessionRuntimeHarness>,
 }
 
 pub(super) trait Connector: Send + Sync {
@@ -57,6 +64,16 @@ pub(super) trait Connector: Send + Sync {
         port: u16,
         target: &str,
     ) -> Pin<Box<dyn Future<Output = Result<tokio::net::TcpStream>> + Send>>;
+
+    fn connect_session(
+        &self,
+        host: &str,
+        port: u16,
+        target: &str,
+        _checkpoint: Option<SessionCheckpoint>,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio::net::TcpStream>> + Send>> {
+        self.connect(host, port, target)
+    }
 }
 
 #[cfg(test)]
@@ -86,7 +103,9 @@ pub(super) trait EstablishmentControl: Send + Sync {
     fn raw_shutdown_taken(&self);
 }
 
-struct DirectConnector;
+struct DirectConnector {
+    session_runtime: Option<SessionRuntimeHarness>,
+}
 
 impl Connector for DirectConnector {
     fn connect(
@@ -98,6 +117,32 @@ impl Connector for DirectConnector {
         let host = host.to_owned();
         let target = target.to_owned();
         Box::pin(async move { connect::connect(&host, port, &target).await })
+    }
+
+    fn connect_session(
+        &self,
+        host: &str,
+        port: u16,
+        target: &str,
+        checkpoint: Option<SessionCheckpoint>,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio::net::TcpStream>> + Send>> {
+        let host = host.to_owned();
+        let target = target.to_owned();
+        let session_runtime = self.session_runtime.clone();
+        Box::pin(async move {
+            let gate = session_runtime
+                .clone()
+                .zip(checkpoint)
+                .map(|(harness, checkpoint)| {
+                    connect::SessionInjectedConnectorGate::new(harness, checkpoint)
+                });
+            let result = connect::connect_with_gate(&host, port, &target, gate).await;
+            if let (Some(harness), Some(mut checkpoint)) = (&session_runtime, checkpoint) {
+                checkpoint.phase = SessionPhase::ConnectReadyRace;
+                harness.wait(checkpoint).await;
+            }
+            result
+        })
     }
 }
 
@@ -150,6 +195,7 @@ async fn wait_for_body_completion(completion: &mut Option<BodyCompletion>) -> In
 
 enum ExchangeEvent {
     Deadline(DeadlineSource),
+    ResponseHeadGate,
     Response(std::result::Result<http::Response<Incoming>, hyper::Error>),
     UploadComplete(Instant),
     Driver(std::result::Result<Result<()>, tokio::task::JoinError>),
@@ -183,6 +229,73 @@ pub(crate) struct TransportResponse {
 pub(crate) struct TransportLease {
     pool: Arc<Mutex<Pool>>,
     lease: Option<ConnectionLease>,
+    active_exchange: ActiveExchangeGuard,
+}
+
+struct ActiveExchangeGuard {
+    session_runtime: Option<SessionRuntimeHarness>,
+    connection: Option<SessionConnectionIdentity>,
+    lease: Option<SessionLeaseIdentity>,
+    correlation: u64,
+    released: bool,
+    response_remainder_wait: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
+}
+
+impl ActiveExchangeGuard {
+    fn new(
+        session_runtime: Option<SessionRuntimeHarness>,
+        lease: &ConnectionLease,
+    ) -> Self {
+        let correlation = session_runtime
+            .as_ref()
+            .map(SessionRuntimeHarness::next_correlation)
+            .unwrap_or(0);
+        Self {
+            session_runtime,
+            connection: lease.session_connection_identity(),
+            lease: lease.session_lease_identity(),
+            correlation,
+            released: false,
+            response_remainder_wait: None,
+        }
+    }
+
+    fn release(&mut self, reusable: bool) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if let Some(harness) = &self.session_runtime {
+            let phase = if reusable {
+                SessionPhase::PoolReleaseClean
+            } else {
+                SessionPhase::PoolReleaseDirty
+            };
+            let checkpoint = harness.checkpoint(
+                phase,
+                self.connection,
+                self.lease,
+                self.correlation,
+            );
+            harness.observe(checkpoint);
+        }
+    }
+
+    fn poll_response_remainder(&mut self, context: &mut Context<'_>) -> Poll<()> {
+        let Some(harness) = &self.session_runtime else {
+            return Poll::Ready(());
+        };
+        let wait = self.response_remainder_wait.get_or_insert_with(|| {
+            let checkpoint = harness.checkpoint(
+                SessionPhase::ResponseRemainder,
+                self.connection,
+                self.lease,
+                self.correlation,
+            );
+            harness.wait_future(checkpoint)
+        });
+        wait.as_mut().poll(context)
+    }
 }
 
 pub(crate) struct ConnectionDriver {
@@ -313,11 +426,21 @@ impl Drop for ConnectionDriver {
 }
 
 impl TransportLease {
-    fn new(pool: Arc<Mutex<Pool>>, lease: ConnectionLease) -> Self {
+    fn new(
+        pool: Arc<Mutex<Pool>>,
+        lease: ConnectionLease,
+        session_runtime: Option<SessionRuntimeHarness>,
+    ) -> Self {
+        let active_exchange = ActiveExchangeGuard::new(session_runtime, &lease);
         Self {
             pool,
             lease: Some(lease),
+            active_exchange,
         }
+    }
+
+    pub(crate) fn poll_response_remainder(&mut self, context: &mut Context<'_>) -> Poll<()> {
+        self.active_exchange.poll_response_remainder(context)
     }
 
     pub(crate) fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<()>> {
@@ -333,7 +456,13 @@ impl TransportLease {
 
     pub(crate) async fn abort_and_wait(mut self) -> Result<()> {
         let result = self.driver_mut().abort_and_wait().await;
-        self.release(false);
+        self.release(false, DirtyLeaseCause::Cancellation);
+        result
+    }
+
+    pub(crate) async fn abort_upload_and_wait(mut self) -> Result<()> {
+        let result = self.driver_mut().abort_and_wait().await;
+        self.release(false, DirtyLeaseCause::Upload);
         result
     }
 
@@ -341,7 +470,12 @@ impl TransportLease {
         if !reusable {
             self.driver_mut().shutdown_now();
         }
-        self.release(reusable);
+        self.release(reusable, DirtyLeaseCause::Cancellation);
+    }
+
+    pub(crate) fn finish_incomplete_body_now(mut self) {
+        self.driver_mut().shutdown_now();
+        self.release(false, DirtyLeaseCause::IncompleteBody);
     }
 
     fn driver_mut(&mut self) -> &mut ConnectionDriver {
@@ -354,16 +488,17 @@ impl TransportLease {
         driver
     }
 
-    fn release(&mut self, reusable: bool) {
+    fn release(&mut self, reusable: bool, cause: DirtyLeaseCause) {
         let Some(mut lease) = self.lease.take() else {
             return;
         };
         let reusable = reusable && lease.is_live() && lease.peer_is_open();
-        lease = lease.complete(if reusable {
-            LeaseTerminal::CleanEof
+        self.active_exchange.release(reusable);
+        lease = if reusable {
+            lease.complete(pool::LeaseTerminal::CleanEof)
         } else {
-            LeaseTerminal::Dirty
-        });
+            lease.complete_dirty(cause)
+        };
         let rejected = {
             self.pool
                 .lock()
@@ -381,7 +516,8 @@ impl Drop for TransportLease {
         };
         let (_, driver) = lease.connection_mut().network_parts_mut();
         driver.shutdown_now();
-        let lease = lease.complete(LeaseTerminal::Dirty);
+        self.active_exchange.release(false);
+        let lease = lease.complete_dirty(DirtyLeaseCause::Cancellation);
         let rejected = {
             self.pool
                 .lock()
@@ -400,13 +536,34 @@ impl Transport {
         pool_max_idle_per_host: usize,
         content_codecs: ContentCodecs,
     ) -> Self {
-        Self::with_configuration(
-            Arc::new(DirectConnector),
+        Self::configured_with_session_runtime(
             proxy,
             tls,
             default_timeout,
             pool_max_idle_per_host,
             content_codecs,
+            None,
+        )
+    }
+
+    pub(crate) fn configured_with_session_runtime(
+        proxy: Option<Proxy>,
+        tls: TlsConfig,
+        default_timeout: Timeout,
+        pool_max_idle_per_host: usize,
+        content_codecs: ContentCodecs,
+        session_runtime: Option<SessionRuntimeHarness>,
+    ) -> Self {
+        Self::with_configuration_and_session_runtime(
+            Arc::new(DirectConnector {
+                session_runtime: session_runtime.clone(),
+            }),
+            proxy,
+            tls,
+            default_timeout,
+            pool_max_idle_per_host,
+            content_codecs,
+            session_runtime,
         )
     }
 
@@ -430,8 +587,31 @@ impl Transport {
         pool_max_idle_per_host: usize,
         content_codecs: ContentCodecs,
     ) -> Self {
+        Self::with_configuration_and_session_runtime(
+            connector,
+            proxy,
+            tls,
+            default_timeout,
+            pool_max_idle_per_host,
+            content_codecs,
+            None,
+        )
+    }
+
+    fn with_configuration_and_session_runtime(
+        connector: Arc<dyn Connector>,
+        proxy: Option<Proxy>,
+        tls: TlsConfig,
+        default_timeout: Timeout,
+        pool_max_idle_per_host: usize,
+        content_codecs: ContentCodecs,
+        session_runtime: Option<SessionRuntimeHarness>,
+    ) -> Self {
         Self {
-            pool: Arc::new(Mutex::new(Pool::new(pool_max_idle_per_host))),
+            pool: Arc::new(Mutex::new(Pool::new_with_session_runtime(
+                pool_max_idle_per_host,
+                session_runtime.clone(),
+            ))),
             #[cfg(test)]
             derived_pool_keys: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -441,6 +621,7 @@ impl Transport {
             tls,
             default_timeout,
             content_codecs,
+            session_runtime,
         }
     }
 
@@ -451,6 +632,27 @@ impl Transport {
                 .expect("transport pool lock poisoned")
                 .clear()
         };
+        if let Some(harness) = &self.session_runtime {
+            if evicted.is_empty() {
+                let checkpoint = harness.checkpoint(
+                    SessionPhase::PoolClear,
+                    None,
+                    None,
+                    harness.next_correlation(),
+                );
+                harness.observe(checkpoint);
+            } else {
+                for connection in &evicted {
+                    let checkpoint = harness.checkpoint(
+                        SessionPhase::PoolClear,
+                        connection.session_identity(),
+                        None,
+                        harness.next_correlation(),
+                    );
+                    harness.observe(checkpoint);
+                }
+            }
+        }
         drop(evicted);
     }
 
@@ -546,13 +748,23 @@ impl Transport {
             total_timeout,
             total_deadline,
         };
-        let track_body_completion = read_timeout.is_some() || total_timeout.is_some();
-        let (outgoing, url, mut body_completion) =
-            outgoing_request(request, track_body_completion, absolute_form)?;
-
         let mut lease = self
             .acquire_connection(key, &host, port, &target, establishment_deadlines)
             .await?;
+        let track_body_completion = read_timeout.is_some() || total_timeout.is_some();
+        let upload_correlation = self
+            .session_runtime
+            .as_ref()
+            .map(SessionRuntimeHarness::next_correlation)
+            .unwrap_or(0);
+        let upload_identity = lease.session_exchange_identity(upload_correlation);
+        let (outgoing, url, mut body_completion) = outgoing_request_with_session_runtime(
+            request,
+            track_body_completion,
+            absolute_form,
+            self.session_runtime.clone(),
+            upload_identity,
+        )?;
         let response = {
             let exchange_started = Instant::now();
             let upload_completed_at = body_completion
@@ -567,10 +779,32 @@ impl Transport {
                     std::cmp::max(exchange_started, completed_at).checked_add(timeout)
                 })
             });
+            let session_connection_identity = lease.session_connection_identity();
+            let session_lease_identity = lease.session_lease_identity();
             let (sender, driver) = lease.connection_mut().network_parts_mut();
+            let response_head_correlation = self
+                .session_runtime
+                .as_ref()
+                .map(SessionRuntimeHarness::begin_request_observation);
             let sending = sender.send_request(outgoing);
             tokio::pin!(sending);
-            loop {
+            let mut head_wait = ResponseHeadWaitEntered::default();
+            let response_head_gate = async {
+                if let Some(harness) = &self.session_runtime {
+                    let correlation = response_head_correlation
+                        .expect("session request observation registered before send");
+                    harness.wait_request_observed(correlation).await;
+                    let checkpoint = harness.checkpoint(
+                        SessionPhase::ResponseHead,
+                        session_connection_identity,
+                        session_lease_identity,
+                        correlation,
+                    );
+                    harness.wait(checkpoint).await;
+                }
+            };
+            tokio::pin!(response_head_gate);
+            let result = loop {
                 if completion_pending
                     && let Some(completed_at) = body_completion
                         .as_ref()
@@ -599,6 +833,9 @@ impl Transport {
                         () = &mut deadline_wait => ExchangeEvent::Deadline(
                             deadline_source.expect("finite deadline wait requires a source"),
                         ),
+                        () = &mut response_head_gate, if !head_wait.permits_post_head() => {
+                            ExchangeEvent::ResponseHeadGate
+                        }
                         result = &mut sending => ExchangeEvent::Response(result),
                         completed_at = wait_for_body_completion(&mut body_completion),
                             if completion_pending => {
@@ -608,6 +845,9 @@ impl Transport {
                     }
                 };
                 match event {
+                    ExchangeEvent::ResponseHeadGate => {
+                        head_wait.enter();
+                    }
                     ExchangeEvent::Deadline(DeadlineSource::Read) => {
                         break Err(Error::response_head_timeout(
                             read_timeout
@@ -625,7 +865,10 @@ impl Transport {
                         };
                         break Err(error);
                     }
-                    ExchangeEvent::Response(result) => break result.map_err(Error::send_hyper),
+                    ExchangeEvent::Response(result) => {
+                        debug_assert!(head_wait.permits_post_head());
+                        break result.map_err(Error::send_hyper);
+                    }
                     ExchangeEvent::UploadComplete(completed_at) => {
                         completion_pending = false;
                         body_completion.take();
@@ -638,14 +881,22 @@ impl Transport {
                         Err(error) => break Err(error),
                     },
                 }
-            }
+            };
+            result.map_err(|error| (error, completion_pending))
         };
         let response = match response {
             Ok(response) => response,
-            Err(send_error) => {
-                let cleanup = TransportLease::new(Arc::clone(&self.pool), lease)
-                    .abort_and_wait()
-                    .await;
+            Err((send_error, upload_pending)) => {
+                let cleanup_lease = TransportLease::new(
+                    Arc::clone(&self.pool),
+                    lease,
+                    self.session_runtime.clone(),
+                );
+                let cleanup = if upload_pending {
+                    cleanup_lease.abort_upload_and_wait().await
+                } else {
+                    cleanup_lease.abort_and_wait().await
+                };
                 return match cleanup {
                     Ok(()) => Err(send_error),
                     Err(driver_error) => Err(Error::with_cleanup(send_error, driver_error)),
@@ -658,7 +909,11 @@ impl Transport {
             head,
             body,
             url,
-            lease: TransportLease::new(Arc::clone(&self.pool), lease),
+            lease: TransportLease::new(
+                Arc::clone(&self.pool),
+                lease,
+                self.session_runtime.clone(),
+            ),
             read_timeout,
             total_timeout,
             total_deadline,
@@ -685,7 +940,12 @@ impl Transport {
                 break;
             };
             if !lease.is_live() || !lease.peer_is_open() {
-                TransportLease::new(Arc::clone(&self.pool), lease).finish_now(false);
+                TransportLease::new(
+                    Arc::clone(&self.pool),
+                    lease,
+                    self.session_runtime.clone(),
+                )
+                .finish_now(false);
                 continue;
             }
             let ready = {
@@ -704,7 +964,12 @@ impl Transport {
                 }
             };
             let Some(ready) = ready else {
-                TransportLease::new(Arc::clone(&self.pool), lease).finish_now(false);
+                TransportLease::new(
+                    Arc::clone(&self.pool),
+                    lease,
+                    self.session_runtime.clone(),
+                )
+                .finish_now(false);
                 return Err(Error::request_exchange_total_timeout(
                     deadlines
                         .total_timeout
@@ -712,13 +977,34 @@ impl Transport {
                 ));
             };
             if ready.is_ok() && lease.is_live() && lease.peer_is_open() {
+                self.observe_pool_acquire(&lease);
                 return Ok(lease);
             }
-            TransportLease::new(Arc::clone(&self.pool), lease).finish_now(false);
+            TransportLease::new(
+                Arc::clone(&self.pool),
+                lease,
+                self.session_runtime.clone(),
+            )
+            .finish_now(false);
         }
 
-        self.connect_connection(key, host, port, target, deadlines)
-            .await
+        let lease = self
+            .connect_connection(key, host, port, target, deadlines)
+            .await?;
+        self.observe_pool_acquire(&lease);
+        Ok(lease)
+    }
+
+    fn observe_pool_acquire(&self, lease: &ConnectionLease) {
+        if let Some(harness) = &self.session_runtime {
+            let checkpoint = harness.checkpoint(
+                SessionPhase::PoolAcquire,
+                lease.session_connection_identity(),
+                lease.session_lease_identity(),
+                harness.next_correlation(),
+            );
+            harness.observe(checkpoint);
+        }
     }
 
     async fn connect_connection(
@@ -735,6 +1021,10 @@ impl Transport {
                 .expect("transport pool lock poisoned")
                 .generation_number(&key)
         };
+        let reservation = self
+            .session_runtime
+            .as_ref()
+            .map(SessionRuntimeHarness::reserve_exchange);
         let establishing = async {
             let tls = self.tls.clone();
             let proxy = self.proxy.clone();
@@ -793,7 +1083,14 @@ impl Transport {
             };
             let stream = self
                 .connector
-                .connect(&endpoint.host, endpoint.port, target)
+                .connect_session(
+                    &endpoint.host,
+                    endpoint.port,
+                    target,
+                    reservation
+                        .as_ref()
+                        .map(|reservation| reservation.checkpoint(SessionPhase::ConnectBlocked)),
+                )
                 .await?;
             let stream = stream
                 .into_std()
@@ -813,6 +1110,10 @@ impl Transport {
                 }
                 None => proxy::ProxyStream::Plain(stream),
             };
+            let connection_identity = reservation
+                .as_ref()
+                .map(|reservation| reservation.checkpoint(SessionPhase::ConnectBlocked))
+                .and_then(|checkpoint| checkpoint.connection);
             let connection = match loaded_tls {
                 Some(loaded_tls) => {
                     #[cfg(test)]
@@ -821,16 +1122,24 @@ impl Transport {
                     #[cfg(test)]
                     self.establishment_checkpoint(EstablishmentStage::Http1)
                         .await;
-                    start_http1(stream, driver).await?
+                    start_http1(stream, driver, connection_identity).await?
                 }
                 None => {
                     #[cfg(test)]
                     self.establishment_checkpoint(EstablishmentStage::Http1)
                         .await;
-                    start_http1(stream, driver).await?
+                    start_http1(stream, driver, connection_identity).await?
                 }
             };
-            Ok(ConnectionLease::new(key, generation, connection))
+            match reservation {
+                Some(reservation) => Ok(ConnectionLease::new_with_exchange_identity(
+                    key,
+                    generation,
+                    connection,
+                    reservation.promote(),
+                )),
+                None => Ok(ConnectionLease::new(key, generation, connection)),
+            }
         };
         tokio::pin!(establishing);
         match select_deadline_source(deadlines.connect_deadline, deadlines.total_deadline) {
@@ -870,7 +1179,11 @@ impl Transport {
     }
 }
 
-async fn start_http1<IO>(stream: IO, mut driver: ConnectionDriver) -> Result<IdleConnection>
+async fn start_http1<IO>(
+    stream: IO,
+    mut driver: ConnectionDriver,
+    session_identity: Option<SessionConnectionIdentity>,
+) -> Result<IdleConnection>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -878,7 +1191,7 @@ where
         .await
         .map_err(Error::handshake)?;
     driver.start(async move { connection.await.map_err(Error::connection_hyper) });
-    Ok(IdleConnection::network(sender, driver))
+    Ok(IdleConnection::network(sender, driver, session_identity))
 }
 
 fn validate_request(request: &Request) -> Result<()> {
@@ -920,6 +1233,22 @@ fn outgoing_request(
     track_body_completion: bool,
     absolute_form: bool,
 ) -> Result<(http::Request<OutgoingBody>, String, Option<BodyCompletion>)> {
+    outgoing_request_with_session_runtime(
+        request,
+        track_body_completion,
+        absolute_form,
+        None,
+        None,
+    )
+}
+
+fn outgoing_request_with_session_runtime(
+    mut request: RequestParts,
+    track_body_completion: bool,
+    absolute_form: bool,
+    session_runtime: Option<SessionRuntimeHarness>,
+    session_identity: Option<SessionExchangeIdentity>,
+) -> Result<(http::Request<OutgoingBody>, String, Option<BodyCompletion>)> {
     let request_target = if absolute_form {
         let mut url =
             url::Url::parse(&request.url).map_err(|_| Error::invalid_url(&request.url))?;
@@ -951,7 +1280,13 @@ fn outgoing_request(
         request.headers.insert(HOST, host);
     }
 
-    let (body, completion) = OutgoingBody::new(request.body, track_body_completion);
+    let (body, completion) =
+        OutgoingBody::new(
+            request.body,
+            track_body_completion,
+            session_runtime,
+            session_identity,
+        );
     let mut outgoing = http::Request::new(body);
     *outgoing.method_mut() = request.method;
     *outgoing.uri_mut() = request_target;
@@ -962,10 +1297,21 @@ fn outgoing_request(
 struct OutgoingBody {
     source: BodySource,
     progress: Option<Arc<BodyProgress>>,
+    upload_entered: OriginUploadActionEntered,
+    upload_counts: UploadQueuedExecutedReplyCounts,
+    session_runtime: Option<SessionRuntimeHarness>,
+    session_identity: Option<SessionExchangeIdentity>,
+    upload_wait: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
+    upload_wait_complete: bool,
 }
 
 impl OutgoingBody {
-    fn new(source: BodySource, track_completion: bool) -> (Self, Option<BodyCompletion>) {
+    fn new(
+        source: BodySource,
+        track_completion: bool,
+        session_runtime: Option<SessionRuntimeHarness>,
+        session_identity: Option<SessionExchangeIdentity>,
+    ) -> (Self, Option<BodyCompletion>) {
         let initially_complete = match &source {
             BodySource::Empty => true,
             BodySource::Bytes(bytes) => bytes.is_empty(),
@@ -975,7 +1321,31 @@ impl OutgoingBody {
         let completion = progress.as_ref().map(|progress| BodyCompletion {
             progress: Arc::clone(progress),
         });
-        (Self { source, progress }, completion)
+        let upload_counts = UploadQueuedExecutedReplyCounts::default();
+        if matches!(&source, BodySource::Stream(_))
+            && let (Some(harness), Some(identity)) = (&session_runtime, session_identity)
+        {
+            let checkpoint = harness.checkpoint(
+                SessionPhase::OriginUploadQueued,
+                Some(identity.connection),
+                Some(identity.lease),
+                identity.correlation,
+            );
+            harness.observe(checkpoint);
+        }
+        (
+            Self {
+                source,
+                progress,
+                upload_entered: OriginUploadActionEntered::default(),
+                upload_counts,
+                session_runtime,
+                session_identity,
+                upload_wait: None,
+                upload_wait_complete: false,
+            },
+            completion,
+        )
     }
 
     fn mark_complete(&self) {
@@ -1083,7 +1453,34 @@ impl Body for OutgoingBody {
                 body.mark_complete();
                 Poll::Ready(Some(Ok(Frame::data(bytes))))
             }
-            BodySource::Stream(mut stream) => match stream.as_mut().poll_next(context) {
+            BodySource::Stream(mut stream) => {
+                if !body.upload_wait_complete && body.upload_wait.is_none() {
+                    body.upload_counts.queued();
+                    body.upload_entered.enter();
+                    body.upload_counts.executed();
+                }
+                if !body.upload_wait_complete
+                    && let (Some(harness), Some(identity)) =
+                        (&body.session_runtime, body.session_identity)
+                {
+                    let wait = body.upload_wait.get_or_insert_with(|| {
+                        let checkpoint = harness.checkpoint(
+                            SessionPhase::OriginUploadExecuted,
+                            Some(identity.connection),
+                            Some(identity.lease),
+                            identity.correlation,
+                        );
+                        harness.wait_future(checkpoint)
+                    });
+                    if wait.as_mut().poll(context).is_pending() {
+                        body.source = BodySource::Stream(stream);
+                        return Poll::Pending;
+                    }
+                    body.upload_wait_complete = true;
+                    body.upload_wait.take();
+                }
+                debug_assert!(body.upload_entered.is_entered());
+                let result = match stream.as_mut().poll_next(context) {
                 Poll::Pending => {
                     body.source = BodySource::Stream(stream);
                     Poll::Pending
@@ -1096,7 +1493,24 @@ impl Body for OutgoingBody {
                     body.mark_complete();
                     Poll::Ready(None)
                 }
-            },
+                };
+                if result.is_ready() {
+                    body.upload_counts.reply_observed();
+                    if let (Some(harness), Some(identity)) =
+                        (&body.session_runtime, body.session_identity)
+                    {
+                        let checkpoint = harness.checkpoint(
+                            SessionPhase::OriginUploadReply,
+                            Some(identity.connection),
+                            Some(identity.lease),
+                            identity.correlation,
+                        );
+                        harness.observe(checkpoint);
+                    }
+                }
+                debug_assert!(body.upload_counts.is_consistent());
+                result
+            }
         }
     }
 
