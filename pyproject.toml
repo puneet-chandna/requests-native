@@ -6,7 +6,8 @@ build-backend = "maturin"
 name = "requests"
 description = "Python HTTP for Humans."
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [
     { name = "Kenneth Reitz", email = "me@kennethreitz.org" },
 ]
@@ -81,6 +82,14 @@ manifest-path = "crates/requests-python/Cargo.toml"
 python-source = "src"
 module-name = "requests._requests_rust"
 bindings = "pyo3"
+include = [
+    { path = "HISTORY.md", format = "sdist" },
+    { path = "MANIFEST.in", format = "sdist" },
+    { path = "requirements-dev.txt", format = "sdist" },
+    { path = "setup.py", format = "sdist" },
+    { path = "tests/**/*.py", format = "sdist" },
+    { path = "tests/certs/**/*", format = "sdist" },
+]
 
 [tool.ruff]
 target-version = "py310"

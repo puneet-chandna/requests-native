@@ -22,3 +22,7 @@ jobs:
       run: |
         python -m pip install pre-commit==4.6.0
         pre-commit run --show-diff-on-failure --color=always --all-files
+    - name: Check Rust formatting
+      run: cargo fmt --all -- --check
+    - name: Lint the Python-independent Rust core
+      run: cargo clippy -p requests --all-targets -- -D warnings

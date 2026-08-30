@@ -34,13 +34,19 @@ jobs:
         PYO3_USE_ABI3_FORWARD_COMPATIBILITY: ${{ matrix.python-version == '3.15-dev' && '1' || '' }}
       run: |
         make
-    - name: Run tests
+    - name: Run default Python backend tests
       run: |
+        echo "Default Python backend"
         make ci
+    - name: Run explicit Rust trial backend tests
+      run: |
+        echo "Explicit Rust trial backend"
+        python -m pytest -q tests_rust/test_backend_boundary.py tests_differential/test_property_boundaries.py
 
   no_chardet:
     name: "No Character Detection"
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: true
 
@@ -56,13 +62,21 @@ jobs:
         run: |
           make
           python -m pip uninstall -y "charset_normalizer" "chardet"
-      - name: Run tests
+      - name: Run default Python backend tests
         run: |
+          echo "Default Python backend"
+          python tests_rust/test_distribution.py --compatibility-smoke no-detector --backend default
           make ci
+      - name: Run explicit Rust trial backend tests
+        run: |
+          echo "Explicit Rust trial backend"
+          python tests_rust/test_distribution.py --compatibility-smoke no-detector --backend trial
+          python -m pytest -q tests_rust/test_backend_boundary.py tests_differential/test_property_boundaries.py
 
   urllib3:
     name: 'urllib3 1.x'
     runs-on: 'ubuntu-latest'
+    timeout-minutes: 15
     strategy:
       fail-fast: true
 
@@ -78,6 +92,13 @@ jobs:
         run: |
           make
           python  -m pip install "urllib3<2"
-      - name: Run tests
+      - name: Run default Python backend tests
         run: |
+          echo "Default Python backend"
+          python tests_rust/test_distribution.py --compatibility-smoke urllib3-1 --backend default
           make ci
+      - name: Run explicit Rust trial backend tests
+        run: |
+          echo "Explicit Rust trial backend"
+          python tests_rust/test_distribution.py --compatibility-smoke urllib3-1 --backend trial
+          python -m pytest -q tests_rust/test_backend_boundary.py tests_differential/test_property_boundaries.py
