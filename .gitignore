@@ -18,6 +18,7 @@ env/
 .worktrees/
 /target/
 src/requests/_requests_rust.*
+!src/requests/_requests_rust.pyi
 .eggs/
 .tox/
 .pytest_cache/

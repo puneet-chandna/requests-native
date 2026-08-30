@@ -68,6 +68,7 @@ struct FunctionGlobalOwner {
     builtins: Py<PyDict>,
 }
 
+#[cfg(not(PyPy))]
 #[allow(unsafe_code)]
 fn exact_function_global_owner(
     py: Python<'_>,
@@ -77,13 +78,32 @@ fn exact_function_global_owner(
         return Ok(None);
     }
     let function = callable.cast::<PyFunction>()?;
-    // SAFETY: PyFunction_GetGlobals returns a borrowed reference owned by the
-    // exact PyFunction while both the function and returned Bound stay under
-    // the attached interpreter token.
+    // SAFETY: CPython returns a borrowed reference owned by this exact
+    // PyFunction while both values remain attached to `py`.
     let globals = unsafe {
         Bound::from_borrowed_ptr(py, pyo3::ffi::PyFunction_GetGlobals(function.as_ptr()))
             .cast_into::<PyDict>()?
     };
+    let builtins = function.getattr("__builtins__")?;
+    if !builtins.is_exact_instance_of::<PyDict>() {
+        return Ok(None);
+    }
+    Ok(Some(FunctionGlobalOwner {
+        globals: globals.unbind(),
+        builtins: builtins.cast_into::<PyDict>()?.unbind(),
+    }))
+}
+
+#[cfg(PyPy)]
+fn exact_function_global_owner(
+    _py: Python<'_>,
+    callable: &Bound<'_, PyAny>,
+) -> PyResult<Option<FunctionGlobalOwner>> {
+    if !callable.is_exact_instance_of::<PyFunction>() {
+        return Ok(None);
+    }
+    let function = callable.cast::<PyFunction>()?;
+    let globals = function.getattr("__globals__")?.cast_into::<PyDict>()?;
     let builtins = function.getattr("__builtins__")?;
     if !builtins.is_exact_instance_of::<PyDict>() {
         return Ok(None);

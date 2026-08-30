@@ -1,3 +1,4 @@
+# pyright: reportConstantRedefinition=false
 """Private Task 17 public-facade admission and dispatch support."""
 
 from __future__ import annotations
@@ -229,15 +230,17 @@ def close_reference(key: int, reference: weakref.ReferenceType[Any]) -> None:
             del _REGISTRY[key]
 
 
-def _new_reference(owner: Any, key: int, generation: int):
+def _new_reference(
+    owner: Any, key: int, generation: int
+) -> weakref.ReferenceType[Any] | None:
     from .adapters import _HTTP_ADAPTER_FACADE_TYPE
 
     if type(owner) is not _HTTP_ADAPTER_FACADE_TYPE:
 
-        def callback(_reference: Any) -> None:
+        def owner_callback(_reference: Any) -> None:
             _drop_generation(key, generation)
 
-        return weakref.ref(owner, callback)
+        return weakref.ref(owner, owner_callback)
 
     def callback(reference: weakref.ReferenceType[Any]) -> None:
         close_reference(key, reference)

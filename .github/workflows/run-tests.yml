@@ -38,7 +38,16 @@ jobs:
       run: |
         echo "Default Python backend"
         make ci
+    - name: Check out frozen Python oracle
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        repository: psf/requests
+        ref: 69f84847045bef7a849cc994a26fe7ba8a169e95
+        path: frozen-oracle
+        persist-credentials: false
     - name: Run explicit Rust trial backend tests
+      env:
+        REQUESTS_ORACLE_ROOT: ${{ github.workspace }}/frozen-oracle
       run: |
         echo "Explicit Rust trial backend"
         python -m pytest -q tests_rust/test_backend_boundary.py tests_differential/test_property_boundaries.py
@@ -67,7 +76,16 @@ jobs:
           echo "Default Python backend"
           python tests_rust/test_distribution.py --compatibility-smoke no-detector --backend default
           make ci
+      - name: Check out frozen Python oracle
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: psf/requests
+          ref: 69f84847045bef7a849cc994a26fe7ba8a169e95
+          path: frozen-oracle
+          persist-credentials: false
       - name: Run explicit Rust trial backend tests
+        env:
+          REQUESTS_ORACLE_ROOT: ${{ github.workspace }}/frozen-oracle
         run: |
           echo "Explicit Rust trial backend"
           python tests_rust/test_distribution.py --compatibility-smoke no-detector --backend trial
@@ -97,7 +115,16 @@ jobs:
           echo "Default Python backend"
           python tests_rust/test_distribution.py --compatibility-smoke urllib3-1 --backend default
           make ci
+      - name: Check out frozen Python oracle
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: psf/requests
+          ref: 69f84847045bef7a849cc994a26fe7ba8a169e95
+          path: frozen-oracle
+          persist-credentials: false
       - name: Run explicit Rust trial backend tests
+        env:
+          REQUESTS_ORACLE_ROOT: ${{ github.workspace }}/frozen-oracle
         run: |
           echo "Explicit Rust trial backend"
           python tests_rust/test_distribution.py --compatibility-smoke urllib3-1 --backend trial

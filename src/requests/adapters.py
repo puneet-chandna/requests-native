@@ -840,7 +840,7 @@ def _trial_http_adapter_setstate(self: HTTPAdapter, state: dict[str, Any]) -> No
 
 
 @contextmanager
-def _rust_adapter_trial():
+def _rust_adapter_trial():  # pyright: ignore[reportUnusedFunction]
     """Privately opt built-in adapters into the native Task 13 trial."""
 
     previous = getattr(_ADAPTER_TRIAL_STATE, "enabled", False)
@@ -853,7 +853,7 @@ def _rust_adapter_trial():
 
 @wraps(_HTTP_ADAPTER_COMPAT_SEND)
 def _trial_http_adapter_send(
-    self,
+    self: HTTPAdapter,
     request: PreparedRequest,
     stream: bool = False,
     timeout: _t.TimeoutType = None,
@@ -908,7 +908,7 @@ def _trial_http_adapter_send(
 
 
 @wraps(_HTTP_ADAPTER_COMPAT_CLOSE)
-def _trial_http_adapter_close(self) -> None:
+def _trial_http_adapter_close(self: HTTPAdapter) -> None:
     with _public_facade_owner_access(self) as allowed:
         try:
             result = (

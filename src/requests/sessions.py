@@ -1051,7 +1051,7 @@ Session.request = _session_facade_request
 
 
 @contextmanager
-def _rust_public_trial():
+def _rust_public_trial():  # pyright: ignore[reportUnusedFunction]
     with _rust_public_trial_context():
         yield
 

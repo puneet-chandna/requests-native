@@ -21028,12 +21028,29 @@ result = case_result("T05", v6_subject, {operation}, v6_controls, v6_observer)
 
 def _v6_t06_source(token: str, operation: str) -> str:
     modes = (
-        "success", "explicit-defaults", "proxy-before-guard",
-        "default-error", "proxy-error", "guard-error", "adapter-error",
-        "clock-1-error", "send-error", "clock-2-error", "subtract-error",
-        "timedelta-error", "elapsed-error", "hook-error", "history-error",
-        "helper-error", "redirect-error", "stream-error", "content-error",
-        "stop-matching", "stop-nonmatching", "stop-deleted", "stop-invalid",
+        "success",
+        "explicit-defaults",
+        "proxy-before-guard",
+        "default-error",
+        "proxy-error",
+        "guard-error",
+        "adapter-error",
+        "clock-1-error",
+        "send-error",
+        "clock-2-error",
+        "subtract-error",
+        "timedelta-error",
+        "elapsed-error",
+        "hook-error",
+        "history-error",
+        "helper-error",
+        "redirect-error",
+        "stream-error",
+        "content-error",
+        "stop-matching",
+        "stop-nonmatching",
+        "stop-deleted",
+        "stop-invalid",
     )
     outcomes = tuple("outcome-" + secrets.token_hex(8) for _ in modes)
     return f"""
@@ -21766,12 +21783,31 @@ result = case_result("T06", v6_subject, {operation}, v6_controls, v6_observer)
 
 def _v6_t07_source(token: str, operation: str) -> str:
     modes = (
-        "success", "select", "clock-1", "adapter", "clock-2", "subtract",
-        "timedelta", "conversion", "elapsed", "hook", "history-truth",
-        "history-get-1", "history-get-2", "history-iteration",
-        "jar-get-1", "jar-get-2", "request-get", "raw-get",
-        "cookie-1", "cookie-2", "redirect-create",
-        "redirect-iteration-1", "redirect-iteration-2", "stream", "content",
+        "success",
+        "select",
+        "clock-1",
+        "adapter",
+        "clock-2",
+        "subtract",
+        "timedelta",
+        "conversion",
+        "elapsed",
+        "hook",
+        "history-truth",
+        "history-get-1",
+        "history-get-2",
+        "history-iteration",
+        "jar-get-1",
+        "jar-get-2",
+        "request-get",
+        "raw-get",
+        "cookie-1",
+        "cookie-2",
+        "redirect-create",
+        "redirect-iteration-1",
+        "redirect-iteration-2",
+        "stream",
+        "content",
     )
     outcomes = tuple("outcome-" + secrets.token_hex(8) for _ in modes)
     return f"""
@@ -22224,12 +22260,27 @@ result = case_result("T07", v6_subject, {operation}, v6_controls, v6_observer)
 
 def _v6_t08_source(token: str, operation: str) -> str:
     modes = (
-        "success", "stop-first-send", "stop-first-hook", "stop-extract-1",
-        "stop-copy", "stop-extract-2", "stop-merge", "stop-proxy",
-        "stop-auth", "stop-second-send", "stop-later-hook",
-        "stop-extract-3", "stop-extract-4", "stale-hooks", "stale-mount",
-        "stale-jar", "stale-auth", "stale-proxies", "stale-extract",
-        "stale-merge", "stale-resolve-proxies",
+        "success",
+        "stop-first-send",
+        "stop-first-hook",
+        "stop-extract-1",
+        "stop-copy",
+        "stop-extract-2",
+        "stop-merge",
+        "stop-proxy",
+        "stop-auth",
+        "stop-second-send",
+        "stop-later-hook",
+        "stop-extract-3",
+        "stop-extract-4",
+        "stale-hooks",
+        "stale-mount",
+        "stale-jar",
+        "stale-auth",
+        "stale-proxies",
+        "stale-extract",
+        "stale-merge",
+        "stale-resolve-proxies",
     )
     outcomes = tuple("outcome-" + secrets.token_hex(8) for _ in modes)
     return f"""
@@ -26626,7 +26677,10 @@ def _redirect_observed_outcome_transform(
         + f"        v6_redirect_mutant_outcome = {outcome!r} if mode == {mode!r} else None\n",
         1,
     )
-    for outcome_name, indentation in (("outcome_key", "        "), ("outcome_name", "            ")):
+    for outcome_name, indentation in (
+        ("outcome_key", "        "),
+        ("outcome_name", "            "),
+    ):
         needle = (
             f"{indentation}outcome = _ordered.__getitem__(holders, {outcome_name})\n"
         )
@@ -27086,7 +27140,7 @@ def _redirect_fixed_alternatives() -> tuple[RedirectAlternativeSpec, ...]:
             "reordered",
             '        self.state.events.append("method-get")\n',
             '        if self.state.mode == "see-other":\n'
-            '            self.state.response.status_code\n'
+            "            self.state.response.status_code\n"
             '        self.state.events.append("method-get")\n',
         ),
         RedirectAlternativeSpec(
@@ -27533,8 +27587,7 @@ def _assert_v6_t_semantic_action_graph(
     ]
     assert action_calls
     assert any(
-        isinstance(call.args[0], ast.Constant)
-        and call.args[0].value == "semantic-call"
+        isinstance(call.args[0], ast.Constant) and call.args[0].value == "semantic-call"
         for call in action_calls
     )
     native_roots = [
@@ -27548,8 +27601,7 @@ def _assert_v6_t_semantic_action_graph(
     ]
     assert any(node.args[1].value == root_attribute for node in native_roots)
     assert any(
-        isinstance(call.args[0], ast.Constant)
-        and call.args[0].value == "native-call"
+        isinstance(call.args[0], ast.Constant) and call.args[0].value == "native-call"
         for call in action_calls
     )
     assert any(
@@ -27605,7 +27657,7 @@ def test_v6_t01_outcome_inventory_is_exact() -> None:
 def test_v6_t01_action_specific_mutations_are_detected(spec: T01MutationSpec) -> None:
     source = _CASES["T01"]
     if spec.kind == "positive":
-        old = '        v6_transition_mutation_anchor = mode\n'
+        old = "        v6_transition_mutation_anchor = mode\n"
         mutated = source.replace(
             old,
             old + "        _object.__setattr__(state, 'unobserved', 'positive')\n",
@@ -27805,7 +27857,7 @@ _V6_T03_ALTERNATIVES = (
         '        request.headers["X-Proxy"] = "set"\n'
         '        if self.state.mode == "proxy-error":',
         '        if self.state.mode == "content-length":\n'
-        '            self.state.initial_auth(request, self.state.response)\n'
+        "            self.state.initial_auth(request, self.state.response)\n"
         '        self.state.events.append("proxy")\n'
         '        request.headers["X-Proxy"] = "set"\n'
         '        if self.state.mode == "proxy-error":',
@@ -27999,9 +28051,7 @@ class T04OutcomeVariant:
     field: str
 
     def transform(self, source: str) -> str:
-        mutation = (
-            f"    varied = _ordered.__getitem__(holders, {self.outcome!r})\n"
-        )
+        mutation = f"    varied = _ordered.__getitem__(holders, {self.outcome!r})\n"
         if self.field == "tag":
             mutation += (
                 f"    _ordered.__setitem__(holders, {self.outcome!r}, "
@@ -28084,9 +28134,9 @@ _V6_T04_ALTERNATIVES = (
     ),
     T04AlternativeSpec(
         "t04-skip-merge-callback",
-        '        self.state.events.append(\n'
+        "        self.state.events.append(\n"
         '            ("merge", authoritative.get("phase"), jar is self.state.q1._cookies,\n'
-        '             jar is self.state.q2._cookies)\n'
+        "             jar is self.state.q2._cookies)\n"
         "        )",
         "        pass",
     ),
@@ -28377,9 +28427,9 @@ _V6_T05_ALTERNATIVES = (
     ),
     T05AlternativeSpec(
         "t05-duplicate-hook",
-        '        self.state.events.append((self.role, response.name))',
-        '        self.state.events.append((self.role, response.name))\n'
-        '        self.state.events.append((self.role, response.name))',
+        "        self.state.events.append((self.role, response.name))",
+        "        self.state.events.append((self.role, response.name))\n"
+        "        self.state.events.append((self.role, response.name))",
     ),
     T05AlternativeSpec(
         "t05-omit-digest-response-request-assignment",
@@ -28504,12 +28554,29 @@ def test_v6_t06_oracle_and_candidate_match() -> None:
 
 
 _V6_T06_MODES = (
-    "success", "explicit-defaults", "proxy-before-guard",
-    "default-error", "proxy-error", "guard-error", "adapter-error",
-    "clock-1-error", "send-error", "clock-2-error", "subtract-error",
-    "timedelta-error", "elapsed-error", "hook-error", "history-error",
-    "helper-error", "redirect-error", "stream-error", "content-error",
-    "stop-matching", "stop-nonmatching", "stop-deleted", "stop-invalid",
+    "success",
+    "explicit-defaults",
+    "proxy-before-guard",
+    "default-error",
+    "proxy-error",
+    "guard-error",
+    "adapter-error",
+    "clock-1-error",
+    "send-error",
+    "clock-2-error",
+    "subtract-error",
+    "timedelta-error",
+    "elapsed-error",
+    "hook-error",
+    "history-error",
+    "helper-error",
+    "redirect-error",
+    "stream-error",
+    "content-error",
+    "stop-matching",
+    "stop-nonmatching",
+    "stop-deleted",
+    "stop-invalid",
 )
 _V6_T06_OUTCOME_COUNT = len(_V6_T06_MODES)
 _V6_T06_MUTATION_ANCHOR = "        v6_transition_mutation_anchor = mode\n"
@@ -28602,27 +28669,27 @@ _V6_T06_ALTERNATIVES = (
     T06AlternativeSpec(
         "t06-skip-eager-default",
         '        self.state.events.append(("default", "stream"))',
-        '        raise self.state.marker',
+        "        raise self.state.marker",
     ),
     T06AlternativeSpec(
         "t06-reorder-proxy-guard",
         '        self.state.events.append(("resolve-proxies", request.name))',
-        '        raise self.state.marker',
+        "        raise self.state.marker",
     ),
     T06AlternativeSpec(
         "t06-cache-clock",
-        '            sessions_module.preferred_clock = self.replacement',
-        '            sessions_module.preferred_clock = self',
+        "            sessions_module.preferred_clock = self.replacement",
+        "            sessions_module.preferred_clock = self",
     ),
     T06AlternativeSpec(
         "t06-cache-timedelta",
-        '        return self.state.delta\n\n\nclass V6T06Truth:',
-        '        return object()\n\n\nclass V6T06Truth:',
+        "        return self.state.delta\n\n\nclass V6T06Truth:",
+        "        return object()\n\n\nclass V6T06Truth:",
     ),
     T06AlternativeSpec(
         "t06-cache-hook",
-        '        return self.state.replacement\n\n\nclass V6T06Cookie:',
-        '        return response\n\n\nclass V6T06Cookie:',
+        "        return self.state.replacement\n\n\nclass V6T06Cookie:",
+        "        return response\n\n\nclass V6T06Cookie:",
     ),
     T06AlternativeSpec(
         "t06-retain-old-through-cookie",
@@ -28636,22 +28703,22 @@ _V6_T06_ALTERNATIVES = (
     ),
     T06AlternativeSpec(
         "t06-one-allow-truth",
-        '        return self.values[self.index - 1]',
-        '        return self.values[0]',
+        "        return self.values[self.index - 1]",
+        "        return self.values[0]",
     ),
     T06AlternativeSpec(
         "t06-cache-live-next",
-        '            sessions_module.next = state.next_authority',
-        '            sessions_module.next = state.forbidden_next',
+        "            sessions_module.next = state.next_authority",
+        "            sessions_module.next = state.forbidden_next",
     ),
     T06AlternativeSpec(
         "t06-broad-stop-catcher",
         '            elif state.mode == "stop-matching":\n'
-        '                sessions_module.StopIteration = V6T06MarkerStop',
+        "                sessions_module.StopIteration = V6T06MarkerStop",
         '            elif state.mode == "stop-matching":\n'
-        '                sessions_module.StopIteration = V6T06MarkerStop\n'
+        "                sessions_module.StopIteration = V6T06MarkerStop\n"
         '            elif state.mode == "stop-nonmatching":\n'
-        '                sessions_module.StopIteration = BaseException',
+        "                sessions_module.StopIteration = BaseException",
     ),
     T06AlternativeSpec(
         "t06-history-shuffle",
@@ -28660,8 +28727,8 @@ _V6_T06_ALTERNATIVES = (
     ),
     T06AlternativeSpec(
         "t06-skip-stream-content",
-        '        return False\n\n\nclass V6T06Request',
-        '        return True\n\n\nclass V6T06Request',
+        "        return False\n\n\nclass V6T06Request",
+        "        return True\n\n\nclass V6T06Request",
     ),
     T06AlternativeSpec(
         "t06-callback-replay",
@@ -28748,13 +28815,19 @@ def test_v6_t06_observer_is_closed_and_inspection_only() -> None:
         if symbol.is_global() and symbol.is_referenced()
     ] == []
     observer = next(
-        node for node in ast.parse(source).body
+        node
+        for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef) and node.name == "v6_observer"
     )
     observer_source = ast.unparse(observer)
     for forbidden in (
-        "Session", "SessionRedirectMixin", "Driver", "Invocation",
-        "case_result", "oracle_call", "_session_pipeline_trial",
+        "Session",
+        "SessionRedirectMixin",
+        "Driver",
+        "Invocation",
+        "case_result",
+        "oracle_call",
+        "_session_pipeline_trial",
     ):
         assert forbidden not in observer_source
     assert not any(
@@ -28777,12 +28850,31 @@ def test_v6_t07_oracle_and_candidate_match() -> None:
 
 
 _V6_T07_MODES = (
-    "success", "select", "clock-1", "adapter", "clock-2", "subtract",
-    "timedelta", "conversion", "elapsed", "hook", "history-truth",
-    "history-get-1", "history-get-2", "history-iteration",
-    "jar-get-1", "jar-get-2", "request-get", "raw-get",
-    "cookie-1", "cookie-2", "redirect-create",
-    "redirect-iteration-1", "redirect-iteration-2", "stream", "content",
+    "success",
+    "select",
+    "clock-1",
+    "adapter",
+    "clock-2",
+    "subtract",
+    "timedelta",
+    "conversion",
+    "elapsed",
+    "hook",
+    "history-truth",
+    "history-get-1",
+    "history-get-2",
+    "history-iteration",
+    "jar-get-1",
+    "jar-get-2",
+    "request-get",
+    "raw-get",
+    "cookie-1",
+    "cookie-2",
+    "redirect-create",
+    "redirect-iteration-1",
+    "redirect-iteration-2",
+    "stream",
+    "content",
 )
 _V6_T07_OUTCOME_COUNT = len(_V6_T07_MODES)
 _V6_T07_MUTATION_ANCHOR = "        v6_transition_mutation_anchor = mode\n"
@@ -28924,7 +29016,7 @@ _V6_T07_ALTERNATIVES = (
     ),
     T07AlternativeSpec(
         "t07-cloned-exception",
-        '            raise self.state.marker\n        return self.state.adapter',
+        "            raise self.state.marker\n        return self.state.adapter",
         '            raise BaseException("t07-select")\n        return self.state.adapter',
     ),
     T07AlternativeSpec(
@@ -28932,14 +29024,14 @@ _V6_T07_ALTERNATIVES = (
         '        if self.state.mode == "redirect-create":\n            raise self.state.marker',
         '        if self.state.mode == "redirect-create":\n'
         '            self.state.events.append("redirect-iteration-1")\n'
-        '            raise self.state.marker',
+        "            raise self.state.marker",
     ),
     T07AlternativeSpec(
         "t07-run-content-after-stream-stop",
         '        if self.state.mode == "stream":\n            raise self.state.marker',
         '        if self.state.mode == "stream":\n'
         '            self.state.events.append("content")\n'
-        '            raise self.state.marker',
+        "            raise self.state.marker",
     ),
 )
 
@@ -29020,13 +29112,19 @@ def test_v6_t07_observer_is_closed_and_inspection_only() -> None:
         if symbol.is_global() and symbol.is_referenced()
     ] == []
     observer = next(
-        node for node in ast.parse(source).body
+        node
+        for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef) and node.name == "v6_observer"
     )
     observer_source = ast.unparse(observer)
     for forbidden in (
-        "Session", "SessionRedirectMixin", "Driver", "Invocation",
-        "case_result", "oracle_call", "_session_pipeline_trial",
+        "Session",
+        "SessionRedirectMixin",
+        "Driver",
+        "Invocation",
+        "case_result",
+        "oracle_call",
+        "_session_pipeline_trial",
     ):
         assert forbidden not in observer_source
     assert not any(
@@ -29049,12 +29147,27 @@ def test_v6_t08_oracle_and_candidate_match() -> None:
 
 
 _V6_T08_MODES = (
-    "success", "stop-first-send", "stop-first-hook", "stop-extract-1",
-    "stop-copy", "stop-extract-2", "stop-merge", "stop-proxy",
-    "stop-auth", "stop-second-send", "stop-later-hook",
-    "stop-extract-3", "stop-extract-4", "stale-hooks", "stale-mount",
-    "stale-jar", "stale-auth", "stale-proxies", "stale-extract",
-    "stale-merge", "stale-resolve-proxies",
+    "success",
+    "stop-first-send",
+    "stop-first-hook",
+    "stop-extract-1",
+    "stop-copy",
+    "stop-extract-2",
+    "stop-merge",
+    "stop-proxy",
+    "stop-auth",
+    "stop-second-send",
+    "stop-later-hook",
+    "stop-extract-3",
+    "stop-extract-4",
+    "stale-hooks",
+    "stale-mount",
+    "stale-jar",
+    "stale-auth",
+    "stale-proxies",
+    "stale-extract",
+    "stale-merge",
+    "stale-resolve-proxies",
 )
 _V6_T08_OUTCOME_COUNT = len(_V6_T08_MODES)
 _V6_T08_MUTATION_ANCHOR = "        v6_transition_mutation_anchor = mode\n"
@@ -29144,18 +29257,66 @@ class T08AlternativeSpec:
 
 
 _V6_T08_ALTERNATIVES = (
-    T08AlternativeSpec("t08-cache-hooks", "        copied.hooks = self.hooks", "        copied.hooks = self.state.first_hooks"),
-    T08AlternativeSpec("t08-cache-mount", "        return self.mounted_adapter", "        return self.state.first_adapter"),
-    T08AlternativeSpec("t08-cache-jar", "        return self._cookies", "        return self.state.seed_jar"),
-    T08AlternativeSpec("t08-cache-auth", "        state.session.rebuild_auth = state.live_auth_authority", "        state.session.rebuild_auth = state.stale_auth_authority"),
-    T08AlternativeSpec("t08-cache-session-proxies", "        state.session.proxies = state.live_session_proxies", "        state.session.proxies = state.seed_session_proxies"),
-    T08AlternativeSpec("t08-cache-extract", "        sessions_module.extract_cookies_to_jar = state.live_extract", "        sessions_module.extract_cookies_to_jar = state.stale_extract"),
-    T08AlternativeSpec("t08-cache-merge", "        sessions_module.merge_cookies = state.live_merge", "        sessions_module.merge_cookies = state.stale_merge"),
-    T08AlternativeSpec("t08-cache-resolve-proxies", "        sessions_module.resolve_proxies = state.live_proxy", "        sessions_module.resolve_proxies = state.stale_proxy"),
-    T08AlternativeSpec("t08-replay-first-hook", '        state.events.append(("first-hook", response.name))', '        state.events.append(("first-hook", response.name))\n        state.events.append(("first-hook", response.name))'),
-    T08AlternativeSpec("t08-replay-second-send", '        self.state.events.append((self.role + "-send", request.name))', '        self.state.events.append((self.role + "-send", request.name))\n        self.state.events.append((self.role + "-send", request.name))'),
-    T08AlternativeSpec("t08-wrong-history", "            state.returned = returned\n            return returned", "            returned.history = []\n            state.returned = returned\n            return returned"),
-    T08AlternativeSpec("t08-skip-live-auth", '        self.state.events.append((\n            "live-auth" if self.live else "stale-auth",', '        self.state.events.append((\n            "auth-skipped" if self.live else "stale-auth",'),
+    T08AlternativeSpec(
+        "t08-cache-hooks",
+        "        copied.hooks = self.hooks",
+        "        copied.hooks = self.state.first_hooks",
+    ),
+    T08AlternativeSpec(
+        "t08-cache-mount",
+        "        return self.mounted_adapter",
+        "        return self.state.first_adapter",
+    ),
+    T08AlternativeSpec(
+        "t08-cache-jar",
+        "        return self._cookies",
+        "        return self.state.seed_jar",
+    ),
+    T08AlternativeSpec(
+        "t08-cache-auth",
+        "        state.session.rebuild_auth = state.live_auth_authority",
+        "        state.session.rebuild_auth = state.stale_auth_authority",
+    ),
+    T08AlternativeSpec(
+        "t08-cache-session-proxies",
+        "        state.session.proxies = state.live_session_proxies",
+        "        state.session.proxies = state.seed_session_proxies",
+    ),
+    T08AlternativeSpec(
+        "t08-cache-extract",
+        "        sessions_module.extract_cookies_to_jar = state.live_extract",
+        "        sessions_module.extract_cookies_to_jar = state.stale_extract",
+    ),
+    T08AlternativeSpec(
+        "t08-cache-merge",
+        "        sessions_module.merge_cookies = state.live_merge",
+        "        sessions_module.merge_cookies = state.stale_merge",
+    ),
+    T08AlternativeSpec(
+        "t08-cache-resolve-proxies",
+        "        sessions_module.resolve_proxies = state.live_proxy",
+        "        sessions_module.resolve_proxies = state.stale_proxy",
+    ),
+    T08AlternativeSpec(
+        "t08-replay-first-hook",
+        '        state.events.append(("first-hook", response.name))',
+        '        state.events.append(("first-hook", response.name))\n        state.events.append(("first-hook", response.name))',
+    ),
+    T08AlternativeSpec(
+        "t08-replay-second-send",
+        '        self.state.events.append((self.role + "-send", request.name))',
+        '        self.state.events.append((self.role + "-send", request.name))\n        self.state.events.append((self.role + "-send", request.name))',
+    ),
+    T08AlternativeSpec(
+        "t08-wrong-history",
+        "            state.returned = returned\n            return returned",
+        "            returned.history = []\n            state.returned = returned\n            return returned",
+    ),
+    T08AlternativeSpec(
+        "t08-skip-live-auth",
+        '        self.state.events.append((\n            "live-auth" if self.live else "stale-auth",',
+        '        self.state.events.append((\n            "auth-skipped" if self.live else "stale-auth",',
+    ),
 )
 
 
@@ -29176,7 +29337,8 @@ def test_v6_t08_action_mutations_and_positive_control(spec: T08MutationSpec) -> 
     if spec.kind == "positive":
         mutated = source.replace(
             _V6_T08_MUTATION_ANCHOR,
-            _V6_T08_MUTATION_ANCHOR + "        _object.__setattr__(state, 'unobserved', 'positive')\n",
+            _V6_T08_MUTATION_ANCHOR
+            + "        _object.__setattr__(state, 'unobserved', 'positive')\n",
             1,
         )
     else:
@@ -29187,20 +29349,28 @@ def test_v6_t08_action_mutations_and_positive_control(spec: T08MutationSpec) -> 
     assert changed.stderr == reference.stderr == ""
 
 
-@pytest.mark.parametrize("variant", _V6_T08_OUTCOME_VARIANTS, ids=lambda variant: variant.name)
+@pytest.mark.parametrize(
+    "variant", _V6_T08_OUTCOME_VARIANTS, ids=lambda variant: variant.name
+)
 def test_v6_t08_tag_and_value_variants_diverge(variant: T08OutcomeVariant) -> None:
     source = _CASES["T08"]
     reference = _v6_t_clean_reference(source)
-    changed = run_oracle_case({"source": dedent(_SESSION_HELPERS + variant.transform(source))})
+    changed = run_oracle_case(
+        {"source": dedent(_SESSION_HELPERS + variant.transform(source))}
+    )
     assert changed.observations != reference.observations
     assert changed.stderr == reference.stderr == ""
 
 
-@pytest.mark.parametrize("alternative", _V6_T08_ALTERNATIVES, ids=lambda alternative: alternative.name)
+@pytest.mark.parametrize(
+    "alternative", _V6_T08_ALTERNATIVES, ids=lambda alternative: alternative.name
+)
 def test_v6_t08_semantic_alternatives_diverge(alternative: T08AlternativeSpec) -> None:
     source = _CASES["T08"]
     reference = _v6_t_clean_reference(source)
-    changed = run_oracle_case({"source": dedent(_SESSION_HELPERS + alternative.transform(source))})
+    changed = run_oracle_case(
+        {"source": dedent(_SESSION_HELPERS + alternative.transform(source))}
+    )
     assert changed.observations != reference.observations
     assert changed.stderr == reference.stderr == ""
 
@@ -29208,11 +29378,29 @@ def test_v6_t08_semantic_alternatives_diverge(alternative: T08AlternativeSpec) -
 def test_v6_t08_observer_is_closed_and_inspection_only() -> None:
     source = _CASES["T08"]
     table = symtable.symtable(source, "<t08-observer>", "exec")
-    observer_table = next(child for child in table.get_children() if child.get_name() == "v6_observer")
-    assert [symbol.get_name() for symbol in observer_table.get_symbols() if symbol.is_global() and symbol.is_referenced()] == []
-    observer = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "v6_observer")
+    observer_table = next(
+        child for child in table.get_children() if child.get_name() == "v6_observer"
+    )
+    assert [
+        symbol.get_name()
+        for symbol in observer_table.get_symbols()
+        if symbol.is_global() and symbol.is_referenced()
+    ] == []
+    observer = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "v6_observer"
+    )
     observer_source = ast.unparse(observer)
-    for forbidden in ("Session", "SessionRedirectMixin", "Driver", "Invocation", "case_result", "oracle_call", "_session_pipeline_trial"):
+    for forbidden in (
+        "Session",
+        "SessionRedirectMixin",
+        "Driver",
+        "Invocation",
+        "case_result",
+        "oracle_call",
+        "_session_pipeline_trial",
+    ):
         assert forbidden not in observer_source
 
 
@@ -30005,9 +30193,7 @@ def test_v6_redirect_observers_retain_every_runtime_global(case_id: str) -> None
     ] == []
 
 
-def test_v6_redirect_generator_handles_are_preconstructed_anchored_and_exact() -> (
-    None
-):
+def test_v6_redirect_generator_handles_are_preconstructed_anchored_and_exact() -> None:
     installer_methods = [
         call.args[2].value
         for case_id in ("T01", "T02", "T03", "T04", "R03", "R04", "R05", "R06", "R07")
@@ -30038,7 +30224,7 @@ def test_v6_redirect_generator_handles_are_preconstructed_anchored_and_exact() -
         source = _CASES[case_id]
         assert 'v6_state.handle = GeneratorHandle(object(), "r0' in source
         assert "v6_state.handle," in source
-        assert 'is handle' in source
+        assert "is handle" in source
         assert '"registered") is False' in source
 
     probe = run_oracle_case(
@@ -30151,7 +30337,11 @@ result = (
 
 
 def test_native_traceback_attacher_preserves_identity_and_chaining() -> None:
-    probe = run_oracle_case({"source": dedent(_SESSION_HELPERS + r"""
+    probe = run_oracle_case(
+        {
+            "source": dedent(
+                _SESSION_HELPERS
+                + r"""
 cause = ValueError("cause")
 context = LookupError("context")
 error = BaseException("native")
@@ -30166,7 +30356,10 @@ result = (
     attached.__context__ is context,
     attached.__suppress_context__ is True,
 )
-""")})
+"""
+            )
+        }
+    )
     assert probe.observations["exception"] is None
     assert probe.observations["result"]["repr"] == "(True, True, True, True, True)"
     assert probe.stderr == ""
@@ -30177,7 +30370,11 @@ result = (
     ("sessions_module", "sessions_module.Session", "sessions_module.Session.send"),
 )
 def test_native_operation_rejects_raw_capability_escape(escaped: str) -> None:
-    probe = run_oracle_case({"source": dedent(_SESSION_HELPERS + f"""
+    probe = run_oracle_case(
+        {
+            "source": dedent(
+                _SESSION_HELPERS
+                + f"""
 operation = native_operation(
     sessions_module.Session, "send", "invalid-native-capability"
 )
@@ -30201,7 +30398,10 @@ except ScenarioSchemaError:
     result = True
 else:
     result = False
-""")})
+"""
+            )
+        }
+    )
     assert probe.observations["exception"] is None
     assert probe.observations["result"]["repr"] == "True"
 
@@ -30218,7 +30418,11 @@ else:
     ),
 )
 def test_native_operation_rejects_forged_opaque_declarations(forgery: str) -> None:
-    probe = run_oracle_case({"source": dedent(_SESSION_HELPERS + f"""
+    probe = run_oracle_case(
+        {
+            "source": dedent(
+                _SESSION_HELPERS
+                + f"""
 operation = native_operation(
     sessions_module.Session, "send", "forged-native-operation"
 )
@@ -30243,7 +30447,10 @@ except ScenarioSchemaError:
     result = True
 else:
     result = False
-""")})
+"""
+            )
+        }
+    )
     assert probe.observations["exception"] is None
     assert probe.observations["result"]["repr"] == "True"
 
@@ -30302,7 +30509,14 @@ result = case_result(
 
 def test_v6_rt_native_root_action_inventory_is_exact() -> None:
     for case_id in _V6_REDIRECT_FAMILY_IDS + (
-        "T01", "T02", "T03", "T04", "T05", "T06", "T07", "T08",
+        "T01",
+        "T02",
+        "T03",
+        "T04",
+        "T05",
+        "T06",
+        "T07",
+        "T08",
     ):
         tree = ast.parse(_CASES[case_id])
         native_roots = [
@@ -30356,7 +30570,9 @@ def _replacement_root_case_source(case_id: str) -> str:
         method = "rebuild_method"
         operation = "redirect-method"
         bound_body = "self.context.events.append('bound'); request.method = 'BOUND'"
-        instance_body = "self.context.events.append('instance'); request.method = 'INSTANCE'"
+        instance_body = (
+            "self.context.events.append('instance'); request.method = 'INSTANCE'"
+        )
         class_body = (
             "assert _type(self).__dict__['rebuild_method'] is self.expected.value; "
             "self.context.events.append('class'); request.method = 'CLASS'"
@@ -30450,7 +30666,11 @@ def test_v6_replacement_roots_remain_live_semantic_calls(case_id: str) -> None:
 
 
 def test_generator_outcome_installer_rejects_invalid_or_replayed_records() -> None:
-    probe = run_oracle_case({"source": dedent(_SESSION_HELPERS + r"""
+    probe = run_oracle_case(
+        {
+            "source": dedent(
+                _SESSION_HELPERS
+                + r"""
 def values():
     yield "value"
 
@@ -30513,14 +30733,21 @@ result = (
     missing_rejected and error_rejected and all(invalid_rejected)
     and scrubbed and replay_rejected
 )
-""")})
+"""
+            )
+        }
+    )
     assert probe.observations["exception"] is None
     assert probe.observations["result"]["repr"] == "True"
     assert probe.stderr == ""
 
 
 def test_generator_terminal_probe_propagates_nonterminal_errors_and_yields() -> None:
-    probe = run_oracle_case({"source": dedent(_SESSION_HELPERS + r"""
+    probe = run_oracle_case(
+        {
+            "source": dedent(
+                _SESSION_HELPERS
+                + r"""
 def raises(marker):
     raise marker
     yield None
@@ -30556,7 +30783,10 @@ result = (
     nonterminal_propagated and yield_rejected
     and error_sink == [] and yield_sink == []
 )
-""")})
+"""
+            )
+        }
+    )
     assert probe.observations["exception"] is None
     assert probe.observations["result"]["repr"] == "True"
     assert probe.stderr == ""
@@ -30677,9 +30907,8 @@ def test_corrected_phase_a_sources_have_one_candidate_owned_result() -> None:
             (index, node)
             for index, node in enumerate(tree.body)
             if isinstance(node, ast.Assign)
-            and [
-                target.id for target in node.targets if isinstance(target, ast.Name)
-            ] == ["result"]
+            and [target.id for target in node.targets if isinstance(target, ast.Name)]
+            == ["result"]
         ]
         assert len(result_assignments) == 1
         result_index, result_assignment = result_assignments[0]

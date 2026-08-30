@@ -43,8 +43,7 @@ class RuntimeCase:
 
 
 PHASE_B_CASES = tuple(
-    RuntimeCase(case_id, PHASE_B_SCENARIOS[case_id])
-    for case_id in PHASE_B_CASE_IDS
+    RuntimeCase(case_id, PHASE_B_SCENARIOS[case_id]) for case_id in PHASE_B_CASE_IDS
 )
 
 
@@ -1094,7 +1093,9 @@ else:
     candidate_result = run_runtime_producer(frozen_oracle)
 result = candidate_result
 """
-    return dedent(assignments + _COMMON_SOURCE + _CASE_BODIES[case.case_id] + final_call)
+    return dedent(
+        assignments + _COMMON_SOURCE + _CASE_BODIES[case.case_id] + final_call
+    )
 
 
 def is_missing_session_runtime_trial(observations: dict[str, object]) -> bool:
@@ -1116,9 +1117,10 @@ def is_missing_session_runtime_trial(observations: dict[str, object]) -> bool:
 def test_phase_b_inventory_and_candidate_owned_call_are_exact() -> None:
     assert tuple(case.case_id for case in PHASE_B_CASES) == PHASE_B_CASE_IDS
     assert tuple(PHASE_B_SCENARIOS) == PHASE_B_CASE_IDS
-    assert tuple(
-        case_id for case_ids in PHASE_B_CLUSTERS.values() for case_id in case_ids
-    ) == PHASE_B_CASE_IDS
+    assert (
+        tuple(case_id for case_ids in PHASE_B_CLUSTERS.values() for case_id in case_ids)
+        == PHASE_B_CASE_IDS
+    )
     assert len(set(PHASE_B_CASE_IDS)) == 18
     assert all(_CASE_BODIES[case_id].strip() for case_id in PHASE_B_CASE_IDS)
     for case in PHASE_B_CASES:
@@ -1133,9 +1135,9 @@ def test_phase_b_inventory_and_candidate_owned_call_are_exact() -> None:
         assert len(seam_calls) == 1
         last = tree.body[-1]
         assert isinstance(last, ast.Assign)
-        assert [target.id for target in last.targets if isinstance(target, ast.Name)] == [
-            "result"
-        ]
+        assert [
+            target.id for target in last.targets if isinstance(target, ast.Name)
+        ] == ["result"]
         candidate_assignment = next(
             node
             for node in ast.walk(tree)
@@ -1164,9 +1166,7 @@ def test_phase_b_inventory_and_candidate_owned_call_are_exact() -> None:
         assert len(poison_assignments) == 1
 
 
-@pytest.mark.parametrize(
-    "case", PHASE_B_CASES[:4], ids=lambda case: case.case_id
-)
+@pytest.mark.parametrize("case", PHASE_B_CASES[:4], ids=lambda case: case.case_id)
 def test_b01_b04_python_delegation_counterfeit_hits_active_poison(
     case: RuntimeCase,
 ) -> None:

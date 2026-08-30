@@ -329,6 +329,13 @@ Pickling omits Rust shadow state and recreates it lazily. `close()` clears both
 visible and Rust pool generations but does not make the adapter permanently
 unusable.
 
+Deferred minor-issue boundary coverage: class-dictionary admission may allow
+only a lazily materialized, empty `__annotations__` cache (or the existing
+empty `__slotnames__` cache). A non-empty cache, replacement, or any additional
+class-dictionary mutation must select the retained Python compatibility path.
+Add the explicit negative-boundary regression when this small coverage gap is
+scheduled; do not broaden native admission from this exception.
+
 The private adapter registry mutex protects only Rust-owned table state. Read
 Python attributes, mappings, weak references, descriptors, and manager proofs
 before taking that mutex. Keep destructive lifecycle epochs separate from

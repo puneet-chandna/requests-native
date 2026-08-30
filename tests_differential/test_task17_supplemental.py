@@ -54,6 +54,74 @@ result = SimpleNamespace(
     }
 
 
+def test_task17_pre_first_trial_rebound_range_forces_model_fallback() -> None:
+    source = r"""
+import builtins
+import sys
+from contextlib import nullcontext
+from types import SimpleNamespace
+import requests
+from requests.models import PreparedRequest
+
+original_range = builtins.range
+def unquote_unreserved_caller():
+    frame = sys._getframe(2)
+    while frame is not None:
+        if frame.f_code is requests.utils.unquote_unreserved.__code__:
+            return True
+        frame = frame.f_back
+    return False
+
+def counterfeit_range(*args):
+    if unquote_unreserved_caller():
+        return original_range(1, 2)
+    return original_range(*args)
+
+builtins.range = counterfeit_range
+try:
+    trial = getattr(requests, "_rust_public_trial", nullcontext)
+    prepared = PreparedRequest()
+    with trial():
+        prepared.prepare_url("http://example.test/%41%42", None)
+    result = SimpleNamespace(url=prepared.url)
+finally:
+    builtins.range = original_range
+"""
+    assert run_rewrite_case({"source": dedent(source)}) == run_oracle_case(
+        {"source": dedent(source)}
+    )
+
+
+def test_task17_cpython_model_admission_does_not_audit_function_internals() -> None:
+    source = r"""
+import sys
+from contextlib import nullcontext
+from types import SimpleNamespace
+import requests
+from requests.models import PreparedRequest
+
+events = []
+function_attributes = {"__code__", "__globals__", "__defaults__", "__kwdefaults__", "__closure__"}
+
+def audit(event, arguments):
+    if event == "object.__getattr__" and len(arguments) == 2 and arguments[1] in function_attributes:
+        events.append(arguments[1])
+
+sys.addaudithook(audit)
+trial = getattr(requests, "_rust_public_trial", nullcontext)
+prepared = PreparedRequest()
+with trial():
+    prepared.prepare_method("get")
+result = SimpleNamespace(method=prepared.method, events=events)
+"""
+    run = run_rewrite_case({"source": dedent(source)})
+    assert run.observations["exception"] is None
+    assert run.observations["result"]["public_state"] == {
+        "method": "GET",
+        "events": [],
+    }
+
+
 def test_task17_rebuild_auth_none_request_preserves_oracle_exception() -> None:
     source = r"""
 from contextlib import nullcontext

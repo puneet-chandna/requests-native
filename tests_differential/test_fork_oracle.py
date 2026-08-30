@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 ORACLE_SOURCE = ROOT.parent / "requests" / "src"
 REWRITE_SOURCE = ROOT / "src"

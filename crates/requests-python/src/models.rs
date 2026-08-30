@@ -234,13 +234,14 @@ struct RewindBodyState {
 
 static REWIND_BODY_STATE: PyOnceLock<RewindBodyState> = PyOnceLock::new();
 
+#[cfg(not(PyPy))]
 #[allow(unsafe_code)]
 fn function_code<'py>(
     py: Python<'py>,
     function: &Bound<'py, PyFunction>,
 ) -> PyResult<Bound<'py, PyCode>> {
-    // SAFETY: CPython returns a borrowed reference owned by the exact
-    // PyFunction, and both the function and returned Bound stay under `py`.
+    // SAFETY: CPython returns a borrowed reference owned by this exact
+    // PyFunction while both values remain attached to `py`.
     unsafe {
         Ok(
             Bound::from_borrowed_ptr(py, pyo3::ffi::PyFunction_GetCode(function.as_ptr()))
@@ -249,13 +250,22 @@ fn function_code<'py>(
     }
 }
 
+#[cfg(PyPy)]
+fn function_code<'py>(
+    _py: Python<'py>,
+    function: &Bound<'py, PyFunction>,
+) -> PyResult<Bound<'py, PyCode>> {
+    Ok(function.getattr("__code__")?.cast_into::<PyCode>()?)
+}
+
+#[cfg(not(PyPy))]
 #[allow(unsafe_code)]
 fn function_globals<'py>(
     py: Python<'py>,
     function: &Bound<'py, PyFunction>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    // SAFETY: CPython returns a borrowed reference owned by the exact
-    // PyFunction, and both the function and returned Bound stay under `py`.
+    // SAFETY: CPython returns a borrowed reference owned by this exact
+    // PyFunction while both values remain attached to `py`.
     unsafe {
         Ok(
             Bound::from_borrowed_ptr(py, pyo3::ffi::PyFunction_GetGlobals(function.as_ptr()))
@@ -264,52 +274,108 @@ fn function_globals<'py>(
     }
 }
 
+#[cfg(PyPy)]
+fn function_globals<'py>(
+    _py: Python<'py>,
+    function: &Bound<'py, PyFunction>,
+) -> PyResult<Bound<'py, PyDict>> {
+    Ok(function.getattr("__globals__")?.cast_into::<PyDict>()?)
+}
+
+#[cfg(not(PyPy))]
 #[allow(unsafe_code)]
 fn function_defaults<'py>(
     py: Python<'py>,
     function: &Bound<'py, PyFunction>,
 ) -> Option<Bound<'py, PyAny>> {
-    // SAFETY: CPython returns either null or a borrowed reference owned by the
-    // exact PyFunction, and both the function and Bound stay under `py`.
+    // SAFETY: CPython returns either null or a borrowed reference owned by
+    // this exact PyFunction while both values remain attached to `py`.
     unsafe {
         Bound::from_borrowed_ptr_or_opt(py, pyo3::ffi::PyFunction_GetDefaults(function.as_ptr()))
     }
 }
 
+#[cfg(PyPy)]
+fn function_defaults<'py>(
+    _py: Python<'py>,
+    function: &Bound<'py, PyFunction>,
+) -> Option<Bound<'py, PyAny>> {
+    function
+        .getattr("__defaults__")
+        .ok()
+        .filter(|value| !value.is_none())
+}
+
+#[cfg(not(PyPy))]
 #[allow(unsafe_code)]
 fn function_kwdefaults<'py>(
     py: Python<'py>,
     function: &Bound<'py, PyFunction>,
 ) -> Option<Bound<'py, PyAny>> {
-    // SAFETY: CPython returns either null or a borrowed reference owned by the
-    // exact PyFunction, and both the function and Bound stay under `py`.
+    // SAFETY: CPython returns either null or a borrowed reference owned by
+    // this exact PyFunction while both values remain attached to `py`.
     unsafe {
         Bound::from_borrowed_ptr_or_opt(py, pyo3::ffi::PyFunction_GetKwDefaults(function.as_ptr()))
     }
 }
 
+#[cfg(PyPy)]
+fn function_kwdefaults<'py>(
+    _py: Python<'py>,
+    function: &Bound<'py, PyFunction>,
+) -> Option<Bound<'py, PyAny>> {
+    function
+        .getattr("__kwdefaults__")
+        .ok()
+        .filter(|value| !value.is_none())
+}
+
+#[cfg(not(PyPy))]
 #[allow(unsafe_code)]
 fn function_closure<'py>(
     py: Python<'py>,
     function: &Bound<'py, PyFunction>,
 ) -> Option<Bound<'py, PyAny>> {
-    // SAFETY: PyFunction_GetClosure returns either null or a borrowed
-    // reference owned by the exact PyFunction while `py` is attached.
+    // SAFETY: CPython returns either null or a borrowed reference owned by
+    // this exact PyFunction while both values remain attached to `py`.
     unsafe {
         Bound::from_borrowed_ptr_or_opt(py, pyo3::ffi::PyFunction_GetClosure(function.as_ptr()))
     }
 }
 
+#[cfg(PyPy)]
+fn function_closure<'py>(
+    _py: Python<'py>,
+    function: &Bound<'py, PyFunction>,
+) -> Option<Bound<'py, PyAny>> {
+    function
+        .getattr("__closure__")
+        .ok()
+        .filter(|value| !value.is_none())
+}
+
+#[cfg(not(PyPy))]
 #[allow(unsafe_code)]
 fn c_function_self<'py>(
     py: Python<'py>,
     function: &Bound<'py, PyCFunction>,
 ) -> Option<Bound<'py, PyAny>> {
-    // SAFETY: PyCFunction_GetSelf returns either null or a borrowed reference
-    // owned by the exact PyCFunction while `py` is attached.
+    // SAFETY: CPython returns either null or a borrowed reference owned by
+    // this exact PyCFunction while both values remain attached to `py`.
     unsafe {
         Bound::from_borrowed_ptr_or_opt(py, pyo3::ffi::PyCFunction_GetSelf(function.as_ptr()))
     }
+}
+
+#[cfg(PyPy)]
+fn c_function_self<'py>(
+    _py: Python<'py>,
+    function: &Bound<'py, PyCFunction>,
+) -> Option<Bound<'py, PyAny>> {
+    function
+        .getattr("__self__")
+        .ok()
+        .filter(|value| !value.is_none())
 }
 
 fn intrinsic_builtin_is(
@@ -352,14 +418,11 @@ fn intrinsic_builtin_is(
             Ok(current.is(py.get_type::<pyo3::exceptions::PyImportError>()))
         }
         IntrinsicBuiltin::KeyError => Ok(current.is(py.get_type::<pyo3::exceptions::PyKeyError>())),
-        IntrinsicBuiltin::Range | IntrinsicBuiltin::Map => {
-            let expected = match intrinsic {
-                IntrinsicBuiltin::Range => std::ptr::addr_of_mut!(pyo3::ffi::PyRange_Type),
-                IntrinsicBuiltin::Map => std::ptr::addr_of_mut!(pyo3::ffi::PyMap_Type),
-                _ => unreachable!(),
-            };
-            Ok(current.as_ptr().cast() == expected)
-        }
+        // Neither builtin has a portable immutable identity API.  Reading the
+        // live module binding would let a pre-admission rebound become the
+        // supposed canonical value, so conservatively keep these paths in
+        // Python.
+        IntrinsicBuiltin::Range | IntrinsicBuiltin::Map => Ok(false),
         IntrinsicBuiltin::Function(expected_name) => {
             let Ok(function) = current.cast::<PyCFunction>() else {
                 return Ok(false);
@@ -620,23 +683,17 @@ fn known_python_function(module: &str, name: &str) -> Option<(&'static str, &'st
     }
 }
 
-#[allow(unsafe_code)]
 fn intrinsic_descriptor_type_is(
+    py: Python<'_>,
     descriptor: &Bound<'_, PyAny>,
     expected: IntrinsicDescriptorType,
-) -> bool {
-    let current = descriptor.get_type().as_type_ptr();
-    // SAFETY: these are interpreter-owned immortal descriptor type objects;
-    // only their stable addresses are compared while Python is attached.
-    let expected = match expected {
-        IntrinsicDescriptorType::Method => {
-            std::ptr::addr_of_mut!(pyo3::ffi::PyMethodDescr_Type)
-        }
-        IntrinsicDescriptorType::Member => {
-            std::ptr::addr_of_mut!(pyo3::ffi::PyMemberDescr_Type)
-        }
+) -> PyResult<bool> {
+    let name = match expected {
+        IntrinsicDescriptorType::Method => "MethodDescriptorType",
+        IntrinsicDescriptorType::Member => "MemberDescriptorType",
     };
-    current == expected
+    let expected = PyModule::import(py, "types")?.getattr(name)?;
+    Ok(descriptor.get_type().as_any().is(&expected))
 }
 
 fn exact_type_identity_is(current: &Bound<'_, PyAny>, module: &str, name: &str) -> PyResult<bool> {
@@ -1067,7 +1124,7 @@ fn known_url_type_is(
     let Some(super_type) = expected_builtins.bind(py).get_item("super")? else {
         return Ok(false);
     };
-    if super_type.as_ptr().cast() != std::ptr::addr_of_mut!(pyo3::ffi::PySuper_Type) {
+    if !super_type.is(py.get_type::<pyo3::types::PySuper>()) {
         return Ok(false);
     }
     let Some(defaults) = function_defaults(py, new_function) else {
@@ -1127,7 +1184,7 @@ fn known_regex_is(
         ("flags", IntrinsicDescriptorType::Member),
     ] {
         let descriptor = namespace.get_item(name)?;
-        if !intrinsic_descriptor_type_is(&descriptor, descriptor_type)
+        if !intrinsic_descriptor_type_is(py, &descriptor, descriptor_type)?
             || !descriptor.getattr("__objclass__")?.is(&pattern_type)
             || descriptor.getattr("__name__")?.extract::<String>()? != name
         {

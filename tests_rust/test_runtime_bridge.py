@@ -179,7 +179,10 @@ def _literal_assignment(path: Path, name: str) -> object:
         node
         for node in tree.body
         if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+        and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        )
     )
     return ast.literal_eval(assignment.value)
 
@@ -240,8 +243,14 @@ def test_b02_eventual_payload_manifest_is_complete_and_disjoint() -> None:
         "NestedSubmit",
     }
     assert set(SESSION_REPLY_SCHEMA) == {"Scalar", "Response", "Nested", "Raised"}
-    assert all("generation" in fields and "sequence" in fields for fields in SESSION_ACTION_SCHEMA.values())
-    assert all("generation" in fields and "sequence" in fields for fields in SESSION_REPLY_SCHEMA.values())
+    assert all(
+        "generation" in fields and "sequence" in fields
+        for fields in SESSION_ACTION_SCHEMA.values()
+    )
+    assert all(
+        "generation" in fields and "sequence" in fields
+        for fields in SESSION_REPLY_SCHEMA.values()
+    )
     assert "correlation" in NATIVE_TRANSFER_SCHEMA
     assert len(SESSION_PAYLOAD_NEGATIVES) == len(set(SESSION_PAYLOAD_NEGATIVES)) == 10
 
@@ -296,8 +305,14 @@ def test_b02_session_payload_schema_freezes_executable_native_unit_proofs() -> N
     )
     for test_name in required_tests:
         assert expected_module.count(f"fn {test_name}()") == 1
-    assert "fn assert_worker_payload<T: WorkerPayload + Send + 'static>()" in expected_module
-    assert "impl<T: ?Sized + WorkerPayload> AmbiguousIfWorkerPayload<u8> for T" in expected_module
+    assert (
+        "fn assert_worker_payload<T: WorkerPayload + Send + 'static>()"
+        in expected_module
+    )
+    assert (
+        "impl<T: ?Sized + WorkerPayload> AmbiguousIfWorkerPayload<u8> for T"
+        in expected_module
+    )
 
     assert SESSION_RUNTIME_SOURCE.is_file(), (
         "Task 16 B02 RED: crates/requests-python/src/sessions.rs is absent"
@@ -330,17 +345,15 @@ def test_session_runtime_has_no_row_switch_or_python_pipeline_delegation() -> No
         pipeline_registration = (
             "module.add_function(wrap_pyfunction!(_session_pipeline_trial, module)?)?;"
         )
-        assert len(
-            re.findall(r"fn\s+_session_pipeline_trial\s*\(", session_source)
-        ) == 1
+        assert (
+            len(re.findall(r"fn\s+_session_pipeline_trial\s*\(", session_source)) == 1
+        )
         assert session_source.count(pipeline_registration) == 1
         remaining = session_source.replace(pipeline_definition, "", 1).replace(
             pipeline_registration, "", 1
         )
         assert "_session_pipeline_trial" not in remaining
-        runtime_trial = _extract_rust_function(
-            session_source, "_session_runtime_trial"
-        )
+        runtime_trial = _extract_rust_function(session_source, "_session_runtime_trial")
         assert "_session_pipeline_trial" not in runtime_trial
         assert "*args" not in session_source
         assert "**kwargs" not in session_source
@@ -557,9 +570,7 @@ def _run_b05_b09_native_interrupt_trial(
                 ("origin-reap", id(retained), at_phase, threading.get_ident())
             )
 
-        def recover(
-            self, resource: object, runtime_generation: object
-        ) -> object:
+        def recover(self, resource: object, runtime_generation: object) -> object:
             events.append(
                 (
                     "recover",
@@ -667,17 +678,20 @@ def _run_b05_b09_native_interrupt_trial(
             "terminal-after-timeout": (1, 1, 1, 1, 1, 1),
             "permanently-nonterminal": (1, 1, 1, 0, 0, 1),
         }[phase]
-        assert tuple(
-            state[key]
-            for key in (
-                "queued",
-                "dequeued",
-                "executed",
-                "reply_observed",
-                "terminal",
-                "timeouts",
+        assert (
+            tuple(
+                state[key]
+                for key in (
+                    "queued",
+                    "dequeued",
+                    "executed",
+                    "reply_observed",
+                    "terminal",
+                    "timeouts",
+                )
             )
-        ) == expected
+            == expected
+        )
         expect_timeout = phase in {
             "terminal-after-timeout",
             "permanently-nonterminal",
@@ -846,7 +860,9 @@ def test_b05_b09_native_interrupt_contracts_have_executable_trial_seams(
     reason="native adversarial supervisor requires POSIX fork",
 )
 @pytest.mark.parametrize("case_id", tuple(NATIVE_INTERRUPT_CONTRACTS))
-@pytest.mark.parametrize("mutation", ("same-resource", "pre-released", "stale-generation"))
+@pytest.mark.parametrize(
+    "mutation", ("same-resource", "pre-released", "stale-generation")
+)
 def test_b05_b09_native_interrupt_audit_rejects_adversarial_collaborators(
     case_id: str, mutation: str
 ) -> None:
@@ -951,9 +967,7 @@ def test_b10_b12_native_fork_boundaries_reset_runtime_and_resources(
             )
 
     subject = ForkAudit()
-    setup_mode = {"B10": None, "B11": "prepare-driver", "B12": "prepare-pool"}[
-        case_id
-    ]
+    setup_mode = {"B10": None, "B11": "prepare-driver", "B12": "prepare-pool"}[case_id]
     scenario: dict[str, object] = {
         "case_id": case_id,
         "operation": {
@@ -1200,9 +1214,7 @@ def test_b14_native_outstanding_stream_lease_survives_peer_clear() -> None:
     peer_cleared = threading.Event()
 
     class StreamAudit:
-        def opened(
-            self, lease_id: str, connection_id: str, generation: str
-        ) -> None:
+        def opened(self, lease_id: str, connection_id: str, generation: str) -> None:
             assert not stream_open.is_set()
             events.append(("opened", lease_id, connection_id, generation))
             stream_open.set()
@@ -1281,7 +1293,9 @@ def test_b10_b14_native_isolation_audit_rejects_adversarial_state(
                 "pid": os.getpid() + (1 if mutation == "stale-pid" else 0),
                 "generation": "stale" if mutation == "stale-generation" else "g",
                 "pool_id": "inherited" if mutation == "inherited-pool-lease" else "p",
-                "lease_id": "released" if mutation == "premature-lease-release" else "l",
+                "lease_id": "released"
+                if mutation == "premature-lease-release"
+                else "l",
                 "correlations": ("same", "same")
                 if mutation == "cross-session-correlation"
                 else ("first", "second"),
@@ -1322,9 +1336,7 @@ def test_b15_native_finalization_is_bounded_and_origin_owned(
 
             class Owner:
                 def __del__(self) -> None:
-                    events.append(
-                        ("owner-del", threading.get_ident() == entry_thread)
-                    )
+                    events.append(("owner-del", threading.get_ident() == entry_thread))
 
             owner = Owner()
             owner_id = id(owner)
@@ -1355,9 +1367,7 @@ def test_b15_native_finalization_is_bounded_and_origin_owned(
                         )
                     )
 
-                def quarantined(
-                    self, owner_token: object, terminal: bool
-                ) -> None:
+                def quarantined(self, owner_token: object, terminal: bool) -> None:
                     assert owner_token is self.owner
                     events.append(("quarantined", id(owner_token), terminal))
 
@@ -1426,8 +1436,7 @@ def test_b15_native_finalization_is_bounded_and_origin_owned(
                 "worker_drop_index": worker_drop_index,
                 "origin_reap_index": origin_reap_index,
                 "origin_reap_on_entry": any(
-                    event[0] == "origin-reaped" and event[2] is True
-                    for event in events
+                    event[0] == "origin-reaped" and event[2] is True for event in events
                 ),
                 "owner_del_on_entry": any(
                     event == ("owner-del", True) for event in events
@@ -1644,9 +1653,7 @@ def test_b18_concurrent_native_trials_keep_channels_and_affinity_isolated() -> N
             assert correlation is correlations[self.name]
             assert channel_id == self.name
             assert interpreter_id == entry_interpreters[self.name]
-            events.append(
-                ("entered", self.name, correlation, threading.get_ident())
-            )
+            events.append(("entered", self.name, correlation, threading.get_ident()))
             entered[self.name].set()
 
         def replied(
@@ -1660,9 +1667,7 @@ def test_b18_concurrent_native_trials_keep_channels_and_affinity_isolated() -> N
             assert correlation is correlations[self.name]
             assert channel_id == self.name
             assert interpreter_id == entry_interpreters[self.name]
-            events.append(
-                ("replied", self.name, correlation, threading.get_ident())
-            )
+            events.append(("replied", self.name, correlation, threading.get_ident()))
 
         def failed(
             self,
@@ -1675,9 +1680,7 @@ def test_b18_concurrent_native_trials_keep_channels_and_affinity_isolated() -> N
             assert correlation is correlations[self.name]
             assert channel_id == self.name
             assert interpreter_id == entry_interpreters[self.name]
-            events.append(
-                ("failed", self.name, correlation, threading.get_ident())
-            )
+            events.append(("failed", self.name, correlation, threading.get_ident()))
 
     def run(name: str) -> None:
         entry_threads[name] = threading.get_ident()
@@ -1755,9 +1758,7 @@ def test_b15_b18_native_completion_audit_rejects_adversarial_state(
     case_id: str, mutation: str
 ) -> None:
     trial = _assert_native_session_trial(case_id)
-    with pytest.raises(
-        ValueError, match="terminal|panic|callable|correlation|reply"
-    ):
+    with pytest.raises(ValueError, match="terminal|panic|callable|correlation|reply"):
         trial(
             SimpleNamespace(),
             {

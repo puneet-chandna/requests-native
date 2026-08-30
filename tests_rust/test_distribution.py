@@ -130,8 +130,10 @@ assert any(path.endswith(".dist-info/licenses/LICENSE") for path in distribution
 assert any(path.endswith(".dist-info/licenses/NOTICE") for path in distribution_files)
 if os.environ["REQUESTS_EDITABLE"] == "0":
     assert "requests/py.typed" in distribution_files
-    assert "requests" in metadata.packages_distributions()
-    assert "requests" in metadata.packages_distributions()["requests"]
+    assert "requests/__init__.py" in distribution_files
+    package_init = distribution.locate_file("requests") / "__init__.py"
+    assert package_init.is_file()
+    assert package_init.resolve() == source
 else:
     assert (checkout / "src/requests/py.typed").is_file()
 assert requests.packages.urllib3 is urllib3
@@ -276,9 +278,26 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
 def test_test_and_lint_workflows_cover_python_default_and_explicit_rust_trial() -> None:
     tests = load_workflow("run-tests.yml")["jobs"]
     for name in ("build", "no_chardet", "urllib3"):
+        steps = {step.get("name"): step for step in tests[name]["steps"]}
+        ordered_names = [step.get("name") for step in tests[name]["steps"]]
         run_steps = "\n".join(str(step.get("run", "")) for step in tests[name]["steps"])
         assert "Default Python backend" in run_steps
         assert "Explicit Rust trial backend" in run_steps
+        oracle = steps["Check out frozen Python oracle"]
+        assert oracle["with"] == {
+            "repository": "psf/requests",
+            "ref": FROZEN_ORACLE_COMMIT,
+            "path": "frozen-oracle",
+            "persist-credentials": False,
+        }
+        assert (
+            ordered_names.index("Run default Python backend tests")
+            < ordered_names.index("Check out frozen Python oracle")
+            < ordered_names.index("Run explicit Rust trial backend tests")
+        )
+        assert steps["Run explicit Rust trial backend tests"]["env"] == {
+            "REQUESTS_ORACLE_ROOT": "${{ github.workspace }}/frozen-oracle"
+        }
     assert 'pip uninstall -y "charset_normalizer" "chardet"' in "\n".join(
         str(step.get("run", "")) for step in tests["no_chardet"]["steps"]
     )
@@ -304,6 +323,81 @@ def test_test_and_lint_workflows_cover_python_default_and_explicit_rust_trial() 
     )
     assert "cargo fmt --all -- --check" in lint_runs
     assert "cargo clippy -p requests --all-targets -- -D warnings" in lint_runs
+
+
+def test_installed_smoke_checks_the_package_file_in_its_distribution() -> None:
+    assert "metadata.packages_distributions" not in INSTALLED_SMOKE
+    assert 'distribution.locate_file("requests") / "__init__.py"' in INSTALLED_SMOKE
+
+
+def test_extension_guards_cpython_function_abi_symbols_from_pypy() -> None:
+    models = (ROOT / "crates/requests-python/src/models.rs").read_text()
+    cookies = (ROOT / "crates/requests-python/src/cookies.rs").read_text()
+    for symbol in (
+        "PyFunction_GetCode",
+        "PyFunction_GetGlobals",
+        "PyFunction_GetDefaults",
+        "PyFunction_GetKwDefaults",
+        "PyFunction_GetClosure",
+        "PyCFunction_GetSelf",
+    ):
+        source = cookies if symbol == "PyFunction_GetGlobals" else models
+        assert re.search(
+            rf"#\[cfg\(not\(PyPy\)\)\][\s\S]{{0,900}}pyo3::ffi::{symbol}", source
+        )
+    assert "#[cfg(PyPy)]" in models
+    assert "#[cfg(PyPy)]" in cookies
+    assert "PyMap_Type" not in models
+
+
+def test_extension_stub_covers_the_private_python_bridge() -> None:
+    stub = (ROOT / "src/requests/_requests_rust.pyi").read_text()
+    for function in (
+        "_adapter_fork_reset_trial",
+        "_adapter_drop_trial",
+        "_adapter_drop_reference_trial",
+        "_adapter_reference_trial",
+        "_adapter_register_trial",
+        "_adapter_send_trial",
+        "_adapter_facade_trial",
+        "_session_facade_trial",
+    ):
+        assert f"def {function}" in stub
+
+
+def test_security_workflows_use_private_repository_safe_reporting() -> None:
+    zizmor = load_workflow("zizmor.yml")["jobs"]["zizmor"]
+    assert zizmor["permissions"] == {"contents": "read"}
+    zizmor_step = zizmor["steps"][-1]
+    assert zizmor_step["with"] == {
+        "advanced-security": False,
+        "annotations": True,
+    }
+
+    codeql = load_workflow("codeql-analysis.yml")["jobs"]["analyze"]
+    analyze = next(
+        step
+        for step in codeql["steps"]
+        if step.get("name") == "Perform CodeQL Analysis"
+    )
+    assert analyze["with"]["upload"] == (
+        "${{ github.event.repository.private && 'never' || 'always' }}"
+    )
+    assert analyze["id"] == "analyze"
+    private_sarif = next(
+        step
+        for step in codeql["steps"]
+        if step.get("name") == "Persist private CodeQL SARIF"
+    )
+    assert private_sarif["if"] == "${{ github.event.repository.private }}"
+    assert private_sarif["uses"] == (
+        "actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f"
+    )
+    assert private_sarif["with"] == {
+        "name": "codeql-sarif",
+        "path": "${{ steps.analyze.outputs.sarif-output }}",
+        "if-no-files-found": "error",
+    }
 
 
 def test_publish_workflow_validates_one_shared_release_artifact_without_publishing() -> (
@@ -366,6 +460,7 @@ def verify_wheel(wheel: Path) -> None:
         dist_info = metadata_name.removesuffix("METADATA")
         sbom_name = f"{dist_info}sboms/requests-python.cyclonedx.json"
         expected_members = expected_python | {
+            "requests/_requests_rust.pyi",
             "requests/py.typed",
             extension[0],
             f"{dist_info}METADATA",
@@ -438,7 +533,8 @@ def verify_sdist(sdist: Path) -> None:
     semantic |= {
         path.relative_to(ROOT).as_posix()
         for path in (ROOT / "src/requests").iterdir()
-        if path.is_file() and (path.suffix == ".py" or path.name == "py.typed")
+        if path.is_file()
+        and (path.suffix in {".py", ".pyi"} or path.name == "py.typed")
     }
     semantic |= {
         path.relative_to(ROOT).as_posix()
@@ -456,7 +552,7 @@ def verify_sdist(sdist: Path) -> None:
         for alias in ("mtls/client/ca", "valid/ca")
         for name in ca_files
     }
-    assert len(semantic) == 79
+    assert len(semantic) == 80
     rust_inputs = {"Cargo.toml", "Cargo.lock"} | {
         path.relative_to(ROOT).as_posix()
         for path in (ROOT / "crates").rglob("*")
