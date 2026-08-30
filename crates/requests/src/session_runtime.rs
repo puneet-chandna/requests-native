@@ -4,10 +4,10 @@
 //! attach hooks to the native request pipeline, but workers only observe opaque
 //! numeric identities and typed phase transitions.
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -400,9 +400,11 @@ mod tests {
 
         let first_wait = harness.wait_request_observed(first);
         tokio::pin!(first_wait);
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut first_wait)
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut first_wait)
+                .await
+                .is_err()
+        );
         harness.mark_request_observed(first);
         first_wait.await;
     }

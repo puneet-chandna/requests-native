@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use http::{Method, Uri};
 
-use crate::transport::{DEFAULT_MAX_IDLE_PER_HOST, Transport};
 use crate::session_runtime::SessionRuntimeHarness;
+use crate::transport::{DEFAULT_MAX_IDLE_PER_HOST, Transport};
 use crate::{Error, Request, RequestBuilder, Response, Result, Timeout};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

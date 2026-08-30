@@ -242,10 +242,7 @@ struct ActiveExchangeGuard {
 }
 
 impl ActiveExchangeGuard {
-    fn new(
-        session_runtime: Option<SessionRuntimeHarness>,
-        lease: &ConnectionLease,
-    ) -> Self {
+    fn new(session_runtime: Option<SessionRuntimeHarness>, lease: &ConnectionLease) -> Self {
         let correlation = session_runtime
             .as_ref()
             .map(SessionRuntimeHarness::next_correlation)
@@ -271,12 +268,8 @@ impl ActiveExchangeGuard {
             } else {
                 SessionPhase::PoolReleaseDirty
             };
-            let checkpoint = harness.checkpoint(
-                phase,
-                self.connection,
-                self.lease,
-                self.correlation,
-            );
+            let checkpoint =
+                harness.checkpoint(phase, self.connection, self.lease, self.correlation);
             harness.observe(checkpoint);
         }
     }
@@ -529,6 +522,7 @@ impl Drop for TransportLease {
 }
 
 impl Transport {
+    #[cfg(test)]
     pub(crate) fn configured(
         proxy: Option<Proxy>,
         tls: TlsConfig,
@@ -579,6 +573,7 @@ impl Transport {
         )
     }
 
+    #[cfg(test)]
     fn with_configuration(
         connector: Arc<dyn Connector>,
         proxy: Option<Proxy>,
@@ -909,11 +904,7 @@ impl Transport {
             head,
             body,
             url,
-            lease: TransportLease::new(
-                Arc::clone(&self.pool),
-                lease,
-                self.session_runtime.clone(),
-            ),
+            lease: TransportLease::new(Arc::clone(&self.pool), lease, self.session_runtime.clone()),
             read_timeout,
             total_timeout,
             total_deadline,
@@ -940,12 +931,8 @@ impl Transport {
                 break;
             };
             if !lease.is_live() || !lease.peer_is_open() {
-                TransportLease::new(
-                    Arc::clone(&self.pool),
-                    lease,
-                    self.session_runtime.clone(),
-                )
-                .finish_now(false);
+                TransportLease::new(Arc::clone(&self.pool), lease, self.session_runtime.clone())
+                    .finish_now(false);
                 continue;
             }
             let ready = {
@@ -964,12 +951,8 @@ impl Transport {
                 }
             };
             let Some(ready) = ready else {
-                TransportLease::new(
-                    Arc::clone(&self.pool),
-                    lease,
-                    self.session_runtime.clone(),
-                )
-                .finish_now(false);
+                TransportLease::new(Arc::clone(&self.pool), lease, self.session_runtime.clone())
+                    .finish_now(false);
                 return Err(Error::request_exchange_total_timeout(
                     deadlines
                         .total_timeout
@@ -980,12 +963,8 @@ impl Transport {
                 self.observe_pool_acquire(&lease);
                 return Ok(lease);
             }
-            TransportLease::new(
-                Arc::clone(&self.pool),
-                lease,
-                self.session_runtime.clone(),
-            )
-            .finish_now(false);
+            TransportLease::new(Arc::clone(&self.pool), lease, self.session_runtime.clone())
+                .finish_now(false);
         }
 
         let lease = self
@@ -1228,18 +1207,13 @@ fn parsed_content_length(value: &http::HeaderValue) -> Option<u64> {
     value.parse().ok()
 }
 
+#[cfg(test)]
 fn outgoing_request(
-    mut request: RequestParts,
+    request: RequestParts,
     track_body_completion: bool,
     absolute_form: bool,
 ) -> Result<(http::Request<OutgoingBody>, String, Option<BodyCompletion>)> {
-    outgoing_request_with_session_runtime(
-        request,
-        track_body_completion,
-        absolute_form,
-        None,
-        None,
-    )
+    outgoing_request_with_session_runtime(request, track_body_completion, absolute_form, None, None)
 }
 
 fn outgoing_request_with_session_runtime(
@@ -1280,13 +1254,12 @@ fn outgoing_request_with_session_runtime(
         request.headers.insert(HOST, host);
     }
 
-    let (body, completion) =
-        OutgoingBody::new(
-            request.body,
-            track_body_completion,
-            session_runtime,
-            session_identity,
-        );
+    let (body, completion) = OutgoingBody::new(
+        request.body,
+        track_body_completion,
+        session_runtime,
+        session_identity,
+    );
     let mut outgoing = http::Request::new(body);
     *outgoing.method_mut() = request.method;
     *outgoing.uri_mut() = request_target;
@@ -1481,18 +1454,18 @@ impl Body for OutgoingBody {
                 }
                 debug_assert!(body.upload_entered.is_entered());
                 let result = match stream.as_mut().poll_next(context) {
-                Poll::Pending => {
-                    body.source = BodySource::Stream(stream);
-                    Poll::Pending
-                }
-                Poll::Ready(Some(chunk)) => {
-                    body.source = BodySource::Stream(stream);
-                    Poll::Ready(Some(chunk.map(Frame::data)))
-                }
-                Poll::Ready(None) => {
-                    body.mark_complete();
-                    Poll::Ready(None)
-                }
+                    Poll::Pending => {
+                        body.source = BodySource::Stream(stream);
+                        Poll::Pending
+                    }
+                    Poll::Ready(Some(chunk)) => {
+                        body.source = BodySource::Stream(stream);
+                        Poll::Ready(Some(chunk.map(Frame::data)))
+                    }
+                    Poll::Ready(None) => {
+                        body.mark_complete();
+                        Poll::Ready(None)
+                    }
                 };
                 if result.is_ready() {
                     body.upload_counts.reply_observed();

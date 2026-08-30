@@ -14,8 +14,7 @@ use hyper::client::conn::http1::SendRequest;
 
 use super::{ConnectionDriver, OutgoingBody};
 use crate::session_runtime::{
-    SessionConnectionIdentity, SessionExchangeIdentity, SessionLeaseIdentity,
-    SessionRuntimeHarness,
+    SessionConnectionIdentity, SessionExchangeIdentity, SessionLeaseIdentity, SessionRuntimeHarness,
 };
 use crate::{CertificateSource, Identity, Proxy, TlsConfig};
 
@@ -347,14 +346,9 @@ impl ConnectionLease {
         connection: IdleConnection,
         session_runtime: Option<&SessionRuntimeHarness>,
     ) -> Self {
-        let session_lease_identity = session_runtime
-            .map(SessionRuntimeHarness::allocate_lease_identity);
-        Self::with_session_lease_identity(
-            key,
-            generation,
-            connection,
-            session_lease_identity,
-        )
+        let session_lease_identity =
+            session_runtime.map(SessionRuntimeHarness::allocate_lease_identity);
+        Self::with_session_lease_identity(key, generation, connection, session_lease_identity)
     }
 
     pub(super) fn new_with_exchange_identity(
@@ -490,6 +484,7 @@ pub(super) struct Pool {
 }
 
 impl Pool {
+    #[cfg(test)]
     pub(super) fn new(max_idle_per_key: usize) -> Self {
         Self::new_with_session_runtime(max_idle_per_key, None)
     }

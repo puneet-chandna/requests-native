@@ -15,3 +15,8 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 pyo3 = "0.29"
+
+[profile.fuzz]
+inherits = "release"
+debug = true
+codegen-units = 1

@@ -63,7 +63,9 @@ fn hex_bytes(input: &str) -> Vec<u8> {
     assert_eq!(input.len() % 2, 0, "fixture hex must contain byte pairs");
     input
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let pair = std::str::from_utf8(pair).expect("fixture hex is ASCII");
             u8::from_str_radix(pair, 16).expect("fixture hex contains valid digits")
@@ -1047,7 +1049,7 @@ impl CadencedGzipServer {
                 .map_err(|error| format!("write cadenced response head: {error}"))?;
 
             write_http_chunk(&mut stream, &wire[..12])?;
-            for extra in wire[12..108].chunks_exact(8) {
+            for extra in wire[12..108].as_chunks::<8>().0 {
                 sleep_cadence(&worker_shutdown)?;
                 write_http_chunk(&mut stream, extra)?;
             }
