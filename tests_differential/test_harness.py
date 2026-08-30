@@ -10,6 +10,22 @@ from tests_differential import runner
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_rewrite_root_can_target_an_installed_package(
+    monkeypatch, tmp_path: Path
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    package = site_packages / "requests"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text('marker = "installed-artifact"\n')
+    monkeypatch.setenv("REQUESTS_DIFFERENTIAL_REWRITE_ROOT", str(site_packages))
+
+    run = runner.run_rewrite_case(
+        {"source": "import requests\nresult = requests.marker\n"}
+    )
+
+    assert run.observations["result"]["repr"] == "'installed-artifact'"
+
+
 def test_children_receive_an_unforgeable_differential_target(monkeypatch) -> None:
     monkeypatch.setenv("REQUESTS_DIFFERENTIAL_TARGET", "caller-forgery")
     case = {

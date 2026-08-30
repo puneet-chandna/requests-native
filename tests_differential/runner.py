@@ -28,6 +28,7 @@ _DEFAULT_TIMEOUT_SECONDS = 10.0
 _TIMEOUT_ENVIRONMENT = "REQUESTS_DIFFERENTIAL_TIMEOUT"
 _TARGET_ENVIRONMENT = "REQUESTS_DIFFERENTIAL_TARGET"
 _DEPENDENCY_PATH_ENVIRONMENT = "REQUESTS_DIFFERENTIAL_DEPENDENCY_PATH"
+_REWRITE_ROOT_ENVIRONMENT = "REQUESTS_DIFFERENTIAL_REWRITE_ROOT"
 _MAX_DIAGNOSTIC_CHARS = 2048
 _PRESERVED_ENVIRONMENT = (
     "COMSPEC",
@@ -60,7 +61,10 @@ def run_oracle_case(case: dict[str, Any]) -> CaseRun:
 
 
 def run_rewrite_case(case: dict[str, Any]) -> CaseRun:
-    return _run_case(case, REPOSITORY_ROOT / "src", "rewrite")
+    rewrite_root = Path(
+        os.environ.get(_REWRITE_ROOT_ENVIRONMENT, REPOSITORY_ROOT / "src")
+    ).resolve()
+    return _run_case(case, rewrite_root, "rewrite")
 
 
 def _run_case(case: dict[str, Any], package_root: Path, target: str) -> CaseRun:

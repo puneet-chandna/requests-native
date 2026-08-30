@@ -7,23 +7,17 @@ import importlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
 import threading
+import unittest
 import venv
 import warnings
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
-import pytest
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
-    import tomli as tomllib
-
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = Path(os.environ.get("REQUESTS_DISTRIBUTION_DIR", ROOT / "dist")).resolve()
@@ -38,14 +32,58 @@ PYTHONS = [
     "pypy-3.11",
 ]
 SYSTEMS = ["ubuntu-22.04", "macos-latest", "windows-latest"]
+FROZEN_ORACLE_COMMIT = "69f84847045bef7a849cc994a26fe7ba8a169e95"
 EXPECTED_WHEEL_KEYS = {
     (python, system)
     for python in PYTHONS
     for system in SYSTEMS
     if (python, system) != ("pypy-3.11", "windows-latest")
 }
+EXPECTED_FREE_THREADED_EVIDENCE = {
+    f"free-threaded-evidence-{system}.json" for system in SYSTEMS
+}
+EXPECTED_CLASSIFIERS = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries",
+]
+EXPECTED_URLS = {
+    "Documentation": "https://requests.readthedocs.io",
+    "Source": "https://github.com/psf/requests",
+}
+EXPECTED_DEPENDENCIES = [
+    "charset_normalizer>=2,<4",
+    "idna>=2.5,<4",
+    "urllib3>=1.26,<3",
+    "certifi>=2023.5.7",
+]
+EXPECTED_EXTRAS = {
+    "security": [],
+    "socks": ["PySocks>=1.5.6, !=1.5.7"],
+    "use_chardet_on_py3": ["chardet>=3.0.2,<8"],
+}
 INSTALLED_SMOKE = r"""
+import importlib
 import os
+import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import metadata
@@ -53,8 +91,12 @@ from pathlib import Path
 
 import requests
 import requests.adapters as adapters
+import requests.compat as compat
+import requests.help
 import requests.packages
+import requests.status_codes as status_codes
 import urllib3
+import idna
 
 checkout = Path(os.environ["REQUESTS_CHECKOUT"]).resolve()
 source = Path(requests.__file__).resolve()
@@ -71,10 +113,36 @@ else:
     assert not extension_source.is_relative_to(checkout), extension_source
 distribution = metadata.distribution("requests")
 assert distribution.version == requests.__version__
+assert requests.__all__ == (
+    "ConnectionError", "ConnectTimeout", "HTTPError", "JSONDecodeError",
+    "PreparedRequest", "ReadTimeout", "Request", "RequestException", "Response",
+    "Session", "Timeout", "TooManyRedirects", "URLRequired", "codes", "delete",
+    "get", "head", "options", "packages", "patch", "post", "put", "request",
+    "session", "utils",
+)
+assert requests.packages.idna is idna
+assert requests.packages.chardet is compat.chardet
+assert requests.utils is importlib.import_module("requests.utils")
+assert requests.codes is status_codes.codes
+assert requests.help.info()["requests"]["version"] == requests.__version__
+distribution_files = {str(path).replace("\\", "/") for path in distribution.files or ()}
+assert any(path.endswith(".dist-info/licenses/LICENSE") for path in distribution_files)
+assert any(path.endswith(".dist-info/licenses/NOTICE") for path in distribution_files)
 if os.environ["REQUESTS_EDITABLE"] == "0":
+    assert "requests/py.typed" in distribution_files
     assert "requests" in metadata.packages_distributions()
     assert "requests" in metadata.packages_distributions()["requests"]
+else:
+    assert (checkout / "src/requests/py.typed").is_file()
 assert requests.packages.urllib3 is urllib3
+certs = subprocess.run(
+    [sys.executable, "-I", "-m", "requests.certs"],
+    text=True,
+    capture_output=True,
+    check=True,
+    timeout=10,
+)
+assert Path(certs.stdout.strip()).is_file(), certs.stdout
 
 extension = requests._requests_rust
 extension._public_facade_pump_trial("reset")
@@ -129,6 +197,11 @@ finally:
 
 
 def load_toml(path: Path) -> dict:
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
+        import tomli as tomllib
+
     with path.open("rb") as stream:
         return tomllib.load(stream)
 
@@ -151,17 +224,10 @@ def test_project_metadata_declares_license_files_dependencies_and_extras() -> No
     project = load_toml(ROOT / "pyproject.toml")["project"]
     assert project["license"] == "Apache-2.0"
     assert project["license-files"] == ["LICENSE", "NOTICE"]
-    assert project["dependencies"] == [
-        "charset_normalizer>=2,<4",
-        "idna>=2.5,<4",
-        "urllib3>=1.26,<3",
-        "certifi>=2023.5.7",
-    ]
-    assert project["optional-dependencies"] == {
-        "security": [],
-        "socks": ["PySocks>=1.5.6, !=1.5.7"],
-        "use_chardet_on_py3": ["chardet>=3.0.2,<8"],
-    }
+    assert project["dependencies"] == EXPECTED_DEPENDENCIES
+    assert project["optional-dependencies"] == EXPECTED_EXTRAS
+    assert project["classifiers"] == EXPECTED_CLASSIFIERS
+    assert project["urls"] == EXPECTED_URLS
 
 
 def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> None:
@@ -179,16 +245,31 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
         "os": SYSTEMS,
         "exclude": [{"python": "pypy-3.11", "os": "windows-latest"}],
     }
+    assert triggers["push"]["branches"] == ["main"]
+    ordered_names = [step.get("name") for step in job["steps"]]
     steps = {step.get("name"): step for step in job["steps"]}
     assert "python -m maturin build" in steps["Build wheel"]["run"]
-    smoke = steps["Test installed wheel outside checkout"]["run"]
-    assert "--installed-smoke" in smoke
+    assert "--manylinux 2_34" in steps["Build wheel"]["run"]
+    assert "--verify-wheel" in steps["Verify exact wheel contents"]["run"]
+    install = steps["Install wheel and explicit test dependencies"]["run"]
+    assert "pytest-httpbin==2.1.0" in install
+    assert "PySocks>=1.5.6,!=1.5.7" in install
+    assert "-e ." not in install and "--editable" not in install
+    assert ordered_names.index("Build wheel") < ordered_names.index(
+        "Check out frozen Python oracle"
+    )
+    assert (
+        steps["Check out frozen Python oracle"]["with"]["ref"] == FROZEN_ORACLE_COMMIT
+    )
+    suite = steps["Run installed artifact suite once"]["run"]
+    assert suite.count("--installed-suite") == 1
     evidence = steps["Record free-threaded ABI evidence"]["run"]
     assert '"before_import"' in evidence
     assert '"after_import"' in evidence
     assert "Py_GIL_DISABLED" in evidence
     assert "is False" not in evidence
     assert "gil_used" not in evidence
+    assert "free-threaded-evidence-${{ matrix.os }}.json" in evidence
     assert steps["Upload wheel"]["with"]["if-no-files-found"] == "error"
 
 
@@ -230,6 +311,26 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
 ):
     jobs = load_workflow("publish.yml")["jobs"]
     assert jobs["wheels"]["uses"] == "./.github/workflows/wheels.yml"
+    sdist_steps = jobs["sdist"]["steps"]
+    sdist_by_name = {step.get("name"): step for step in sdist_steps}
+    sdist_names = [step.get("name") for step in sdist_steps]
+    assert "--verify-sdist" in sdist_by_name["Verify exact sdist contents"]["run"]
+    sdist_install = sdist_by_name["Install sdist and explicit test dependencies"]["run"]
+    assert "pytest-httpbin==2.1.0" in sdist_install
+    assert "-e ." not in sdist_install and "--editable" not in sdist_install
+    assert sdist_names.index("Build sdist") < sdist_names.index(
+        "Check out frozen Python oracle"
+    )
+    assert (
+        sdist_by_name["Check out frozen Python oracle"]["with"]["ref"]
+        == FROZEN_ORACLE_COMMIT
+    )
+    assert (
+        sdist_by_name["Run installed artifact suite once"]["run"].count(
+            "--installed-suite"
+        )
+        == 1
+    )
     manifest = jobs["manifest"]
     assert set(manifest["needs"]) == {"sdist", "wheels"}
     runs = "\n".join(str(step.get("run", "")) for step in manifest["steps"])
@@ -245,8 +346,7 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     assert "github.ref == 'refs/heads/main'" in jobs["publish-test-pypi"]["if"]
 
 
-def test_built_wheel_and_sdist_have_complete_clean_inventory_and_metadata() -> None:
-    wheel, sdist = artifact_paths()
+def verify_wheel(wheel: Path) -> None:
     with zipfile.ZipFile(wheel) as archive:
         members = archive.namelist()
         metadata_name = next(
@@ -294,15 +394,14 @@ def test_built_wheel_and_sdist_have_complete_clean_inventory_and_metadata() -> N
     assert metadata["Requires-Python"] == ">=3.10"
     assert metadata["License-Expression"] == "Apache-2.0"
     assert metadata.get_all("License-File") == ["LICENSE", "NOTICE"]
-    project = load_toml(ROOT / "pyproject.toml")["project"]
     assert metadata["Author-email"] == "Kenneth Reitz <me@kennethreitz.org>"
     assert metadata["Maintainer-email"] == (
         "Ian Stapleton Cordasco <graffatcolmingov@gmail.com>, "
         "Nate Prewitt <nate.prewitt@gmail.com>"
     )
-    assert metadata.get_all("Classifier") == project["classifiers"]
+    assert metadata.get_all("Classifier") == EXPECTED_CLASSIFIERS
     assert sorted(metadata.get_all("Project-URL")) == sorted(
-        f"{name}, {url}" for name, url in project["urls"].items()
+        f"{name}, {url}" for name, url in EXPECTED_URLS.items()
     )
     assert set(metadata.get_all("Requires-Dist")) == {
         "charset-normalizer>=2,<4",
@@ -318,6 +417,8 @@ def test_built_wheel_and_sdist_have_complete_clean_inventory_and_metadata() -> N
         "use_chardet_on_py3",
     }
 
+
+def verify_sdist(sdist: Path) -> None:
     with tarfile.open(sdist, "r:gz") as archive:
         names = {
             member.name.split("/", 1)[-1]
@@ -366,6 +467,12 @@ def test_built_wheel_and_sdist_have_complete_clean_inventory_and_metadata() -> N
     assert names == semantic | rust_inputs | {"PKG-INFO"}
 
 
+def test_built_wheel_and_sdist_have_complete_clean_inventory_and_metadata() -> None:
+    wheel, sdist = artifact_paths()
+    verify_wheel(wheel)
+    verify_sdist(sdist)
+
+
 def _clean_environment() -> dict[str, str]:
     preserved = (
         "COMSPEC",
@@ -407,10 +514,64 @@ def run_installed_smoke(python: Path, *, editable: bool, checkout: Path = ROOT) 
         )
 
 
-@pytest.mark.parametrize("kind", ["wheel", "sdist", "editable"])
-def test_fresh_install_runs_default_and_trial_outside_checkout(
-    tmp_path: Path, kind: str
-) -> None:
+def run_installed_suite(python: Path, oracle: Path, checkout: Path) -> None:
+    run_installed_smoke(python, editable=False, checkout=checkout)
+    environment = _clean_environment()
+    environment.update(
+        {
+            "REQUESTS_ORACLE_ROOT": str(oracle.resolve()),
+            "REQUESTS_DIFFERENTIAL_REWRITE_ROOT": _target_site_packages(python),
+        }
+    )
+    with tempfile.TemporaryDirectory(prefix="requests-installed-suite-") as directory:
+        suite = Path(directory)
+        shutil.copytree(ROOT / "tests", suite / "tests")
+        shutil.copytree(ROOT / "tests_differential", suite / "tests_differential")
+        shutil.copy2(ROOT / "requirements-dev.txt", suite / "requirements-dev.txt")
+        (suite / "tests_rust").mkdir()
+        shutil.copy2(
+            ROOT / "tests_rust/test_backend_boundary.py",
+            suite / "tests_rust/test_backend_boundary.py",
+        )
+        # This is the only selected test that reads rewrite source; artifacts do not
+        # contain source or Rust crates, so the installed suite excludes it by name.
+        subprocess.run(
+            [
+                str(python),
+                "-m",
+                "pytest",
+                "-q",
+                "tests",
+                "tests_differential/test_import_api.py",
+                "tests_differential/test_public_types.py",
+                "tests_differential/test_property_boundaries.py",
+                "tests_rust/test_backend_boundary.py",
+                "-k",
+                "not task17_red_outer_pump_runtime_and_static_call_graph_share_adapter_leaf",
+            ],
+            cwd=suite,
+            env=environment,
+            check=True,
+            timeout=900,
+        )
+
+
+def _target_site_packages(python: Path) -> str:
+    return subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('platlib'))",
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    ).stdout.strip()
+
+
+def _assert_fresh_install(tmp_path: Path, kind: str) -> None:
     wheel, sdist = artifact_paths()
     environment = _clean_environment()
     virtualenv = tmp_path / kind
@@ -428,6 +589,24 @@ def test_fresh_install_runs_default_and_trial_outside_checkout(
         timeout=240,
     )
     run_installed_smoke(python, editable=kind == "editable")
+
+
+def test_fresh_wheel_install_runs_default_and_trial_outside_checkout(
+    tmp_path: Path,
+) -> None:
+    _assert_fresh_install(tmp_path, "wheel")
+
+
+def test_fresh_sdist_install_runs_default_and_trial_outside_checkout(
+    tmp_path: Path,
+) -> None:
+    _assert_fresh_install(tmp_path, "sdist")
+
+
+def test_fresh_editable_install_runs_default_and_trial_outside_checkout(
+    tmp_path: Path,
+) -> None:
+    _assert_fresh_install(tmp_path, "editable")
 
 
 def wheel_key(path: Path) -> tuple[str, str]:
@@ -451,9 +630,7 @@ def wheel_key(path: Path) -> tuple[str, str]:
         system = "macos-latest"
     elif platform_tag == "win_amd64":
         system = "windows-latest"
-    elif re.fullmatch(
-        r"(?:manylinux|musllinux|linux)[A-Za-z0-9_.]*_x86_64", platform_tag
-    ):
+    elif platform_tag == "manylinux_2_34_x86_64":
         system = "ubuntu-22.04"
     else:
         raise ValueError(f"unsupported platform wheel tag: {path.name}")
@@ -527,26 +704,38 @@ def compatibility_smoke(kind: str, backend: str) -> None:
 def verify_manifest(directory: Path) -> dict[str, str]:
     wheels = sorted(directory.rglob("requests-*.whl"))
     sdists = sorted(directory.rglob("requests-*.tar.gz"))
-    evidence = sorted(directory.rglob("free-threaded-evidence.json"))
+    evidence = sorted(directory.rglob("free-threaded-evidence-*.json"))
     files = {path for path in directory.rglob("*") if path.is_file()}
     if len(sdists) != 1:
         raise ValueError(f"expected one sdist, found {len(sdists)}")
     if sdists[0].name != "requests-2.34.2.tar.gz":
         raise ValueError(f"unexpected sdist project/version: {sdists[0].name}")
-    if len(evidence) != 1:
+    if (
+        len(evidence) != len(EXPECTED_FREE_THREADED_EVIDENCE)
+        or {path.name for path in evidence} != EXPECTED_FREE_THREADED_EVIDENCE
+    ):
         raise ValueError(
-            f"expected one free-threaded evidence file, found {len(evidence)}"
+            "free-threaded evidence matrix mismatch: "
+            f"found={sorted(path.name for path in evidence)!r}"
         )
     if files != {*wheels, *sdists, *evidence}:
         raise ValueError("unexpected release artifact")
-    free_threaded = json.loads(evidence[0].read_text())
-    if (
-        set(free_threaded) != {"Py_GIL_DISABLED", "before_import", "after_import"}
-        or free_threaded["Py_GIL_DISABLED"] != 1
-        or type(free_threaded["before_import"]) is not bool
-        or type(free_threaded["after_import"]) is not bool
-    ):
-        raise ValueError("invalid free-threaded evidence")
+    for path in evidence:
+        free_threaded = json.loads(path.read_text())
+        if (
+            set(free_threaded) != {"Py_GIL_DISABLED", "before_import", "after_import"}
+            or free_threaded["Py_GIL_DISABLED"] != 1
+            or type(free_threaded["before_import"]) is not bool
+            or type(free_threaded["after_import"]) is not bool
+        ):
+            raise ValueError(f"invalid free-threaded evidence: {path.name}")
+        system = path.name.removeprefix("free-threaded-evidence-").removesuffix(".json")
+        sibling_wheels = list(path.parent.glob("requests-*.whl"))
+        if len(sibling_wheels) != 1 or wheel_key(sibling_wheels[0]) != (
+            "3.14t",
+            system,
+        ):
+            raise ValueError(f"orphaned free-threaded evidence: {path.name}")
     keys = [wheel_key(path) for path in wheels]
     if len(keys) != len(set(keys)):
         raise ValueError("duplicate wheel matrix key")
@@ -564,9 +753,6 @@ def verify_manifest(directory: Path) -> dict[str, str]:
 
 def write_complete_manifest_fixture(directory: Path) -> None:
     (directory / "requests-2.34.2.tar.gz").touch()
-    (directory / "free-threaded-evidence.json").write_text(
-        '{"Py_GIL_DISABLED": 1, "after_import": true, "before_import": false}\n'
-    )
     for python, system in sorted(EXPECTED_WHEEL_KEYS):
         python_tag = {
             "3.10": "cp310-cp310",
@@ -579,11 +765,17 @@ def write_complete_manifest_fixture(directory: Path) -> None:
             "pypy-3.11": "pp311-pypy311_pp73",
         }[python]
         platform = {
-            "ubuntu-22.04": "manylinux_2_17_x86_64",
+            "ubuntu-22.04": "manylinux_2_34_x86_64",
             "macos-latest": "macosx_11_0_x86_64",
             "windows-latest": "win_amd64",
         }[system]
-        (directory / f"requests-2.34.2-{python_tag}-{platform}.whl").touch()
+        artifact = directory / f"wheel-{python}-{system}"
+        artifact.mkdir()
+        (artifact / f"requests-2.34.2-{python_tag}-{platform}.whl").touch()
+        if python == "3.14t":
+            (artifact / f"free-threaded-evidence-{system}.json").write_text(
+                '{"Py_GIL_DISABLED": 1, "after_import": true, "before_import": false}\n'
+            )
 
 
 def test_publish_manifest_accepts_only_the_complete_unique_matrix(
@@ -593,45 +785,100 @@ def test_publish_manifest_accepts_only_the_complete_unique_matrix(
     manifest = verify_manifest(tmp_path)
     assert len(manifest) == 24
 
-    next(tmp_path.glob("requests-*cp310-cp310*linux*.whl")).unlink()
-    with pytest.raises(ValueError, match="wheel matrix mismatch"):
+    next(tmp_path.rglob("requests-*cp310-cp310*linux*.whl")).unlink()
+    with unittest.TestCase().assertRaisesRegex(ValueError, "wheel matrix mismatch"):
         verify_manifest(tmp_path)
 
     duplicate = tmp_path / "duplicate"
     duplicate.mkdir()
-    source = next(tmp_path.glob("requests-*cp311-cp311*linux*.whl"))
+    source = next(tmp_path.rglob("requests-*cp311-cp311*linux*.whl"))
     (duplicate / source.name).touch()
-    with pytest.raises(ValueError, match="duplicate wheel matrix key"):
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError, "duplicate wheel matrix key"
+    ):
         verify_manifest(tmp_path)
 
 
-@pytest.mark.parametrize(
-    "filename,message",
-    [
+def test_wheel_key_rejects_wrong_version_abi_and_platform() -> None:
+    cases = [
         ("requests-9.9.9-cp310-cp310-manylinux_2_17_x86_64.whl", "project/version"),
         ("requests-2.34.2-cp310-abi3-manylinux_2_17_x86_64.whl", "Python wheel tag"),
         ("requests-2.34.2-py3-none-any.whl", "Python wheel tag"),
         ("requests-2.34.2-cp310-cp310-any.whl", "platform wheel tag"),
-    ],
-)
-def test_wheel_key_rejects_wrong_version_abi_and_platform(
-    filename: str, message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        wheel_key(Path(filename))
+        (
+            "requests-2.34.2-cp310-cp310-linux_x86_64.whl",
+            "platform wheel tag",
+        ),
+        (
+            "requests-2.34.2-cp310-cp310-musllinux_1_2_x86_64.whl",
+            "platform wheel tag",
+        ),
+    ]
+    for filename, message in cases:
+        with unittest.TestCase().assertRaisesRegex(ValueError, message):
+            wheel_key(Path(filename))
 
 
 def test_publish_manifest_rejects_extra_artifacts(tmp_path: Path) -> None:
     write_complete_manifest_fixture(tmp_path)
     (tmp_path / "unexpected.txt").touch()
-    with pytest.raises(ValueError, match="unexpected release artifact"):
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError, "unexpected release artifact"
+    ):
+        verify_manifest(tmp_path)
+
+
+def test_publish_manifest_requires_all_free_threaded_evidence(tmp_path: Path) -> None:
+    write_complete_manifest_fixture(tmp_path)
+    next(tmp_path.rglob("free-threaded-evidence-macos-latest.json")).unlink()
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError, "free-threaded evidence matrix mismatch"
+    ):
+        verify_manifest(tmp_path)
+
+
+def test_publish_manifest_rejects_invalid_free_threaded_evidence(
+    tmp_path: Path,
+) -> None:
+    write_complete_manifest_fixture(tmp_path)
+    next(tmp_path.rglob("free-threaded-evidence-windows-latest.json")).write_text(
+        "{}\n"
+    )
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError, "invalid free-threaded evidence"
+    ):
+        verify_manifest(tmp_path)
+
+
+def test_publish_manifest_rejects_duplicate_and_orphaned_free_threaded_evidence(
+    tmp_path: Path,
+) -> None:
+    write_complete_manifest_fixture(tmp_path)
+    evidence = next(tmp_path.rglob("free-threaded-evidence-ubuntu-22.04.json"))
+    duplicate = tmp_path / "duplicate" / evidence.name
+    duplicate.parent.mkdir()
+    shutil.copy2(evidence, duplicate)
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError, "free-threaded evidence matrix mismatch"
+    ):
+        verify_manifest(tmp_path)
+
+    duplicate.unlink()
+    evidence.replace(tmp_path / evidence.name)
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError, "orphaned free-threaded evidence"
+    ):
         verify_manifest(tmp_path)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--verify-manifest", type=Path)
+    parser.add_argument("--verify-wheel", type=Path)
+    parser.add_argument("--verify-sdist", type=Path)
     parser.add_argument("--installed-smoke", type=Path)
+    parser.add_argument("--installed-suite", type=Path)
+    parser.add_argument("--oracle", type=Path)
     parser.add_argument("--compatibility-smoke", choices=["no-detector", "urllib3-1"])
     parser.add_argument("--backend", choices=["default", "trial"])
     parser.add_argument("checkout", nargs="?", type=Path, default=ROOT)
@@ -639,11 +886,26 @@ def main() -> int:
     if arguments.verify_manifest:
         print(json.dumps(verify_manifest(arguments.verify_manifest), sort_keys=True))
         return 0
+    if arguments.verify_wheel:
+        verify_wheel(arguments.verify_wheel)
+        return 0
+    if arguments.verify_sdist:
+        verify_sdist(arguments.verify_sdist)
+        return 0
     if arguments.installed_smoke:
         run_installed_smoke(
             arguments.installed_smoke,
             editable=False,
             checkout=arguments.checkout.resolve(),
+        )
+        return 0
+    if arguments.installed_suite:
+        if arguments.oracle is None:
+            parser.error("--installed-suite requires --oracle")
+        run_installed_suite(
+            arguments.installed_suite,
+            arguments.oracle,
+            arguments.checkout.resolve(),
         )
         return 0
     if arguments.compatibility_smoke and arguments.backend:

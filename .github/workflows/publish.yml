@@ -18,7 +18,7 @@ jobs:
   sdist:
     name: Build sdist
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -30,6 +30,34 @@ jobs:
         run: python -m pip install "maturin>=1.13,<2"
       - name: Build sdist
         run: python -m maturin sdist --out dist
+      - name: Verify exact sdist contents
+        shell: bash
+        run: |
+          sdist="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          python tests_rust/test_distribution.py --verify-sdist "$sdist"
+      - name: Install sdist and explicit test dependencies
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/requests-sdist-smoke"
+          smoke_python="$RUNNER_TEMP/requests-sdist-smoke/bin/python"
+          sdist="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          echo "SDIST_PYTHON=$smoke_python" >> "$GITHUB_ENV"
+          "$smoke_python" -m pip install \
+            "$sdist" \
+            "pytest>=6.2,<10" \
+            "pytest-httpbin==2.1.0" \
+            "httpbin~=0.10.0" \
+            "trustme" \
+            "PySocks>=1.5.6,!=1.5.7"
+      - name: Check out frozen Python oracle
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: psf/requests
+          ref: 69f84847045bef7a849cc994a26fe7ba8a169e95
+          path: frozen-oracle
+          persist-credentials: false
+      - name: Run installed artifact suite once
+        run: python tests_rust/test_distribution.py --installed-suite "$SDIST_PYTHON" --oracle "$GITHUB_WORKSPACE/frozen-oracle" "$GITHUB_WORKSPACE"
       - name: Upload sdist
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v6.0.0
         with:
