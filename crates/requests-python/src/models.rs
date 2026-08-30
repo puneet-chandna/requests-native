@@ -16,6 +16,7 @@ use requests::{
     prepare_method_bytes, prepare_url, url_is_native_safe,
 };
 
+use crate::body::{_prepare_body_trial, _prepare_content_length_trial};
 use crate::errors::{MappingSite, map_typed_message};
 
 struct CanonicalFunction {
@@ -3068,11 +3069,45 @@ fn _prepare_auth_trial(
     Ok(compat.call0()?.unbind())
 }
 
+#[pyfunction]
+fn _model_facade_trial(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    operation: &str,
+    args: &Bound<'_, PyAny>,
+    _kwargs: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let args = args.cast::<PyTuple>()?;
+    match operation {
+        "prepare_method" if args.len() == 1 => {
+            _prepare_method_trial(py, subject, &args.get_item(0)?)
+        }
+        "prepare_url" if args.len() == 2 => {
+            _prepare_url_trial(py, subject, &args.get_item(0)?, &args.get_item(1)?)
+        }
+        "prepare_headers" if args.len() == 1 => {
+            _prepare_headers_trial(py, subject, &args.get_item(0)?)
+        }
+        "prepare_body" if args.len() == 3 => _prepare_body_trial(
+            py,
+            subject,
+            &args.get_item(0)?,
+            &args.get_item(1)?,
+            &args.get_item(2)?,
+        ),
+        "prepare_content_length" if args.len() == 1 => {
+            _prepare_content_length_trial(py, subject, &args.get_item(0)?)
+        }
+        _ => Ok(py.NotImplemented()),
+    }
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_prepare_method_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_prepare_url_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_prepare_headers_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_prepared_fields_snapshot, module)?)?;
     module.add_function(wrap_pyfunction!(_prepare_auth_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_model_facade_trial, module)?)?;
     Ok(())
 }

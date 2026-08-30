@@ -132,15 +132,14 @@ impl Response {
     fn take_body(&mut self, decoded: bool) -> ResponseBody {
         let chunked = has_chunked_transfer_encoding(&self.head.headers);
         let expected_content_length = self.content_length();
-        let encoding = if decoded {
-            self.head
-                .headers
-                .get(CONTENT_ENCODING)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| ContentEncoding::enabled(value, self.content_codecs))
-        } else {
-            None
-        };
+        let wire_encoding = self
+            .head
+            .headers
+            .get(CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| ContentEncoding::enabled(value, self.content_codecs));
+        let encoding = decoded.then_some(wire_encoding).flatten();
+        let declared_completion_length = expected_content_length;
         ResponseBody {
             source: self.body.take().map(|body| match encoding {
                 Some(encoding) => {
@@ -155,6 +154,8 @@ impl Response {
             total_deadline: self.total_deadline.take().map(BodyDeadline::new),
             chunked,
             expected_content_length,
+            declared_completion_length,
+            encoded_completion: wire_encoding.is_some(),
             received_body_bytes: 0,
             remainder_wait: None,
             terminal: false,
@@ -258,6 +259,8 @@ pub struct ResponseBody {
     total_deadline: Option<BodyDeadline>,
     chunked: bool,
     expected_content_length: Option<u64>,
+    declared_completion_length: Option<u64>,
+    encoded_completion: bool,
     received_body_bytes: u64,
     remainder_wait: Option<ResponseRemainderWaitEntered>,
     terminal: bool,
@@ -287,6 +290,24 @@ impl BodyDeadline {
 }
 
 impl ResponseBody {
+    #[doc(hidden)]
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    #[doc(hidden)]
+    pub fn finish_declared_length(&mut self, allow_encoded_completion: bool) {
+        if !self.terminal
+            && (!self.encoded_completion || allow_encoded_completion)
+            && self
+                .declared_completion_length
+                .is_some_and(|declared| self.received_body_bytes == declared)
+        {
+            self.remainder_wait = None;
+            self.finish_now(ResponseEvent::CleanEof);
+        }
+    }
+
     pub async fn close(mut self) -> Result<()> {
         let Some(driver) = self.begin_terminal(ResponseEvent::Close) else {
             return Ok(());
@@ -433,6 +454,8 @@ impl ResponseBody {
                 total_deadline: None,
                 chunked: false,
                 expected_content_length: None,
+                declared_completion_length: None,
+                encoded_completion: false,
                 received_body_bytes: 0,
                 remainder_wait: None,
                 terminal: false,
@@ -489,9 +512,7 @@ impl Stream for ResponseBody {
                 self.remainder_wait = self.expected_content_length.and_then(|declared| {
                     ResponseRemainderWaitEntered::checked(declared, self.received_body_bytes)
                 });
-                debug_assert!(self
-                    .remainder_wait
-                    .is_none_or(|wait| wait.remaining() > 0));
+                debug_assert!(self.remainder_wait.is_none_or(|wait| wait.remaining() > 0));
                 if wire_progress {
                     drop(self.read_deadline.take());
                 }

@@ -1,5 +1,7 @@
 use std::io::{self, Read};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::blocking;
 use crate::{BodySource, HeaderMap, Method, Proxy, Result, Timeout, TlsConfig};
@@ -15,14 +17,11 @@ pub struct AdapterPool {
 }
 
 struct PoolCapacity {
-    maximum: usize,
-    block: bool,
-    in_use: Mutex<usize>,
-    available: Condvar,
+    semaphore: Option<Arc<Semaphore>>,
 }
 
 struct PoolPermit {
-    capacity: Arc<PoolCapacity>,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 pub struct AdapterResponse {
@@ -53,15 +52,13 @@ impl AdapterPool {
         Ok(Self {
             client: builder.build()?,
             capacity: Arc::new(PoolCapacity {
-                maximum: maximum_idle_per_host,
-                block,
-                in_use: Mutex::new(0),
-                available: Condvar::new(),
+                semaphore: (block && maximum_idle_per_host > 0)
+                    .then(|| Arc::new(Semaphore::new(maximum_idle_per_host))),
             }),
         })
     }
 
-    pub fn send(
+    pub async fn send_async(
         &self,
         method: Method,
         url: &str,
@@ -69,14 +66,15 @@ impl AdapterPool {
         body: BodySource,
         timeout: Timeout,
     ) -> Result<AdapterResponse> {
-        let permit = self.capacity.acquire();
+        let permit = self.capacity.acquire().await;
         let inner = self
             .client
             .request(method, url)
             .headers(headers)
             .body(body)
             .timeout(timeout)
-            .send()?;
+            .send_async()
+            .await?;
         Ok(AdapterResponse { inner, permit })
     }
 
@@ -86,30 +84,17 @@ impl AdapterPool {
 }
 
 impl PoolCapacity {
-    fn acquire(self: &Arc<Self>) -> PoolPermit {
-        let mut in_use = self.in_use.lock().expect("adapter capacity lock poisoned");
-        while self.block && self.maximum > 0 && *in_use >= self.maximum {
-            in_use = self
-                .available
-                .wait(in_use)
-                .expect("adapter capacity lock poisoned");
-        }
-        *in_use += 1;
-        PoolPermit {
-            capacity: Arc::clone(self),
-        }
-    }
-}
-
-impl Drop for PoolPermit {
-    fn drop(&mut self) {
-        let mut in_use = self
-            .capacity
-            .in_use
-            .lock()
-            .expect("adapter capacity lock poisoned");
-        *in_use = in_use.saturating_sub(1);
-        self.capacity.available.notify_one();
+    async fn acquire(self: &Arc<Self>) -> PoolPermit {
+        let permit = match &self.semaphore {
+            Some(semaphore) => Some(
+                Arc::clone(semaphore)
+                    .acquire_owned()
+                    .await
+                    .expect("adapter capacity semaphore is never closed"),
+            ),
+            None => None,
+        };
+        PoolPermit { _permit: permit }
     }
 }
 
@@ -145,6 +130,48 @@ impl Read for AdapterResponseBody {
 }
 
 impl AdapterResponseBody {
+    pub async fn read_async(
+        self,
+        amount: Option<usize>,
+        allow_encoded_completion: bool,
+    ) -> io::Result<(Self, Vec<u8>)> {
+        let Self { inner, mut permit } = self;
+        let (inner, bytes) = inner.read_async(amount, allow_encoded_completion).await?;
+        if inner.is_terminal() {
+            permit = None;
+        }
+        Ok((Self { inner, permit }, bytes))
+    }
+
+    pub async fn read_frame_async(
+        self,
+        maximum: usize,
+        allow_encoded_completion: bool,
+    ) -> io::Result<(Self, Vec<u8>)> {
+        let Self { inner, mut permit } = self;
+        let (inner, bytes) = inner
+            .read_frame_async(maximum, allow_encoded_completion)
+            .await?;
+        if inner.is_terminal() {
+            permit = None;
+        }
+        Ok((Self { inner, permit }, bytes))
+    }
+
+    pub fn finish_encoded_declared_length(&mut self) {
+        self.inner.finish_encoded_declared_length();
+        if self.inner.is_terminal() {
+            self.permit = None;
+        }
+    }
+
+    pub async fn close_async(self) -> Result<()> {
+        let Self { inner, permit } = self;
+        let result = inner.close_async().await;
+        drop(permit);
+        result
+    }
+
     pub fn close(mut self) -> Result<()> {
         let result = self.inner.close();
         self.permit = None;

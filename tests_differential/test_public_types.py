@@ -634,7 +634,7 @@ try:
         prepared.prepare(method="POST", url="mock://resource", headers={"X":"1"}, data=b"body", auth=("u","p"), cookies={"c":"v"}, hooks={"response":[]})
         prepared.prepare_method("PATCH"); prepared.prepare_url("mock://resource", [("p","1")]); prepared.prepare_headers({"X":"2"})
         prepared.prepare_body(b"body", None, None); prepared.prepare_content_length(b"body"); prepared.prepare_auth(("u","p"), "mock://resource"); prepared.prepare_cookies({"c":"v"}); prepared.prepare_hooks({"response":[]})
-        response = Response(); response.status_code = 200; response.url = "mock://resource"; response.raw = SimpleNamespace(close=lambda: None, release_conn=lambda: None); response._content = b"one\ntwo"; response._content_consumed = True
+        response = Response(); response.status_code = 200; response.url = "mock://resource"; response.request = prepared; response.raw = SimpleNamespace(close=lambda: None, release_conn=lambda: None); response._content = b"one\ntwo"; response._content_consumed = True
         list(iter(response)); list(response.iter_content(2)); list(response.iter_lines()); response.content; response.raise_for_status(); response.__getstate__(); pickle.loads(pickle.dumps(response)); response.close()
         json_response = Response(); json_response._content = b'{"ok":true}'; json_response._content_consumed = True; json_response.json()
         session = Session(); session.adapters.clear(); session.mount("mock://", ScriptedAdapter())
@@ -645,7 +645,9 @@ try:
         base = BaseAdapter()
         try: base.send(prepared)
         except NotImplementedError: pass
-        base.close(); adapter = HTTPAdapter(); old_send = adapters_module._HTTP_ADAPTER_COMPAT_SEND; adapters_module._HTTP_ADAPTER_COMPAT_SEND = lambda adapter, request, **kwargs: ScriptedAdapter().send(request, **kwargs)
+        try: base.close()
+        except NotImplementedError: pass
+        adapter = HTTPAdapter(); old_send = adapters_module._HTTP_ADAPTER_COMPAT_SEND; adapters_module._HTTP_ADAPTER_COMPAT_SEND = lambda adapter, request, **kwargs: ScriptedAdapter().send(request, **kwargs)
         try: adapter.send(prepared)
         finally: adapters_module._HTTP_ADAPTER_COMPAT_SEND = old_send
         adapter.__getstate__(); pickle.loads(pickle.dumps(adapter)); adapter.close()
@@ -965,6 +967,7 @@ import requests
 
 trial_context = requests._rust_public_trial
 observer = requests._requests_rust._public_facade_pump_trial
+runtime_observer = requests._requests_rust._runtime_submission_trial
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -978,6 +981,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 observer("reset")
+runtime_observer("reset")
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 worker = threading.Thread(target=server.serve_forever, daemon=True)
 worker.start()
@@ -985,10 +989,11 @@ url = f"http://127.0.0.1:{server.server_port}/resource"
 session = requests.Session()
 try:
     with trial_context():
-        response = session.get(url)
+        response = session.get(url, stream=True)
+        observation = observer("snapshot")
+        runtime_observation = runtime_observer("snapshot")
         content = response.content
         response.close()
-    observation = observer("snapshot")
 finally:
     session.close()
     server.shutdown()
@@ -1002,7 +1007,11 @@ result = SimpleNamespace(**{
     "adapter_leaf_entries": observation["adapter_leaf_entries"],
     "nested_pump_entries": observation["nested_pump_entries"],
     "submission_ids": observation["submission_ids"],
+    "submission_parent_ids": observation["submission_parent_ids"],
     "adapter_submission_ids": observation["adapter_submission_ids"],
+    "runtime_events": runtime_observation["events"],
+    "runtime_outstanding": runtime_observation["outstanding"],
+    "runtime_generation": requests._requests_rust._runtime_generation_trial(),
 })
 """
 
@@ -1030,7 +1039,12 @@ def _assert_one_outer_pump_runtime() -> None:
         "nested_pump_entries": 0,
     }
     assert len(result["submission_ids"]) == 1
+    assert result["submission_parent_ids"] == [None]
     assert result["adapter_submission_ids"] == result["submission_ids"]
+    assert len(result["runtime_events"]) == 1
+    assert result["runtime_events"][0][:2] == [result["submission_ids"][0], None]
+    assert result["runtime_events"][0][2] == result["runtime_generation"]
+    assert result["runtime_outstanding"] == 0
 
 
 def _rust_function(source: str, name: str) -> str:
@@ -1097,8 +1111,13 @@ def test_task17_red_outer_pump_runtime_and_static_call_graph_share_adapter_leaf(
     joined = "\n".join(reachable.values())
     assert "run_session_facade" in facade
     assert (
-        sum(block.count("run_with_owned_actions(") for block in reachable.values()) == 1
+        sum(block.count("run_with_owned_actions(") for block in reachable.values()) == 0
     )
+    assert "run_with_actions" not in _rust_function(sessions_rust, "run_session_facade")
+    adapter_leaf = _rust_function(adapters_rust, "native_adapter_leaf")
+    assert adapter_leaf.count("run_with_actions_and_signal_checker(") == 1
+    assert "send_async(" in adapter_leaf
+    assert "pool.send(" not in adapter_leaf
     assert "send_from_session" in reachable
     assert all(
         forbidden not in joined

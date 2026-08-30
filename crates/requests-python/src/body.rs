@@ -1020,7 +1020,7 @@ const PREPARE_BODY_GLOBALS: &[&str] = &[
 const CONTENT_LENGTH_GLOBALS: &[&str] = &["builtin_str", "super_len"];
 
 #[pyfunction]
-fn _prepare_body_trial(
+pub(crate) fn _prepare_body_trial(
     py: Python<'_>,
     subject: &Bound<'_, PyAny>,
     data: &Bound<'_, PyAny>,
@@ -1259,7 +1259,7 @@ fn unpack_pair(value: &Bound<'_, PyAny>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
 }
 
 #[pyfunction]
-fn _prepare_content_length_trial(
+pub(crate) fn _prepare_content_length_trial(
     py: Python<'_>,
     subject: &Bound<'_, PyAny>,
     body: &Bound<'_, PyAny>,

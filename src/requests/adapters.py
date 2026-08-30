@@ -77,6 +77,12 @@ if typing.TYPE_CHECKING:
     from . import _types as _t
     from .models import PreparedRequest
 
+from ._rust_public import close_owner as _close_public_facade_owner
+from ._rust_public import dispatch as _public_facade_dispatch
+from ._rust_public import owner_access as _public_facade_owner_access
+from ._rust_public import owner_transition as _public_facade_owner_transition
+from ._rust_public import register_adapter as _public_facade_register_adapter
+from ._rust_public import suspend_dispatch as _suspend_public_facade_dispatch
 from ._types import is_prepared as _is_prepared
 
 DEFAULT_POOLBLOCK = False
@@ -127,6 +133,7 @@ class BaseAdapter:
 
     def __init__(self) -> None:
         super().__init__()
+        _public_facade_dispatch("adapter", self, "construct", (), {})
 
     def send(
         self,
@@ -151,10 +158,28 @@ class BaseAdapter:
         :param cert: (optional) Any user-provided SSL certificate to be trusted.
         :param proxies: (optional) The proxies dictionary to apply to the request.
         """
+        result = _public_facade_dispatch(
+            "adapter",
+            self,
+            "send",
+            (request,),
+            {
+                "stream": stream,
+                "timeout": timeout,
+                "verify": verify,
+                "cert": cert,
+                "proxies": proxies,
+            },
+        )
+        if result is not NotImplemented:
+            return result
         raise NotImplementedError
 
     def close(self) -> None:
         """Cleans up adapter specific items."""
+        result = _public_facade_dispatch("adapter", self, "close", (), {})
+        if result is not NotImplemented:
+            return result
         raise NotImplementedError
 
 
@@ -224,7 +249,13 @@ class HTTPAdapter(BaseAdapter):
         self.init_poolmanager(pool_connections, pool_maxsize, block=pool_block)
 
     def __getstate__(self) -> dict[str, Any]:
-        return {attr: getattr(self, attr, None) for attr in self.__attrs__}
+        with _public_facade_owner_access(self) as allowed:
+            if allowed:
+                _public_facade_dispatch("adapter", self, "state", (), {})
+                result = _public_facade_dispatch("adapter", self, "pickle", (), {})
+                if result is not NotImplemented:
+                    return result
+            return {attr: getattr(self, attr, None) for attr in self.__attrs__}
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         # Can't handle by adding 'proxy_manager' to self.__attrs__ because
@@ -768,30 +799,44 @@ def _drop_rust_adapter_trial(identity: int) -> None:
 
 @wraps(_HTTP_ADAPTER_COMPAT_INIT)
 def _trial_http_adapter_init(self: HTTPAdapter, *args: Any, **kwargs: Any) -> None:
-    _HTTP_ADAPTER_COMPAT_INIT(self, *args, **kwargs)
+    with _suspend_public_facade_dispatch():
+        _HTTP_ADAPTER_COMPAT_INIT(self, *args, **kwargs)
+    result = _public_facade_dispatch("adapter", self, "construct", args, kwargs)
+    if result is not NotImplemented:
+        return result
     _register_rust_adapter_trial(self)
 
 
 def _register_rust_adapter_trial(self: HTTPAdapter) -> None:
+    _public_facade_register_adapter(self)
+
+
+def _detach_rust_adapter_trial(self: HTTPAdapter) -> None:
     try:
         from . import _requests_rust
     except ImportError:
+        _close_public_facade_owner(self)
         return
+    from ._rust_public import close_reference
+
     identity = id(self)
-    cleanup = _requests_rust._adapter_drop_trial
-
-    def callback(
-        _reference: Any, identity: int = identity, cleanup: Any = cleanup
-    ) -> None:
-        cleanup(identity)
-
-    _requests_rust._adapter_register_trial(self, callback)
+    reference = _requests_rust._adapter_reference_trial(self)
+    if reference is None:
+        _close_public_facade_owner(self)
+        return
+    close_reference(identity, reference)
+    _requests_rust._adapter_drop_reference_trial(identity, reference)
 
 
 @wraps(_HTTP_ADAPTER_COMPAT_SETSTATE)
 def _trial_http_adapter_setstate(self: HTTPAdapter, state: dict[str, Any]) -> None:
-    _HTTP_ADAPTER_COMPAT_SETSTATE(self, state)
-    _register_rust_adapter_trial(self)
+    with _public_facade_owner_transition(self) as transition:
+        if transition.first:
+            _detach_rust_adapter_trial(self)
+        with _suspend_public_facade_dispatch():
+            _HTTP_ADAPTER_COMPAT_SETSTATE(self, state)
+    if transition.quiescent:
+        _register_rust_adapter_trial(self)
 
 
 @contextmanager
@@ -806,8 +851,9 @@ def _rust_adapter_trial():
         _ADAPTER_TRIAL_STATE.enabled = previous
 
 
+@wraps(_HTTP_ADAPTER_COMPAT_SEND)
 def _trial_http_adapter_send(
-    self: HTTPAdapter,
+    self,
     request: PreparedRequest,
     stream: bool = False,
     timeout: _t.TimeoutType = None,
@@ -815,44 +861,83 @@ def _trial_http_adapter_send(
     cert: _t.CertType = None,
     proxies: dict[str, str] | None = None,
 ) -> Response:
-    if getattr(_ADAPTER_TRIAL_STATE, "enabled", False):
-        try:
-            from . import _requests_rust
-        except ImportError:
-            pass
-        else:
-            result = _requests_rust._adapter_send_trial(
+    with _public_facade_owner_access(self) as allowed:
+        if allowed:
+            result = _public_facade_dispatch(
+                "adapter",
                 self,
-                request,
-                stream,
-                timeout,
-                verify,
-                cert,
-                proxies,
+                "send",
+                (request,),
+                {
+                    "stream": stream,
+                    "timeout": timeout,
+                    "verify": verify,
+                    "cert": cert,
+                    "proxies": proxies,
+                },
             )
             if result is not NotImplemented:
                 return result
-    return _HTTP_ADAPTER_COMPAT_SEND(
-        self,
-        request,
-        stream=stream,
-        timeout=timeout,
-        verify=verify,
-        cert=cert,
-        proxies=proxies,
-    )
+        if allowed and getattr(_ADAPTER_TRIAL_STATE, "enabled", False):
+            try:
+                from . import _requests_rust
+            except ImportError:
+                pass
+            else:
+                _register_rust_adapter_trial(self)
+                result = _requests_rust._adapter_send_trial(
+                    self,
+                    request,
+                    stream,
+                    timeout,
+                    verify,
+                    cert,
+                    proxies,
+                )
+                if result is not NotImplemented:
+                    return result
+        return _HTTP_ADAPTER_COMPAT_SEND(
+            self,
+            request,
+            stream=stream,
+            timeout=timeout,
+            verify=verify,
+            cert=cert,
+            proxies=proxies,
+        )
 
 
-def _trial_http_adapter_close(self: HTTPAdapter) -> None:
-    _HTTP_ADAPTER_COMPAT_CLOSE(self)
-    try:
-        from . import _requests_rust
-    except ImportError:
-        return
-    _requests_rust._adapter_close_trial(self)
+@wraps(_HTTP_ADAPTER_COMPAT_CLOSE)
+def _trial_http_adapter_close(self) -> None:
+    with _public_facade_owner_access(self) as allowed:
+        try:
+            result = (
+                _public_facade_dispatch("adapter", self, "close", (), {})
+                if allowed
+                else NotImplemented
+            )
+            if result is NotImplemented:
+                _HTTP_ADAPTER_COMPAT_CLOSE(self)
+        finally:
+            try:
+                _drop_rust_adapter_trial(id(self))
+            finally:
+                _close_public_facade_owner(self)
 
 
 HTTPAdapter.__init__ = _trial_http_adapter_init
 HTTPAdapter.__setstate__ = _trial_http_adapter_setstate
 HTTPAdapter.send = _trial_http_adapter_send
 HTTPAdapter.close = _trial_http_adapter_close
+_HTTP_ADAPTER_FACADE_TYPE = HTTPAdapter
+
+
+# Static inventory marker for the compiled extension dispatch seam.
+_ADAPTER_FACADE_SEAM = "_adapter_facade_trial"
+_ADAPTER_FACADE_INVENTORY = (
+    "construct",
+    "send",
+    "close",
+    "state",
+    "pickle",
+)

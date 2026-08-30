@@ -37,6 +37,7 @@ from urllib3.util import parse_url
 
 from . import _types as _t
 from ._internal_utils import to_native_string, unicode_is_ascii
+from ._rust_public import dispatch as _public_facade_dispatch
 from .auth import HTTPBasicAuth
 from .compat import (
     JSONDecodeError,
@@ -359,6 +360,9 @@ class Request(RequestHooksMixin):
 
     def prepare(self) -> PreparedRequest:
         """Constructs a :class:`PreparedRequest <PreparedRequest>` for transmission and returns it."""
+        result = _public_facade_dispatch("model", self, "request.prepare", (), {})
+        if result is not NotImplemented:
+            return result
         p = PreparedRequest()
         p.prepare(
             method=self.method,
@@ -436,6 +440,16 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
     ) -> None:
         """Prepares the entire request with the given parameters."""
 
+        result = _public_facade_dispatch(
+            "model",
+            self,
+            "prepared.prepare",
+            (method, url, headers, files, data, params, auth, cookies, hooks, json),
+            {},
+        )
+        if result is not NotImplemented:
+            return result
+
         url = cast("_t.UriType", url)
         self.prepare_method(method)
         self.prepare_url(url, params)
@@ -466,6 +480,9 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
 
     def prepare_method(self, method: str | None) -> None:
         """Prepares the given HTTP method."""
+        result = _public_facade_dispatch("model", self, "prepare_method", (method,), {})
+        if result is not NotImplemented:
+            return result
         self.method = method
         if self.method is not None:
             self.method = to_native_string(self.method.upper())
@@ -486,6 +503,11 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         params: _t.ParamsType,
     ) -> None:
         """Prepares the given HTTP URL."""
+        result = _public_facade_dispatch(
+            "model", self, "prepare_url", (url, params), {}
+        )
+        if result is not NotImplemented:
+            return result
         #: Accept objects that have string representations.
         #: We're unable to blindly call unicode/str functions
         #: as this will include the bytestring indicator (b'')
@@ -565,6 +587,12 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
     def prepare_headers(self, headers: Mapping[str, str | bytes] | None) -> None:
         """Prepares the given HTTP headers."""
 
+        result = _public_facade_dispatch(
+            "model", self, "prepare_headers", (headers,), {}
+        )
+        if result is not NotImplemented:
+            return result
+
         self.headers = CaseInsensitiveDict()
         if headers:
             for header in headers.items():
@@ -577,6 +605,12 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         self, data: _t.DataType, files: _t.FilesType, json: _t.JsonType = None
     ) -> None:
         """Prepares the given HTTP body data."""
+
+        result = _public_facade_dispatch(
+            "model", self, "prepare_body", (data, files, json), {}
+        )
+        if result is not NotImplemented:
+            return result
 
         # Check if file, fo, generator, iterator.
         # If not, run through normal process.
@@ -653,6 +687,11 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
 
     def prepare_content_length(self, body: _t.BodyType) -> None:
         """Prepare Content-Length header based on request method and body"""
+        result = _public_facade_dispatch(
+            "model", self, "prepare_content_length", (body,), {}
+        )
+        if result is not NotImplemented:
+            return result
         if body is not None:
             length = super_len(body)
             if length:
@@ -673,6 +712,10 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         url: _t.UriType = "",
     ) -> None:
         """Prepares the given HTTP auth data."""
+
+        result = _public_facade_dispatch("model", self, "prepare_auth", (auth, url), {})
+        if result is not NotImplemented:
+            return result
 
         # If no Auth is explicitly provided, extract it from the URL first.
         if auth is None:
@@ -709,6 +752,11 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         to ``prepare_cookies`` will have no actual effect, unless the "Cookie"
         header is removed beforehand.
         """
+        result = _public_facade_dispatch(
+            "model", self, "prepare_cookies", (cookies,), {}
+        )
+        if result is not NotImplemented:
+            return result
         if isinstance(cookies, cookielib.CookieJar):
             self._cookies = cookies
         else:
@@ -721,6 +769,9 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
 
     def prepare_hooks(self, hooks: _t.HooksInputType | None) -> None:
         """Prepares the given hooks."""
+        result = _public_facade_dispatch("model", self, "prepare_hooks", (hooks,), {})
+        if result is not NotImplemented:
+            return result
         # hooks can be passed as None to the prepare method and to this
         # method. To prevent iterating over None, simply use an empty list
         # if hooks is False-y
@@ -816,6 +867,10 @@ class Response:
         self.close()
 
     def __getstate__(self) -> dict[str, Any]:
+        _public_facade_dispatch("response", self, "state", (), {})
+        result = _public_facade_dispatch("response", self, "pickle", (), {})
+        if result is not NotImplemented:
+            return result
         # Consume everything; accessing the content attribute makes
         # sure the content has been fully read.
         if not self._content_consumed:
@@ -856,6 +911,9 @@ class Response:
 
     def __iter__(self) -> Iterator[bytes]:
         """Allows you to use a response as an iterator."""
+        result = _public_facade_dispatch("response", self, "iter", (), {})
+        if result is not NotImplemented:
+            return result
         return self.iter_content(128)
 
     @property
@@ -931,6 +989,11 @@ class Response:
         bytes will be returned. This can be bypassed by manually setting
         `encoding` on the response.
         """
+        result = _public_facade_dispatch(
+            "response", self, "iter_content", (chunk_size, decode_unicode), {}
+        )
+        if result is not NotImplemented:
+            return result
 
         def generate() -> Generator[bytes, None, None]:
             # Special case for urllib3.
@@ -1006,6 +1069,16 @@ class Response:
 
         .. note:: This method is not reentrant safe.
         """
+        result = _public_facade_dispatch(
+            "response",
+            self,
+            "iter_lines",
+            (chunk_size, decode_unicode, delimiter),
+            {},
+        )
+        if result is not NotImplemented:
+            yield from result
+            return
 
         pending: str | bytes | None = None
 
@@ -1034,6 +1107,9 @@ class Response:
     @property
     def content(self) -> bytes:
         """Content of the response, in bytes."""
+        result = _public_facade_dispatch("response", self, "content", (), {})
+        if result is not NotImplemented:
+            return result
 
         if self._content is False:
             # Read the contents.
@@ -1098,6 +1174,10 @@ class Response:
             contain valid json.
         """
 
+        result = _public_facade_dispatch("response", self, "json", (), kwargs)
+        if result is not NotImplemented:
+            return result
+
         if not self.encoding and self.content and len(self.content) > 3:
             # No encoding set. JSON RFC 4627 section 3 states we should expect
             # UTF-8, -16 or -32. Detect which one to use; If the detection or
@@ -1143,6 +1223,9 @@ class Response:
 
     def raise_for_status(self) -> None:
         """Raises :class:`HTTPError`, if one occurred."""
+        result = _public_facade_dispatch("response", self, "raise_for_status", (), {})
+        if result is not NotImplemented:
+            return result
 
         http_error_msg = ""
         if isinstance(self.reason, bytes):
@@ -1176,9 +1259,44 @@ class Response:
 
         *Note: Should not normally need to be called explicitly.*
         """
+        result = _public_facade_dispatch("response", self, "close", (), {})
+        if result is not NotImplemented:
+            return result
         if not self._content_consumed:
             self.raw.close()
 
         release_conn = getattr(self.raw, "release_conn", None)
         if release_conn is not None:
             release_conn()
+
+
+# Task 17 keeps these ordinary Python heap types authoritative.  The private
+# seams are consulted only inside requests._rust_public_trial(), and a
+# NotImplemented reply falls through exactly once to the captured Python code.
+_MODEL_FACADE_OPERATIONS = {
+    Request: {"prepare": "request.prepare"},
+    PreparedRequest: {
+        "prepare": "prepared.prepare",
+        "prepare_method": "prepare_method",
+        "prepare_url": "prepare_url",
+        "prepare_headers": "prepare_headers",
+        "prepare_body": "prepare_body",
+        "prepare_content_length": "prepare_content_length",
+        "prepare_auth": "prepare_auth",
+        "prepare_cookies": "prepare_cookies",
+        "prepare_hooks": "prepare_hooks",
+    },
+}
+_RESPONSE_FACADE_OPERATIONS = {
+    "__iter__": "iter",
+    "iter_lines": "iter_lines",
+    "json": "json",
+    "raise_for_status": "raise_for_status",
+    "close": "close",
+}
+
+
+# Static inventory markers for the compiled extension dispatch seam.
+_MODEL_FACADE_SEAM = "_model_facade_trial"
+_RESPONSE_FACADE_SEAM = "_response_facade_trial"
+_RESPONSE_FACADE_INVENTORY = ("state", "pickle")

@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Read;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +23,11 @@ use requests::{
     Proxy, Timeout, TlsConfig, Uri,
 };
 
-use crate::errors::{exception_matches, map_decoder_error, map_typed_response_error};
+use crate::bridge::WorkerPayload;
+use crate::errors::{
+    exception_matches, map_decoder_error, map_typed_raw_response_error, map_typed_response_error,
+};
+use crate::runtime::run_with_actions_and_signal_checker;
 
 #[derive(PartialEq)]
 struct RetrySnapshot {
@@ -197,8 +200,36 @@ struct AdapterPoolSelection {
 }
 
 static ADAPTER_POOLS: OnceLock<Mutex<HashMap<usize, SideEntry>>> = OnceLock::new();
+static ADAPTER_PID: AtomicU64 = AtomicU64::new(0);
 static NEXT_ADAPTER_LIFECYCLE_EPOCH: AtomicU64 = AtomicU64::new(1);
 const MANAGER_PROOF_ATTEMPTS: usize = 8;
+
+fn ensure_adapter_process() -> PyResult<()> {
+    let pid = u64::from(std::process::id());
+    if ADAPTER_PID.load(Ordering::Acquire) == pid {
+        return Ok(());
+    }
+    let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut table = registry
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+    if ADAPTER_PID.load(Ordering::Relaxed) == pid {
+        return Ok(());
+    }
+    let inherited = std::mem::take(&mut *table);
+    NEXT_ADAPTER_LIFECYCLE_EPOCH.store(1, Ordering::Release);
+    ADAPTER_PID.store(pid, Ordering::Release);
+    drop(table);
+    for entry in inherited.into_values() {
+        clear_realms(entry);
+    }
+    Ok(())
+}
+
+#[pyfunction]
+fn _adapter_fork_reset_trial() -> PyResult<()> {
+    ensure_adapter_process()
+}
 
 #[pyclass(module = "requests._requests_rust", unsendable)]
 struct NativeAdapterRaw {
@@ -657,6 +688,46 @@ fn dict_proof_is_pristine(
     Ok(true)
 }
 
+fn class_dict_proof_is_pristine(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    proof: &DictProof,
+) -> PyResult<bool> {
+    if exact_dict_snapshot(py, value, &proof.items)? {
+        return dict_proof_is_pristine(py, value, proof);
+    }
+    // pickle/copyreg may memoize this interpreter-owned empty cache on an
+    // otherwise unchanged Python class. It is not callable authority.
+    if proof.items.iter().any(|(name, _)| name == "__slotnames__")
+        || value.len()? != proof.items.len() + 1
+    {
+        return Ok(false);
+    }
+    let Ok(slotnames) = value.get_item("__slotnames__") else {
+        return Ok(false);
+    };
+    let Ok(slotnames) = slotnames.cast_exact::<PyList>() else {
+        return Ok(false);
+    };
+    if !slotnames.is_empty() {
+        return Ok(false);
+    }
+    for (name, original) in &proof.items {
+        let Ok(current) = value.get_item(name) else {
+            return Ok(false);
+        };
+        if !current.is(original.bind(py)) {
+            return Ok(false);
+        }
+    }
+    for behavior in &proof.behaviors {
+        if !behavior_proof_is_pristine(py, behavior.object.bind(py), behavior)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn sequence_proof_inner(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
@@ -772,7 +843,11 @@ fn behavior_proof_is_pristine(
             .getattr("__bases__")?
             .is(class_proof.bases.sequence.bind(py))
             && sequence_proof_is_pristine(py, &class_proof.bases)?
-            && dict_proof_is_pristine(py, &value.getattr("__dict__")?, &class_proof.dictionary)?),
+            && class_dict_proof_is_pristine(
+                py,
+                &value.getattr("__dict__")?,
+                &class_proof.dictionary,
+            )?),
         Some(BehaviorDetails::Partial {
             function,
             arguments,
@@ -988,6 +1063,14 @@ struct NativeSendInput {
     pool_block: bool,
     retry: RetrySnapshot,
 }
+
+enum AdapterSendAction {}
+
+impl WorkerPayload for AdapterSendAction {}
+
+enum AdapterSendReply {}
+
+impl WorkerPayload for AdapterSendReply {}
 
 #[derive(Clone, Copy)]
 struct ProxyManagerConfiguration {
@@ -2396,6 +2479,7 @@ fn exact_dict_snapshot_is_current(
 }
 
 fn registered_adapter_pristine(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<bool> {
+    ensure_adapter_process()?;
     let identity = adapter_id(py, adapter)?;
     let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     for _ in 0..MANAGER_PROOF_ATTEMPTS {
@@ -2501,6 +2585,7 @@ fn _adapter_register_trial(
     adapter: &Bound<'_, PyAny>,
     callback: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
+    ensure_adapter_process()?;
     if !adapter
         .get_type()
         .as_any()
@@ -2509,6 +2594,20 @@ fn _adapter_register_trial(
         return Ok(false);
     }
     let identity = adapter_id(py, adapter)?;
+    let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let existing_reference = {
+        let table = table
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+        table
+            .get(&identity)
+            .map(|entry| Arc::clone(&entry.weak_adapter))
+    };
+    if let Some(existing_reference) = existing_reference
+        && existing_reference.bind(py).call0()?.is(adapter)
+    {
+        return registered_adapter_pristine(py, adapter);
+    }
     let manager = adapter.getattr("poolmanager")?;
     if !manager_identity_is_pristine(py, &manager)?
         || !manager_configuration_is_pristine(adapter, &manager)?
@@ -2536,7 +2635,6 @@ fn _adapter_register_trial(
     else {
         return Ok(false);
     };
-    let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut table = table
         .lock()
         .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
@@ -2559,6 +2657,38 @@ fn _adapter_register_trial(
         clear_realms(previous);
     }
     Ok(true)
+}
+
+#[pyfunction]
+fn _adapter_reference_trial(
+    py: Python<'_>,
+    adapter: &Bound<'_, PyAny>,
+) -> PyResult<Option<Py<PyAny>>> {
+    ensure_adapter_process()?;
+    if !adapter
+        .get_type()
+        .as_any()
+        .is(adapter_state(py)?.adapter_type.bind(py))
+    {
+        return Ok(None);
+    }
+    let identity = adapter_id(py, adapter)?;
+    let weak_adapter = {
+        let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+        let table = table
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+        table
+            .get(&identity)
+            .map(|entry| Arc::clone(&entry.weak_adapter))
+    };
+    let Some(weak_adapter) = weak_adapter else {
+        return Ok(None);
+    };
+    if !weak_adapter.bind(py).call0()?.is(adapter) {
+        return Ok(None);
+    }
+    Ok(Some(weak_adapter.as_ref().clone_ref(py)))
 }
 
 fn record_visible_proxy_manager(
@@ -2763,10 +2893,37 @@ fn record_visible_direct_manager(
 
 #[pyfunction]
 fn _adapter_drop_trial(identity: usize) -> PyResult<usize> {
+    ensure_adapter_process()?;
     let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut table = table
         .lock()
         .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+    let Some(entry) = table.remove(&identity) else {
+        return Ok(0);
+    };
+    let count = realm_pool_count(&entry);
+    drop(table);
+    clear_realms(entry);
+    Ok(count)
+}
+
+#[pyfunction]
+fn _adapter_drop_reference_trial(
+    py: Python<'_>,
+    identity: usize,
+    reference: &Bound<'_, PyAny>,
+) -> PyResult<usize> {
+    ensure_adapter_process()?;
+    let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut table = table
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("adapter pool table lock poisoned"))?;
+    let matches = table
+        .get(&identity)
+        .is_some_and(|entry| entry.weak_adapter.bind(py).is(reference));
+    if !matches {
+        return Ok(0);
+    }
     let Some(entry) = table.remove(&identity) else {
         return Ok(0);
     };
@@ -2799,6 +2956,7 @@ fn clear_realm(realm: PoolRealm) {
 }
 
 fn reap_adapter_pools(py: Python<'_>) -> PyResult<()> {
+    ensure_adapter_process()?;
     let registry = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     let candidates = {
         let table = registry
@@ -2846,6 +3004,7 @@ fn adapter_pool(
     adapter: &Bound<'_, PyAny>,
     input: &NativeSendInput,
 ) -> PyResult<Result<AdapterPoolSelection, String>> {
+    ensure_adapter_process()?;
     reap_adapter_pools(py)?;
     let identity = adapter_id(py, adapter)?;
     let poolmanager = adapter.getattr("poolmanager")?;
@@ -3017,12 +3176,16 @@ fn sleep_before_retry(py: Python<'_>, state: &RetryState, retry_after: f64) -> P
     Ok(())
 }
 
-fn drain_response(py: Python<'_>, response: AdapterResponse) {
-    let mut body = response.into_raw_body();
-    let _ = py.detach(move || {
-        let mut drained = Vec::new();
-        body.read_to_end(&mut drained)
-    });
+fn drain_response(py: Python<'_>, response: AdapterResponse) -> PyResult<()> {
+    let body = response.into_raw_body();
+    let drained = run_with_actions_and_signal_checker(
+        py,
+        move |_actions| async move { body.read_async(None, true).await },
+        |_py, action: AdapterSendAction| -> AdapterSendReply { match action {} },
+        |py| py.check_signals(),
+    )?;
+    let _ = drained;
+    Ok(())
 }
 
 fn redirect_location(status: u16, headers: &HeaderMap) -> Option<String> {
@@ -3404,9 +3567,8 @@ fn build_python_response(
         .unbind())
 }
 
-#[pyfunction]
 #[allow(clippy::too_many_arguments)] // Mirrors HTTPAdapter.send's public signature.
-fn _adapter_send_trial(
+fn native_adapter_leaf(
     py: Python<'_>,
     adapter: &Bound<'_, PyAny>,
     request: &Bound<'_, PyAny>,
@@ -3474,7 +3636,12 @@ fn _adapter_send_trial(
             .map_or(BodySource::Empty, BodySource::from);
         let timeout = input.timeout;
         let pool = Arc::clone(&pool);
-        let attempt = py.detach(move || pool.send(method, &url, headers, body, timeout));
+        let attempt = run_with_actions_and_signal_checker(
+            py,
+            move |_actions| async move { pool.send_async(method, &url, headers, body, timeout).await },
+            |_py, action: AdapterSendAction| -> AdapterSendReply { match action {} },
+            |py| py.check_signals(),
+        )?;
         let response = match attempt {
             Ok(response) => response,
             Err(error) => {
@@ -3528,7 +3695,7 @@ fn _adapter_send_trial(
         let next = match incremented {
             Ok(next) => next,
             Err(_) if input.retry.policy.raise_on_status => {
-                drain_response(py, response);
+                drain_response(py, response)?;
                 let message = format!("too many {status} responses");
                 let state = adapter_state(py)?;
                 let original = canonical_retry_surrogate(
@@ -3545,7 +3712,7 @@ fn _adapter_send_trial(
             }
         };
         let headers = response.headers().clone();
-        drain_response(py, response);
+        drain_response(py, response)?;
         let retry_after = if input.retry.policy.respect_retry_after && has_retry_after {
             retry_after(py, &retry_object, &headers)?
         } else {
@@ -3556,8 +3723,137 @@ fn _adapter_send_trial(
     }
 }
 
+pub(crate) enum PublicSessionSend<'py> {
+    Compatibility {
+        session: &'py Bound<'py, PyAny>,
+        args: &'py Bound<'py, PyTuple>,
+        kwargs: &'py Bound<'py, PyDict>,
+    },
+    Adapter {
+        adapter: &'py Bound<'py, PyAny>,
+        request: &'py Bound<'py, PyAny>,
+        stream: bool,
+        timeout: &'py Bound<'py, PyAny>,
+        verify: &'py Bound<'py, PyAny>,
+        cert: &'py Bound<'py, PyAny>,
+        proxies: &'py Bound<'py, PyAny>,
+    },
+}
+
+pub(crate) fn send_from_session(
+    py: Python<'_>,
+    send: PublicSessionSend<'_>,
+) -> PyResult<Py<PyAny>> {
+    match send {
+        PublicSessionSend::Compatibility {
+            session,
+            args,
+            kwargs,
+        } => {
+            let sessions = PyModule::import(py, "requests.sessions")?;
+            let compatibility = sessions.getattr("_SESSION_FACADE_COMPAT_SEND")?;
+            let mut items = Vec::with_capacity(args.len() + 1);
+            items.push(session.clone());
+            items.extend(args.try_iter()?.collect::<PyResult<Vec<_>>>()?);
+            let positional = PyTuple::new(py, items)?;
+            Ok(compatibility.call(positional, Some(kwargs))?.unbind())
+        }
+        PublicSessionSend::Adapter {
+            adapter,
+            request,
+            stream,
+            timeout,
+            verify,
+            cert,
+            proxies,
+        } => {
+            let _pump_guard = crate::sessions::PublicPumpGuard::enter_if_absent();
+            let _leaf_guard = crate::sessions::enter_public_adapter_leaf();
+            native_adapter_leaf(py, adapter, request, stream, timeout, verify, cert, proxies)
+        }
+    }
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn _adapter_send_trial(
+    py: Python<'_>,
+    adapter: &Bound<'_, PyAny>,
+    request: &Bound<'_, PyAny>,
+    stream: bool,
+    timeout: &Bound<'_, PyAny>,
+    verify: &Bound<'_, PyAny>,
+    cert: &Bound<'_, PyAny>,
+    proxies: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    send_from_session(
+        py,
+        PublicSessionSend::Adapter {
+            adapter,
+            request,
+            stream,
+            timeout,
+            verify,
+            cert,
+            proxies,
+        },
+    )
+}
+
+#[pyfunction]
+fn _adapter_facade_trial(
+    py: Python<'_>,
+    adapter: &Bound<'_, PyAny>,
+    operation: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: &Bound<'_, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    if operation != "send" || args.is_empty() {
+        return Ok(py.NotImplemented());
+    }
+    let request = args.get_item(0)?;
+    let stream = kwargs
+        .get_item("stream")?
+        .map(|value| value.extract::<bool>())
+        .transpose()?
+        .unwrap_or(false);
+    let none = py.None();
+    let default_verify = PyBool::new(py, true).to_owned().into_any();
+    let timeout = kwargs
+        .get_item("timeout")?
+        .unwrap_or_else(|| none.bind(py).clone());
+    let verify = kwargs
+        .get_item("verify")?
+        .unwrap_or_else(|| default_verify.clone());
+    let cert = kwargs
+        .get_item("cert")?
+        .unwrap_or_else(|| none.bind(py).clone());
+    let proxies = kwargs
+        .get_item("proxies")?
+        .unwrap_or_else(|| none.bind(py).clone());
+    let empty_proxies = PyDict::new(py).into_any();
+    let proxies = if proxies.is_truthy()? {
+        proxies
+    } else {
+        empty_proxies
+    };
+    send_from_session(
+        py,
+        PublicSessionSend::Adapter {
+            adapter,
+            request: &request,
+            stream,
+            timeout: &timeout,
+            verify: &verify,
+            cert: &cert,
+            proxies: &proxies,
+        },
+    )
+}
+
 #[pyfunction]
 fn _adapter_close_trial(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<usize> {
+    ensure_adapter_process()?;
     if !adapter
         .get_type()
         .as_any()
@@ -3662,6 +3958,7 @@ fn _adapter_close_trial(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> PyResult<
 
 #[pyfunction]
 fn _adapter_pool_side_table_trial(py: Python<'_>) -> PyResult<usize> {
+    ensure_adapter_process()?;
     let table = ADAPTER_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     let table = table
         .lock()
@@ -3682,13 +3979,59 @@ impl NativeAdapterRaw {
         self.decoded_offset = 0;
     }
 
+    fn read_wire(
+        &mut self,
+        py: Python<'_>,
+        amount: Option<usize>,
+        suppress_incomplete: bool,
+        allow_encoded_completion: bool,
+        fill_requested: bool,
+    ) -> PyResult<Vec<u8>> {
+        let Some(body) = self.body.take() else {
+            return Ok(Vec::new());
+        };
+        let result = run_with_actions_and_signal_checker(
+            py,
+            move |_actions| async move {
+                if fill_requested {
+                    body.read_async(amount, allow_encoded_completion).await
+                } else {
+                    body.read_frame_async(
+                        amount.expect("frame reads always have a maximum"),
+                        allow_encoded_completion,
+                    )
+                    .await
+                }
+            },
+            |_py, action: AdapterSendAction| -> AdapterSendReply { match action {} },
+            |py| py.check_signals(),
+        );
+        match result {
+            Ok(Ok((body, bytes))) => {
+                self.body = Some(body);
+                Ok(bytes)
+            }
+            Ok(Err(error))
+                if suppress_incomplete && self.suppresses_urllib3_126_incomplete(py, &error) =>
+            {
+                self.finish_body_failure();
+                Ok(Vec::new())
+            }
+            Ok(Err(error)) => Err(self.map_io_failure(py, error)),
+            Err(signal) => {
+                self.finish_body_failure();
+                Err(signal)
+            }
+        }
+    }
+
     fn map_io_failure(&mut self, py: Python<'_>, error: std::io::Error) -> PyErr {
         let mapped = error
             .get_ref()
             .and_then(|source| source.downcast_ref::<requests::Error>())
             .map_or_else(
                 || PyRuntimeError::new_err(error.to_string()),
-                |source| map_typed_response_error(py, source, Some(self.pool.bind(py))),
+                |source| map_typed_raw_response_error(py, source, Some(self.pool.bind(py))),
             );
         self.finish_body_failure();
         mapped
@@ -3769,6 +4112,40 @@ impl NativeAdapterRaw {
         }
     }
 
+    fn decoder_reached_clean_end(decoder: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if decoder
+            .getattr("has_unconsumed_tail")
+            .is_ok_and(|tail| tail.is_truthy().unwrap_or(false))
+        {
+            return Ok(false);
+        }
+        if let Ok(decoders) = decoder.getattr("_decoders") {
+            for nested in decoders.try_iter()? {
+                if !Self::decoder_reached_clean_end(&nested?)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        let candidate = decoder.getattr("_obj").unwrap_or_else(|_| decoder.clone());
+        if let Ok(eof) = candidate.getattr("eof") {
+            return eof.is_truthy();
+        }
+        if let Ok(is_finished) = candidate.getattr("is_finished") {
+            return is_finished.call0()?.is_truthy();
+        }
+        Ok(false)
+    }
+
+    fn finish_decoded_wire_if_complete(&mut self, decoder: &Bound<'_, PyAny>) -> PyResult<()> {
+        if Self::decoder_reached_clean_end(decoder)?
+            && let Some(body) = self.body.as_mut()
+        {
+            body.finish_encoded_declared_length();
+        }
+        Ok(())
+    }
+
     fn fill_decoded_bounded(&mut self, py: Python<'_>, wanted: Option<usize>) -> PyResult<()> {
         if self.decoded_offset > 0 {
             self.decoded.drain(..self.decoded_offset);
@@ -3783,20 +4160,12 @@ impl NativeAdapterRaw {
                     .is_truthy()?,
                 _ => false,
             };
-            let mut wire = if has_tail { Vec::new() } else { vec![0; 8192] };
-            let read = if has_tail {
-                0
+            let wire = if has_tail {
+                Vec::new()
             } else {
-                let result = match self.body.as_mut() {
-                    Some(body) => py.detach(|| body.read(&mut wire)),
-                    None => Ok(0),
-                };
-                match result {
-                    Ok(read) => read,
-                    Err(error) => return Err(self.map_io_failure(py, error)),
-                }
+                self.read_wire(py, Some(8192), false, false, false)?
             };
-            wire.truncate(read);
+            let read = wire.len();
             if read == 0 && !has_tail {
                 self.body = None;
                 if self.decode_failed {
@@ -3845,20 +4214,8 @@ impl NativeAdapterRaw {
         amount: Option<usize>,
         decoder: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<u8>> {
-        let mut wire = Vec::new();
-        let result = match (self.body.as_mut(), amount) {
-            (Some(body), Some(amount)) => {
-                wire.resize(amount, 0);
-                py.detach(|| body.read(&mut wire))
-            }
-            (Some(body), None) => py.detach(|| body.read_to_end(&mut wire)),
-            (None, _) => Ok(0),
-        };
-        let read = match result {
-            Ok(read) => read,
-            Err(error) => return Err(self.map_io_failure(py, error)),
-        };
-        wire.truncate(read);
+        let wire = self.read_wire(py, amount, false, false, false)?;
+        let read = wire.len();
         if read == 0 {
             self.body = None;
             self.decoder_eof = true;
@@ -3901,6 +4258,10 @@ impl NativeAdapterRaw {
                 return Ok(PyBytes::new(py, &bytes).into_any().unbind());
             }
             self.fill_decoded_bounded(py, amount)?;
+            let available = self.decoded.len().saturating_sub(self.decoded_offset);
+            if amount.is_none_or(|wanted| available < wanted) {
+                self.finish_decoded_wire_if_complete(decoder.bind(py))?;
+            }
             let end = amount
                 .map(|amount| {
                     self.decoded_offset
@@ -3920,32 +4281,11 @@ impl NativeAdapterRaw {
                 "Calling read(decode_content=False) is not supported after read(decode_content=True) was called.",
             ));
         }
-        let Some(body) = self.body.as_mut() else {
+        if self.body.is_none() {
             self.closed = true;
             return Ok(PyBytes::new(py, b"").into_any().unbind());
-        };
-        let mut bytes = Vec::new();
-        let result = match amount {
-            Some(amount) => {
-                bytes.resize(amount, 0);
-                let read = py.detach(|| body.read(&mut bytes));
-                match read {
-                    Ok(read) => {
-                        bytes.truncate(read);
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            None => py.detach(|| body.read_to_end(&mut bytes)).map(|_| ()),
-        };
-        if let Err(error) = result {
-            if self.suppresses_urllib3_126_incomplete(py, &error) {
-                self.finish_body_failure();
-                return Ok(PyBytes::new(py, b"").into_any().unbind());
-            }
-            return Err(self.map_io_failure(py, error));
         }
+        let bytes = self.read_wire(py, amount, true, true, true)?;
         if bytes.is_empty() {
             self.closed = true;
             self.body = None;
@@ -4023,7 +4363,13 @@ impl NativeAdapterRaw {
         if let Some(body) = self.body.take() {
             self.closed = true;
             self.decoder_eof = true;
-            if let Err(error) = py.detach(|| body.close()) {
+            let result = run_with_actions_and_signal_checker(
+                py,
+                move |_actions| async move { body.close_async().await },
+                |_py, action: AdapterSendAction| -> AdapterSendReply { match action {} },
+                |py| py.check_signals(),
+            )?;
+            if let Err(error) = result {
                 return Err(map_typed_response_error(
                     py,
                     &error,
@@ -4085,9 +4431,13 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_select_proxy_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_retry_policy_snapshot_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_register_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_adapter_reference_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_drop_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_adapter_drop_reference_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_send_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_adapter_facade_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_close_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_pool_side_table_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_adapter_fork_reset_trial, module)?)?;
     Ok(())
 }

@@ -188,6 +188,14 @@ pub(crate) fn map_typed_response_error(
     map_stream_error(py, &models, original)
 }
 
+pub(crate) fn map_typed_raw_response_error(
+    py: Python<'_>,
+    error: &Error,
+    pool: Option<&Bound<'_, PyAny>>,
+) -> PyErr {
+    canonical_response_error(py, error, pool).unwrap_or_else(|error| error)
+}
+
 fn urllib3_v2(py: Python<'_>) -> PyResult<bool> {
     Ok(!PyModule::import(py, "urllib3")?
         .getattr("__version__")?

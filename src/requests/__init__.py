@@ -182,7 +182,7 @@ from .exceptions import (
     URLRequired,
 )
 from .models import PreparedRequest, Request, Response
-from .sessions import Session, session
+from .sessions import Session, _rust_public_trial, session
 from .status_codes import codes
 
 __all__ = (
@@ -223,5 +223,9 @@ from importlib.util import find_spec as _find_spec
 
 if _find_spec(f"{__name__}._requests_rust") is not None:
     from . import _requests_rust as _requests_rust
+    from ._rust_public import install_extension_hooks as _install_extension_hooks
+
+    _install_extension_hooks(_requests_rust)
+    del _install_extension_hooks
 
 del _find_spec

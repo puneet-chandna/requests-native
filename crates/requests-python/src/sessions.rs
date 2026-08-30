@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,32 +14,158 @@ use pyo3::exceptions::{
     PyTimeoutError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{
-    PyAny, PyBool, PyDict, PyList, PyModule, PyString, PyTuple, PyType,
-};
+use pyo3::types::{PyAny, PyBool, PyDict, PyList, PyModule, PyString, PyTuple, PyType};
 use pyo3::wrap_pyfunction;
 
 use crate::bridge::{ActionSender, WorkerPayload};
 use crate::runtime::{
-    last_origin_quarantine_token, origin_quarantine_is_terminal,
-    origin_quarantine_retains_owner,
-    run_with_owned_actions, take_origin_quarantine_owner,
-    run_with_owned_actions_and_signal_checker, signal_wins_ready_result,
+    last_origin_quarantine_token, origin_quarantine_is_terminal, origin_quarantine_retains_owner,
+    run_with_owned_actions, run_with_owned_actions_and_signal_checker, signal_wins_ready_result,
+    take_origin_quarantine_owner,
 };
 use requests::blocking::BlockingRuntimeDriver;
 use requests::session_runtime::{
-    SessionCheckpoint, SessionPhase, SessionRuntimeHooks, SessionRuntimeHarness,
+    SessionCheckpoint, SessionPhase, SessionRuntimeHarness, SessionRuntimeHooks,
 };
+
+#[derive(Default)]
+struct PublicPumpObservation {
+    process_id: u32,
+    outer_entries: u64,
+    outer_exits: u64,
+    max_depth: u64,
+    adapter_leaf_entries: u64,
+    nested_pump_entries: u64,
+    submission_ids: Vec<u64>,
+    submission_parent_ids: Vec<Option<u64>>,
+    adapter_submission_ids: Vec<u64>,
+}
+
+static PUBLIC_PUMP_OBSERVATION: OnceLock<Mutex<PublicPumpObservation>> = OnceLock::new();
+static PUBLIC_PUMP_OBSERVATION_ENABLED: AtomicBool = AtomicBool::new(false);
+static NEXT_PUBLIC_SUBMISSION: AtomicU64 = AtomicU64::new(1);
+const MAX_PUBLIC_PUMP_OBSERVATIONS: usize = 256;
+
+thread_local! {
+    static PUBLIC_PUMP_SUBMISSION: Cell<u64> = const { Cell::new(0) };
+    static PUBLIC_PUMP_DEPTH: Cell<u64> = const { Cell::new(0) };
+    static PUBLIC_ADAPTER_LEAF_DEPTH: Cell<u64> = const { Cell::new(0) };
+}
+
+fn begin_public_pump() -> (u64, u64) {
+    let capture = PUBLIC_PUMP_OBSERVATION_ENABLED.load(Ordering::Acquire);
+    let submission = if capture {
+        NEXT_PUBLIC_SUBMISSION.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
+    let depth = PUBLIC_PUMP_DEPTH.with(|depth| {
+        let next = depth.get() + 1;
+        depth.set(next);
+        next
+    });
+    let prior_submission = PUBLIC_PUMP_SUBMISSION.with(|current| current.replace(submission));
+    if capture
+        && let Ok(mut observation) = PUBLIC_PUMP_OBSERVATION
+            .get_or_init(|| Mutex::new(PublicPumpObservation::default()))
+            .lock()
+        && PUBLIC_PUMP_OBSERVATION_ENABLED.load(Ordering::Acquire)
+    {
+        if observation.process_id == std::process::id() {
+            observation.outer_entries += 1;
+            observation.max_depth = observation.max_depth.max(depth);
+            observation.nested_pump_entries += u64::from(depth > 1);
+        } else {
+            PUBLIC_PUMP_OBSERVATION_ENABLED.store(false, Ordering::Release);
+        }
+    }
+    (submission, prior_submission)
+}
+
+fn end_public_pump(prior_submission: u64) {
+    PUBLIC_PUMP_SUBMISSION.with(|current| current.set(prior_submission));
+    PUBLIC_PUMP_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    if PUBLIC_PUMP_OBSERVATION_ENABLED.load(Ordering::Acquire)
+        && let Ok(mut observation) = PUBLIC_PUMP_OBSERVATION
+            .get_or_init(|| Mutex::new(PublicPumpObservation::default()))
+            .lock()
+        && PUBLIC_PUMP_OBSERVATION_ENABLED.load(Ordering::Acquire)
+        && observation.process_id == std::process::id()
+    {
+        observation.outer_exits += 1;
+    }
+}
+
+pub(crate) struct PublicPumpGuard {
+    prior_submission: u64,
+}
+
+impl PublicPumpGuard {
+    pub(crate) fn enter() -> Self {
+        let (_, prior_submission) = begin_public_pump();
+        Self { prior_submission }
+    }
+
+    pub(crate) fn enter_if_absent() -> Option<Self> {
+        (PUBLIC_PUMP_DEPTH.with(Cell::get) == 0).then(Self::enter)
+    }
+}
+
+impl Drop for PublicPumpGuard {
+    fn drop(&mut self) {
+        end_public_pump(self.prior_submission);
+    }
+}
+
+pub(crate) struct PublicAdapterLeafGuard;
+
+impl Drop for PublicAdapterLeafGuard {
+    fn drop(&mut self) {
+        PUBLIC_ADAPTER_LEAF_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) fn enter_public_adapter_leaf() -> PublicAdapterLeafGuard {
+    PUBLIC_ADAPTER_LEAF_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    if PUBLIC_PUMP_OBSERVATION_ENABLED.load(Ordering::Acquire)
+        && let Ok(mut observation) = PUBLIC_PUMP_OBSERVATION
+            .get_or_init(|| Mutex::new(PublicPumpObservation::default()))
+            .lock()
+        && PUBLIC_PUMP_OBSERVATION_ENABLED.load(Ordering::Acquire)
+        && observation.process_id == std::process::id()
+    {
+        observation.adapter_leaf_entries += 1;
+    }
+    PublicAdapterLeafGuard
+}
+
+pub(crate) fn record_public_runtime_submission(id: u64, parent_id: Option<u64>) {
+    if !PUBLIC_PUMP_OBSERVATION_ENABLED.load(Ordering::Acquire)
+        || PUBLIC_PUMP_SUBMISSION.with(Cell::get) == 0
+    {
+        return;
+    }
+    if let Ok(mut observation) = PUBLIC_PUMP_OBSERVATION
+        .get_or_init(|| Mutex::new(PublicPumpObservation::default()))
+        .lock()
+        && PUBLIC_PUMP_OBSERVATION_ENABLED.load(Ordering::Acquire)
+        && observation.process_id == std::process::id()
+        && observation.submission_ids.len() < MAX_PUBLIC_PUMP_OBSERVATIONS
+    {
+        observation.submission_ids.push(id);
+        observation.submission_parent_ids.push(parent_id);
+        if PUBLIC_ADAPTER_LEAF_DEPTH.with(Cell::get) != 0 {
+            observation.adapter_submission_ids.push(id);
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 enum SessionHarnessAction {
     Checkpoint(SessionCheckpoint),
     Cancellation(RuntimeCancellationPhase),
     LoopbackRequest(Vec<u8>),
-    LoopbackPartial {
-        declared: u64,
-        bytes: Vec<u8>,
-    },
+    LoopbackPartial { declared: u64, bytes: Vec<u8> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -476,10 +602,16 @@ impl RuntimeOperation {
             "strict-recover-response-remainder" => Ok(Self::RecoverResponseRemainder),
             "strict-recover-origin-upload" => Ok(Self::RecoverOriginUpload),
             "strict-recover-cancel-before-poll" => Ok(Self::RecoverCancelBeforePoll),
-            "strict-recover-cancel-queued-before-dequeue" => Ok(Self::RecoverCancelQueuedBeforeDequeue),
+            "strict-recover-cancel-queued-before-dequeue" => {
+                Ok(Self::RecoverCancelQueuedBeforeDequeue)
+            }
             "strict-recover-cancel-reply-observed" => Ok(Self::RecoverCancelReplyObserved),
-            "strict-recover-cancel-terminal-after-timeout" => Ok(Self::RecoverCancelTerminalAfterTimeout),
-            "strict-recover-cancel-permanently-nonterminal" => Ok(Self::RecoverCancelPermanentlyNonterminal),
+            "strict-recover-cancel-terminal-after-timeout" => {
+                Ok(Self::RecoverCancelTerminalAfterTimeout)
+            }
+            "strict-recover-cancel-permanently-nonterminal" => {
+                Ok(Self::RecoverCancelPermanentlyNonterminal)
+            }
             "strict-fork-prepare-import" => Ok(Self::ForkPrepareImport),
             "strict-fork-prepare-driver" => Ok(Self::ForkPrepareDriver),
             "strict-fork-prepare-pool" => Ok(Self::ForkPreparePool),
@@ -506,7 +638,9 @@ impl RuntimeOperation {
             "strict-await-live-authority" => Ok(Self::AwaitLiveAuthority),
             "strict-concurrent-channel-reply" => Ok(Self::ConcurrentChannelReply),
             "strict-concurrent-channel-fail" => Ok(Self::ConcurrentChannelFail),
-            "strict-validate-terminal-nonterminal-conflict" => Ok(Self::ValidateTerminalNonterminalConflict),
+            "strict-validate-terminal-nonterminal-conflict" => {
+                Ok(Self::ValidateTerminalNonterminalConflict)
+            }
             "strict-validate-python-panic-payload" => Ok(Self::ValidatePythonPanicPayload),
             "strict-validate-stale-callable" => Ok(Self::ValidateStaleCallable),
             _ => Err(PyValueError::new_err("unknown runtime operation")),
@@ -518,8 +652,12 @@ impl RuntimeOperation {
             Self::ConnectBlocked | Self::RecoverConnectBlocked => Some("connect-wait"),
             Self::ConnectReadyRace | Self::RecoverConnectReadyRace => Some("connect-wait"),
             Self::InterruptResponseHead | Self::RecoverResponseHead => Some("response-head-wait"),
-            Self::InterruptResponseRemainder | Self::RecoverResponseRemainder => Some("response-remainder-wait"),
-            Self::InterruptOriginUpload | Self::RecoverOriginUpload => Some("origin-upload-action-wait"),
+            Self::InterruptResponseRemainder | Self::RecoverResponseRemainder => {
+                Some("response-remainder-wait")
+            }
+            Self::InterruptOriginUpload | Self::RecoverOriginUpload => {
+                Some("origin-upload-action-wait")
+            }
             Self::CancelBeforePoll | Self::RecoverCancelBeforePoll => Some("before-poll"),
             Self::CancelQueuedBeforeDequeue | Self::RecoverCancelQueuedBeforeDequeue => {
                 Some("queued-before-dequeue")
@@ -560,18 +698,14 @@ enum CompletionAction {
     NativeAwaitComplete,
     NativeChannelEntered { envelope: CompletionEnvelope },
     NativeChannelComplete { envelope: CompletionEnvelope },
-    ChannelSend {
-        envelope: CompletionEnvelope,
-    },
+    ChannelSend { envelope: CompletionEnvelope },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompletionReply {
     Ack,
     Failed,
-    Channel {
-        envelope: CompletionEnvelope,
-    },
+    Channel { envelope: CompletionEnvelope },
 }
 
 impl WorkerPayload for CompletionAction {}
@@ -854,7 +988,9 @@ impl SessionRedirectCursor {
     fn claim(&self, token: &Bound<'_, PyAny>) -> PyResult<()> {
         let mut inner = self.lock_inner()?;
         if inner.terminal != RedirectCursorTerminal::Live || inner.state.is_none() {
-            return Err(PyRuntimeError::new_err("stale or terminated redirect cursor"));
+            return Err(PyRuntimeError::new_err(
+                "stale or terminated redirect cursor",
+            ));
         }
         if inner.claimed_token.is_some() {
             return Err(PyRuntimeError::new_err("redirect cursor already claimed"));
@@ -893,7 +1029,11 @@ impl SessionRedirectCursor {
         let resolution = (|| -> PyResult<bool> {
             let base_exception = py.import("builtins")?.getattr("BaseException")?;
             let mut catchers = Vec::with_capacity(3);
-            for name in ["ChunkedEncodingError", "ContentDecodingError", "RuntimeError"] {
+            for name in [
+                "ChunkedEncodingError",
+                "ContentDecodingError",
+                "RuntimeError",
+            ] {
                 let catcher = Self::global_name(py, module, name)?;
                 let valid = catcher
                     .cast::<PyType>()
@@ -975,14 +1115,12 @@ impl SessionRedirectCursor {
     ) -> PyResult<Bound<'py, PyAny>> {
         let canonical = Self::declared_capability(capabilities, "get-redirect-target")?;
         let canonical_owner = Self::declared_capability(capabilities, "redirect-type")?;
-        if let Some(method) =
-            Self::payload_method_override(
-                session,
-                "get_redirect_target",
-                &canonical,
-                &canonical_owner,
-            )?
-        {
+        if let Some(method) = Self::payload_method_override(
+            session,
+            "get_redirect_target",
+            &canonical,
+            &canonical_owner,
+        )? {
             return method.call1((response,));
         }
         if !response.getattr("is_redirect")?.is_truthy()? {
@@ -1005,12 +1143,7 @@ impl SessionRedirectCursor {
         let canonical = Self::declared_capability(capabilities, "rebuild-method")?;
         let canonical_owner = Self::declared_capability(capabilities, "redirect-type")?;
         if let Some(method) =
-            Self::payload_method_override(
-                session,
-                "rebuild_method",
-                &canonical,
-                &canonical_owner,
-            )?
+            Self::payload_method_override(session, "rebuild_method", &canonical, &canonical_owner)?
         {
             method.call1((request, response))?;
             return Ok(());
@@ -1070,12 +1203,7 @@ impl SessionRedirectCursor {
         let canonical = Self::declared_capability(capabilities, "rebuild-proxies")?;
         let canonical_owner = Self::declared_capability(capabilities, "redirect-type")?;
         if let Some(method) =
-            Self::payload_method_override(
-                session,
-                "rebuild_proxies",
-                &canonical,
-                &canonical_owner,
-            )?
+            Self::payload_method_override(session, "rebuild_proxies", &canonical, &canonical_owner)?
         {
             return method.call1((request, proxies));
         }
@@ -1127,12 +1255,7 @@ impl SessionRedirectCursor {
         let canonical = Self::declared_capability(capabilities, "rebuild-auth")?;
         let canonical_owner = Self::declared_capability(capabilities, "redirect-type")?;
         if let Some(method) =
-            Self::payload_method_override(
-                session,
-                "rebuild_auth",
-                &canonical,
-                &canonical_owner,
-            )?
+            Self::payload_method_override(session, "rebuild_auth", &canonical, &canonical_owner)?
         {
             method.call1((request, response))?;
             return Ok(());
@@ -1163,10 +1286,7 @@ impl SessionRedirectCursor {
         Ok(())
     }
 
-    fn advance_state(
-        py: Python<'_>,
-        state: &mut RedirectCursorState,
-    ) -> PyResult<RedirectAdvance> {
+    fn advance_state(py: Python<'_>, state: &mut RedirectCursorState) -> PyResult<RedirectAdvance> {
         let module = PyModule::import(py, "requests.sessions")?;
         let session = state.session.bind(py);
         let capabilities = state.capabilities.bind(py);
@@ -1258,10 +1378,7 @@ impl SessionRedirectCursor {
         } else {
             url = module.getattr("requote_uri")?.call1((&url,))?;
         }
-        prepared.setattr(
-            "url",
-            module.getattr("to_native_string")?.call1((&url,))?,
-        )?;
+        prepared.setattr("url", module.getattr("to_native_string")?.call1((&url,))?)?;
         Self::rebuild_method_value(py, capabilities, session, &prepared, &response)?;
 
         let status = response.getattr("status_code")?;
@@ -1574,30 +1691,54 @@ impl SessionSubmission {
                 let plan = match (operation, kind.as_str(), method.as_str(), outcome_is_none) {
                     (_, "semantic-call", "install_generator", true) => OriginPlan::GeneratorInstall,
                     ("merge-setting", "semantic-call", "__call__", _) => OriginPlan::MergeSetting,
-                    ("merge-setting", "call", "__call__", false) => OriginPlan::MergeSettingOperation,
+                    ("merge-setting", "call", "__call__", false) => {
+                        OriginPlan::MergeSettingOperation
+                    }
                     ("merge-setting", "call", "__call__", true) => OriginPlan::MergeSettingSetup,
                     ("merge-hooks", "semantic-call", "__call__", _) => OriginPlan::MergeHooks,
                     ("mount", "call", "__call__", true) => OriginPlan::MountSetup,
                     ("get-adapter", "call", "__call__", true) => OriginPlan::GetAdapterSetup,
                     ("prepare-request-auth", "set-attr", "auth", _) => OriginPlan::SetAuth,
-                    ("prepare-request-auth", "set-attr", "trust_env", _) => OriginPlan::SetTrustEnvironment,
-                    ("prepare-request-cookies", "set-attr", "value", _) => OriginPlan::SetActiveValue,
-                    ("prepare-request-cookies", "call", "__call__", _) => OriginPlan::PrepareRequestSetup,
-                    ("prepare-request-cookies", "call", "prepare_request", _) => OriginPlan::CookiePrepare,
-                    ("prepare-request-auth", "call", "prepare_request", _) => OriginPlan::AuthPrepare,
-                    ("prepare-request-settings", "call", "prepare_request", _) => OriginPlan::SettingPrepare,
+                    ("prepare-request-auth", "set-attr", "trust_env", _) => {
+                        OriginPlan::SetTrustEnvironment
+                    }
+                    ("prepare-request-cookies", "set-attr", "value", _) => {
+                        OriginPlan::SetActiveValue
+                    }
+                    ("prepare-request-cookies", "call", "__call__", _) => {
+                        OriginPlan::PrepareRequestSetup
+                    }
+                    ("prepare-request-cookies", "call", "prepare_request", _) => {
+                        OriginPlan::CookiePrepare
+                    }
+                    ("prepare-request-auth", "call", "prepare_request", _) => {
+                        OriginPlan::AuthPrepare
+                    }
+                    ("prepare-request-settings", "call", "prepare_request", _) => {
+                        OriginPlan::SettingPrepare
+                    }
                     ("prepare-request", "call", "prepare_request", _) => OriginPlan::PrepareRequest,
-                    ("prepare-request", "call", "__call__", true) => OriginPlan::PrepareRequestSetup,
-                    ("prepare-request", "call", "__call__", false) => OriginPlan::PrepareRequestSetup,
+                    ("prepare-request", "call", "__call__", true) => {
+                        OriginPlan::PrepareRequestSetup
+                    }
+                    ("prepare-request", "call", "__call__", false) => {
+                        OriginPlan::PrepareRequestSetup
+                    }
                     ("prepare-request", "call", "prepare", _) => OriginPlan::PrepareRequest,
                     ("session-request", "call", "prepare_request", _) => OriginPlan::DirectPrepare,
                     ("session-request", "call", "__call__", _) => OriginPlan::PrepareRequestSetup,
-                    ("session-request", "semantic-call", "__call__", _) => OriginPlan::SessionRequest,
+                    ("session-request", "semantic-call", "__call__", _) => {
+                        OriginPlan::SessionRequest
+                    }
                     ("mount", "call", "mount", _) => OriginPlan::Mount,
                     ("get-adapter", "call", "get_adapter", _) => OriginPlan::GetAdapter,
-                    ("environment", "call", "merge_environment_settings", _) => OriginPlan::EnvironmentSettings,
+                    ("environment", "call", "merge_environment_settings", _) => {
+                        OriginPlan::EnvironmentSettings
+                    }
                     ("environment", "call", "__call__", _) => OriginPlan::EnvironmentOperation,
-                    ("environment-proxies", "call", "__call__", _) => OriginPlan::EnvironmentProxies,
+                    ("environment-proxies", "call", "__call__", _) => {
+                        OriginPlan::EnvironmentProxies
+                    }
                     ("environment-ca", "call", "__call__", _) => OriginPlan::EnvironmentCa,
                     ("environment-merge", "call", "__call__", _) => OriginPlan::EnvironmentMerge,
                     ("rebuild-proxies", "call", "__call__", _) => OriginPlan::RebuildProxies,
@@ -1613,28 +1754,42 @@ impl SessionSubmission {
                     ("close", "call", "__call__", _) => OriginPlan::CloseOperation,
                     ("close-reuse", "call", "close", _) => OriginPlan::CloseReuseClose,
                     ("close-reuse", "call", "send", _) => OriginPlan::CloseReuseSend,
-                    ("redirect-target", "native-call", "__call__", false) => OriginPlan::RedirectTarget,
-                    ("redirect-method", "native-call", "__call__", false) => OriginPlan::RedirectMethod,
-                    ("redirect-url", "native-call", "construct", false) => OriginPlan::ResolveRedirectsStart,
+                    ("redirect-target", "native-call", "__call__", false) => {
+                        OriginPlan::RedirectTarget
+                    }
+                    ("redirect-method", "native-call", "__call__", false) => {
+                        OriginPlan::RedirectMethod
+                    }
+                    ("redirect-url", "native-call", "construct", false) => {
+                        OriginPlan::ResolveRedirectsStart
+                    }
                     ("redirect-url", "semantic-call", "resume", _)
                     | ("redirect-url", "semantic-call", "resume_terminal", _)
-                    | ("redirect-url", "semantic-call", "close", _) => OriginPlan::RedirectUrlCommand,
+                    | ("redirect-url", "semantic-call", "close", _) => {
+                        OriginPlan::RedirectUrlCommand
+                    }
                     ("redirect-url", "semantic-call", "mutate", _) => OriginPlan::SemanticCall,
                     ("redirect-url", "semantic-call", "probe_terminal", false) => {
                         OriginPlan::SemanticCall
                     }
-                    ("redirect-headers", "native-call", "__call__", false) => OriginPlan::ResolveRedirectsStart,
+                    ("redirect-headers", "native-call", "__call__", false) => {
+                        OriginPlan::ResolveRedirectsStart
+                    }
                     ("redirect-history", "native-call", "resolve_redirects", false) => {
                         OriginPlan::RedirectHistoryResolve
                     }
-                    ("redirect-history", "native-call", "send", false) => OriginPlan::RedirectHistorySend,
+                    ("redirect-history", "native-call", "send", false) => {
+                        OriginPlan::RedirectHistorySend
+                    }
                     ("redirect-history", "semantic-call", "collect_generator", false) => {
                         OriginPlan::SemanticCall
                     }
                     ("redirect-limit-errors", "native-call", "__call__", false) => {
                         OriginPlan::ResolveRedirectsStart
                     }
-                    ("redirect-generator", "native-call", "construct", false) => OriginPlan::ResolveRedirectsStart,
+                    ("redirect-generator", "native-call", "construct", false) => {
+                        OriginPlan::ResolveRedirectsStart
+                    }
                     ("redirect-generator", "semantic-call", "resume", _)
                     | ("redirect-generator", "semantic-call", "resume_terminal", _)
                     | ("redirect-generator", "semantic-call", "release_current", _)
@@ -1649,12 +1804,18 @@ impl SessionSubmission {
                     | ("redirect-generator", "semantic-call", "resume_error", _) => {
                         OriginPlan::SemanticCall
                     }
-                    ("redirect-generator", "native-call", "send_no_redirect", false) => OriginPlan::SessionSend,
+                    ("redirect-generator", "native-call", "send_no_redirect", false) => {
+                        OriginPlan::SessionSend
+                    }
                     ("redirect-generator", "semantic-call", "probe_terminal", false) => {
                         OriginPlan::SemanticCall
                     }
-                    ("redirect-resource", "native-call", "__call__", false) => OriginPlan::ResolveRedirectsStart,
-                    ("redirect-cookies", "native-call", "construct", false) => OriginPlan::ResolveRedirectsStart,
+                    ("redirect-resource", "native-call", "__call__", false) => {
+                        OriginPlan::ResolveRedirectsStart
+                    }
+                    ("redirect-cookies", "native-call", "construct", false) => {
+                        OriginPlan::ResolveRedirectsStart
+                    }
                     ("redirect-proxy-auth-rewind", "native-call", "__call__", false) => {
                         OriginPlan::ResolveRedirectsStart
                     }
@@ -1664,32 +1825,72 @@ impl SessionSubmission {
                     ("redirect-nested-resend", "semantic-call", "collect_generator", false) => {
                         OriginPlan::SemanticCall
                     }
-                    ("digest-redirect", "native-call", "__call__", false) => OriginPlan::SessionSend,
+                    ("digest-redirect", "native-call", "__call__", false) => {
+                        OriginPlan::SessionSend
+                    }
                     ("send", "native-call", "__call__", false)
                     | ("send-error", "native-call", "__call__", false)
                     | ("send-reentrant-mutation", "native-call", "__call__", false) => {
                         OriginPlan::SessionSend
                     }
                     (operation, "semantic-call", _, _)
-                        if matches!(operation,
-                            "redirect-target" | "redirect-method" | "redirect-url"
-                            | "redirect-headers" | "redirect-history"
-                            | "redirect-limit-errors" | "redirect-generator"
-                            | "redirect-resource" | "redirect-cookies"
-                            | "redirect-proxy-auth-rewind" | "redirect-nested-resend"
-                            | "digest-redirect" | "send" | "send-error"
-                            | "send-reentrant-mutation") => OriginPlan::SemanticCall,
+                        if matches!(
+                            operation,
+                            "redirect-target"
+                                | "redirect-method"
+                                | "redirect-url"
+                                | "redirect-headers"
+                                | "redirect-history"
+                                | "redirect-limit-errors"
+                                | "redirect-generator"
+                                | "redirect-resource"
+                                | "redirect-cookies"
+                                | "redirect-proxy-auth-rewind"
+                                | "redirect-nested-resend"
+                                | "digest-redirect"
+                                | "send"
+                                | "send-error"
+                                | "send-reentrant-mutation"
+                        ) =>
+                    {
+                        OriginPlan::SemanticCall
+                    }
                     (operation, "semantic-call", "collect", false)
-                        if matches!(operation, "redirect-history") => OriginPlan::SemanticCall,
-                    (operation, "next", "__next__", _) if matches!(operation,
-                        "redirect-url" | "redirect-headers" | "redirect-limit-errors" | "redirect-resource"
-                        | "redirect-cookies" | "redirect-proxy-auth-rewind"
-                        | "redirect-nested-resend" | "redirect-generator") => OriginPlan::CursorNext,
-                    (operation, "close", "close", _) if matches!(operation,
-                        "redirect-url" | "redirect-headers" | "redirect-limit-errors"
-                        | "redirect-history" | "redirect-resource" | "redirect-cookies"
-                        | "redirect-proxy-auth-rewind" | "redirect-nested-resend"
-                        | "redirect-generator") => OriginPlan::CursorClose,
+                        if matches!(operation, "redirect-history") =>
+                    {
+                        OriginPlan::SemanticCall
+                    }
+                    (operation, "next", "__next__", _)
+                        if matches!(
+                            operation,
+                            "redirect-url"
+                                | "redirect-headers"
+                                | "redirect-limit-errors"
+                                | "redirect-resource"
+                                | "redirect-cookies"
+                                | "redirect-proxy-auth-rewind"
+                                | "redirect-nested-resend"
+                                | "redirect-generator"
+                        ) =>
+                    {
+                        OriginPlan::CursorNext
+                    }
+                    (operation, "close", "close", _)
+                        if matches!(
+                            operation,
+                            "redirect-url"
+                                | "redirect-headers"
+                                | "redirect-limit-errors"
+                                | "redirect-history"
+                                | "redirect-resource"
+                                | "redirect-cookies"
+                                | "redirect-proxy-auth-rewind"
+                                | "redirect-nested-resend"
+                                | "redirect-generator"
+                        ) =>
+                    {
+                        OriginPlan::CursorClose
+                    }
                     ("redirect-generator", "drop", _, _) => OriginPlan::CursorDrop,
                     _ => {
                         return Err(PyNotImplementedError::new_err(
@@ -1698,10 +1899,9 @@ impl SessionSubmission {
                     }
                 };
                 let raw_sequence = plans.len() as u64;
-                let sequence = Sequence::checked(raw_sequence)
-                    .map_err(PyRuntimeError::new_err)?;
-                let correlation = CorrelationId::checked(raw_sequence)
-                    .map_err(PyRuntimeError::new_err)?;
+                let sequence = Sequence::checked(raw_sequence).map_err(PyRuntimeError::new_err)?;
+                let correlation =
+                    CorrelationId::checked(raw_sequence).map_err(PyRuntimeError::new_err)?;
                 let request_id = RequestId::checked(raw_sequence, generation)
                     .map_err(PyRuntimeError::new_err)?;
                 let category = category_for_operation(plan);
@@ -1763,7 +1963,12 @@ impl SessionSubmission {
                 typed_actions.push((scenario_index, typed));
             }
         }
-        Ok((Self { actions: typed_actions }, plans))
+        Ok((
+            Self {
+                actions: typed_actions,
+            },
+            plans,
+        ))
     }
 
     async fn submit(
@@ -1789,9 +1994,7 @@ impl SessionExecutor {
         receiver.getattr("root")?.getattr("value")
     }
 
-    fn native_capabilities<'py>(
-        receiver: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn native_capabilities<'py>(receiver: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         receiver.getattr("capabilities")
     }
 
@@ -1804,10 +2007,8 @@ impl SessionExecutor {
             return Ok(error);
         }
         let capabilities = Self::native_capabilities(receiver)?;
-        let attacher = SessionRedirectCursor::declared_capability(
-            &capabilities,
-            "traceback-attacher",
-        )?;
+        let attacher =
+            SessionRedirectCursor::declared_capability(&capabilities, "traceback-attacher")?;
         let original = error.value(py);
         let attached = attacher.call1((original,))?;
         if !attached.is(original) {
@@ -1884,17 +2085,29 @@ impl SessionExecutor {
         owner: &mut OriginSessionOwner,
     ) -> SessionReply {
         let (category, generation, sequence) = match action {
-            SessionAction::ReadGlobal { generation, sequence, .. } => {
-                (ActionCategory::Global, generation, sequence)
-            }
-            SessionAction::ReadBody { request_id, generation, sequence } => {
+            SessionAction::ReadGlobal {
+                generation,
+                sequence,
+                ..
+            } => (ActionCategory::Global, generation, sequence),
+            SessionAction::ReadBody {
+                request_id,
+                generation,
+                sequence,
+            } => {
                 if let Err(error) = request_id.validate_generation(generation) {
                     owner.pending_error = Some(PyRuntimeError::new_err(error));
                     return raised_reply(generation, sequence);
                 }
                 (ActionCategory::Body, generation, sequence)
             }
-            SessionAction::SendCustomAdapter { adapter_id, request_id, generation, sequence, .. } => {
+            SessionAction::SendCustomAdapter {
+                adapter_id,
+                request_id,
+                generation,
+                sequence,
+                ..
+            } => {
                 if adapter_id.validate_generation(generation).is_err()
                     || request_id.validate_generation(generation).is_err()
                 {
@@ -1903,7 +2116,13 @@ impl SessionExecutor {
                 }
                 (ActionCategory::Adapter, generation, sequence)
             }
-            SessionAction::DispatchHook { hook_id, response_id, generation, sequence, .. } => {
+            SessionAction::DispatchHook {
+                hook_id,
+                response_id,
+                generation,
+                sequence,
+                ..
+            } => {
                 if hook_id.validate_generation(generation).is_err()
                     || response_id.validate_generation(generation).is_err()
                 {
@@ -1912,7 +2131,12 @@ impl SessionExecutor {
                 }
                 (ActionCategory::Hook, generation, sequence)
             }
-            SessionAction::RunAuth { auth_id, request_id, generation, sequence } => {
+            SessionAction::RunAuth {
+                auth_id,
+                request_id,
+                generation,
+                sequence,
+            } => {
                 if auth_id.validate_generation(generation).is_err()
                     || request_id.validate_generation(generation).is_err()
                 {
@@ -1921,7 +2145,13 @@ impl SessionExecutor {
                 }
                 (ActionCategory::Auth, generation, sequence)
             }
-            SessionAction::ExtractCookies { jar_id, request_id, response_id, generation, sequence } => {
+            SessionAction::ExtractCookies {
+                jar_id,
+                request_id,
+                response_id,
+                generation,
+                sequence,
+            } => {
                 if jar_id.validate_generation(generation).is_err()
                     || request_id.validate_generation(generation).is_err()
                     || response_id.validate_generation(generation).is_err()
@@ -1931,7 +2161,12 @@ impl SessionExecutor {
                 }
                 (ActionCategory::Cookies, generation, sequence)
             }
-            SessionAction::NestedSubmit { request_id, generation, sequence, .. } => {
+            SessionAction::NestedSubmit {
+                request_id,
+                generation,
+                sequence,
+                ..
+            } => {
                 if let Err(error) = request_id.validate_generation(generation) {
                     owner.pending_error = Some(PyRuntimeError::new_err(error));
                     return raised_reply(generation, sequence);
@@ -1980,7 +2215,9 @@ impl SessionExecutor {
             }
             return Self::execute_origin_plan(py, &owner.operation, plan, &scenario, &action);
         }
-        Err(PyRuntimeError::new_err("session action sequence is out of range"))
+        Err(PyRuntimeError::new_err(
+            "session action sequence is out of range",
+        ))
     }
 
     fn execute_origin_plan(
@@ -1999,24 +2236,20 @@ impl SessionExecutor {
         let call_kwargs = PyDict::new(py);
         call_kwargs.call_method1("update", (&kwargs,))?;
         let result = match plan {
-            OriginPlan::SemanticCall => receiver.getattr("value")?.call(
-                args.cast::<PyTuple>()?,
-                Some(&call_kwargs),
-            ),
+            OriginPlan::SemanticCall => receiver
+                .getattr("value")?
+                .call(args.cast::<PyTuple>()?, Some(&call_kwargs)),
             OriginPlan::GeneratorInstall => Self::install_redirect_cursor(py, &args),
-            OriginPlan::MergeSetting | OriginPlan::MergeHooks => receiver.getattr("value")?.call(
-                args.cast::<PyTuple>()?,
-                Some(&call_kwargs),
-            ),
+            OriginPlan::MergeSetting | OriginPlan::MergeHooks => receiver
+                .getattr("value")?
+                .call(args.cast::<PyTuple>()?, Some(&call_kwargs)),
             OriginPlan::MergeSettingOperation => Self::merge_setting_operation(py, &receiver),
-            OriginPlan::MergeSettingSetup => receiver.call(
-                args.cast::<PyTuple>()?,
-                Some(&call_kwargs),
-            ),
-            OriginPlan::MountSetup | OriginPlan::GetAdapterSetup => receiver.call(
-                args.cast::<PyTuple>()?,
-                Some(&call_kwargs),
-            ),
+            OriginPlan::MergeSettingSetup => {
+                receiver.call(args.cast::<PyTuple>()?, Some(&call_kwargs))
+            }
+            OriginPlan::MountSetup | OriginPlan::GetAdapterSetup => {
+                receiver.call(args.cast::<PyTuple>()?, Some(&call_kwargs))
+            }
             OriginPlan::SetAuth => receiver
                 .setattr("auth", action.getattr("target")?)
                 .map(|_| py.None().into_bound(py)),
@@ -2026,13 +2259,14 @@ impl SessionExecutor {
             OriginPlan::SetActiveValue => receiver
                 .setattr("value", action.getattr("target")?)
                 .map(|_| py.None().into_bound(py)),
-            OriginPlan::Mount | OriginPlan::GetAdapter | OriginPlan::EnvironmentSettings => Self::execute_session_operation(
-                py, operation, plan, &receiver, &args,
-            ),
+            OriginPlan::Mount | OriginPlan::GetAdapter | OriginPlan::EnvironmentSettings => {
+                Self::execute_session_operation(py, operation, plan, &receiver, &args)
+            }
             OriginPlan::CloseEnter => Ok(receiver.clone()),
             OriginPlan::CloseOperation => Self::execute_close_operation(&receiver),
-            OriginPlan::CloseReuseClose => Self::close_session(&receiver)
-                .map(|_| py.None().into_bound(py)),
+            OriginPlan::CloseReuseClose => {
+                Self::close_session(&receiver).map(|_| py.None().into_bound(py))
+            }
             OriginPlan::CloseReuseSend => Self::send_after_close(py, &receiver, &args),
             OriginPlan::EnvironmentOperation => Self::execute_environment_operation(py, &receiver),
             OriginPlan::EnvironmentProxies => Self::environment_proxies(py, &receiver),
@@ -2040,29 +2274,26 @@ impl SessionExecutor {
             OriginPlan::EnvironmentMerge => Self::environment_merge(py, &receiver),
             OriginPlan::RebuildProxies => Self::rebuild_proxies(py, &receiver),
             OriginPlan::RebuildAuth => Self::rebuild_auth(py, &receiver),
-            OriginPlan::ConstructSetup | OriginPlan::PickleSetup => receiver.call(
-                args.cast::<PyTuple>()?,
-                Some(&call_kwargs),
-            ),
+            OriginPlan::ConstructSetup | OriginPlan::PickleSetup => {
+                receiver.call(args.cast::<PyTuple>()?, Some(&call_kwargs))
+            }
             OriginPlan::Construct => Self::construct_session(py, &receiver),
             OriginPlan::Pickle => Self::pickle_session(py, &receiver),
             OriginPlan::ActiveStreamClose => Self::active_stream_close(py, &receiver),
             OriginPlan::ActiveStreamTrailing => {
                 let method: String = action.getattr("method")?.extract()?;
-                receiver.getattr(method)?.call(
-                    args.cast::<PyTuple>()?,
-                    Some(&call_kwargs),
-                )
+                receiver
+                    .getattr(method)?
+                    .call(args.cast::<PyTuple>()?, Some(&call_kwargs))
             }
             OriginPlan::PrepareRequest => Self::prepare_request(py, &receiver, &args),
             OriginPlan::CookiePrepare => Self::cookie_prepare(py, &receiver, &args),
             OriginPlan::AuthPrepare => Self::auth_prepare(py, &receiver, &args),
             OriginPlan::SettingPrepare => Self::setting_prepare(py, &receiver, &args),
             OriginPlan::DirectPrepare => Self::direct_prepare(py, &receiver, &args),
-            OriginPlan::PrepareRequestSetup => receiver.call(
-                args.cast::<PyTuple>()?,
-                Some(&call_kwargs),
-            ),
+            OriginPlan::PrepareRequestSetup => {
+                receiver.call(args.cast::<PyTuple>()?, Some(&call_kwargs))
+            }
             OriginPlan::SessionRequest => Self::session_request(py, &args, &call_kwargs),
             OriginPlan::RedirectTarget => Self::redirect_target(py, &args),
             OriginPlan::RedirectMethod => Self::redirect_method(py, &args),
@@ -2092,9 +2323,7 @@ impl SessionExecutor {
             }
             OriginPlan::RedirectResource => Self::redirect_resource(py, &receiver),
             OriginPlan::RedirectCookies => Self::redirect_cookies(py, &receiver),
-            OriginPlan::RedirectProxyAuthRewind => {
-                Self::redirect_proxy_auth_rewind(py, &receiver)
-            }
+            OriginPlan::RedirectProxyAuthRewind => Self::redirect_proxy_auth_rewind(py, &receiver),
             OriginPlan::RedirectNestedResend => Self::redirect_nested_resend(py, &receiver),
             OriginPlan::DigestRedirect => Self::digest_redirect(py, &receiver),
             OriginPlan::SessionSend => {
@@ -2118,13 +2347,12 @@ impl SessionExecutor {
         };
         if !outcome.is_none() {
             let holders = scenario.getattr("context")?.getattr("holders")?;
-            holders.set_item(outcome, PyTuple::new(py, [tag.into_pyobject(py)?.into_any().unbind(), value])?)?;
+            holders.set_item(
+                outcome,
+                PyTuple::new(py, [tag.into_pyobject(py)?.into_any().unbind(), value])?,
+            )?;
         }
-        if failed {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        if failed { Ok(true) } else { Ok(false) }
     }
 
     fn merge_setting_operation<'py>(
@@ -2186,10 +2414,8 @@ impl SessionExecutor {
                 for key in adapters.try_iter()? {
                     let key = key?;
                     let key_len: usize = sessions.getattr("len")?.call1((&key,))?.extract()?;
-                    let prefix_len: usize = sessions
-                        .getattr("len")?
-                        .call1((&prefix,))?
-                        .extract()?;
+                    let prefix_len: usize =
+                        sessions.getattr("len")?.call1((&prefix,))?.extract()?;
                     if key_len < prefix_len {
                         keys_to_move.push(key.unbind());
                     }
@@ -2217,16 +2443,12 @@ impl SessionExecutor {
                         return Ok(adapter);
                     }
                 }
-                let exception = py
-                    .import("requests.sessions")?
-                    .getattr("InvalidSchema")?;
+                let exception = py.import("requests.sessions")?.getattr("InvalidSchema")?;
                 let message = format!(
                     "No connection adapters were found for {}",
                     url.repr()?.to_str()?
                 );
-                Err(PyErr::from_value(
-                    exception.call1((message,))?,
-                ))
+                Err(PyErr::from_value(exception.call1((message,))?))
             }
             ("environment", OriginPlan::EnvironmentSettings) => {
                 Self::merge_environment_settings(py, receiver, args)
@@ -2259,10 +2481,22 @@ impl SessionExecutor {
             }
         }
         let returned = PyDict::new(py);
-        returned.set_item("proxies", Self::merge_environment_value(py, &proxies, &session.getattr("proxies")?)?)?;
-        returned.set_item("stream", Self::merge_environment_value(py, &stream, &session.getattr("stream")?)?)?;
-        returned.set_item("verify", Self::merge_environment_value(py, &verify, &session.getattr("verify")?)?)?;
-        returned.set_item("cert", Self::merge_environment_value(py, &cert, &session.getattr("cert")?)?)?;
+        returned.set_item(
+            "proxies",
+            Self::merge_environment_value(py, &proxies, &session.getattr("proxies")?)?,
+        )?;
+        returned.set_item(
+            "stream",
+            Self::merge_environment_value(py, &stream, &session.getattr("stream")?)?,
+        )?;
+        returned.set_item(
+            "verify",
+            Self::merge_environment_value(py, &verify, &session.getattr("verify")?)?,
+        )?;
+        returned.set_item(
+            "cert",
+            Self::merge_environment_value(py, &cert, &session.getattr("cert")?)?,
+        )?;
         Ok(returned.into_any())
     }
 
@@ -2283,20 +2517,29 @@ impl SessionExecutor {
         let original_os = module.getattr("os")?.unbind();
         let original_netrc = module.getattr("get_netrc_auth")?.unbind();
         let original_bypass = module.getattr("should_bypass_proxies")?.unbind();
-        module.setattr("get_environ_proxies", state.getattr("operation_helper_forbidden")?)?;
+        module.setattr(
+            "get_environ_proxies",
+            state.getattr("operation_helper_forbidden")?,
+        )?;
         module.setattr("merge_setting", state.getattr("merge")?)?;
         module.setattr("os", state.getattr("operation_os_forbidden")?)?;
-        module.setattr("get_netrc_auth", state.getattr("operation_netrc_forbidden")?)?;
-        module.setattr("should_bypass_proxies", state.getattr("operation_bypass_forbidden")?)?;
+        module.setattr(
+            "get_netrc_auth",
+            state.getattr("operation_netrc_forbidden")?,
+        )?;
+        module.setattr(
+            "should_bypass_proxies",
+            state.getattr("operation_bypass_forbidden")?,
+        )?;
         session.setattr("trust_env", state.getattr("gate")?)?;
         let result = (|| {
             if session.getattr("trust_env")?.is_truthy()? {
                 let no_proxy = proxies.call_method1("get", ("no_proxy",))?;
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("no_proxy", no_proxy)?;
-                let environment = module.getattr("get_environ_proxies")?.call(
-                    ("http://example.test/path",), Some(&kwargs),
-                )?;
+                let environment = module
+                    .getattr("get_environ_proxies")?
+                    .call(("http://example.test/path",), Some(&kwargs))?;
                 for pair in environment.call_method0("items")?.try_iter()? {
                     let pair = pair?;
                     proxies.call_method1("setdefault", (pair.get_item(0)?, pair.get_item(1)?))?;
@@ -2312,7 +2555,9 @@ impl SessionExecutor {
             ] {
                 returned.set_item(
                     result_keys.get_item(index)?,
-                    module.getattr("merge_setting")?.call1((request, session_value))?,
+                    module
+                        .getattr("merge_setting")?
+                        .call1((request, session_value))?,
                 )?;
             }
             Ok(returned.into_any())
@@ -2342,10 +2587,7 @@ impl SessionExecutor {
             state.getattr("early_bypass_forbidden")?
         };
         module.setattr("proxy_bypass", initial_bypass)?;
-        module.setattr(
-            "getproxies",
-            state.getattr("eager_getproxies_forbidden")?,
-        )?;
+        module.setattr("getproxies", state.getattr("eager_getproxies_forbidden")?)?;
         let real_environment = original_os.bind(py).getattr("environ")?;
         let mut saved_proxy_environment: Option<Vec<(Py<PyAny>, Py<PyAny>)>> = None;
         let (no_proxy, url) = if mode == "precedence" {
@@ -2362,23 +2604,16 @@ impl SessionExecutor {
                 }
             }
             for (key, _) in &saved {
-                real_environment.call_method1(
-                    "pop",
-                    (key.bind(py), py.None().into_bound(py)),
-                )?;
+                real_environment.call_method1("pop", (key.bind(py), py.None().into_bound(py)))?;
             }
             real_environment.set_item("HTTP_PROXY", "http://upper-http.proxy")?;
             real_environment.set_item("http_proxy", state.getattr("proxy_url")?)?;
             real_environment.set_item("ALL_PROXY", "http://upper-all.proxy")?;
             real_environment.set_item("all_proxy", state.getattr("all_url")?)?;
-            real_environment.set_item(
-                "HTTP://API.EXAMPLE.TEST_PROXY",
-                "http://host-upper.proxy",
-            )?;
-            real_environment.set_item(
-                "http://api.example.test_proxy",
-                state.getattr("host_url")?,
-            )?;
+            real_environment
+                .set_item("HTTP://API.EXAMPLE.TEST_PROXY", "http://host-upper.proxy")?;
+            real_environment
+                .set_item("http://api.example.test_proxy", state.getattr("host_url")?)?;
             module.setattr("os", original_os.bind(py))?;
             saved_proxy_environment = Some(saved);
             (
@@ -2415,12 +2650,7 @@ impl SessionExecutor {
         };
 
         let result = (|| {
-            let bypassed = Self::should_bypass_environment_proxy(
-                py,
-                &module,
-                &url,
-                &no_proxy,
-            )?;
+            let bypassed = Self::should_bypass_environment_proxy(py, &module, &url, &no_proxy)?;
             if matches!(
                 mode.as_str(),
                 "suffix" | "port" | "cidr" | "ipv4" | "hostless" | "lower" | "upper"
@@ -2451,10 +2681,7 @@ impl SessionExecutor {
                 }
             }
             for key in keys {
-                real_environment.call_method1(
-                    "pop",
-                    (key.bind(py), py.None().into_bound(py)),
-                )?;
+                real_environment.call_method1("pop", (key.bind(py), py.None().into_bound(py)))?;
             }
             for (key, value) in saved {
                 real_environment.set_item(key.bind(py), value.bind(py))?;
@@ -2520,9 +2747,7 @@ impl SessionExecutor {
                         Err(error) => {
                             let address_error = ipaddress.getattr("AddressValueError")?;
                             if !error.matches(py, &address_error).unwrap()
-                                && !error
-                                    .matches(py, py.get_type::<PyValueError>())
-                                    .unwrap()
+                                && !error.matches(py, py.get_type::<PyValueError>()).unwrap()
                             {
                                 return Err(error);
                             }
@@ -2574,9 +2799,7 @@ impl SessionExecutor {
                 Ok(bypass) => bypass.is_truthy(),
                 Err(error) => {
                     let gaierror = socket_module.getattr("gaierror")?;
-                    if error
-                        .matches(py, py.get_type::<PyTypeError>())
-                        .unwrap()
+                    if error.matches(py, py.get_type::<PyTypeError>()).unwrap()
                         || error.matches(py, &gaierror).unwrap()
                     {
                         Ok(false)
@@ -2626,17 +2849,13 @@ impl SessionExecutor {
                 let environment_helper = module.getattr("get_environ_proxies")?;
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("no_proxy", no_proxy)?;
-                let environment = environment_helper.call(
-                    ("http://ca.example.test/",),
-                    Some(&kwargs),
-                )?;
+                let environment =
+                    environment_helper.call(("http://ca.example.test/",), Some(&kwargs))?;
                 if !proxies.is_none() {
                     for pair in environment.call_method0("items")?.try_iter()? {
                         let pair = pair?;
-                        proxies.call_method1(
-                            "setdefault",
-                            (pair.get_item(0)?, pair.get_item(1)?),
-                        )?;
+                        proxies
+                            .call_method1("setdefault", (pair.get_item(0)?, pair.get_item(1)?))?;
                     }
                 }
                 if verify.is(PyBool::new(py, true)) || verify.is_none() {
@@ -2686,25 +2905,17 @@ impl SessionExecutor {
 
         let result = (|| {
             let merge_proxies = module.getattr("merge_setting")?;
-            let merged_proxies = merge_proxies.call1((
-                request_values.get_item(0)?,
-                session.getattr("proxies")?,
-            ))?;
+            let merged_proxies =
+                merge_proxies.call1((request_values.get_item(0)?, session.getattr("proxies")?))?;
             let merge_stream = module.getattr("merge_setting")?;
-            let merged_stream = merge_stream.call1((
-                request_values.get_item(1)?,
-                session.getattr("stream")?,
-            ))?;
+            let merged_stream =
+                merge_stream.call1((request_values.get_item(1)?, session.getattr("stream")?))?;
             let merge_verify = module.getattr("merge_setting")?;
-            let merged_verify = merge_verify.call1((
-                request_values.get_item(2)?,
-                session.getattr("verify")?,
-            ))?;
+            let merged_verify =
+                merge_verify.call1((request_values.get_item(2)?, session.getattr("verify")?))?;
             let merge_cert = module.getattr("merge_setting")?;
-            let merged_cert = merge_cert.call1((
-                request_values.get_item(3)?,
-                session.getattr("cert")?,
-            ))?;
+            let merged_cert =
+                merge_cert.call1((request_values.get_item(3)?, session.getattr("cert")?))?;
             let returned = PyDict::new(py);
             let result_keys = state.getattr("result_keys")?;
             returned.set_item(result_keys.get_item(0)?, merged_proxies)?;
@@ -2731,7 +2942,10 @@ impl SessionExecutor {
         let session = state.getattr("session")?;
         let supplied = state.getattr("supplied")?;
         let missing = py.import("builtins")?.getattr("object")?.call0()?;
-        let original_key_error = module.dict().get_item("KeyError")?.map(|value| value.unbind());
+        let original_key_error = module
+            .dict()
+            .get_item("KeyError")?
+            .map(|value| value.unbind());
         let builtins_controller = state.getattr("builtins_controller")?;
         let original_builtin_key_error = builtins_controller
             .call_method1("get", ("KeyError", &missing))?
@@ -2785,17 +2999,10 @@ impl SessionExecutor {
             let (username, password) = match credentials {
                 Ok(values) => values,
                 Err(error) => {
-                    let catcher = match Self::live_key_error_type(
-                        &module,
-                        &builtins_controller,
-                    ) {
+                    let catcher = match Self::live_key_error_type(&module, &builtins_controller) {
                         Ok(catcher) => catcher,
                         Err(matcher_error) => {
-                            return Err(Self::attach_exception_context(
-                                py,
-                                matcher_error,
-                                &error,
-                            ));
+                            return Err(Self::attach_exception_context(py, matcher_error, &error));
                         }
                     };
                     let valid = py
@@ -2812,11 +3019,7 @@ impl SessionExecutor {
                             let matcher_error = PyTypeError::new_err(
                                 "catching classes that do not inherit from BaseException is not allowed",
                             );
-                            return Err(Self::attach_exception_context(
-                                py,
-                                matcher_error,
-                                &error,
-                            ));
+                            return Err(Self::attach_exception_context(py, matcher_error, &error));
                         }
                     }
                 }
@@ -2852,10 +3055,8 @@ impl SessionExecutor {
         if original_builtin_key_error.bind(py).is(&missing) {
             builtins_controller.call_method1("delete", ("KeyError",))?;
         } else {
-            builtins_controller.call_method1(
-                "set",
-                ("KeyError", original_builtin_key_error.bind(py)),
-            )?;
+            builtins_controller
+                .call_method1("set", ("KeyError", original_builtin_key_error.bind(py)))?;
         }
         result
     }
@@ -2882,19 +3083,15 @@ impl SessionExecutor {
     ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
         let exact_tuple_len = value.cast::<PyTuple>().ok().map(|tuple| tuple.len());
         let mut iterator = value.try_iter()?;
-        let first = iterator
-            .next()
-            .transpose()?
-            .ok_or_else(|| PyValueError::new_err("not enough values to unpack (expected 2, got 0)"))?;
-        let second = iterator
-            .next()
-            .transpose()?
-            .ok_or_else(|| PyValueError::new_err("not enough values to unpack (expected 2, got 1)"))?;
+        let first = iterator.next().transpose()?.ok_or_else(|| {
+            PyValueError::new_err("not enough values to unpack (expected 2, got 0)")
+        })?;
+        let second = iterator.next().transpose()?.ok_or_else(|| {
+            PyValueError::new_err("not enough values to unpack (expected 2, got 1)")
+        })?;
         if iterator.next().transpose()?.is_some() {
             return Err(PyValueError::new_err(match exact_tuple_len {
-                Some(length) => format!(
-                    "too many values to unpack (expected 2, got {length})"
-                ),
+                Some(length) => format!("too many values to unpack (expected 2, got {length})"),
                 None => "too many values to unpack (expected 2)".to_owned(),
             }));
         }
@@ -2902,9 +3099,7 @@ impl SessionExecutor {
     }
 
     fn attach_exception_context(py: Python<'_>, error: PyErr, context: &PyErr) -> PyErr {
-        let _ = error
-            .value(py)
-            .setattr("__context__", context.value(py));
+        let _ = error.value(py).setattr("__context__", context.value(py));
         error
     }
 
@@ -3238,10 +3433,7 @@ impl SessionExecutor {
         }
         state.setattr("prepared_auth", py.None())?;
         let prepared = state.getattr("prepared")?;
-        prepared.setattr(
-            "current_prepare",
-            state.getattr("early_prepare_forbidden")?,
-        )?;
+        prepared.setattr("current_prepare", state.getattr("early_prepare_forbidden")?)?;
         let original_prepared = module.getattr("_is_prepared")?.unbind();
         let original_netrc = module.getattr("get_netrc_auth")?.unbind();
         module.setattr("_is_prepared", state.getattr("prepared_one")?)?;
@@ -3262,9 +3454,7 @@ impl SessionExecutor {
             let original_url = original_request.getattr("url")?;
             let url = prepared.getattr("url")?;
             if live_headers.contains("Authorization")? {
-                let strip_method = state
-                    .getattr("session")?
-                    .getattr("should_strip_auth")?;
+                let strip_method = state.getattr("session")?.getattr("should_strip_auth")?;
                 if strip_method.call1((&original_url, &url))?.is_truthy()? {
                     live_headers.del_item("Authorization")?;
                 }
@@ -3327,10 +3517,7 @@ impl SessionExecutor {
         let default_get = module.getattr("DEFAULT_PORTS")?.getattr("get")?;
         let old_scheme = old_parsed.getattr("scheme")?;
         let default_value = default_get.call1((old_scheme, py.None().into_bound(py)))?;
-        let default_port = PyTuple::new(
-            py,
-            [default_value.unbind(), py.None()],
-        )?;
+        let default_port = PyTuple::new(py, [default_value.unbind(), py.None()])?;
         if !changed_scheme
             && default_port.contains(old_parsed.getattr("port")?)?
             && default_port.contains(new_parsed.getattr("port")?)?
@@ -3379,9 +3566,7 @@ impl SessionExecutor {
         Ok(())
     }
 
-    fn execute_close_operation<'py>(
-        invocation: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn execute_close_operation<'py>(invocation: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let py = invocation.py();
         let state = invocation.getattr("state")?;
         let session = state.getattr("session")?;
@@ -3402,9 +3587,7 @@ impl SessionExecutor {
         state.setattr("use_replacement", true)?;
         let body_marker = state.getattr("body_marker")?;
         if let Err(error) = session.getattr("close").and_then(|close| close.call0()) {
-            error
-                .value(py)
-                .setattr("__context__", &body_marker)?;
+            error.value(py).setattr("__context__", &body_marker)?;
             return Err(error);
         }
         Err(PyErr::from_value(body_marker))
@@ -3486,19 +3669,17 @@ impl SessionExecutor {
         for name in ["params", "auth"] {
             kwargs.set_item(
                 name,
-                module.getattr("merge_setting")?.call1((
-                    request.getattr(name)?,
-                    session.getattr(name)?,
-                ))?,
+                module
+                    .getattr("merge_setting")?
+                    .call1((request.getattr(name)?, session.getattr(name)?))?,
             )?;
         }
         kwargs.set_item("cookies", merged_cookies)?;
         kwargs.set_item(
             "hooks",
-            module.getattr("merge_hooks")?.call1((
-                request.getattr("hooks")?,
-                session.getattr("hooks")?,
-            ))?,
+            module
+                .getattr("merge_hooks")?
+                .call1((request.getattr("hooks")?, session.getattr("hooks")?))?,
         )?;
         prepared.getattr("prepare")?.call((), Some(&kwargs))?;
         Ok(prepared)
@@ -3580,14 +3761,12 @@ impl SessionExecutor {
             (request.getattr("headers")?, session.getattr("headers")?),
             Some(&header_kwargs),
         )?;
-        let params = module.getattr("merge_setting")?.call1((
-            request.getattr("params")?,
-            session.getattr("params")?,
-        ))?;
-        let auth = module.getattr("merge_setting")?.call1((
-            request.getattr("auth")?,
-            session.getattr("auth")?,
-        ))?;
+        let params = module
+            .getattr("merge_setting")?
+            .call1((request.getattr("params")?, session.getattr("params")?))?;
+        let auth = module
+            .getattr("merge_setting")?
+            .call1((request.getattr("auth")?, session.getattr("auth")?))?;
         let prepared = models.getattr("PreparedRequest")?.call0()?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("method", request.getattr("method")?)?;
@@ -3622,38 +3801,98 @@ impl SessionExecutor {
         request_kwargs.set_item("method", method.call_method0("upper")?)?;
         request_kwargs.set_item("url", url)?;
         for name in ["headers", "files"] {
-            request_kwargs.set_item(name, supplied.get_item(name)?.unwrap_or_else(|| py.None().into_bound(py)))?;
+            request_kwargs.set_item(
+                name,
+                supplied
+                    .get_item(name)?
+                    .unwrap_or_else(|| py.None().into_bound(py)),
+            )?;
         }
-        let data = supplied.get_item("data")?.unwrap_or_else(|| py.None().into_bound(py));
-        request_kwargs.set_item("data", if data.is_truthy()? { data } else { PyDict::new(py).into_any() })?;
-        request_kwargs.set_item("json", supplied.get_item("json")?.unwrap_or_else(|| py.None().into_bound(py)))?;
-        let params = supplied.get_item("params")?.unwrap_or_else(|| py.None().into_bound(py));
-        request_kwargs.set_item("params", if params.is_truthy()? { params } else { PyDict::new(py).into_any() })?;
+        let data = supplied
+            .get_item("data")?
+            .unwrap_or_else(|| py.None().into_bound(py));
+        request_kwargs.set_item(
+            "data",
+            if data.is_truthy()? {
+                data
+            } else {
+                PyDict::new(py).into_any()
+            },
+        )?;
+        request_kwargs.set_item(
+            "json",
+            supplied
+                .get_item("json")?
+                .unwrap_or_else(|| py.None().into_bound(py)),
+        )?;
+        let params = supplied
+            .get_item("params")?
+            .unwrap_or_else(|| py.None().into_bound(py));
+        request_kwargs.set_item(
+            "params",
+            if params.is_truthy()? {
+                params
+            } else {
+                PyDict::new(py).into_any()
+            },
+        )?;
         for name in ["auth", "cookies", "hooks"] {
-            request_kwargs.set_item(name, supplied.get_item(name)?.unwrap_or_else(|| py.None().into_bound(py)))?;
+            request_kwargs.set_item(
+                name,
+                supplied
+                    .get_item(name)?
+                    .unwrap_or_else(|| py.None().into_bound(py)),
+            )?;
         }
         let request = request_factory.call((), Some(&request_kwargs))?;
 
         let prepare = session.getattr("prepare_request")?;
         let prepared = prepare.call1((request,))?;
-        module.getattr("_is_prepared")?.call1((&prepared,))?.is_truthy()?;
+        module
+            .getattr("_is_prepared")?
+            .call1((&prepared,))?
+            .is_truthy()?;
 
-        let proxies = supplied.get_item("proxies")?.unwrap_or_else(|| py.None().into_bound(py));
-        let proxies = if proxies.is_truthy()? { proxies } else { PyDict::new(py).into_any() };
+        let proxies = supplied
+            .get_item("proxies")?
+            .unwrap_or_else(|| py.None().into_bound(py));
+        let proxies = if proxies.is_truthy()? {
+            proxies
+        } else {
+            PyDict::new(py).into_any()
+        };
         let environment = session.getattr("merge_environment_settings")?;
         let prepared_url = prepared.getattr("url")?;
         let settings = environment.call1((
             prepared_url,
             proxies,
-            supplied.get_item("stream")?.unwrap_or_else(|| py.None().into_bound(py)),
-            supplied.get_item("verify")?.unwrap_or_else(|| py.None().into_bound(py)),
-            supplied.get_item("cert")?.unwrap_or_else(|| py.None().into_bound(py)),
+            supplied
+                .get_item("stream")?
+                .unwrap_or_else(|| py.None().into_bound(py)),
+            supplied
+                .get_item("verify")?
+                .unwrap_or_else(|| py.None().into_bound(py)),
+            supplied
+                .get_item("cert")?
+                .unwrap_or_else(|| py.None().into_bound(py)),
         ))?;
         let send_kwargs = PyDict::new(py);
-        send_kwargs.set_item("timeout", supplied.get_item("timeout")?.unwrap_or_else(|| py.None().into_bound(py)))?;
-        send_kwargs.set_item("allow_redirects", supplied.get_item("allow_redirects")?.unwrap_or_else(|| PyBool::new(py, true).to_owned().into_any()))?;
+        send_kwargs.set_item(
+            "timeout",
+            supplied
+                .get_item("timeout")?
+                .unwrap_or_else(|| py.None().into_bound(py)),
+        )?;
+        send_kwargs.set_item(
+            "allow_redirects",
+            supplied
+                .get_item("allow_redirects")?
+                .unwrap_or_else(|| PyBool::new(py, true).to_owned().into_any()),
+        )?;
         send_kwargs.call_method1("update", (settings,))?;
-        session.getattr("send")?.call((prepared,), Some(&send_kwargs))
+        session
+            .getattr("send")?
+            .call((prepared,), Some(&send_kwargs))
     }
 
     fn direct_prepare<'py>(
@@ -3705,10 +3944,7 @@ impl SessionExecutor {
             &outcome_key,
             PyTuple::new(
                 py,
-                [
-                    "return".into_pyobject(py)?.into_any().unbind(),
-                    py.None(),
-                ],
+                ["return".into_pyobject(py)?.into_any().unbind(), py.None()],
             )?,
         )?;
         Ok(py.None().into_bound(py))
@@ -3751,22 +3987,34 @@ impl SessionExecutor {
         let mut selected = method.clone();
         let status = response.getattr("status_code")?;
         let code = module.getattr("codes")?.getattr("see_other")?;
-        if status.rich_compare(&code, pyo3::basic::CompareOp::Eq)?.is_truthy()?
-            && method.rich_compare("HEAD", pyo3::basic::CompareOp::Ne)?.is_truthy()?
+        if status
+            .rich_compare(&code, pyo3::basic::CompareOp::Eq)?
+            .is_truthy()?
+            && method
+                .rich_compare("HEAD", pyo3::basic::CompareOp::Ne)?
+                .is_truthy()?
         {
             selected = PyString::intern(py, "GET").into_any();
         }
         let status = response.getattr("status_code")?;
         let code = module.getattr("codes")?.getattr("found")?;
-        if status.rich_compare(&code, pyo3::basic::CompareOp::Eq)?.is_truthy()?
-            && method.rich_compare("HEAD", pyo3::basic::CompareOp::Ne)?.is_truthy()?
+        if status
+            .rich_compare(&code, pyo3::basic::CompareOp::Eq)?
+            .is_truthy()?
+            && method
+                .rich_compare("HEAD", pyo3::basic::CompareOp::Ne)?
+                .is_truthy()?
         {
             selected = PyString::intern(py, "GET").into_any();
         }
         let status = response.getattr("status_code")?;
         let code = module.getattr("codes")?.getattr("moved")?;
-        if status.rich_compare(&code, pyo3::basic::CompareOp::Eq)?.is_truthy()?
-            && method.rich_compare("POST", pyo3::basic::CompareOp::Eq)?.is_truthy()?
+        if status
+            .rich_compare(&code, pyo3::basic::CompareOp::Eq)?
+            .is_truthy()?
+            && method
+                .rich_compare("POST", pyo3::basic::CompareOp::Eq)?
+                .is_truthy()?
         {
             selected = PyString::intern(py, "GET").into_any();
         }
@@ -3780,17 +4028,74 @@ impl SessionExecutor {
         )))
     }
 
-    fn redirect_url_command<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>, _action: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("redirect-url") }
-    fn redirect_headers<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("redirect-headers") }
-    fn redirect_history_resolve<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("redirect-history-resolve") }
-    fn redirect_history_send<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("redirect-history-send") }
-    fn redirect_limit_errors<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("redirect-limit-errors") }
-    fn redirect_generator_command<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>, _action: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("redirect-generator") }
-    fn redirect_resource<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("redirect-resource") }
-    fn redirect_cookies<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("redirect-cookies") }
-    fn redirect_proxy_auth_rewind<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("redirect-proxy-auth-rewind") }
-    fn redirect_nested_resend<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("redirect-nested-resend") }
-    fn digest_redirect<'py>(_py: Python<'py>, _receiver: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { Self::redirect_unimplemented("digest-redirect") }
+    fn redirect_url_command<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+        _action: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("redirect-url")
+    }
+    fn redirect_headers<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("redirect-headers")
+    }
+    fn redirect_history_resolve<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("redirect-history-resolve")
+    }
+    fn redirect_history_send<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("redirect-history-send")
+    }
+    fn redirect_limit_errors<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("redirect-limit-errors")
+    }
+    fn redirect_generator_command<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+        _action: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("redirect-generator")
+    }
+    fn redirect_resource<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("redirect-resource")
+    }
+    fn redirect_cookies<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("redirect-cookies")
+    }
+    fn redirect_proxy_auth_rewind<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("redirect-proxy-auth-rewind")
+    }
+    fn redirect_nested_resend<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("redirect-nested-resend")
+    }
+    fn digest_redirect<'py>(
+        _py: Python<'py>,
+        _receiver: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::redirect_unimplemented("digest-redirect")
+    }
     fn send_global<'py>(
         py: Python<'py>,
         module: &Bound<'py, PyModule>,
@@ -3841,14 +4146,9 @@ impl SessionExecutor {
         session: &Bound<'py, PyAny>,
         url: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let canonical = SessionRedirectCursor::declared_capability(
-            capabilities,
-            "get-adapter",
-        )?;
-        let canonical_owner = SessionRedirectCursor::declared_capability(
-            capabilities,
-            "session-type",
-        )?;
+        let canonical = SessionRedirectCursor::declared_capability(capabilities, "get-adapter")?;
+        let canonical_owner =
+            SessionRedirectCursor::declared_capability(capabilities, "session-type")?;
         if let Some(method) = SessionRedirectCursor::payload_method_override(
             session,
             "get_adapter",
@@ -3859,7 +4159,11 @@ impl SessionExecutor {
             kwargs.set_item("url", url)?;
             return method.call((), Some(&kwargs));
         }
-        for pair in session.getattr("adapters")?.call_method0("items")?.try_iter()? {
+        for pair in session
+            .getattr("adapters")?
+            .call_method0("items")?
+            .try_iter()?
+        {
             let pair = pair?;
             let prefix = pair.get_item(0)?;
             let adapter = pair.get_item(1)?;
@@ -3913,7 +4217,11 @@ impl SessionExecutor {
         py: Python<'py>,
         cursor: &Py<SessionRedirectCursor>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        cursor.bind(py).borrow().advance(py).map(|value| value.into_bound(py))
+        cursor
+            .bind(py)
+            .borrow()
+            .advance(py)
+            .map(|value| value.into_bound(py))
     }
 
     fn session_send_composed<'py>(
@@ -3975,9 +4283,7 @@ impl SessionExecutor {
         let adapter = Self::send_get_adapter(py, capabilities, &session, &get_adapter_url)?;
 
         let start = Self::send_global(py, &module, builtins, "preferred_clock")?.call0()?;
-        let mut response = adapter
-            .getattr("send")?
-            .call((&request,), Some(&kwargs))?;
+        let mut response = adapter.getattr("send")?.call((&request,), Some(&kwargs))?;
         let end = Self::send_global(py, &module, builtins, "preferred_clock")?.call0()?;
         let elapsed = end.call_method1("__sub__", (&start,))?;
         let elapsed_kwargs = PyDict::new(py);
@@ -3994,12 +4300,7 @@ impl SessionExecutor {
             drop(history_truth);
             for item in response.getattr("history")?.try_iter()? {
                 let item = item?;
-                let extract = Self::send_global(
-                    py,
-                    &module,
-                    builtins,
-                    "extract_cookies_to_jar",
-                )?;
+                let extract = Self::send_global(py, &module, builtins, "extract_cookies_to_jar")?;
                 let cookies = session.getattr("cookies")?;
                 let history_request = item.getattr("request")?;
                 let raw = item.getattr("raw")?;
@@ -4013,14 +4314,10 @@ impl SessionExecutor {
 
         let mut history: Vec<Py<PyAny>> = Vec::new();
         if allow_redirects.is_truthy()? {
-            let canonical = SessionRedirectCursor::declared_capability(
-                capabilities,
-                "resolve-redirects",
-            )?;
-            let canonical_owner = SessionRedirectCursor::declared_capability(
-                capabilities,
-                "redirect-type",
-            )?;
+            let canonical =
+                SessionRedirectCursor::declared_capability(capabilities, "resolve-redirects")?;
+            let canonical_owner =
+                SessionRedirectCursor::declared_capability(capabilities, "redirect-type")?;
             let override_method = SessionRedirectCursor::payload_method_override(
                 &session,
                 "resolve_redirects",
@@ -4069,14 +4366,10 @@ impl SessionExecutor {
 
         if !allow_redirects.is_truthy()? {
             let next = Self::send_global(py, &module, builtins, "next")?;
-            let canonical = SessionRedirectCursor::declared_capability(
-                capabilities,
-                "resolve-redirects",
-            )?;
-            let canonical_owner = SessionRedirectCursor::declared_capability(
-                capabilities,
-                "redirect-type",
-            )?;
+            let canonical =
+                SessionRedirectCursor::declared_capability(capabilities, "resolve-redirects")?;
+            let canonical_owner =
+                SessionRedirectCursor::declared_capability(capabilities, "redirect-type")?;
             let override_method = SessionRedirectCursor::payload_method_override(
                 &session,
                 "resolve_redirects",
@@ -4173,7 +4466,9 @@ fn category_for_operation(plan: OriginPlan) -> ActionCategory {
         | OriginPlan::PickleSetup
         | OriginPlan::Pickle => ActionCategory::Global,
         OriginPlan::ActiveStreamClose | OriginPlan::ActiveStreamTrailing => ActionCategory::Adapter,
-        OriginPlan::CloseEnter | OriginPlan::CloseOperation | OriginPlan::CloseReuseClose => ActionCategory::Global,
+        OriginPlan::CloseEnter | OriginPlan::CloseOperation | OriginPlan::CloseReuseClose => {
+            ActionCategory::Global
+        }
         OriginPlan::CloseReuseSend => ActionCategory::Adapter,
         OriginPlan::RedirectTarget | OriginPlan::RedirectMethod => ActionCategory::Global,
         OriginPlan::ResolveRedirectsStart
@@ -4268,13 +4563,18 @@ fn runtime_affinity_program(
     let observer_done = runtime_scenario_item(gates, "observer_done")?
         .ok_or_else(|| PyValueError::new_err("missing observer completion gate"))?;
     observer_done.call_method0("set")?;
-    let response = subject.getattr("adapter")?.call_method1("send", (&request,))?;
+    let response = subject
+        .getattr("adapter")?
+        .call_method1("send", (&request,))?;
     subject.getattr("clock")?.call0()?;
     let response = subject.getattr("hook")?.call1((&response,))?;
     subject.getattr("cookie")?.call1((&response,))?;
 
     let result = runtime_result(py);
-    result.set_item("response_identity", response.is(&subject.getattr("response")?))?;
+    result.set_item(
+        "response_identity",
+        response.is(&subject.getattr("response")?),
+    )?;
     result.set_item("response_name", response.getattr("name")?)?;
     result.set_item("events", subject.getattr("events")?)?;
     let program = runtime_scenario_item(scenario, "program")?
@@ -4285,10 +4585,16 @@ fn runtime_affinity_program(
     for event in events.try_iter()? {
         let event = event?;
         let label: String = event.get_item(0)?.extract()?;
-        if program.call_method1("__contains__", (label.as_str(),))?.is_truthy()? {
+        if program
+            .call_method1("__contains__", (label.as_str(),))?
+            .is_truthy()?
+        {
             callback_count += 1;
         }
-        if matches!(label.as_str(), "global" | "auth" | "body" | "clock" | "hook" | "cookie") {
+        if matches!(
+            label.as_str(),
+            "global" | "auth" | "body" | "clock" | "hook" | "cookie"
+        ) {
             let length = event.len()?;
             all_callbacks_on_entry &= event.get_item(length - 1)?.is_truthy()?
                 && event.get_item(length - 2)?.is_truthy()?;
@@ -4312,7 +4618,9 @@ fn runtime_payload_program(
     gates: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let request = subject.getattr("request")?;
-    let response = subject.getattr("adapter")?.call_method1("send", (&request,))?;
+    let response = subject
+        .getattr("adapter")?
+        .call_method1("send", (&request,))?;
     let schema = PyList::empty(py);
     let payload_schema = runtime_scenario_item(scenario, "payload_schema")?
         .ok_or_else(|| PyValueError::new_err("missing payload schema"))?;
@@ -4399,7 +4707,10 @@ fn runtime_nested_program(
         "nested_calls",
         subject.getattr("nested_adapter")?.getattr("calls")?,
     )?;
-    result.set_item("distinct_correlation", !outer_correlation.is(&nested_correlation))?;
+    result.set_item(
+        "distinct_correlation",
+        !outer_correlation.is(&nested_correlation),
+    )?;
     let mut same_generation_observed = [false, false];
     let mut locks_free = true;
     let mut names = Vec::new();
@@ -4408,23 +4719,31 @@ fn runtime_nested_program(
         let label: String = event.get_item(0)?.extract()?;
         names.push(label.clone());
         if label == "outer-action" {
-            same_generation_observed[0] = event.get_item(1)?.is_truthy()?
-                && event.get_item(2)?.is_truthy()?;
+            same_generation_observed[0] =
+                event.get_item(1)?.is_truthy()? && event.get_item(2)?.is_truthy()?;
         } else if label == "nested-action" {
-            same_generation_observed[1] = event.get_item(1)?.is_truthy()?
-                && event.get_item(2)?.is_truthy()?;
+            same_generation_observed[1] =
+                event.get_item(1)?.is_truthy()? && event.get_item(2)?.is_truthy()?;
         } else if matches!(label.as_str(), "outer-hook" | "nested-hook") {
             locks_free &= event.get_item(event.len()? - 1)?.is_truthy()?;
         }
     }
     let expected = [
-        "outer-submit", "adapter", "outer-action", "outer-hook",
-        "nested-submit", "adapter", "nested-action", "nested-hook",
+        "outer-submit",
+        "adapter",
+        "outer-action",
+        "outer-hook",
+        "nested-submit",
+        "adapter",
+        "nested-action",
+        "nested-hook",
         "outer-resume",
     ];
     result.set_item(
         "same_generation_observed",
-        same_generation_observed.into_iter().all(|observed| observed),
+        same_generation_observed
+            .into_iter()
+            .all(|observed| observed),
     )?;
     result.set_item("locks_free", locks_free)?;
     result.set_item("exact_once", names == expected)?;
@@ -4507,7 +4826,10 @@ struct SessionRuntimeDestructorObserver {
 #[pymethods]
 impl SessionRuntimeDestructorObserver {
     fn __call__(&self, py: Python<'_>, _reference: &Bound<'_, PyAny>) -> PyResult<()> {
-        let current: u64 = py.import("threading")?.call_method0("get_ident")?.extract()?;
+        let current: u64 = py
+            .import("threading")?
+            .call_method0("get_ident")?
+            .extract()?;
         self.records.bind(py).call_method1(
             "append",
             (PyList::new(
@@ -4531,11 +4853,25 @@ impl SessionRuntimeDestructorObserver {
 #[pymethods]
 impl SessionRuntimeInterrupter {
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
-        if !self.ready.bind(py).call_method1("wait", (2,))?.is_truthy()? {
-            return Err(PyRuntimeError::new_err("runtime interrupt ready gate expired"));
+        if !self
+            .ready
+            .bind(py)
+            .call_method1("wait", (2,))?
+            .is_truthy()?
+        {
+            return Err(PyRuntimeError::new_err(
+                "runtime interrupt ready gate expired",
+            ));
         }
-        if !self.armed.bind(py).call_method1("wait", (2,))?.is_truthy()? {
-            return Err(PyRuntimeError::new_err("runtime interrupt arm gate expired"));
+        if !self
+            .armed
+            .bind(py)
+            .call_method1("wait", (2,))?
+            .is_truthy()?
+        {
+            return Err(PyRuntimeError::new_err(
+                "runtime interrupt arm gate expired",
+            ));
         }
         let os = py.import("os")?;
         let signal = py.import("signal")?;
@@ -4636,7 +4972,10 @@ fn runtime_exception_record<'py>(
     let error_type = error.get_type(py);
     let error_name = PyList::new(
         py,
-        [error_type.getattr("__module__")?, error_type.getattr("__qualname__")?],
+        [
+            error_type.getattr("__module__")?,
+            error_type.getattr("__qualname__")?,
+        ],
     )?;
     let args = PyList::empty(py);
     for arg in value.getattr("args")?.try_iter()? {
@@ -4718,10 +5057,7 @@ fn runtime_error_program(
     Ok(result.unbind().into_any())
 }
 
-fn runtime_ready_signal_handshake(
-    py: Python<'_>,
-    scenario: &Bound<'_, PyAny>,
-) -> PyResult<()> {
+fn runtime_ready_signal_handshake(py: Python<'_>, scenario: &Bound<'_, PyAny>) -> PyResult<()> {
     let write_fd: i32 = runtime_scenario_item(scenario, "native_ready_write_fd")?
         .ok_or_else(|| PyValueError::new_err("missing native ready gate"))?
         .extract()?;
@@ -4761,8 +5097,7 @@ fn worker_drop_before_origin_owner(require_terminal: bool) -> PyResult<()> {
         ));
     };
     let terminal = origin_quarantine_is_terminal(token).unwrap_or(false);
-    if (!require_terminal || terminal) && origin_quarantine_retains_owner(token)
-    {
+    if (!require_terminal || terminal) && origin_quarantine_retains_owner(token) {
         Ok(())
     } else {
         Err(PyRuntimeError::new_err(
@@ -4815,7 +5150,11 @@ fn runtime_interruption_program(
         RuntimeOperation::AdapterInterruptResponseHead => "response-head",
         RuntimeOperation::AdapterInterruptResponseRead => "response-read",
         RuntimeOperation::AdapterInterruptUpload => "upload",
-        _ => return Err(PyValueError::new_err("invalid adapter interruption operation")),
+        _ => {
+            return Err(PyValueError::new_err(
+                "invalid adapter interruption operation",
+            ));
+        }
     };
     let marker = subject.getattr("marker")?;
     let events = subject.getattr("events")?;
@@ -4829,7 +5168,7 @@ fn runtime_interruption_program(
             let record = runtime_exact_interrupt(py, &marker, &entered, &release, || {
                 dirty.call_method1("send", (&request,))
             })?;
-            events.call_method1("append", (PyList::new(py, ["cancel-observed"])? ,))?;
+            events.call_method1("append", (PyList::new(py, ["cancel-observed"])?,))?;
             let recovery_request = runtime_named_request(py, &request, "connect-recovery")?;
             let clean = subject.getattr("clean_adapter")?;
             let recovered = clean.call_method1("send", (&recovery_request,))?;
@@ -4852,8 +5191,12 @@ fn runtime_interruption_program(
             )?;
             result.set_item(
                 "signal_before_ready",
-                events.call_method1("index", (cancel_event,))?.extract::<usize>()?
-                    < events.call_method1("index", (recovery_event,))?.extract::<usize>()?,
+                events
+                    .call_method1("index", (cancel_event,))?
+                    .extract::<usize>()?
+                    < events
+                        .call_method1("index", (recovery_event,))?
+                        .extract::<usize>()?,
             )?;
             result.set_item("recovered", recovered.getattr("name")?)?;
         }
@@ -4865,7 +5208,7 @@ fn runtime_interruption_program(
                 (&request_write, b"GET /head HTTP/1.1\r\nHost: local\r\n\r\n"),
             )?;
             os.call_method1("close", (&request_write,))?;
-            events.call_method1("append", (PyList::new(py, ["request-sent"])? ,))?;
+            events.call_method1("append", (PyList::new(py, ["request-sent"])?,))?;
             let entered = gates.get_item("request_received")?;
             if !entered.call_method1("wait", (2,))?.is_truthy()? {
                 return Err(PyRuntimeError::new_err("response head gate expired"));
@@ -4894,7 +5237,10 @@ fn runtime_interruption_program(
             let distinct = !clean_read.eq(&dirty_read)?;
             os.call_method1(
                 "write",
-                (&clean_write, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+                (
+                    &clean_write,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                ),
             )?;
             os.call_method1("close", (&clean_write,))?;
             let recovered = os.call_method1("read", (&clean_read, 4096))?;
@@ -4976,7 +5322,7 @@ fn runtime_interruption_program(
             let record = runtime_exact_interrupt(py, &marker, &entered, &release, || {
                 body.call_method0("read")
             })?;
-            events.call_method1("append", (PyList::new(py, ["cancel-observed"])? ,))?;
+            events.call_method1("append", (PyList::new(py, ["cancel-observed"])?,))?;
             let clean_body = subject.getattr("clean_body")?;
             let recovered = clean_body.call_method0("read")?;
             result.set_item("error", record)?;
@@ -4984,7 +5330,10 @@ fn runtime_interruption_program(
             result.set_item("queued", 1)?;
             result.set_item("executed", body.getattr("reads")?)?;
             result.set_item("reply_observed", 0)?;
-            result.set_item("body_not_reread", body.getattr("reads")?.extract::<u64>()? == 1)?;
+            result.set_item(
+                "body_not_reread",
+                body.getattr("reads")?.extract::<u64>()? == 1,
+            )?;
             result.set_item(
                 "no_synthetic_close",
                 body.getattr("synthetic_closes")?.extract::<u64>()? == 0,
@@ -5111,7 +5460,9 @@ fn runtime_cancellation_program(
         .ok_or_else(|| PyValueError::new_err("missing cancellation phases"))?;
     let cases = subject.getattr("cases")?;
     if cases.len()? != declared_phases.len()? {
-        return Err(PyValueError::new_err("cancellation phase inventory mismatch"));
+        return Err(PyValueError::new_err(
+            "cancellation phase inventory mismatch",
+        ));
     }
     let weakref = py.import("weakref")?;
     let gc = py.import("gc")?;
@@ -5125,7 +5476,9 @@ fn runtime_cancellation_program(
         let phase_name: String = case.getattr("phase")?.extract()?;
         let declared: String = declared_phases.get_item(index)?.extract()?;
         if phase_name != declared {
-            return Err(PyValueError::new_err("cancellation phase authority mismatch"));
+            return Err(PyValueError::new_err(
+                "cancellation phase authority mismatch",
+            ));
         }
         let phase = RuntimeCancellationPhase::parse(&phase_name)?;
         let owner = case.getattr("owner")?;
@@ -5225,7 +5578,9 @@ fn runtime_fork_program(
         let read_fd = gates.get_item("read_fd")?;
         os.call_method1("close", (&read_fd,))?;
         let request = runtime_named_value(py, "child")?;
-        let response = subject.getattr("adapter")?.call_method1("send", (&request,))?;
+        let response = subject
+            .getattr("adapter")?
+            .call_method1("send", (&request,))?;
         let pid: i64 = os.call_method0("getpid")?.extract()?;
         let payload = format!(
             "{pid}:{child_generation}:{}",
@@ -5248,9 +5603,14 @@ fn runtime_fork_program(
         ),
     )?;
     if ready.get_item(0)?.len()? == 0 {
-        os.call_method1("kill", (child_pid, py.import("signal")?.getattr("SIGKILL")?))?;
+        os.call_method1(
+            "kill",
+            (child_pid, py.import("signal")?.getattr("SIGKILL")?),
+        )?;
         os.call_method1("waitpid", (child_pid, 0))?;
-        return Err(PyRuntimeError::new_err("fork child did not reach result gate"));
+        return Err(PyRuntimeError::new_err(
+            "fork child did not reach result gate",
+        ));
     }
     let payload = os
         .call_method1("read", (gates.get_item("read_fd")?, 4096))?
@@ -5280,10 +5640,7 @@ fn runtime_fork_program(
         runtime_scenario_item(scenario, "prefork")?
             .ok_or_else(|| PyValueError::new_err("missing prefork phase"))?,
     )?;
-    result.set_item(
-        "child_pid_changed",
-        child_pid_value != parent_pid,
-    )?;
+    result.set_item("child_pid_changed", child_pid_value != parent_pid)?;
     result.set_item("child_generation", child_generation_value)?;
     result.set_item("parent_generation", parent_generation)?;
     result.set_item(
@@ -5292,7 +5649,10 @@ fn runtime_fork_program(
     )?;
     result.set_item("child_response", payload.get_item(2)?)?;
     result.set_item("parent_response", parent_response.getattr("name")?)?;
-    result.set_item("child_exit", os.call_method1("waitstatus_to_exitcode", (status,))?)?;
+    result.set_item(
+        "child_exit",
+        os.call_method1("waitstatus_to_exitcode", (status,))?,
+    )?;
     result.set_item("waited", waited_pid == child_pid)?;
     result.set_item("parent_usable", true)?;
     Ok(result.unbind().into_any())
@@ -5324,9 +5684,18 @@ fn runtime_session_isolation_program(
     result.set_item("events", subject.getattr("events")?)?;
     result.set_item(
         "counts",
-        PyList::new(py, [first_adapter.getattr("calls")?, second_adapter.getattr("calls")?])?,
+        PyList::new(
+            py,
+            [
+                first_adapter.getattr("calls")?,
+                second_adapter.getattr("calls")?,
+            ],
+        )?,
     )?;
-    result.set_item("peer_survived", again.getattr("name")?.eq("session-two-response")?)?;
+    result.set_item(
+        "peer_survived",
+        again.getattr("name")?.eq("session-two-response")?,
+    )?;
     result.set_item("shared_runtime", gates.get_item("shared_runtime")?)?;
     result.set_item(
         "separate_adapters",
@@ -5554,7 +5923,9 @@ fn emit_isolation_resources(
                 state.driver.clone(),
                 state.harness.clone(),
                 state.pool_exchange,
-                finish_pool_response.then(|| state.live_response.take()).flatten(),
+                finish_pool_response
+                    .then(|| state.live_response.take())
+                    .flatten(),
             ))
         })?;
     let generation = driver.generation();
@@ -5564,10 +5935,7 @@ fn emit_isolation_resources(
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
         .wait()
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-    subject.call_method1(
-        "runtime",
-        (pid, generation, driver_id, driver_thread_id),
-    )?;
+    subject.call_method1("runtime", (pid, generation, driver_id, driver_thread_id))?;
     if let Some(exchange) = pool_exchange {
         subject.call_method1(
             "pool",
@@ -5576,7 +5944,10 @@ fn emit_isolation_resources(
                 generation,
                 exchange.pool.get(),
                 exchange.lease.expect("pool acquire has lease").get(),
-                exchange.connection.expect("pool acquire has connection").get(),
+                exchange
+                    .connection
+                    .expect("pool acquire has connection")
+                    .get(),
             ),
         )?;
     }
@@ -5608,10 +5979,7 @@ fn emit_isolation_resources(
     Ok(())
 }
 
-fn fork_after_import_before_driver(
-    py: Python<'_>,
-    subject: &Bound<'_, PyAny>,
-) -> PyResult<()> {
+fn fork_after_import_before_driver(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<()> {
     emit_isolation_resources(py, subject, false, false)
 }
 
@@ -5619,10 +5987,7 @@ fn fork_after_live_driver(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResul
     emit_isolation_resources(py, subject, false, false)
 }
 
-fn fork_after_live_pool_lease(
-    py: Python<'_>,
-    subject: &Bound<'_, PyAny>,
-) -> PyResult<()> {
+fn fork_after_live_pool_lease(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<()> {
     emit_isolation_resources(py, subject, true, false)
 }
 
@@ -5797,8 +6162,7 @@ fn multi_session_pool_isolation(
                 }
             }
 
-            let third_response =
-                native_isolation_send(worker_second, address, "/second").await?;
+            let third_response = native_isolation_send(worker_second, address, "/second").await?;
             let third_identity = worker_second_hooks
                 .latest(SessionPhase::PoolAcquire)
                 .ok_or_else(|| "second reuse did not acquire lease".to_owned())?;
@@ -5903,8 +6267,7 @@ fn outstanding_stream_lease_isolation(subject: &Bound<'_, PyAny>) -> PyResult<()
                 ),
             ]);
             let (address, server, shutdown) = start_native_keepalive_server(routes, 2).await?;
-            let stream_response =
-                native_isolation_send(worker_stream, address, "/stream").await?;
+            let stream_response = native_isolation_send(worker_stream, address, "/stream").await?;
             let identity = worker_stream_hooks
                 .latest(SessionPhase::PoolAcquire)
                 .ok_or_else(|| "stream did not acquire lease".to_owned())?;
@@ -5976,11 +6339,11 @@ fn outstanding_stream_lease_isolation(subject: &Bound<'_, PyAny>) -> PyResult<()
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
         .map_err(PyRuntimeError::new_err)?;
     let lease = identity.lease.expect("pool acquire has lease").get();
-    let connection = identity.connection.expect("pool acquire has connection").get();
-    audit.call_method1(
-        "opened",
-        (lease, connection, stream_harness.generation()),
-    )?;
+    let connection = identity
+        .connection
+        .expect("pool acquire has connection")
+        .get();
+    audit.call_method1("opened", (lease, connection, stream_harness.generation()))?;
     audit.call_method1(
         "peer_closed",
         (
@@ -5988,10 +6351,7 @@ fn outstanding_stream_lease_isolation(subject: &Bound<'_, PyAny>) -> PyResult<()
             PyTuple::new(subject.py(), peer_cleared_connections)?,
         ),
     )?;
-    audit.call_method1(
-        "chunk",
-        (lease, connection, payload.as_ref()),
-    )?;
+    audit.call_method1("chunk", (lease, connection, payload.as_ref()))?;
     audit.call_method1("stream_closed", (lease, connection))?;
     audit.call_method1("lease_released", (lease, connection))?;
     Ok(())
@@ -6055,9 +6415,7 @@ fn runtime_native_isolation_audit(
         | RuntimeOperation::ForkChildCleanupAfterPool => {
             cleanup_native_fork_resources(subject)?;
         }
-        RuntimeOperation::MultiSessionIsolation => {
-            multi_session_pool_isolation(subject, scenario)?
-        }
+        RuntimeOperation::MultiSessionIsolation => multi_session_pool_isolation(subject, scenario)?,
         RuntimeOperation::OutstandingStreamIsolation => {
             outstanding_stream_lease_isolation(subject)?
         }
@@ -6287,9 +6645,9 @@ fn execute_completion_action(
             subject.call_method1("panic_entered", (panic_id,))?;
             Ok(())
         })(),
-        CompletionAction::NativeAwaitEntered => subject
-            .call_method0("native_await_entered")
-            .map(|_| ()),
+        CompletionAction::NativeAwaitEntered => {
+            subject.call_method0("native_await_entered").map(|_| ())
+        }
         CompletionAction::NativeAwaitComplete => (|| -> PyResult<()> {
             let gates = owner
                 .gates
@@ -6311,24 +6669,21 @@ fn execute_completion_action(
         })(),
         CompletionAction::NativeChannelEntered { envelope } => {
             let result = (|| -> PyResult<()> {
-            let scenario = owner
-                .scenario
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("missing channel scenario"))?
-                .bind(py);
-            let request = runtime_scenario_item(scenario, "request")?
-                .ok_or_else(|| PyValueError::new_err("missing channel request"))?;
-            let correlation = runtime_scenario_item(scenario, "correlation")?
-                .ok_or_else(|| PyValueError::new_err("missing channel correlation"))?;
-            let channel_id = runtime_scenario_item(scenario, "channel_id")?
-                .ok_or_else(|| PyValueError::new_err("missing channel id"))?;
-            let interpreter = runtime_scenario_item(scenario, "entry_interpreter")?
-                .ok_or_else(|| PyValueError::new_err("missing entry interpreter"))?;
-            subject.call_method1(
-                "entered",
-                (request, correlation, channel_id, interpreter),
-            )?;
-            Ok(())
+                let scenario = owner
+                    .scenario
+                    .as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("missing channel scenario"))?
+                    .bind(py);
+                let request = runtime_scenario_item(scenario, "request")?
+                    .ok_or_else(|| PyValueError::new_err("missing channel request"))?;
+                let correlation = runtime_scenario_item(scenario, "correlation")?
+                    .ok_or_else(|| PyValueError::new_err("missing channel correlation"))?;
+                let channel_id = runtime_scenario_item(scenario, "channel_id")?
+                    .ok_or_else(|| PyValueError::new_err("missing channel id"))?;
+                let interpreter = runtime_scenario_item(scenario, "entry_interpreter")?
+                    .ok_or_else(|| PyValueError::new_err("missing entry interpreter"))?;
+                subject.call_method1("entered", (request, correlation, channel_id, interpreter))?;
+                Ok(())
             })();
             return match result {
                 Ok(()) => CompletionReply::Channel { envelope },
@@ -6342,47 +6697,45 @@ fn execute_completion_action(
         }
         CompletionAction::NativeChannelComplete { envelope } => {
             let result = (|| -> PyResult<()> {
-            let scenario = owner
-                .scenario
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("missing channel scenario"))?
-                .bind(py);
-            let gates = owner
-                .gates
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("missing channel gates"))?
-                .bind(py);
-            let released: bool = gates
-                .getattr("release")?
-                .call_method1("wait", (2.0,))?
-                .extract()?;
-            if !released {
-                return Err(PyRuntimeError::new_err("channel release timed out"));
-            }
-            let correlation = runtime_scenario_item(scenario, "correlation")?
-                .ok_or_else(|| PyValueError::new_err("missing channel correlation"))?;
-            let channel_id = runtime_scenario_item(scenario, "channel_id")?
-                .ok_or_else(|| PyValueError::new_err("missing channel id"))?;
-            let interpreter = runtime_scenario_item(scenario, "entry_interpreter")?
-                .ok_or_else(|| PyValueError::new_err("missing entry interpreter"))?;
-            if let Some(error) = runtime_scenario_item(scenario, "error")?
-                .filter(|error| !error.is_none())
-            {
-                subject.call_method1(
-                    "failed",
-                    (&error, correlation, channel_id, interpreter),
-                )?;
-                owner.error = Some(PyErr::from_value(error));
-            } else {
-                let response = runtime_scenario_item(scenario, "response")?
-                    .ok_or_else(|| PyValueError::new_err("missing channel response"))?;
-                subject.call_method1(
-                    "replied",
-                    (&response, correlation, channel_id, interpreter),
-                )?;
-                owner.value = Some(response.unbind());
-            }
-            Ok(())
+                let scenario = owner
+                    .scenario
+                    .as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("missing channel scenario"))?
+                    .bind(py);
+                let gates = owner
+                    .gates
+                    .as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("missing channel gates"))?
+                    .bind(py);
+                let released: bool = gates
+                    .getattr("release")?
+                    .call_method1("wait", (2.0,))?
+                    .extract()?;
+                if !released {
+                    return Err(PyRuntimeError::new_err("channel release timed out"));
+                }
+                let correlation = runtime_scenario_item(scenario, "correlation")?
+                    .ok_or_else(|| PyValueError::new_err("missing channel correlation"))?;
+                let channel_id = runtime_scenario_item(scenario, "channel_id")?
+                    .ok_or_else(|| PyValueError::new_err("missing channel id"))?;
+                let interpreter = runtime_scenario_item(scenario, "entry_interpreter")?
+                    .ok_or_else(|| PyValueError::new_err("missing entry interpreter"))?;
+                if let Some(error) =
+                    runtime_scenario_item(scenario, "error")?.filter(|error| !error.is_none())
+                {
+                    subject
+                        .call_method1("failed", (&error, correlation, channel_id, interpreter))?;
+                    owner.error = Some(PyErr::from_value(error));
+                } else {
+                    let response = runtime_scenario_item(scenario, "response")?
+                        .ok_or_else(|| PyValueError::new_err("missing channel response"))?;
+                    subject.call_method1(
+                        "replied",
+                        (&response, correlation, channel_id, interpreter),
+                    )?;
+                    owner.value = Some(response.unbind());
+                }
+                Ok(())
             })();
             return match result {
                 Ok(()) => CompletionReply::Channel { envelope },
@@ -6603,10 +6956,7 @@ fn run_native_panic_program(
     }
 }
 
-fn bounded_session_finalization(
-    py: Python<'_>,
-    subject: &Bound<'_, PyAny>,
-) -> PyResult<Py<PyAny>> {
+fn bounded_session_finalization(py: Python<'_>, subject: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let owner = run_completion_program(py, subject, CompletionProgram::Close)?;
     Ok(owner.subject)
 }
@@ -6663,11 +7013,8 @@ fn independent_concurrent_session_channels(
     scenario: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let (action, reply) = validate_completion_envelopes(scenario)?;
-    let owner = run_completion_program(
-        py,
-        subject,
-        CompletionProgram::Channel { envelope: action },
-    )?;
+    let owner =
+        run_completion_program(py, subject, CompletionProgram::Channel { envelope: action })?;
     if action != reply {
         return Err(PyValueError::new_err("channel reply envelope mismatch"));
     }
@@ -6827,25 +7174,25 @@ fn native_concurrent_session_channel(
     operation: RuntimeOperation,
 ) -> PyResult<Py<PyAny>> {
     let (action, reply) = validate_completion_envelopes(scenario)?;
-    let declared_error = runtime_scenario_item(scenario, "error")?
-        .is_some_and(|error| !error.is_none());
+    let declared_error =
+        runtime_scenario_item(scenario, "error")?.is_some_and(|error| !error.is_none());
     match operation {
-        RuntimeOperation::ConcurrentChannelReply
-            if action.error_id.is_some() || declared_error =>
-        {
+        RuntimeOperation::ConcurrentChannelReply if action.error_id.is_some() || declared_error => {
             return Err(PyValueError::new_err(
                 "reply channel declared an error envelope",
             ));
         }
-        RuntimeOperation::ConcurrentChannelFail
-            if action.error_id.is_none() || !declared_error =>
-        {
+        RuntimeOperation::ConcurrentChannelFail if action.error_id.is_none() || !declared_error => {
             return Err(PyValueError::new_err(
                 "failed channel omitted its error envelope",
             ));
         }
         RuntimeOperation::ConcurrentChannelReply | RuntimeOperation::ConcurrentChannelFail => {}
-        _ => return Err(PyValueError::new_err("invalid concurrent channel operation")),
+        _ => {
+            return Err(PyValueError::new_err(
+                "invalid concurrent channel operation",
+            ));
+        }
     }
     let mut owner = run_native_completion_program(
         py,
@@ -6867,9 +7214,7 @@ fn validate_completion_adversarial(scenario: &Bound<'_, PyAny>) -> PyResult<()> 
         .ok_or_else(|| PyValueError::new_err("missing completion mutation"))?
         .extract()?;
     match mutation.as_str() {
-        "terminal-nonterminal-conflict" => {
-            Err(PyValueError::new_err("conflicting terminal state"))
-        }
+        "terminal-nonterminal-conflict" => Err(PyValueError::new_err("conflicting terminal state")),
         "python-panic-payload" => Err(PyValueError::new_err("python panic payload rejected")),
         "stale-callable" => Err(PyValueError::new_err("stale callable rejected")),
         _ => Err(PyValueError::new_err("unknown completion mutation")),
@@ -6958,12 +7303,10 @@ fn execute_session_harness_action(
                     let operation = RuntimeOperation::parse(scenario)?;
                     if operation == RuntimeOperation::ConnectReadyRace {
                         collaborator.call_method1("connect_dial", (subject.getattr("dirty")?,))?;
-                        let write_fd: i32 = runtime_scenario_item(
-                            scenario,
-                            "native_ready_write_fd",
-                        )?
-                        .ok_or_else(|| PyValueError::new_err("missing native ready gate"))?
-                        .extract()?;
+                        let write_fd: i32 =
+                            runtime_scenario_item(scenario, "native_ready_write_fd")?
+                                .ok_or_else(|| PyValueError::new_err("missing native ready gate"))?
+                                .extract()?;
                         py.detach(move || -> std::io::Result<()> {
                             let mut ready = std::fs::OpenOptions::new()
                                 .write(true)
@@ -6974,7 +7317,8 @@ fn execute_session_harness_action(
                     }
                 }
                 SessionPhase::ResponseHead => {
-                    if RuntimeOperation::parse(scenario)? == RuntimeOperation::InterruptResponseHead {
+                    if RuntimeOperation::parse(scenario)? == RuntimeOperation::InterruptResponseHead
+                    {
                         collaborator
                             .call_method1("response_head_wait", (subject.getattr("dirty")?,))?;
                     }
@@ -7153,14 +7497,17 @@ fn run_session_harness_interrupt(
         move |actions| {
             if let Some(phase) = cancellation_phase {
                 return Box::pin(async move {
-                    let _ = actions.request(SessionHarnessAction::Cancellation(phase)).await;
+                    let _ = actions
+                        .request(SessionHarnessAction::Cancellation(phase))
+                        .await;
                     if phase == RuntimeCancellationPhase::PermanentlyNonterminal {
                         loop {
                             thread::park();
                         }
                     }
                     std::future::pending::<bool>().await
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
             }
             let blocking_phase = match operation {
                 RuntimeOperation::ConnectBlocked => SessionPhase::ConnectBlocked,
@@ -7212,14 +7559,8 @@ fn runtime_interrupt_phase(
     LAST_INTERRUPT_RUNTIME_GENERATION.with(|slot| slot.set(Some(native_generation)));
 
     let evidence = Arc::new(NativeInterruptEvidence::default());
-    let operation_result = run_session_harness_interrupt(
-        py,
-        subject,
-        scenario,
-        gates,
-        operation,
-        evidence.clone(),
-    );
+    let operation_result =
+        run_session_harness_interrupt(py, subject, scenario, gates, operation, evidence.clone());
 
     let error = match operation_result {
         Ok(()) => {
@@ -7233,7 +7574,9 @@ fn runtime_interrupt_phase(
         return Err(error);
     }
     if phase == "response-head-wait" && !no_post_head_actions(&evidence) {
-        return Err(PyRuntimeError::new_err("post-head action escaped cancellation"));
+        return Err(PyRuntimeError::new_err(
+            "post-head action escaped cancellation",
+        ));
     }
     if phase == "response-remainder-wait" && !no_synthetic_eof_or_content(&evidence) {
         return Err(PyRuntimeError::new_err(
@@ -7242,9 +7585,7 @@ fn runtime_interrupt_phase(
     }
     subject.call_method1("cancelled", (&dirty, &generation))?;
     subject.call_method1("worker_dropped", (&dirty,))?;
-    worker_drop_before_origin_owner(
-        operation != RuntimeOperation::CancelPermanentlyNonterminal,
-    )?;
+    worker_drop_before_origin_owner(operation != RuntimeOperation::CancelPermanentlyNonterminal)?;
     subject.call_method1("quarantined", (&owner, phase))?;
     if last_origin_quarantine_token().is_none() {
         return Err(PyRuntimeError::new_err(
@@ -7288,7 +7629,12 @@ fn runtime_recover_phase(
         .interrupt_phase()
         .ok_or_else(|| PyValueError::new_err("invalid recovery operation"))?;
     let quarantine_token = last_origin_quarantine_token();
-    if quarantine_token.is_none() && gates.getattr("release")?.call_method0("is_set")?.is_truthy()? {
+    if quarantine_token.is_none()
+        && gates
+            .getattr("release")?
+            .call_method0("is_set")?
+            .is_truthy()?
+    {
         return Err(PyValueError::new_err("release gate is already set"));
     }
     let recovery = subject.call_method1("recover", (&dirty, &generation))?;
@@ -7302,8 +7648,7 @@ fn runtime_recover_phase(
     }
     if let Some(token) = quarantine_token
         && origin_quarantine_is_terminal(token).unwrap_or(false)
-        && let Some(quarantined) =
-            take_origin_quarantine_owner::<SessionHarnessOriginOwner>(token)
+        && let Some(quarantined) = take_origin_quarantine_owner::<SessionHarnessOriginOwner>(token)
     {
         subject.call_method1("origin_reaped", (quarantined.retained.bind(py), phase))?;
     }
@@ -7341,7 +7686,9 @@ fn _session_runtime_trial(
         RuntimeOperation::PanicRecovery => {
             translate_session_worker_panic(py, subject, scenario, gates)
         }
-        RuntimeOperation::LiveClockMutation => reload_live_python_authority_after_await(py, subject),
+        RuntimeOperation::LiveClockMutation => {
+            reload_live_python_authority_after_await(py, subject)
+        }
         RuntimeOperation::SendConcurrentChannel => {
             independent_concurrent_session_channels(py, subject, scenario)
         }
@@ -7413,6 +7760,83 @@ fn _session_runtime_trial(
     }
 }
 
+fn run_session_facade(
+    py: Python<'_>,
+    session: &Bound<'_, PyAny>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: &Bound<'_, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    let _pump_guard = PublicPumpGuard::enter();
+    crate::adapters::send_from_session(
+        py,
+        crate::adapters::PublicSessionSend::Compatibility {
+            session,
+            args,
+            kwargs,
+        },
+    )
+}
+
+#[pyfunction]
+fn _session_facade_trial(
+    py: Python<'_>,
+    session: &Bound<'_, PyAny>,
+    operation: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: &Bound<'_, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    if operation == "send" {
+        return run_session_facade(py, session, args, kwargs);
+    }
+    Ok(py.NotImplemented())
+}
+
+#[pyfunction]
+fn _public_facade_pump_trial(py: Python<'_>, operation: &str) -> PyResult<Py<PyAny>> {
+    let observation =
+        PUBLIC_PUMP_OBSERVATION.get_or_init(|| Mutex::new(PublicPumpObservation::default()));
+    if operation == "reset" {
+        let mut state = observation
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("public pump observation lock poisoned"))?;
+        *state = PublicPumpObservation {
+            process_id: std::process::id(),
+            ..PublicPumpObservation::default()
+        };
+        NEXT_PUBLIC_SUBMISSION.store(1, Ordering::Relaxed);
+        PUBLIC_PUMP_OBSERVATION_ENABLED.store(true, Ordering::Release);
+        return Ok(py.None());
+    }
+    if operation != "snapshot" {
+        return Err(PyValueError::new_err(
+            "unknown public pump observation operation",
+        ));
+    }
+    PUBLIC_PUMP_OBSERVATION_ENABLED.store(false, Ordering::Release);
+    let mut observation = observation
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("public pump observation lock poisoned"))?;
+    let observation = if observation.process_id == std::process::id() {
+        std::mem::take(&mut *observation)
+    } else {
+        *observation = PublicPumpObservation::default();
+        PublicPumpObservation::default()
+    };
+    let result = PyDict::new(py);
+    result.set_item("outer_entries", observation.outer_entries)?;
+    result.set_item("outer_exits", observation.outer_exits)?;
+    result.set_item("max_depth", observation.max_depth)?;
+    result.set_item("adapter_leaf_entries", observation.adapter_leaf_entries)?;
+    result.set_item("nested_pump_entries", observation.nested_pump_entries)?;
+    result.set_item("submission_ids", &observation.submission_ids)?;
+    result.set_item("submission_parent_ids", &observation.submission_parent_ids)?;
+    result.set_item(
+        "adapter_submission_ids",
+        &observation.adapter_submission_ids,
+    )?;
+    Ok(result.into_any().unbind())
+}
+
 #[pyfunction]
 fn _session_pipeline_trial(
     subject: &Bound<'_, PyAny>,
@@ -7430,6 +7854,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_session_redirect_cursor_frame, module)?)?;
     module.add_function(wrap_pyfunction!(_session_runtime_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_session_pipeline_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_session_facade_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_public_facade_pump_trial, module)?)?;
     Ok(())
 }
 
@@ -7457,6 +7883,36 @@ mod task16_session_payload_contract {
     struct BorrowedValue<'a>(&'a str);
 
     #[test]
+    fn nested_public_pump_guard_restores_the_prior_tls_submission() {
+        PUBLIC_PUMP_OBSERVATION_ENABLED.store(true, Ordering::Release);
+        *PUBLIC_PUMP_OBSERVATION
+            .get_or_init(|| Mutex::new(PublicPumpObservation::default()))
+            .lock()
+            .expect("public pump observation lock") = PublicPumpObservation {
+            process_id: std::process::id(),
+            ..PublicPumpObservation::default()
+        };
+        NEXT_PUBLIC_SUBMISSION.store(1, Ordering::Relaxed);
+        PUBLIC_PUMP_SUBMISSION.with(|current| current.set(77));
+        PUBLIC_PUMP_DEPTH.with(|depth| depth.set(0));
+
+        {
+            let _outer = PublicPumpGuard::enter();
+            assert_eq!(PUBLIC_PUMP_SUBMISSION.with(Cell::get), 1);
+            {
+                let _inner = PublicPumpGuard::enter();
+                assert_eq!(PUBLIC_PUMP_SUBMISSION.with(Cell::get), 2);
+            }
+            assert_eq!(PUBLIC_PUMP_SUBMISSION.with(Cell::get), 1);
+        }
+
+        assert_eq!(PUBLIC_PUMP_SUBMISSION.with(Cell::get), 77);
+        assert_eq!(PUBLIC_PUMP_DEPTH.with(Cell::get), 0);
+        PUBLIC_PUMP_SUBMISSION.with(|current| current.set(0));
+        PUBLIC_PUMP_OBSERVATION_ENABLED.store(false, Ordering::Release);
+    }
+
+    #[test]
     fn all_session_payload_variants_are_worker_payloads() {
         assert_worker_payload::<SessionAction>();
         assert_worker_payload::<SessionReply>();
@@ -7482,24 +7938,118 @@ mod task16_session_payload_contract {
         let _ = (cursor_id, opaque_value_id);
 
         let actions = [
-            SessionAction::ReadGlobal { authority: GlobalAuthority::Sessions, generation, sequence },
-            SessionAction::ReadBody { request_id, generation, sequence },
-            SessionAction::SendCustomAdapter { adapter_id, request_id, generation, correlation, sequence },
-            SessionAction::DispatchHook { hook_id, response_id, generation, correlation, sequence },
-            SessionAction::RunAuth { auth_id, request_id, generation, sequence },
-            SessionAction::ExtractCookies { jar_id, request_id, response_id, generation, sequence },
-            SessionAction::NestedSubmit { request_id, generation, parent_correlation: correlation, correlation, sequence },
+            SessionAction::ReadGlobal {
+                authority: GlobalAuthority::Sessions,
+                generation,
+                sequence,
+            },
+            SessionAction::ReadBody {
+                request_id,
+                generation,
+                sequence,
+            },
+            SessionAction::SendCustomAdapter {
+                adapter_id,
+                request_id,
+                generation,
+                correlation,
+                sequence,
+            },
+            SessionAction::DispatchHook {
+                hook_id,
+                response_id,
+                generation,
+                correlation,
+                sequence,
+            },
+            SessionAction::RunAuth {
+                auth_id,
+                request_id,
+                generation,
+                sequence,
+            },
+            SessionAction::ExtractCookies {
+                jar_id,
+                request_id,
+                response_id,
+                generation,
+                sequence,
+            },
+            SessionAction::NestedSubmit {
+                request_id,
+                generation,
+                parent_correlation: correlation,
+                correlation,
+                sequence,
+            },
         ];
 
         for action in actions {
             match action {
-                SessionAction::ReadGlobal { authority, generation, sequence } => { let _ = (authority, generation, sequence); }
-                SessionAction::ReadBody { request_id, generation, sequence } => { let _ = (request_id, generation, sequence); }
-                SessionAction::SendCustomAdapter { adapter_id, request_id, generation, correlation, sequence } => { let _ = (adapter_id, request_id, generation, correlation, sequence); }
-                SessionAction::DispatchHook { hook_id, response_id, generation, correlation, sequence } => { let _ = (hook_id, response_id, generation, correlation, sequence); }
-                SessionAction::RunAuth { auth_id, request_id, generation, sequence } => { let _ = (auth_id, request_id, generation, sequence); }
-                SessionAction::ExtractCookies { jar_id, request_id, response_id, generation, sequence } => { let _ = (jar_id, request_id, response_id, generation, sequence); }
-                SessionAction::NestedSubmit { request_id, generation, parent_correlation, correlation, sequence } => { let _ = (request_id, generation, parent_correlation, correlation, sequence); }
+                SessionAction::ReadGlobal {
+                    authority,
+                    generation,
+                    sequence,
+                } => {
+                    let _ = (authority, generation, sequence);
+                }
+                SessionAction::ReadBody {
+                    request_id,
+                    generation,
+                    sequence,
+                } => {
+                    let _ = (request_id, generation, sequence);
+                }
+                SessionAction::SendCustomAdapter {
+                    adapter_id,
+                    request_id,
+                    generation,
+                    correlation,
+                    sequence,
+                } => {
+                    let _ = (adapter_id, request_id, generation, correlation, sequence);
+                }
+                SessionAction::DispatchHook {
+                    hook_id,
+                    response_id,
+                    generation,
+                    correlation,
+                    sequence,
+                } => {
+                    let _ = (hook_id, response_id, generation, correlation, sequence);
+                }
+                SessionAction::RunAuth {
+                    auth_id,
+                    request_id,
+                    generation,
+                    sequence,
+                } => {
+                    let _ = (auth_id, request_id, generation, sequence);
+                }
+                SessionAction::ExtractCookies {
+                    jar_id,
+                    request_id,
+                    response_id,
+                    generation,
+                    sequence,
+                } => {
+                    let _ = (jar_id, request_id, response_id, generation, sequence);
+                }
+                SessionAction::NestedSubmit {
+                    request_id,
+                    generation,
+                    parent_correlation,
+                    correlation,
+                    sequence,
+                } => {
+                    let _ = (
+                        request_id,
+                        generation,
+                        parent_correlation,
+                        correlation,
+                        sequence,
+                    );
+                }
             }
         }
     }
@@ -7516,23 +8066,95 @@ mod task16_session_payload_contract {
         let error_id = OpaqueValueId::checked(43, generation).unwrap();
 
         let replies = [
-            SessionReply::Scalar { value, generation, correlation, sequence },
-            SessionReply::Response { response_id, generation, correlation, sequence },
-            SessionReply::Nested { request_id, generation, correlation, sequence },
-            SessionReply::Raised { error_id, generation, correlation, sequence },
+            SessionReply::Scalar {
+                value,
+                generation,
+                correlation,
+                sequence,
+            },
+            SessionReply::Response {
+                response_id,
+                generation,
+                correlation,
+                sequence,
+            },
+            SessionReply::Nested {
+                request_id,
+                generation,
+                correlation,
+                sequence,
+            },
+            SessionReply::Raised {
+                error_id,
+                generation,
+                correlation,
+                sequence,
+            },
         ];
         for reply in replies {
             match reply {
-                SessionReply::Scalar { value, generation, correlation, sequence } => { let _ = (value, generation, correlation, sequence); }
-                SessionReply::Response { response_id, generation, correlation, sequence } => { let _ = (response_id, generation, correlation, sequence); }
-                SessionReply::Nested { request_id, generation, correlation, sequence } => { let _ = (request_id, generation, correlation, sequence); }
-                SessionReply::Raised { error_id, generation, correlation, sequence } => { let _ = (error_id, generation, correlation, sequence); }
+                SessionReply::Scalar {
+                    value,
+                    generation,
+                    correlation,
+                    sequence,
+                } => {
+                    let _ = (value, generation, correlation, sequence);
+                }
+                SessionReply::Response {
+                    response_id,
+                    generation,
+                    correlation,
+                    sequence,
+                } => {
+                    let _ = (response_id, generation, correlation, sequence);
+                }
+                SessionReply::Nested {
+                    request_id,
+                    generation,
+                    correlation,
+                    sequence,
+                } => {
+                    let _ = (request_id, generation, correlation, sequence);
+                }
+                SessionReply::Raised {
+                    error_id,
+                    generation,
+                    correlation,
+                    sequence,
+                } => {
+                    let _ = (error_id, generation, correlation, sequence);
+                }
             }
         }
 
-        let transfer = NativeTransfer { method: MethodId::Get, url: UrlId::checked(47, generation).unwrap(), headers: HeadersId::checked(53, generation).unwrap(), body_id: value, adapter_id, generation, correlation };
-        let NativeTransfer { method, url, headers, body_id, adapter_id, generation, correlation } = transfer;
-        let _ = (method, url, headers, body_id, adapter_id, generation, correlation);
+        let transfer = NativeTransfer {
+            method: MethodId::Get,
+            url: UrlId::checked(47, generation).unwrap(),
+            headers: HeadersId::checked(53, generation).unwrap(),
+            body_id: value,
+            adapter_id,
+            generation,
+            correlation,
+        };
+        let NativeTransfer {
+            method,
+            url,
+            headers,
+            body_id,
+            adapter_id,
+            generation,
+            correlation,
+        } = transfer;
+        let _ = (
+            method,
+            url,
+            headers,
+            body_id,
+            adapter_id,
+            generation,
+            correlation,
+        );
     }
 
     #[test]

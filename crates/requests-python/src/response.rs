@@ -1745,6 +1745,43 @@ fn _response_lifecycle_trial(
     response_lifecycle(py, subject, error, phase, audit)
 }
 
+#[pyfunction]
+fn _response_facade_trial(
+    py: Python<'_>,
+    subject: &Bound<'_, PyAny>,
+    operation: &str,
+    args: &Bound<'_, PyAny>,
+    kwargs: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let args = args.cast::<PyTuple>()?;
+    let kwargs = kwargs.cast::<PyDict>()?;
+    match operation {
+        "iter" if args.is_empty() => {
+            let chunk_size = 128_i32.into_pyobject(py)?;
+            iter_content_dispatch(py, subject, chunk_size.as_any(), false)
+        }
+        "iter_content" if args.len() == 2 => iter_content_dispatch(
+            py,
+            subject,
+            &args.get_item(0)?,
+            args.get_item(1)?.extract::<bool>()?,
+        ),
+        "iter_lines" if args.len() == 3 => _response_iter_lines_trial(
+            py,
+            subject,
+            &args.get_item(0)?,
+            args.get_item(1)?.extract::<bool>()?,
+            &args.get_item(2)?,
+        ),
+        "content" if args.is_empty() => content_dispatch(py, subject),
+        "json" if args.is_empty() => json_dispatch(py, subject, kwargs),
+        "raise_for_status" if args.is_empty() => metadata_dispatch(py, subject, "raise_for_status"),
+        "close" if args.is_empty() => close_dispatch(py, subject),
+        "pickle" if args.is_empty() => pickle_get_dispatch(py, subject),
+        _ => Ok(py.NotImplemented()),
+    }
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = response_state(module.py())?;
     module.add_class::<NativeContentIterator>()?;
@@ -1762,6 +1799,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_response_fields_snapshot, module)?)?;
     module.add_function(wrap_pyfunction!(_response_disposition_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_response_lifecycle_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_response_facade_trial, module)?)?;
     Ok(())
 }
 

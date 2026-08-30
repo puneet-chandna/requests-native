@@ -13,10 +13,16 @@ import sys
 import time
 from collections import OrderedDict
 from collections.abc import Generator, Mapping, MutableMapping
+from contextlib import contextmanager
 from datetime import timedelta
+from functools import wraps
 from typing import TYPE_CHECKING, Any, cast
 
 from ._internal_utils import to_native_string
+from ._rust_public import close_owner as _close_public_facade_owner
+from ._rust_public import dispatch as _public_facade_dispatch
+from ._rust_public import rust_public_trial as _rust_public_trial_context
+from ._rust_public import suspend_dispatch as _suspend_public_facade_dispatch
 from ._types import is_prepared as _is_prepared
 from .adapters import HTTPAdapter
 from .auth import _basic_auth_str
@@ -133,6 +139,11 @@ class SessionRedirectMixin:
 
     def get_redirect_target(self, resp: Response) -> str | None:
         """Receives a Response. Returns a redirect URI or ``None``"""
+        result = _public_facade_dispatch(
+            "session", self, "get_redirect_target", (resp,), {}
+        )
+        if result is not NotImplemented:
+            return result
         # Due to the nature of how requests processes redirects this method will
         # be called at least once upon the original response and at least twice
         # on each subsequent redirect response (if any).
@@ -153,6 +164,11 @@ class SessionRedirectMixin:
 
     def should_strip_auth(self, old_url: str, new_url: str) -> bool:
         """Decide whether Authorization header should be removed when redirecting"""
+        result = _public_facade_dispatch(
+            "session", self, "should_strip_auth", (old_url, new_url), {}
+        )
+        if result is not NotImplemented:
+            return result
         old_parsed = urlparse(old_url)
         new_parsed = urlparse(new_url)
         if old_parsed.hostname != new_parsed.hostname:
@@ -196,6 +212,17 @@ class SessionRedirectMixin:
         **adapter_kwargs: Any,
     ) -> Generator[Response, None, None]:
         """Receives a Response. Returns a generator of Responses or Requests."""
+
+        result = _public_facade_dispatch(
+            "session",
+            self,
+            "resolve_redirects",
+            (resp, req, stream, timeout, verify, cert, proxies, yield_requests),
+            adapter_kwargs,
+        )
+        if result is not NotImplemented:
+            yield from result
+            return
 
         hist: list[Response] = []  # keep track of history
 
@@ -313,6 +340,11 @@ class SessionRedirectMixin:
         request to avoid leaking credentials. This method intelligently removes
         and reapplies authentication where possible to avoid credential loss.
         """
+        result = _public_facade_dispatch(
+            "session", self, "rebuild_auth", (prepared_request, response), {}
+        )
+        if result is not NotImplemented:
+            return result
         original_request = response.request
         assert _is_prepared(original_request)
         assert _is_prepared(prepared_request)
@@ -347,6 +379,11 @@ class SessionRedirectMixin:
 
         :rtype: dict
         """
+        result = _public_facade_dispatch(
+            "session", self, "rebuild_proxies", (prepared_request, proxies), {}
+        )
+        if result is not NotImplemented:
+            return result
         assert _is_prepared(prepared_request)
         headers = prepared_request.headers
         scheme = urlparse(prepared_request.url).scheme
@@ -373,6 +410,11 @@ class SessionRedirectMixin:
         """When being redirected we may want to change the method of the request
         based on certain specs or browser behavior.
         """
+        result = _public_facade_dispatch(
+            "session", self, "rebuild_method", (prepared_request, response), {}
+        )
+        if result is not NotImplemented:
+            return result
         method = prepared_request.method
 
         # https://tools.ietf.org/html/rfc7231#section-6.4.4
@@ -503,9 +545,15 @@ class Session(SessionRedirectMixin):
         self.mount("http://", HTTPAdapter())
 
     def __enter__(self) -> Self:
+        result = _public_facade_dispatch("session", self, "enter", (), {})
+        if result is not NotImplemented:
+            return result
         return self
 
     def __exit__(self, *args: Any) -> None:
+        result = _public_facade_dispatch("session", self, "exit", args, {})
+        if result is not NotImplemented:
+            return result
         self.close()
 
     def prepare_request(self, request: Request) -> PreparedRequest:
@@ -518,6 +566,11 @@ class Session(SessionRedirectMixin):
             session's settings.
         :rtype: requests.PreparedRequest
         """
+        result = _public_facade_dispatch(
+            "session", self, "prepare_request", (request,), {}
+        )
+        if result is not NotImplemented:
+            return result
         url = cast("_t.UriType", request.url)
         method = cast(str, request.method)
 
@@ -754,6 +807,11 @@ class Session(SessionRedirectMixin):
 
         :rtype: requests.Response
         """
+        result = _public_facade_dispatch(
+            "session", self, "send", (request,), kwargs.copy()
+        )
+        if result is not NotImplemented:
+            return result
         # Set defaults that the hooks can utilize to ensure they always have
         # the correct parameters to reproduce the previous request.
         kwargs.setdefault("stream", self.stream)
@@ -841,6 +899,15 @@ class Session(SessionRedirectMixin):
 
         :rtype: dict
         """
+        result = _public_facade_dispatch(
+            "session",
+            self,
+            "merge_environment_settings",
+            (url, proxies, stream, verify, cert),
+            {},
+        )
+        if result is not NotImplemented:
+            return result
         # Gather clues from the surrounding environment.
         if self.trust_env:
             # Set environment's proxies.
@@ -873,6 +940,9 @@ class Session(SessionRedirectMixin):
 
         :rtype: requests.adapters.BaseAdapter
         """
+        result = _public_facade_dispatch("session", self, "get_adapter", (url,), {})
+        if result is not NotImplemented:
+            return result
         for prefix, adapter in self.adapters.items():
             if url.lower().startswith(prefix.lower()):
                 return adapter
@@ -882,14 +952,25 @@ class Session(SessionRedirectMixin):
 
     def close(self) -> None:
         """Closes all adapters and as such the session"""
-        for v in self.adapters.values():
-            v.close()
+        try:
+            result = _public_facade_dispatch("session", self, "close", (), {})
+            if result is not NotImplemented:
+                return result
+            for v in self.adapters.values():
+                v.close()
+        finally:
+            _close_public_facade_owner(self)
 
     def mount(self, prefix: str, adapter: BaseAdapter) -> None:
         """Registers a connection adapter to a prefix.
 
         Adapters are sorted in descending order by prefix length.
         """
+        result = _public_facade_dispatch(
+            "session", self, "mount", (prefix, adapter), {}
+        )
+        if result is not NotImplemented:
+            return result
         self.adapters[prefix] = adapter
         keys_to_move = [k for k in self.adapters if len(k) < len(prefix)]
 
@@ -897,6 +978,10 @@ class Session(SessionRedirectMixin):
             self.adapters[key] = self.adapters.pop(key)
 
     def __getstate__(self) -> dict[str, Any]:
+        _public_facade_dispatch("session", self, "state", (), {})
+        result = _public_facade_dispatch("session", self, "pickle", (), {})
+        if result is not NotImplemented:
+            return result
         state = {attr: getattr(self, attr, None) for attr in self.__attrs__}
         return state
 
@@ -918,3 +1003,78 @@ def session() -> Session:
     :rtype: Session
     """
     return Session()
+
+
+_SESSION_REDIRECT_FACADE_OPERATIONS = {
+    "get_redirect_target": "get_redirect_target",
+    "should_strip_auth": "should_strip_auth",
+    "resolve_redirects": "resolve_redirects",
+    "rebuild_proxies": "rebuild_proxies",
+    "rebuild_method": "rebuild_method",
+}
+_SESSION_FACADE_OPERATIONS = {
+    "__enter__": "enter",
+    "__exit__": "exit",
+    "prepare_request": "prepare_request",
+    "request": "request",
+    "send": "send",
+    "merge_environment_settings": "merge_environment_settings",
+    "get_adapter": "get_adapter",
+    "mount": "mount",
+}
+_SESSION_FACADE_COMPAT_SEND = Session.send
+_SESSION_FACADE_TYPE = Session
+_SESSION_FACADE_COMPAT_INIT = Session.__init__
+_SESSION_FACADE_COMPAT_REQUEST = Session.request
+
+
+@wraps(_SESSION_FACADE_COMPAT_INIT)
+def _session_facade_init(self: Session, *args: Any, **kwargs: Any) -> None:
+    with _suspend_public_facade_dispatch():
+        _SESSION_FACADE_COMPAT_INIT(self, *args, **kwargs)
+    result = _public_facade_dispatch("session", self, "construct", args, kwargs)
+    if result is not NotImplemented:
+        return result
+    return None
+
+
+@wraps(_SESSION_FACADE_COMPAT_REQUEST)
+def _session_facade_request(self: Session, *args: Any, **kwargs: Any) -> Response:
+    result = _public_facade_dispatch("session", self, "request", args, kwargs)
+    if result is not NotImplemented:
+        return result
+    return _SESSION_FACADE_COMPAT_REQUEST(self, *args, **kwargs)
+
+
+Session.__init__ = _session_facade_init
+Session.request = _session_facade_request
+
+
+@contextmanager
+def _rust_public_trial():
+    with _rust_public_trial_context():
+        yield
+
+
+# Static inventory marker for the compiled extension dispatch seam.
+_SESSION_FACADE_SEAM = "_session_facade_trial"
+_SESSION_FACADE_INVENTORY = (
+    "construct",
+    "prepare_request",
+    "request",
+    "send",
+    "get_redirect_target",
+    "should_strip_auth",
+    "resolve_redirects",
+    "merge_environment_settings",
+    "rebuild_auth",
+    "rebuild_proxies",
+    "rebuild_method",
+    "mount",
+    "get_adapter",
+    "enter",
+    "exit",
+    "close",
+    "state",
+    "pickle",
+)

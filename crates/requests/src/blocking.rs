@@ -3,7 +3,7 @@ use std::future::{Future, poll_fn};
 use std::io::{self, Read};
 use std::mem;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use bytes::Bytes;
@@ -19,6 +19,13 @@ use crate::{
 };
 
 static PROCESS_RUNTIME: OnceLock<DriverRegistry> = OnceLock::new();
+static NEXT_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
+static OUTSTANDING_SUBMISSIONS: AtomicUsize = AtomicUsize::new(0);
+static SUBMISSION_PROCESS_ID: AtomicU32 = AtomicU32::new(0);
+
+tokio::task_local! {
+    static ACTIVE_SUBMISSION_ID: u64;
+}
 
 #[derive(Clone)]
 pub struct BlockingRuntimeDriver {
@@ -74,13 +81,24 @@ impl BlockingRuntimeDriver {
                 current: current_process_id,
             });
         }
+        ensure_submission_process(current_process_id);
         let (sender, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let task = self.inner.handle.spawn(async move {
-            let output = future.await;
-            let _ = sender.send(output);
-        });
+        let id = NEXT_SUBMISSION_ID.fetch_add(1, Ordering::Relaxed);
+        let parent_id = ACTIVE_SUBMISSION_ID.try_with(|active| *active).ok();
+        OUTSTANDING_SUBMISSIONS.fetch_add(1, Ordering::AcqRel);
+        let outstanding = OutstandingSubmission;
+        let task = self
+            .inner
+            .handle
+            .spawn(ACTIVE_SUBMISSION_ID.scope(id, async move {
+                let _outstanding = outstanding;
+                let output = future.await;
+                let _ = sender.send(output);
+            }));
         Ok(BlockingSubmission {
+            id,
+            parent_id,
             process_id: self.process_id(),
             receiver: Some(receiver),
             abort: Some(task.abort_handle()),
@@ -146,6 +164,8 @@ impl fmt::Display for BlockingTaskError {
 impl std::error::Error for BlockingTaskError {}
 
 pub struct BlockingSubmission<T> {
+    id: u64,
+    parent_id: Option<u64>,
     process_id: u32,
     receiver: Option<mpsc::Receiver<T>>,
     abort: Option<AbortHandle>,
@@ -153,6 +173,14 @@ pub struct BlockingSubmission<T> {
 }
 
 impl<T> BlockingSubmission<T> {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn parent_id(&self) -> Option<u64> {
+        self.parent_id
+    }
+
     pub fn try_wait(&mut self) -> Result<Option<T>, BlockingTaskError> {
         self.try_wait_for_process(std::process::id())
     }
@@ -246,6 +274,30 @@ impl<T> BlockingSubmission<T> {
     }
 }
 
+struct OutstandingSubmission;
+
+impl Drop for OutstandingSubmission {
+    fn drop(&mut self) {
+        OUTSTANDING_SUBMISSIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[doc(hidden)]
+pub fn outstanding_submission_count() -> usize {
+    ensure_submission_process(std::process::id());
+    OUTSTANDING_SUBMISSIONS.load(Ordering::Acquire)
+}
+
+fn ensure_submission_process(process_id: u32) {
+    if SUBMISSION_PROCESS_ID.load(Ordering::Acquire) == process_id {
+        return;
+    }
+    if SUBMISSION_PROCESS_ID.swap(process_id, Ordering::AcqRel) != process_id {
+        NEXT_SUBMISSION_ID.store(1, Ordering::Release);
+        OUTSTANDING_SUBMISSIONS.store(0, Ordering::Release);
+    }
+}
+
 impl<T> Drop for BlockingSubmission<T> {
     fn drop(&mut self) {
         self.finish_drop_for_process(std::process::id());
@@ -318,6 +370,7 @@ impl DriverRegistry {
         if let Some(inherited) = current.take() {
             mem::forget(inherited);
         }
+        ensure_submission_process(process_id);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_io()
@@ -325,8 +378,7 @@ impl DriverRegistry {
             .thread_name("requests-runtime")
             .build()?;
         let generation = (u64::from(process_id) << 32)
-            | ((self.next_generation.fetch_add(1, Ordering::Relaxed) + 1)
-                & u64::from(u32::MAX));
+            | ((self.next_generation.fetch_add(1, Ordering::Relaxed) + 1) & u64::from(u32::MAX));
         let driver = Arc::new(DriverInner {
             process_id,
             generation,
@@ -365,6 +417,7 @@ pub struct ResponseBody {
     inner: Option<AsyncResponseBody>,
     driver: BlockingRuntimeDriver,
     remainder: Option<Bytes>,
+    pending_error: Option<io::Error>,
     terminal: bool,
 }
 
@@ -516,6 +569,20 @@ impl RequestBuilder {
             driver,
         })
     }
+
+    /// Execute this request on an already-running async driver.
+    ///
+    /// The Python adapter uses this path so its signal-aware origin driver owns
+    /// the only runtime submission for the transport future.
+    #[doc(hidden)]
+    pub async fn send_async(self) -> RequestResult<Response> {
+        let Self { inner, driver } = self;
+        let response = inner.send().await?;
+        Ok(Response {
+            inner: response,
+            driver,
+        })
+    }
 }
 
 impl Response {
@@ -549,6 +616,7 @@ impl Response {
             inner: Some(inner.into_body()),
             driver,
             remainder: None,
+            pending_error: None,
             terminal: false,
         }
     }
@@ -559,6 +627,7 @@ impl Response {
             inner: Some(inner.into_raw_body()),
             driver,
             remainder: None,
+            pending_error: None,
             terminal: false,
         }
     }
@@ -580,7 +649,12 @@ impl Read for ResponseBody {
             return Ok(0);
         }
         if let Some(remainder) = self.remainder.take() {
-            return Ok(copy_frame(buffer, remainder, &mut self.remainder));
+            let read = copy_frame(buffer, remainder, &mut self.remainder);
+            self.finish_declared_length_if_buffer_empty(false);
+            return Ok(read);
+        }
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
         }
         if self.terminal {
             return Ok(0);
@@ -599,16 +673,35 @@ impl Read for ResponseBody {
             };
             Ok((body, frame))
         });
-        let (body, frame) = match polled {
+        let (mut body, frame) = match polled {
             Ok(polled) => polled,
             Err(error) => {
                 self.terminal = true;
                 return Err(io::Error::other(error));
             }
         };
-        self.inner = Some(body);
+        let frame = match frame {
+            Some(Ok(frame)) => {
+                let read = copy_frame(buffer, frame, &mut self.remainder);
+                if self.remainder.is_none() {
+                    body.finish_declared_length(false);
+                }
+                if body.is_terminal() {
+                    self.terminal = true;
+                } else {
+                    self.inner = Some(body);
+                }
+                return Ok(read);
+            }
+            frame => frame,
+        };
+        if body.is_terminal() {
+            self.terminal = true;
+        } else {
+            self.inner = Some(body);
+        }
         match frame {
-            Some(Ok(frame)) => Ok(copy_frame(buffer, frame, &mut self.remainder)),
+            Some(Ok(_)) => unreachable!("successful frames return after copying"),
             Some(Err(error)) => {
                 self.terminal = true;
                 Err(io::Error::other(error))
@@ -622,6 +715,156 @@ impl Read for ResponseBody {
 }
 
 impl ResponseBody {
+    #[doc(hidden)]
+    pub fn is_terminal(&self) -> bool {
+        self.terminal && self.remainder.is_none() && self.pending_error.is_none()
+    }
+
+    fn finish_declared_length_if_buffer_empty(&mut self, allow_encoded_completion: bool) {
+        if self.remainder.is_some() {
+            return;
+        }
+        let terminal = self.inner.as_mut().is_some_and(|body| {
+            body.finish_declared_length(allow_encoded_completion);
+            body.is_terminal()
+        });
+        if terminal {
+            self.terminal = true;
+            self.inner = None;
+        }
+    }
+
+    /// Read from the async response body without creating another runtime
+    /// submission. Ownership makes cancellation drop the body and its lease.
+    #[doc(hidden)]
+    pub async fn read_async(
+        self,
+        amount: Option<usize>,
+        allow_encoded_completion: bool,
+    ) -> io::Result<(Self, Vec<u8>)> {
+        self.read_async_inner(amount, allow_encoded_completion, true)
+            .await
+    }
+
+    /// Read at most one transport frame. Decoders use this so reaching their
+    /// requested decoded output does not consume a later EOF implicitly.
+    #[doc(hidden)]
+    pub async fn read_frame_async(
+        self,
+        maximum: usize,
+        allow_encoded_completion: bool,
+    ) -> io::Result<(Self, Vec<u8>)> {
+        self.read_async_inner(Some(maximum), allow_encoded_completion, false)
+            .await
+    }
+
+    async fn read_async_inner(
+        mut self,
+        amount: Option<usize>,
+        allow_encoded_completion: bool,
+        fill_requested: bool,
+    ) -> io::Result<(Self, Vec<u8>)> {
+        if amount == Some(0) {
+            return Ok((self, Vec::new()));
+        }
+        let mut output = Vec::new();
+        if let Some(remainder) = self.remainder.take() {
+            match amount {
+                Some(amount) => {
+                    let read = amount.min(remainder.len());
+                    output.extend_from_slice(&remainder[..read]);
+                    if read < remainder.len() {
+                        self.remainder = Some(remainder.slice(read..));
+                    }
+                    if output.len() == amount {
+                        self.finish_declared_length_if_buffer_empty(allow_encoded_completion);
+                        return Ok((self, output));
+                    }
+                }
+                None => output.extend_from_slice(&remainder),
+            }
+            self.finish_declared_length_if_buffer_empty(allow_encoded_completion);
+        }
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        if self.terminal {
+            return Ok((self, output));
+        }
+        let Some(mut body) = self.inner.take() else {
+            self.terminal = true;
+            return Ok((self, output));
+        };
+
+        loop {
+            let frame = loop {
+                match poll_fn(|context| Pin::new(&mut body).poll_next(context)).await {
+                    Some(Ok(frame)) if frame.is_empty() => {}
+                    frame => break frame,
+                }
+            };
+            match frame {
+                Some(Ok(frame)) => match amount {
+                    Some(amount) => {
+                        let wanted = amount.saturating_sub(output.len());
+                        let read = wanted.min(frame.len());
+                        output.extend_from_slice(&frame[..read]);
+                        if read < frame.len() {
+                            self.remainder = Some(frame.slice(read..));
+                        }
+                        if self.remainder.is_none() {
+                            body.finish_declared_length(allow_encoded_completion);
+                        }
+                        if body.is_terminal() {
+                            self.terminal = true;
+                            return Ok((self, output));
+                        }
+                        if output.len() == amount || !fill_requested {
+                            self.inner = Some(body);
+                            return Ok((self, output));
+                        }
+                    }
+                    None => {
+                        output.extend_from_slice(&frame);
+                        body.finish_declared_length(allow_encoded_completion);
+                        if body.is_terminal() {
+                            self.terminal = true;
+                            return Ok((self, output));
+                        }
+                    }
+                },
+                Some(Err(error)) => {
+                    self.terminal = true;
+                    let error = io::Error::other(error);
+                    if output.is_empty() {
+                        return Err(error);
+                    }
+                    self.pending_error = Some(error);
+                    return Ok((self, output));
+                }
+                None => {
+                    self.terminal = true;
+                    return Ok((self, output));
+                }
+            }
+        }
+    }
+
+    /// Mark an encoded wire body clean only after its decoder has proved that
+    /// the complete representation was consumed successfully.
+    #[doc(hidden)]
+    pub fn finish_encoded_declared_length(&mut self) {
+        self.finish_declared_length_if_buffer_empty(true);
+    }
+
+    #[doc(hidden)]
+    pub async fn close_async(mut self) -> RequestResult<()> {
+        let Some(body) = self.inner.take() else {
+            return Ok(());
+        };
+        body.close().await
+    }
+
     pub fn close(mut self) -> RequestResult<()> {
         let Some(body) = self.inner.take() else {
             return Ok(());

@@ -2,6 +2,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use pyo3::types::{PyAny, PyDict};
 use pyo3::wrap_pyfunction;
 use requests::blocking::{
     BlockingDriverError, BlockingRuntimeDriver, BlockingSubmission, BlockingTaskError,
+    outstanding_submission_count,
 };
 
 use crate::bridge::{ActionReceiver, ActionSender, BridgeClosed, WorkerPayload, action_channel};
@@ -66,6 +68,21 @@ pub(crate) fn signal_wins_ready_result(py: Python<'_>) -> PyResult<()> {
 thread_local! {
     static ORIGIN_QUARANTINE: RefCell<Vec<Box<dyn OriginQuarantineEntry>>> = RefCell::new(Vec::new());
     static LAST_ORIGIN_QUARANTINE_TOKEN: Cell<Option<OriginQuarantineToken>> = const { Cell::new(None) };
+    static ACTIVE_ORIGIN_SUBMISSION: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+struct ActiveOriginSubmissionGuard(Option<u64>);
+
+impl ActiveOriginSubmissionGuard {
+    fn enter(id: u64) -> Self {
+        Self(ACTIVE_ORIGIN_SUBMISSION.with(|active| active.replace(Some(id))))
+    }
+}
+
+impl Drop for ActiveOriginSubmissionGuard {
+    fn drop(&mut self) {
+        ACTIVE_ORIGIN_SUBMISSION.with(|active| active.set(self.0));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,7 +124,9 @@ impl<A, R, O: 'static> OriginQuarantineEntry for QuarantinedOrigin<A, R, O> {
     }
 
     fn take_owner(&mut self) -> Option<Box<dyn Any>> {
-        self.owner.take().map(|owner| Box::new(owner) as Box<dyn Any>)
+        self.owner
+            .take()
+            .map(|owner| Box::new(owner) as Box<dyn Any>)
     }
 
     fn retains_owner(&self) -> bool {
@@ -126,9 +145,9 @@ impl<A, R, O> Drop for QuarantinedOrigin<A, R, O> {
 
 fn reap_origin_quarantine() {
     ORIGIN_QUARANTINE.with(|entries| {
-        entries.borrow_mut().retain(|entry| {
-            !OriginQuarantineReapAudit(entry.retention_audit())
-        });
+        entries
+            .borrow_mut()
+            .retain(|entry| !OriginQuarantineReapAudit(entry.retention_audit()));
     });
 }
 
@@ -158,9 +177,7 @@ where
     R: Send + 'static,
     O: 'static,
 {
-    let token = OriginQuarantineToken(
-        NEXT_ORIGIN_QUARANTINE_TOKEN.fetch_add(1, Ordering::Relaxed),
-    );
+    let token = OriginQuarantineToken(NEXT_ORIGIN_QUARANTINE_TOKEN.fetch_add(1, Ordering::Relaxed));
     let terminal = std::sync::Arc::new(AtomicBool::new(false));
     match submission {
         Some(submission) => {
@@ -232,9 +249,7 @@ pub(crate) fn reap_origin_quarantine_token(token: OriginQuarantineToken) -> bool
     })
 }
 
-pub(crate) fn take_origin_quarantine_owner<O: 'static>(
-    token: OriginQuarantineToken,
-) -> Option<O> {
+pub(crate) fn take_origin_quarantine_owner<O: 'static>(token: OriginQuarantineToken) -> Option<O> {
     ORIGIN_QUARANTINE.with(|entries| {
         let mut entries = entries.borrow_mut();
         let index = entries.iter().position(|entry| entry.token() == token)?;
@@ -272,6 +287,25 @@ where
 }
 
 static SIGNAL_FUTURE_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+struct RuntimeSubmissionEvent {
+    id: u64,
+    parent_id: Option<u64>,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct RuntimeSubmissionObservation {
+    process_id: u32,
+    generation: u64,
+    events: Vec<RuntimeSubmissionEvent>,
+}
+
+static RUNTIME_SUBMISSION_OBSERVATION: OnceLock<Mutex<RuntimeSubmissionObservation>> =
+    OnceLock::new();
+static RUNTIME_SUBMISSION_OBSERVATION_ENABLED: AtomicBool = AtomicBool::new(false);
+const MAX_RUNTIME_SUBMISSION_OBSERVATIONS: usize = 256;
 
 #[derive(Debug)]
 enum ProbeAction {
@@ -363,6 +397,7 @@ impl PythonCallContext {
         F: for<'py> FnMut(Python<'py>, A) -> R,
         S: for<'py> FnMut(Python<'py>) -> PyResult<()>,
     {
+        let _active_submission = ActiveOriginSubmissionGuard::enter(submission.id());
         self.ensure_affinity(py)?;
         reap_origin_quarantine();
         loop {
@@ -411,6 +446,7 @@ impl PythonCallContext {
         F: for<'py> FnMut(Python<'py>, A, &mut O) -> R,
         S: for<'py> FnMut(Python<'py>) -> PyResult<()>,
     {
+        let _active_submission = ActiveOriginSubmissionGuard::enter(submission.id());
         self.ensure_affinity(py)?;
         reap_origin_quarantine();
         let mut cancellation_phase = SessionCancellationPhase::CancelBeforePoll;
@@ -514,7 +550,77 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    driver.submit(future).map_err(driver_error)
+    let submission = driver.submit(future).map_err(driver_error)?;
+    let parent_id = submission
+        .parent_id()
+        .or_else(|| ACTIVE_ORIGIN_SUBMISSION.with(Cell::get));
+    if RUNTIME_SUBMISSION_OBSERVATION_ENABLED.load(Ordering::Acquire)
+        && let Ok(mut observation) = RUNTIME_SUBMISSION_OBSERVATION
+            .get_or_init(|| Mutex::new(RuntimeSubmissionObservation::default()))
+            .lock()
+        && RUNTIME_SUBMISSION_OBSERVATION_ENABLED.load(Ordering::Acquire)
+    {
+        if observation.process_id != std::process::id() {
+            observation.events.clear();
+            RUNTIME_SUBMISSION_OBSERVATION_ENABLED.store(false, Ordering::Release);
+        } else {
+            if observation.generation != driver.generation() {
+                observation.events.clear();
+                observation.generation = driver.generation();
+            }
+            if observation.events.len() < MAX_RUNTIME_SUBMISSION_OBSERVATIONS {
+                observation.events.push(RuntimeSubmissionEvent {
+                    id: submission.id(),
+                    parent_id,
+                    generation: driver.generation(),
+                });
+            }
+        }
+    }
+    crate::sessions::record_public_runtime_submission(submission.id(), parent_id);
+    Ok(submission)
+}
+
+#[pyfunction]
+fn _runtime_submission_trial(py: Python<'_>, operation: &str) -> PyResult<Py<PyAny>> {
+    let observation = RUNTIME_SUBMISSION_OBSERVATION
+        .get_or_init(|| Mutex::new(RuntimeSubmissionObservation::default()));
+    if operation == "reset" {
+        let generation = driver()?.generation();
+        let mut observation = observation
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("runtime submission observation lock poisoned"))?;
+        observation.process_id = std::process::id();
+        observation.generation = generation;
+        observation.events.clear();
+        RUNTIME_SUBMISSION_OBSERVATION_ENABLED.store(true, Ordering::Release);
+        return Ok(py.None());
+    }
+    if operation != "snapshot" {
+        return Err(PyRuntimeError::new_err(
+            "unknown runtime submission observation operation",
+        ));
+    }
+    RUNTIME_SUBMISSION_OBSERVATION_ENABLED.store(false, Ordering::Release);
+    let mut observation = observation
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("runtime submission observation lock poisoned"))?;
+    let events = if observation.process_id == std::process::id() {
+        std::mem::take(&mut observation.events)
+    } else {
+        observation.events.clear();
+        Vec::new()
+    };
+    let result = PyDict::new(py);
+    result.set_item(
+        "events",
+        events
+            .iter()
+            .map(|event| (event.id, event.parent_id, event.generation))
+            .collect::<Vec<_>>(),
+    )?;
+    result.set_item("outstanding", outstanding_submission_count())?;
+    Ok(result.into_any().unbind())
 }
 
 fn driver_error(error: BlockingDriverError) -> PyErr {
@@ -955,6 +1061,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_runtime_cancel_ownership_probe, module)?)?;
     module.add_function(wrap_pyfunction!(_runtime_signal_was_cancelled, module)?)?;
     module.add_function(wrap_pyfunction!(_runtime_generation_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_runtime_submission_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_panic_boundary_trial, module)?)?;
     Ok(())
 }
