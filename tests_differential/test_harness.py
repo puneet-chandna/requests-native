@@ -448,6 +448,14 @@ def test_repr_traversal_failure_preserves_captured_repr(monkeypatch) -> None:
     assert runner._safe_repr(StableRepr()) == "<stable repr>"
 
 
+def test_safe_repr_normalizes_zero_padded_identity() -> None:
+    class PaddedIdentity:
+        def __repr__(self) -> str:
+            return f"<padded at 0x{id(self):016X}>"
+
+    assert runner._safe_repr(PaddedIdentity()) == "<padded at 0x...>"
+
+
 def test_semantic_hex_in_custom_repr_is_preserved() -> None:
     case = {
         "source": dedent(

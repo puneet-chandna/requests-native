@@ -335,7 +335,7 @@ def _safe_repr(value: object) -> str:
 
     try:
         identities = sorted(
-            (re.escape(hex(identity)) for identity in _reachable_identities(value)),
+            (rf"0x0*{identity:x}" for identity in _reachable_identities(value)),
             key=len,
             reverse=True,
         )
@@ -343,6 +343,7 @@ def _safe_repr(value: object) -> str:
             rf"(?<![0-9a-fA-F])(?:{'|'.join(identities)})(?![0-9a-fA-F])",
             "0x...",
             representation,
+            flags=re.IGNORECASE,
         )
     except Exception:
         return representation

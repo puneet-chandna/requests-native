@@ -418,11 +418,20 @@ fn intrinsic_builtin_is(
             Ok(current.is(py.get_type::<pyo3::exceptions::PyImportError>()))
         }
         IntrinsicBuiltin::KeyError => Ok(current.is(py.get_type::<pyo3::exceptions::PyKeyError>())),
-        // Neither builtin has a portable immutable identity API.  Reading the
-        // live module binding would let a pre-admission rebound become the
-        // supposed canonical value, so conservatively keep these paths in
-        // Python.
-        IntrinsicBuiltin::Range | IntrinsicBuiltin::Map => Ok(false),
+        IntrinsicBuiltin::Range | IntrinsicBuiltin::Map => {
+            let Ok(current) = current.cast::<PyType>() else {
+                return Ok(false);
+            };
+            static_type_is(
+                current,
+                "builtins",
+                match intrinsic {
+                    IntrinsicBuiltin::Range => "range",
+                    IntrinsicBuiltin::Map => "map",
+                    _ => unreachable!(),
+                },
+            )
+        }
         IntrinsicBuiltin::Function(expected_name) => {
             let Ok(function) = current.cast::<PyCFunction>() else {
                 return Ok(false);

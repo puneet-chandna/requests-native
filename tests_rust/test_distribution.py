@@ -330,9 +330,49 @@ def test_installed_smoke_checks_the_package_file_in_its_distribution() -> None:
     assert 'distribution.locate_file("requests") / "__init__.py"' in INSTALLED_SMOKE
 
 
+def test_installed_suite_isolates_mutating_test_groups(
+    monkeypatch, tmp_path: Path
+) -> None:
+    commands: list[list[str]] = []
+
+    monkeypatch.setitem(globals(), "run_installed_smoke", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        globals(),
+        "_target_site_packages",
+        lambda python: str(tmp_path / "site-packages"),
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: commands.append(command),
+    )
+
+    run_installed_suite(Path("python"), tmp_path / "oracle", ROOT)
+
+    assert [command[4:] for command in commands] == [
+        ["tests"],
+        ["tests_differential/test_import_api.py"],
+        [
+            "tests_differential/test_public_types.py",
+            "-k",
+            "not task17_red_outer_pump_runtime_and_static_call_graph_share_adapter_leaf",
+        ],
+        [
+            "tests_rust/test_backend_boundary.py",
+            "tests_differential/test_property_boundaries.py",
+        ],
+    ]
+
+
 def test_extension_guards_cpython_function_abi_symbols_from_pypy() -> None:
+    manifest = load_toml(ROOT / "crates/requests-python/Cargo.toml")
+    build_script = ROOT / "crates/requests-python/build.rs"
     models = (ROOT / "crates/requests-python/src/models.rs").read_text()
     cookies = (ROOT / "crates/requests-python/src/cookies.rs").read_text()
+    assert manifest["build-dependencies"]["pyo3-build-config"] == "0.29"
+    assert build_script.read_text() == (
+        "fn main() {\n    pyo3_build_config::use_pyo3_cfgs();\n}\n"
+    )
     for symbol in (
         "PyFunction_GetCode",
         "PyFunction_GetGlobals",
@@ -629,27 +669,27 @@ def run_installed_suite(python: Path, oracle: Path, checkout: Path) -> None:
             ROOT / "tests_rust/test_backend_boundary.py",
             suite / "tests_rust/test_backend_boundary.py",
         )
-        # This is the only selected test that reads rewrite source; artifacts do not
-        # contain source or Rust crates, so the installed suite excludes it by name.
-        subprocess.run(
-            [
-                str(python),
-                "-m",
-                "pytest",
-                "-q",
-                "tests",
-                "tests_differential/test_import_api.py",
+        groups = (
+            ("tests",),
+            ("tests_differential/test_import_api.py",),
+            (
                 "tests_differential/test_public_types.py",
-                "tests_differential/test_property_boundaries.py",
-                "tests_rust/test_backend_boundary.py",
                 "-k",
                 "not task17_red_outer_pump_runtime_and_static_call_graph_share_adapter_leaf",
-            ],
-            cwd=suite,
-            env=environment,
-            check=True,
-            timeout=900,
+            ),
+            (
+                "tests_rust/test_backend_boundary.py",
+                "tests_differential/test_property_boundaries.py",
+            ),
         )
+        for group in groups:
+            subprocess.run(
+                [str(python), "-m", "pytest", "-q", *group],
+                cwd=suite,
+                env=environment,
+                check=True,
+                timeout=900,
+            )
 
 
 def _target_site_packages(python: Path) -> str:

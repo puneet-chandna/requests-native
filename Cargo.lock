@@ -924,6 +924,7 @@ version = "2.34.2"
 dependencies = [
  "bytes",
  "pyo3",
+ "pyo3-build-config",
  "requests",
  "tokio",
 ]

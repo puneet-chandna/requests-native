@@ -699,26 +699,38 @@ fn class_dict_proof_is_pristine(
     // CPython may memoize an empty `__slotnames__` or `__annotations__`
     // cache on an otherwise unchanged class. Neither carries callable
     // authority, but any non-empty value remains a failed admission.
-    if proof
-        .items
-        .iter()
-        .any(|(name, _)| name == "__slotnames__" || name == "__annotations__")
-        || value.len()? != proof.items.len() + 1
-    {
+    if value.len()? != proof.items.len() + 1 {
         return Ok(false);
     }
-    match value.get_item("__slotnames__") {
-        Ok(slotnames)
-            if slotnames
-                .cast_exact::<PyList>()
-                .is_ok_and(|items| items.is_empty()) => {}
-        _ => match value.get_item("__annotations__") {
-            Ok(annotations)
-                if annotations
-                    .cast_exact::<PyDict>()
-                    .is_ok_and(|items| items.is_empty()) => {}
-            _ => return Ok(false),
-        },
+    let proof_has_slotnames = proof.items.iter().any(|(name, _)| name == "__slotnames__");
+    let proof_has_annotations = proof
+        .items
+        .iter()
+        .any(|(name, _)| name == "__annotations__");
+    let extra_cache_is_pristine = !proof_has_slotnames
+        && match value.get_item("__slotnames__") {
+            Ok(slotnames)
+                if slotnames
+                    .cast_exact::<PyList>()
+                    .is_ok_and(|items| items.is_empty()) =>
+            {
+                true
+            }
+            _ => false,
+        }
+        || !proof_has_annotations
+            && match value.get_item("__annotations__") {
+                Ok(annotations)
+                    if annotations
+                        .cast_exact::<PyDict>()
+                        .is_ok_and(|items| items.is_empty()) =>
+                {
+                    true
+                }
+                _ => false,
+            };
+    if !extra_cache_is_pristine {
+        return Ok(false);
     }
     for (name, original) in &proof.items {
         let Ok(current) = value.get_item(name) else {

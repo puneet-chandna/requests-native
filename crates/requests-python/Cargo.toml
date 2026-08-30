@@ -14,6 +14,9 @@ pyo3 = { workspace = true, features = ["extension-module"] }
 requests = { path = "../requests" }
 tokio = { version = "1", features = ["sync", "time"] }
 
+[build-dependencies]
+pyo3-build-config = "0.29"
+
 [lints.rust]
 unsafe_code = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(PyPy)'] }

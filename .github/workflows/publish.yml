@@ -59,7 +59,7 @@ jobs:
       - name: Run installed artifact suite once
         run: python tests_rust/test_distribution.py --installed-suite "$SDIST_PYTHON" --oracle "$GITHUB_WORKSPACE/frozen-oracle" "$GITHUB_WORKSPACE"
       - name: Upload sdist
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v6.0.0
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -97,7 +97,7 @@ jobs:
           find artifacts -type f -name '*.whl' -exec cp '{}' dist/ \;
           find artifacts -type f -name '*.tar.gz' -exec cp '{}' dist/ \;
       - name: Upload validated release artifacts
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v6.0.0
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: release-dist
           path: |
