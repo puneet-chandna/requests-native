@@ -276,10 +276,16 @@ for name in PUBLIC_TYPES:
     second = weakref.ref(value, lambda ref, name=name: callback_events.append([name, "second"]))
     references.append([name, first, second]); del value
 gc.collect()
+gc.collect()
+gc.collect()
+callback_phases = OrderedDict((name, []) for name in PUBLIC_TYPES)
+for name, phase in callback_events:
+    callback_phases[name].append(phase)
+assert all(phases == ["second", "first"] for phases in callback_phases.values())
 result = {
     "rows": rows,
     "slotted": [slotted_pickle(models_module, Request, "Task17SlottedRequest"), slotted_pickle(sessions_module, Session, "Task17SlottedSession"), slotted_pickle(adapters_module, HTTPAdapter, "Task17SlottedAdapter")],
-    "callbacks": callback_events,
+    "callbacks": callback_phases,
     "collected": [[name, first() is None, second() is None] for name, first, second in references],
     "user_ref_distinct": [first is not second for _, first, second in references],
 }
@@ -826,6 +832,9 @@ def exercise(cls):
     restored_before = baseline(restored)
     copied_snapshot = extension._public_facade_snapshot(copied)
     restored_snapshot = extension._public_facade_snapshot(restored)
+    gc.collect()
+    gc.collect()
+    gc.collect()
     internal = [reference for reference in weakref.getweakrefs(owner) if reference is not user]
     return {
         "owner": owner,
@@ -866,6 +875,8 @@ def subclass_lifecycle(base, use_trial):
     plain_user_identity = weakref.ref(owner) is user
     del owner
     gc.collect()
+    gc.collect()
+    gc.collect()
     return [events, admitted, internal, plain_user_identity, user() is None, first() is None, second() is None]
 
 controls = [subclass_lifecycle(Session, False), subclass_lifecycle(HTTPAdapter, False)]
@@ -880,6 +891,8 @@ first = weakref.ref(collected, lambda reference: events.append("first"))
 second = weakref.ref(collected, lambda reference: events.append("second"))
 enumerated = weakref.getweakrefs(collected)
 del collected
+gc.collect()
+gc.collect()
 gc.collect()
 result = SimpleNamespace(**{
     "rows": [{

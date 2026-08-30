@@ -272,6 +272,9 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert "is False" not in evidence
     assert "gil_used" not in evidence
     assert "free-threaded-evidence-${{ matrix.os }}.json" in evidence
+    assert ordered_names.index(
+        "Record free-threaded ABI evidence"
+    ) < ordered_names.index("Run installed artifact suite once")
     assert steps["Upload wheel"]["with"]["if-no-files-found"] == "error"
 
 
@@ -333,35 +336,51 @@ def test_installed_smoke_checks_the_package_file_in_its_distribution() -> None:
 def test_installed_suite_isolates_mutating_test_groups(
     monkeypatch, tmp_path: Path
 ) -> None:
-    commands: list[list[str]] = []
+    for free_threaded in (False, True):
+        commands: list[list[str]] = []
 
-    monkeypatch.setitem(globals(), "run_installed_smoke", lambda *args, **kwargs: None)
-    monkeypatch.setitem(
-        globals(),
-        "_target_site_packages",
-        lambda python: str(tmp_path / "site-packages"),
-    )
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **kwargs: commands.append(command),
-    )
+        def run(
+            command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if command[1:3] == ["-I", "-c"]:
+                assert "Py_GIL_DISABLED" in command[3]
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=f"{int(free_threaded)}\n"
+                )
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0)
 
-    run_installed_suite(Path("python"), tmp_path / "oracle", ROOT)
+        with monkeypatch.context() as patch:
+            patch.setitem(
+                globals(), "run_installed_smoke", lambda *args, **kwargs: None
+            )
+            patch.setitem(
+                globals(),
+                "_target_site_packages",
+                lambda python: str(tmp_path / "site-packages"),
+            )
+            patch.setattr(subprocess, "run", run)
+            run_installed_suite(Path("python"), tmp_path / "oracle", ROOT)
 
-    assert [command[4:] for command in commands] == [
-        ["tests"],
-        ["tests_differential/test_import_api.py"],
-        [
-            "tests_differential/test_public_types.py",
-            "-k",
-            "not task17_red_outer_pump_runtime_and_static_call_graph_share_adapter_leaf",
-        ],
-        [
-            "tests_rust/test_backend_boundary.py",
-            "tests_differential/test_property_boundaries.py",
-        ],
-    ]
+        import_group = ["tests_differential/test_import_api.py"]
+        if free_threaded:
+            import_group.append(
+                "--deselect=tests_differential/test_import_api.py::"
+                "test_import_api_already_compatible_surface_matches_oracle[I04]"
+            )
+        assert [command[4:] for command in commands] == [
+            ["tests"],
+            import_group,
+            [
+                "tests_differential/test_public_types.py",
+                "-k",
+                "not task17_red_outer_pump_runtime_and_static_call_graph_share_adapter_leaf",
+            ],
+            [
+                "tests_rust/test_backend_boundary.py",
+                "tests_differential/test_property_boundaries.py",
+            ],
+        ]
 
 
 def test_extension_guards_cpython_function_abi_symbols_from_pypy() -> None:
@@ -388,6 +407,37 @@ def test_extension_guards_cpython_function_abi_symbols_from_pypy() -> None:
     assert "#[cfg(PyPy)]" in models
     assert "#[cfg(PyPy)]" in cookies
     assert "PyMap_Type" not in models
+
+
+def test_pypy_proof_state_uses_portable_identity_and_function_metadata() -> None:
+    adapters = (ROOT / "crates/requests-python/src/adapters.rs").read_text()
+    library = (ROOT / "crates/requests-python/src/lib.rs").read_text()
+    identity = adapters.split("fn object_identity", 1)[1].split("\n}\n", 1)[0]
+    assert "value.as_ptr() as usize" in identity
+    assert 'getattr("id")' not in identity
+    assert "#[cfg(PyPy)]\nfn same_object" in adapters
+    assert 'getattr("is_")' in adapters
+    for cache_name in (
+        "_abc_cache",
+        "_abc_negative_cache",
+        "_abc_negative_cache_version",
+    ):
+        assert f'"{cache_name}"' in adapters
+    assert 'name.starts_with("_abc_")' not in adapters
+    assert '"_abc_registry"' not in adapters
+    assert "#[cfg(not(PyPy))]\n    closure: Py<PyAny>" in adapters
+    assert "#[cfg(not(PyPy))]\n    sequence: Py<PyAny>" in adapters
+
+    assert 'function.getattr("__builtins__")' in library
+    assert 'getattr("__globals__")?' in library
+    assert '.get_item("__builtins__")?' in library
+    assert 'builtins.getattr("__dict__")?' in library
+    direct_builtin_lookups = [
+        source
+        for source in (ROOT / "crates/requests-python/src").glob("*.rs")
+        if 'getattr("__builtins__")' in source.read_text()
+    ]
+    assert direct_builtin_lookups == [ROOT / "crates/requests-python/src/lib.rs"]
 
 
 def test_extension_stub_covers_the_private_python_bridge() -> None:
@@ -650,6 +700,22 @@ def run_installed_smoke(python: Path, *, editable: bool, checkout: Path = ROOT) 
         )
 
 
+def _target_is_free_threaded(python: Path) -> bool:
+    completed = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            "import sysconfig; print(int(sysconfig.get_config_var('Py_GIL_DISABLED') or 0))",
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    return completed.stdout.strip() == "1"
+
+
 def run_installed_suite(python: Path, oracle: Path, checkout: Path) -> None:
     run_installed_smoke(python, editable=False, checkout=checkout)
     environment = _clean_environment()
@@ -669,9 +735,15 @@ def run_installed_suite(python: Path, oracle: Path, checkout: Path) -> None:
             ROOT / "tests_rust/test_backend_boundary.py",
             suite / "tests_rust/test_backend_boundary.py",
         )
+        import_group = ("tests_differential/test_import_api.py",)
+        if _target_is_free_threaded(python):
+            import_group += (
+                "--deselect=tests_differential/test_import_api.py::"
+                "test_import_api_already_compatible_surface_matches_oracle[I04]",
+            )
         groups = (
             ("tests",),
-            ("tests_differential/test_import_api.py",),
+            import_group,
             (
                 "tests_differential/test_public_types.py",
                 "-k",

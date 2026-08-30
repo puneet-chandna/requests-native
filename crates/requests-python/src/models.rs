@@ -1121,10 +1121,7 @@ fn known_url_type_is(
         || new_function.getattr("__qualname__")?.extract::<String>()? != "Url.__new__"
         || !function_code(py, new_function)?.eq(expected_code.bind(py))?
         || !function_globals(py, new_function)?.is(expected_globals.bind(py))
-        || !new_function
-            .getattr("__builtins__")?
-            .cast_into::<PyDict>()?
-            .is(expected_builtins.bind(py))
+        || !crate::function_builtins_dict(new_function.as_any())?.is(expected_builtins.bind(py))
         || function_kwdefaults(py, new_function).is_some()
         || expected_globals.bind(py).contains("super")?
     {
@@ -1898,7 +1895,7 @@ fn canonical_function_shape_is(
     };
     let code = function_code(py, function)?;
     let globals = function_globals(py, function)?;
-    let builtins = function.getattr("__builtins__")?.cast_into::<PyDict>()?;
+    let builtins = crate::function_builtins_dict(function.as_any())?;
     Ok(code.eq(expected.code.bind(py))?
         && globals.is(expected.globals.bind(py))
         && builtins.is(expected.builtins.bind(py))

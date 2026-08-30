@@ -1233,6 +1233,41 @@ def test_in_place_main_manager_mapping_mutations_fall_back_then_restore(monkeypa
         assert server.requests == 1
 
 
+def test_equal_but_distinct_manager_mapping_key_falls_back(monkeypatch):
+    marker = object()
+    adapter = HTTPAdapter()
+    mapping = adapter.poolmanager.connection_pool_kw
+    original_items = list(mapping.items())
+    original_key = next(key for key in mapping if key == "maxsize")
+    replacement_key = "".join(("max", "size"))
+    assert replacement_key == original_key and replacement_key is not original_key
+    mapping.clear()
+    mapping.update(
+        (replacement_key if key is original_key else key, value)
+        for key, value in original_items
+    )
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+
+    with _rust_adapter_trial():
+        assert adapter.send(prepared("http://example.test/")) is marker
+
+
+@pytest.mark.skipif(
+    not hasattr(urllib3._collections.RecentlyUsedContainer, "_abc_registry"),
+    reason="runtime exposes no mutable _abc_registry class cache",
+)
+def test_pypy_abc_registry_replacement_falls_back(monkeypatch):
+    marker = object()
+    adapter = HTTPAdapter()
+    monkeypatch.setattr(
+        urllib3._collections.RecentlyUsedContainer, "_abc_registry", object()
+    )
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+
+    with _rust_adapter_trial():
+        assert adapter.send(prepared("http://example.test/")) is marker
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["pools_getitem", "key_partial_keywords", "pool_init"],

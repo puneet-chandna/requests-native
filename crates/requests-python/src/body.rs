@@ -238,7 +238,7 @@ impl<'py> GlobalResolver<'py> {
         let function = callable.cast::<PyFunction>()?;
         Ok(Self {
             globals: function.getattr("__globals__")?.cast_into::<PyDict>()?,
-            builtins: function.getattr("__builtins__")?.cast_into::<PyDict>()?,
+            builtins: crate::function_builtins_dict(function.as_any())?,
         })
     }
 

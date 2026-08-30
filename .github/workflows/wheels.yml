@@ -89,9 +89,6 @@ jobs:
           ref: 69f84847045bef7a849cc994a26fe7ba8a169e95
           path: frozen-oracle
           persist-credentials: false
-      - name: Run installed artifact suite once
-        shell: bash
-        run: python tests_rust/test_distribution.py --installed-suite "$SMOKE_PYTHON" --oracle "$GITHUB_WORKSPACE/frozen-oracle" "$GITHUB_WORKSPACE"
       - name: Record free-threaded ABI evidence
         if: matrix.python == '3.14t'
         shell: bash
@@ -99,6 +96,9 @@ jobs:
           wheel="$(find wheelhouse -maxdepth 1 -type f -name '*.whl' -print -quit)"
           [[ "$(basename "$wheel")" == *-cp314-cp314t-* ]]
           "$SMOKE_PYTHON" -c 'import json, pathlib, sys, sysconfig; before = sys._is_gil_enabled(); import requests._requests_rust; after = sys._is_gil_enabled(); evidence = {"Py_GIL_DISABLED": sysconfig.get_config_var("Py_GIL_DISABLED"), "before_import": before, "after_import": after}; assert evidence["Py_GIL_DISABLED"] == 1; pathlib.Path("wheelhouse/free-threaded-evidence-${{ matrix.os }}.json").write_text(json.dumps(evidence, sort_keys=True) + "\n")'
+      - name: Run installed artifact suite once
+        shell: bash
+        run: python tests_rust/test_distribution.py --installed-suite "$SMOKE_PYTHON" --oracle "$GITHUB_WORKSPACE/frozen-oracle" "$GITHUB_WORKSPACE"
       - name: Upload wheel
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:

@@ -57,6 +57,9 @@ struct RetryStateGuard {
 
 static RETRY_STATE: PyOnceLock<RetryStateGuard> = PyOnceLock::new();
 
+#[cfg(PyPy)]
+static IDENTITY_OPERATOR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
 struct AdapterState {
     adapters_module: Py<PyAny>,
     adapter_type: Py<PyAny>,
@@ -115,10 +118,10 @@ type ObjectItems = Vec<(Py<PyAny>, Py<PyAny>)>;
 struct CallableProof {
     function: Py<PyAny>,
     code: Py<PyAny>,
-    defaults: Py<PyAny>,
     default_items: Option<SequenceProof>,
     kwdefaults: Py<PyAny>,
     kwdefault_items: Option<MappingProof>,
+    #[cfg(not(PyPy))]
     closure: Py<PyAny>,
     closure_cells: Vec<ClosureCellProof>,
     attributes: MappingProof,
@@ -143,6 +146,7 @@ struct MappingProof {
 }
 
 struct SequenceProof {
+    #[cfg(not(PyPy))]
     sequence: Py<PyAny>,
     items: Vec<Py<PyAny>>,
     behaviors: Vec<BehaviorProof>,
@@ -537,17 +541,38 @@ fn exact_dict_snapshot(
         let Ok(current) = value.get_item(name) else {
             return Ok(false);
         };
-        if !current.is(original.bind(py)) {
+        if !same_object(py, &current, original.bind(py))? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-fn object_identity(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<usize> {
-    PyModule::import(py, "builtins")?
-        .getattr("id")?
-        .call1((value,))?
+fn object_identity(value: &Bound<'_, PyAny>) -> usize {
+    value.as_ptr() as usize
+}
+
+#[cfg(not(PyPy))]
+fn same_object(
+    _py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    expected: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    Ok(value.is(expected))
+}
+
+#[cfg(PyPy)]
+fn same_object(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    expected: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    IDENTITY_OPERATOR
+        .get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+            Ok(PyModule::import(py, "operator")?.getattr("is_")?.unbind())
+        })?
+        .bind(py)
+        .call1((value, expected))?
         .extract()
 }
 
@@ -588,10 +613,10 @@ fn callable_proof(
     Ok(CallableProof {
         function: value.clone().unbind(),
         code: value.getattr("__code__")?.unbind(),
-        defaults: defaults.unbind(),
         default_items,
         kwdefaults: kwdefaults.unbind(),
         kwdefault_items,
+        #[cfg(not(PyPy))]
         closure: closure.unbind(),
         closure_cells,
         attributes: mapping_proof_inner(py, &value.getattr("__dict__")?, visited)?,
@@ -601,21 +626,33 @@ fn callable_proof(
 
 fn callable_proof_is_pristine(py: Python<'_>, proof: &CallableProof) -> PyResult<bool> {
     let function = proof.function.bind(py);
-    if !function.getattr("__code__")?.is(proof.code.bind(py))
-        || !function
-            .getattr("__defaults__")?
-            .is(proof.defaults.bind(py))
-        || !function
-            .getattr("__kwdefaults__")?
-            .is(proof.kwdefaults.bind(py))
-        || !function.getattr("__closure__")?.is(proof.closure.bind(py))
-        || !mapping_proof_is_pristine(py, &function.getattr("__dict__")?, &proof.attributes)?
-        || !mapping_proof_is_pristine(
-            py,
-            &function.getattr("__annotations__")?,
-            &proof.annotations,
-        )?
-    {
+    if !same_object(py, &function.getattr("__code__")?, proof.code.bind(py))? {
+        return Ok(false);
+    }
+    let defaults = function.getattr("__defaults__")?;
+    if !same_object(
+        py,
+        &function.getattr("__kwdefaults__")?,
+        proof.kwdefaults.bind(py),
+    )? {
+        return Ok(false);
+    }
+    #[cfg(not(PyPy))]
+    if !same_object(
+        py,
+        &function.getattr("__closure__")?,
+        proof.closure.bind(py),
+    )? {
+        return Ok(false);
+    }
+    if !mapping_proof_is_pristine(py, &function.getattr("__dict__")?, &proof.attributes)? {
+        return Ok(false);
+    }
+    if !mapping_proof_is_pristine(
+        py,
+        &function.getattr("__annotations__")?,
+        &proof.annotations,
+    )? {
         return Ok(false);
     }
     if let Some(expected) = &proof.kwdefault_items
@@ -623,10 +660,12 @@ fn callable_proof_is_pristine(py: Python<'_>, proof: &CallableProof) -> PyResult
     {
         return Ok(false);
     }
-    if let Some(expected) = &proof.default_items
-        && !sequence_proof_is_pristine(py, expected)?
-    {
-        return Ok(false);
+    match &proof.default_items {
+        Some(expected) if !sequence_attribute_is_pristine(py, &defaults, expected)? => {
+            return Ok(false);
+        }
+        None if !defaults.is_none() => return Ok(false),
+        _ => {}
     }
     let closure = function.getattr("__closure__")?;
     if closure.is_none() {
@@ -637,13 +676,13 @@ fn callable_proof_is_pristine(py: Python<'_>, proof: &CallableProof) -> PyResult
         return Ok(false);
     }
     for (cell, expected) in current.iter().zip(&proof.closure_cells) {
-        if !cell.is(expected.cell.bind(py)) {
+        if !same_object(py, cell, expected.cell.bind(py))? {
             return Ok(false);
         }
         let contents = cell.getattr("cell_contents").ok();
         match (contents, &expected.contents) {
             (None, None) => {}
-            (Some(contents), Some(expected)) if contents.is(expected.bind(py)) => {}
+            (Some(contents), Some(expected)) if same_object(py, &contents, expected.bind(py))? => {}
             _ => return Ok(false),
         }
         if let Some(behavior) = &expected.behavior
@@ -693,13 +732,12 @@ fn class_dict_proof_is_pristine(
     value: &Bound<'_, PyAny>,
     proof: &DictProof,
 ) -> PyResult<bool> {
-    if exact_dict_snapshot(py, value, &proof.items)? {
-        return dict_proof_is_pristine(py, value, proof);
-    }
     // CPython may memoize an empty `__slotnames__` or `__annotations__`
     // cache on an otherwise unchanged class. Neither carries callable
-    // authority, but any non-empty value remains a failed admission.
-    if value.len()? != proof.items.len() + 1 {
+    // authority, but any non-empty value remains a failed admission. PyPy's
+    // ABC caches also mutate during ordinary `isinstance` checks.
+    let length = value.len()?;
+    if length != proof.items.len() && length != proof.items.len() + 1 {
         return Ok(false);
     }
     let proof_has_slotnames = proof.items.iter().any(|(name, _)| name == "__slotnames__");
@@ -707,41 +745,49 @@ fn class_dict_proof_is_pristine(
         .items
         .iter()
         .any(|(name, _)| name == "__annotations__");
-    let extra_cache_is_pristine = !proof_has_slotnames
-        && match value.get_item("__slotnames__") {
-            Ok(slotnames)
-                if slotnames
-                    .cast_exact::<PyList>()
-                    .is_ok_and(|items| items.is_empty()) =>
-            {
-                true
-            }
-            _ => false,
-        }
-        || !proof_has_annotations
-            && match value.get_item("__annotations__") {
-                Ok(annotations)
-                    if annotations
-                        .cast_exact::<PyDict>()
+    if length == proof.items.len() + 1 {
+        let extra_cache_is_pristine = !proof_has_slotnames
+            && match value.get_item("__slotnames__") {
+                Ok(slotnames)
+                    if slotnames
+                        .cast_exact::<PyList>()
                         .is_ok_and(|items| items.is_empty()) =>
                 {
                     true
                 }
                 _ => false,
-            };
-    if !extra_cache_is_pristine {
-        return Ok(false);
-    }
-    for (name, original) in &proof.items {
-        let Ok(current) = value.get_item(name) else {
-            return Ok(false);
-        };
-        if !current.is(original.bind(py)) {
+            }
+            || !proof_has_annotations
+                && match value.get_item("__annotations__") {
+                    Ok(annotations)
+                        if annotations
+                            .cast_exact::<PyDict>()
+                            .is_ok_and(|items| items.is_empty()) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+        if !extra_cache_is_pristine {
             return Ok(false);
         }
     }
-    for behavior in &proof.behaviors {
-        if !behavior_proof_is_pristine(py, behavior.object.bind(py), behavior)? {
+    for ((name, original), behavior) in proof.items.iter().zip(&proof.behaviors) {
+        let Ok(current) = value.get_item(name) else {
+            return Ok(false);
+        };
+        if cfg!(PyPy)
+            && matches!(
+                name.as_str(),
+                "_abc_cache" | "_abc_negative_cache" | "_abc_negative_cache_version"
+            )
+        {
+            continue;
+        }
+        if !same_object(py, &current, original.bind(py))? {
+            return Ok(false);
+        }
+        if !behavior_proof_is_pristine(py, &current, behavior)? {
             return Ok(false);
         }
     }
@@ -762,6 +808,7 @@ fn sequence_proof_inner(
         .map(|item| behavior_proof_inner(py, item.bind(py), visited))
         .collect::<PyResult<Vec<_>>>()?;
     Ok(SequenceProof {
+        #[cfg(not(PyPy))]
         sequence: value.clone().unbind(),
         items,
         behaviors,
@@ -773,7 +820,7 @@ fn behavior_proof_inner(
     value: &Bound<'_, PyAny>,
     visited: &mut HashSet<usize>,
 ) -> PyResult<BehaviorProof> {
-    if !visited.insert(object_identity(py, value)?) {
+    if !visited.insert(object_identity(value)) {
         return Ok(BehaviorProof {
             object: value.clone().unbind(),
             details: None,
@@ -830,16 +877,19 @@ fn behavior_proof(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Behavior
     behavior_proof_inner(py, value, &mut HashSet::new())
 }
 
-fn sequence_proof_is_pristine(py: Python<'_>, proof: &SequenceProof) -> PyResult<bool> {
-    let sequence = proof.sequence.bind(py);
+fn sequence_contents_are_pristine(
+    py: Python<'_>,
+    sequence: &Bound<'_, PyAny>,
+    proof: &SequenceProof,
+) -> PyResult<bool> {
     let items = sequence.try_iter()?.collect::<PyResult<Vec<_>>>()?;
-    if items.len() != proof.items.len()
-        || items
-            .iter()
-            .zip(&proof.items)
-            .any(|(item, expected)| !item.is(expected.bind(py)))
-    {
+    if items.len() != proof.items.len() {
         return Ok(false);
+    }
+    for (item, expected) in items.iter().zip(&proof.items) {
+        if !same_object(py, item, expected.bind(py))? {
+            return Ok(false);
+        }
     }
     for behavior in &proof.behaviors {
         if !behavior_proof_is_pristine(py, behavior.object.bind(py), behavior)? {
@@ -849,33 +899,52 @@ fn sequence_proof_is_pristine(py: Python<'_>, proof: &SequenceProof) -> PyResult
     Ok(true)
 }
 
+fn sequence_attribute_is_pristine(
+    py: Python<'_>,
+    sequence: &Bound<'_, PyAny>,
+    proof: &SequenceProof,
+) -> PyResult<bool> {
+    #[cfg(not(PyPy))]
+    if !same_object(py, sequence, proof.sequence.bind(py))? {
+        return Ok(false);
+    }
+    sequence_contents_are_pristine(py, sequence, proof)
+}
+
 fn behavior_proof_is_pristine(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
     proof: &BehaviorProof,
 ) -> PyResult<bool> {
-    if !value.is(proof.object.bind(py)) {
+    if !same_object(py, value, proof.object.bind(py))? {
         return Ok(false);
     }
     match &proof.details {
         Some(BehaviorDetails::Function(callable)) => callable_proof_is_pristine(py, callable),
-        Some(BehaviorDetails::Class(class_proof)) => Ok(value
-            .getattr("__bases__")?
-            .is(class_proof.bases.sequence.bind(py))
-            && sequence_proof_is_pristine(py, &class_proof.bases)?
-            && class_dict_proof_is_pristine(
+        Some(BehaviorDetails::Class(class_proof)) => {
+            if !sequence_attribute_is_pristine(
+                py,
+                &value.getattr("__bases__")?,
+                &class_proof.bases,
+            )? {
+                return Ok(false);
+            }
+            if !class_dict_proof_is_pristine(
                 py,
                 &value.getattr("__dict__")?,
                 &class_proof.dictionary,
-            )?),
+            )? {
+                return Ok(false);
+            }
+            Ok(true)
+        }
         Some(BehaviorDetails::Partial {
             function,
             arguments,
             keywords,
         }) => {
             if !behavior_proof_is_pristine(py, &value.getattr("func")?, function)?
-                || !value.getattr("args")?.is(arguments.sequence.bind(py))
-                || !sequence_proof_is_pristine(py, arguments)?
+                || !sequence_attribute_is_pristine(py, &value.getattr("args")?, arguments)?
             {
                 return Ok(false);
             }
@@ -1114,7 +1183,7 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
     let adapter_type = adapters.getattr("HTTPAdapter")?;
     let send = adapter_type.getattr("send")?;
     let send_globals = send.getattr("__globals__")?.cast_into::<PyDict>()?;
-    let send_builtins = send.getattr("__builtins__")?.cast_into::<PyDict>()?;
+    let send_builtins = crate::function_builtins_dict(&send)?;
     let prepared_request_type =
         PyModule::import(py, "requests.models")?.getattr("PreparedRequest")?;
     let methods = [
@@ -1301,9 +1370,7 @@ fn adapter_identity_is_pristine(
     }
     let send = adapter_type.getattr("send")?;
     if !send.getattr("__globals__")?.is(state.send_globals.bind(py))
-        || !send
-            .getattr("__builtins__")?
-            .is(state.send_builtins.bind(py))
+        || !crate::function_builtins_dict(&send)?.is(state.send_builtins.bind(py))
     {
         return Ok(false);
     }
@@ -1840,7 +1907,7 @@ fn mapping_proof_inner(
     let mut behaviors = Vec::new();
     for (_, item) in &items {
         let item = item.bind(py);
-        if item.hasattr("items")? && visited.insert(object_identity(py, item)?) {
+        if item.hasattr("items")? && visited.insert(object_identity(item)) {
             behaviors.push(BehaviorProof {
                 object: item.clone().unbind(),
                 details: Some(BehaviorDetails::Mapping(Box::new(mapping_proof_inner(
@@ -1898,7 +1965,7 @@ fn routing_mapping_proof_is_pristine(
     value: &Bound<'_, PyAny>,
     proof: &MappingProof,
 ) -> PyResult<bool> {
-    if !value.is(proof.mapping.bind(py)) {
+    if !same_object(py, value, proof.mapping.bind(py))? {
         return Ok(false);
     }
     let Ok(dictionary) = value.cast_exact::<PyDict>() else {
@@ -1924,11 +1991,16 @@ fn routing_mapping_matches_canonical(
     {
         return Ok(false);
     }
-    Ok(candidate.items.iter().zip(&canonical.items).all(
-        |((key, value), (expected_key, expected_value))| {
-            key.bind(py).is(expected_key.bind(py)) && value.bind(py).is(expected_value.bind(py))
-        },
-    ))
+    for ((key, value), (expected_key, expected_value)) in
+        candidate.items.iter().zip(&canonical.items)
+    {
+        if !same_object(py, key.bind(py), expected_key.bind(py))?
+            || !same_object(py, value.bind(py), expected_value.bind(py))?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn mapping_proof_is_pristine(
@@ -1936,20 +2008,20 @@ fn mapping_proof_is_pristine(
     value: &Bound<'_, PyAny>,
     proof: &MappingProof,
 ) -> PyResult<bool> {
-    if !value.is(proof.mapping.bind(py)) {
+    if !same_object(py, value, proof.mapping.bind(py))? {
         return Ok(false);
     }
     let current = object_items(value)?;
-    if current.len() != proof.items.len()
-        || current
-            .iter()
-            .zip(&proof.items)
-            .any(|((key, value), (expected_key, expected_value))| {
-                !key.bind(py).is(expected_key.bind(py))
-                    || !value.bind(py).is(expected_value.bind(py))
-            })
-    {
+    if current.len() != proof.items.len() {
         return Ok(false);
+    }
+    for ((key, value), (expected_key, expected_value)) in current.iter().zip(&proof.items) {
+        if !same_object(py, key.bind(py), expected_key.bind(py))? {
+            return Ok(false);
+        }
+        if !same_object(py, value.bind(py), expected_value.bind(py))? {
+            return Ok(false);
+        }
     }
     for behavior in &proof.behaviors {
         if !behavior_proof_is_pristine(py, behavior.object.bind(py), behavior)? {

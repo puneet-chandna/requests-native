@@ -54,7 +54,7 @@ fn callable_proof(value: &Bound<'_, PyAny>) -> PyResult<CallableProof> {
         kwdefaults: value.getattr("__kwdefaults__")?.unbind(),
         closure: value.getattr("__closure__")?.unbind(),
         globals: value.getattr("__globals__")?.unbind(),
-        builtins: value.getattr("__builtins__")?.unbind(),
+        builtins: crate::function_builtins(value)?.unbind(),
     })
 }
 
@@ -71,7 +71,7 @@ fn callable_is_pristine(
             .is(proof.kwdefaults.bind(py))
         && current.getattr("__closure__")?.is(proof.closure.bind(py))
         && current.getattr("__globals__")?.is(proof.globals.bind(py))
-        && current.getattr("__builtins__")?.is(proof.builtins.bind(py)))
+        && crate::function_builtins(current)?.is(proof.builtins.bind(py)))
 }
 
 fn initialize_internal_utils_state(py: Python<'_>) -> PyResult<InternalUtilsState> {

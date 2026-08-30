@@ -84,13 +84,9 @@ fn exact_function_global_owner(
         Bound::from_borrowed_ptr(py, pyo3::ffi::PyFunction_GetGlobals(function.as_ptr()))
             .cast_into::<PyDict>()?
     };
-    let builtins = function.getattr("__builtins__")?;
-    if !builtins.is_exact_instance_of::<PyDict>() {
-        return Ok(None);
-    }
     Ok(Some(FunctionGlobalOwner {
         globals: globals.unbind(),
-        builtins: builtins.cast_into::<PyDict>()?.unbind(),
+        builtins: crate::function_builtins_dict(function.as_any())?.unbind(),
     }))
 }
 
@@ -104,13 +100,9 @@ fn exact_function_global_owner(
     }
     let function = callable.cast::<PyFunction>()?;
     let globals = function.getattr("__globals__")?.cast_into::<PyDict>()?;
-    let builtins = function.getattr("__builtins__")?;
-    if !builtins.is_exact_instance_of::<PyDict>() {
-        return Ok(None);
-    }
     Ok(Some(FunctionGlobalOwner {
         globals: globals.unbind(),
-        builtins: builtins.cast_into::<PyDict>()?.unbind(),
+        builtins: crate::function_builtins_dict(function.as_any())?.unbind(),
     }))
 }
 
@@ -127,10 +119,7 @@ fn initialize_cookie_state(py: Python<'_>) -> PyResult<CookieState> {
     let cookie_type = cookiejar.getattr("Cookie")?.cast_into::<PyType>()?;
     let cookielib = module.getattr("cookielib")?;
     let cookie_constructor = cookielib.getattr("Cookie")?;
-    let create_cookie_builtins = module
-        .getattr("create_cookie")?
-        .getattr("__builtins__")?
-        .cast_into::<PyDict>()?;
+    let create_cookie_builtins = crate::function_builtins_dict(&module.getattr("create_cookie")?)?;
     let deepvalues = cookielib.getattr("deepvalues")?;
     let deepvalues_code = deepvalues.getattr("__code__")?;
     let morsel_type = PyModule::import(py, "http.cookies")?

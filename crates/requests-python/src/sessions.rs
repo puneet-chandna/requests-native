@@ -2302,7 +2302,7 @@ impl SessionExecutor {
                 let capabilities = Self::native_capabilities(&receiver)?;
                 SessionRedirectCursor::from_invocation(
                     py,
-                    &root.getattr("__builtins__")?,
+                    &crate::function_builtins(&root)?,
                     &capabilities,
                     &args,
                     &call_kwargs,
@@ -4231,7 +4231,7 @@ impl SessionExecutor {
         supplied: &Bound<'py, PyDict>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let root = Self::native_root(receiver)?;
-        let builtins = root.getattr("__builtins__")?;
+        let builtins = crate::function_builtins(&root)?;
         let capabilities = Self::native_capabilities(receiver)?;
         Self::session_send_with_builtins(py, &builtins, &capabilities, args, supplied)
     }

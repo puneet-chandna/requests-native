@@ -929,6 +929,10 @@ Normalize only nondeterministic data such as elapsed time, random multipart
 boundaries, digest cnonce, and ephemeral ports. Every normalization needs a
 comment explaining why it is not part of the contract.
 
+P04 groups weakref callbacks by public object type and preserves each object's
+observed phase sequence. This normalizes only cross-object collection order;
+it does not sort or discard any object's callback phases.
+
 ## CI and distribution
 
 Preserve the current test matrix:
@@ -946,6 +950,11 @@ it cannot import `src/requests` accidentally.
 
 Do not claim free-threaded support based on a normal CPython wheel. Do not
 claim PyPy support based on CPython ABI builds.
+
+Free-threaded wheel qualification runs 13 of the 14 import tests. It deselects
+only the rewrite comparison for I04 because importing the extension
+intentionally enables the process-global GIL and changes that case's warning
+and logging observation; the ABI evidence step records this before the suite.
 
 Preserve the frozen distribution surface:
 

@@ -199,8 +199,7 @@ fn descriptor_matches(
     };
     Ok(
         function_matches_code(&function, expected.code.bind(function.py()), globals)?
-            && function
-                .getattr("__builtins__")?
+            && crate::function_builtins_dict(function.as_any())?
                 .is(expected.builtins.bind(function.py())),
     )
 }
@@ -325,10 +324,7 @@ fn initialize_response_state(py: Python<'_>) -> PyResult<ResponseState> {
             CanonicalDescriptor {
                 kind,
                 code: code.into_any().unbind(),
-                builtins: function
-                    .getattr("__builtins__")?
-                    .cast_into::<PyDict>()?
-                    .unbind(),
+                builtins: crate::function_builtins_dict(function.as_any())?.unbind(),
             },
         );
     }
