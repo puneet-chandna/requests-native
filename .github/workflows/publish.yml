@@ -96,7 +96,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > artifact-metadata.json
       - name: Validate exact artifact fan-out
-        run: python tests_rust/test_distribution.py --verify-manifest artifacts --source-commit "$GITHUB_SHA" --matrix-result "${{ needs.wheels.result }}" --artifact-metadata artifact-metadata.json > artifact-manifest.json
+        env:
+          WHEELS_RESULT: ${{ needs.wheels.result }}
+        run: python tests_rust/test_distribution.py --verify-manifest artifacts --source-commit "$GITHUB_SHA" --matrix-result "$WHEELS_RESULT" --artifact-metadata artifact-metadata.json > artifact-manifest.json
       - name: Assemble validated release directory
         shell: bash
         run: |
