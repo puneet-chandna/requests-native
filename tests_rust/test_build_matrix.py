@@ -82,7 +82,7 @@ def test_bootstrap_workflow_has_the_complete_supported_matrix() -> None:
     document = yaml.safe_load(workflow.read_text())
 
     triggers = document.get("on", document.get(True))
-    assert set(triggers) == {"workflow_dispatch", "push", "pull_request"}
+    assert set(triggers) == {"workflow_dispatch"}
 
     job = document["jobs"]["wheel-smoke"]
     matrix = job["strategy"]["matrix"]

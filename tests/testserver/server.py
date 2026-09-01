@@ -2,6 +2,17 @@ import select
 import socket
 import ssl
 import threading
+from io import BytesIO
+
+
+def buffer_wsgi_request_body(application):
+    def buffered(environ, start_response):
+        length = int(environ.get("CONTENT_LENGTH") or 0)
+        if length:
+            environ["wsgi.input"] = BytesIO(environ["wsgi.input"].read(length))
+        return application(environ, start_response)
+
+    return buffered
 
 
 def consume_socket_content(sock, timeout=0.5):

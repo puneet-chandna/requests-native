@@ -1,6 +1,20 @@
 name: Type Check
 
-on: [push, pull_request]
+on:
+  push:
+    paths:
+      - pyproject.toml
+      - "src/requests/**"
+      - .github/workflows/typecheck.yml
+  pull_request:
+    paths:
+      - pyproject.toml
+      - "src/requests/**"
+      - .github/workflows/typecheck.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

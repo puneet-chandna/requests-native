@@ -974,6 +974,13 @@ Preserve the current test matrix:
 - the existing PyPy/Windows exclusion;
 - no-character-detector and urllib3 1.x compatibility jobs.
 
+The complete 23-cell compiled wheel matrix is an automatic path-filtered push
+and pull-request gate. `workflow_dispatch` and `workflow_call` remain additional
+entry points, not substitutes for that gate. Control Actions usage by batching
+phase commits before pushing and by keeping the source/editable workflow to its
+single Ubuntu anchor plus the two compatibility jobs; do not remove automatic
+artifact-matrix coverage.
+
 Add Rust checks without deleting Python compatibility jobs. Test both source
 builds and installed wheels. A wheel test must run from outside the checkout so
 it cannot import `src/requests` accidentally.

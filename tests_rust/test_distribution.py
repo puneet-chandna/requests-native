@@ -241,13 +241,33 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
         "push",
         "pull_request",
     }
+    assert triggers["push"]["branches"] == ["main"]
+    assert triggers["push"]["paths"] == triggers["pull_request"]["paths"]
+    assert {
+        "Cargo.lock",
+        "Cargo.toml",
+        "LICENSE",
+        "NOTICE",
+        "crates/**",
+        "pyproject.toml",
+        "requirements-dev.txt",
+        "src/**",
+        "tests/**",
+        "tests_differential/**",
+        "tests_rust/test_backend_boundary.py",
+        "tests_rust/test_distribution.py",
+    } <= set(triggers["push"]["paths"])
+    porting = " ".join((ROOT / "PORTING.md").read_text().split())
+    assert "automatic path-filtered push and pull-request gate" in porting
+    assert "complete 23-cell compiled wheel matrix" in porting
     job = workflow["jobs"]["wheels"]
+    assert job["strategy"]["fail-fast"] is False
     assert job["strategy"]["matrix"] == {
         "python": PYTHONS,
         "os": SYSTEMS,
         "exclude": [{"python": "pypy-3.11", "os": "windows-latest"}],
     }
-    assert triggers["push"]["branches"] == ["main"]
+    assert len(PYTHONS) * len(SYSTEMS) - 1 == 23
     ordered_names = [step.get("name") for step in job["steps"]]
     steps = {step.get("name"): step for step in job["steps"]}
     assert "python -m maturin build" in steps["Build wheel"]["run"]
@@ -326,6 +346,53 @@ def test_test_and_lint_workflows_cover_python_default_and_explicit_rust_trial() 
     )
     assert "cargo fmt --all -- --check" in lint_runs
     assert "cargo clippy -p requests --all-targets -- -D warnings" in lint_runs
+
+
+def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> None:
+    tests = load_workflow("run-tests.yml")
+    test_triggers = tests.get("on", tests.get(True))
+    build = tests["jobs"]["build"]
+    assert build["runs-on"] == "ubuntu-22.04"
+    assert "strategy" not in build
+    assert tests["concurrency"]["cancel-in-progress"] is True
+    assert set(tests["jobs"]) == {"build", "no_chardet", "urllib3"}
+    assert test_triggers["push"]["paths"] == test_triggers["pull_request"]["paths"]
+    assert {
+        ".github/workflows/**",
+        "API_COMPATIBILITY.tsv",
+        "HISTORY.md",
+        "LICENSE",
+        "LIFETIMES.tsv",
+        "MANIFEST.in",
+        "NOTICE",
+        "ORACLE.lock",
+        "README.md",
+        "requirements-dev.txt",
+        "setup.py",
+    } <= set(test_triggers["push"]["paths"])
+
+    for name in ("lint.yml", "typecheck.yml", "codeql-analysis.yml", "zizmor.yml"):
+        workflow = load_workflow(name)
+        assert workflow["concurrency"]["cancel-in-progress"] is True
+
+    codeql = load_workflow("codeql-analysis.yml")
+    codeql_triggers = codeql.get("on", codeql.get(True))
+    assert {
+        "docs/**/*.py",
+        "scripts/**/*.py",
+        "setup.py",
+        "src/**/*.py",
+        "src/**/*.pyi",
+        "tests/**/*.py",
+        "tests_differential/**/*.py",
+        "tests_rust/**/*.py",
+    } <= set(codeql_triggers["push"]["paths"])
+    assert codeql_triggers["push"]["paths"] == codeql_triggers["pull_request"]["paths"]
+
+    zizmor = load_workflow("zizmor.yml")
+    zizmor_triggers = zizmor.get("on", zizmor.get(True))
+    assert zizmor_triggers["push"]["paths"] == [".github/workflows/**"]
+    assert zizmor_triggers["pull_request"]["paths"] == [".github/workflows/**"]
 
 
 def test_installed_smoke_checks_the_package_file_in_its_distribution() -> None:
@@ -517,8 +584,16 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     )
     manifest = jobs["manifest"]
     assert set(manifest["needs"]) == {"sdist", "wheels"}
+    manifest_by_name = {step.get("name"): step for step in manifest["steps"]}
     runs = "\n".join(str(step.get("run", "")) for step in manifest["steps"])
     assert "--verify-manifest" in runs
+    assert "--source-commit" in runs
+    assert "--matrix-result" in runs
+    assert "--artifact-metadata" in runs
+    assert (
+        "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100"
+        in manifest_by_name["Fetch GitHub artifact metadata"]["run"]
+    )
     assert manifest["steps"][-1]["with"]["name"] == "release-dist"
     for name in ("publish", "publish-test-pypi"):
         download = jobs[name]["steps"][0]
@@ -528,6 +603,10 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
             "checkout" not in step.get("uses", "") for step in jobs[name]["steps"]
         )
     assert "github.ref == 'refs/heads/main'" in jobs["publish-test-pypi"]["if"]
+    triggers = load_workflow("publish.yml").get(
+        "on", load_workflow("publish.yml").get(True)
+    )
+    assert triggers["workflow_dispatch"]["inputs"]["test-pypi-only"]["default"] is False
 
 
 def verify_wheel(wheel: Path) -> None:
@@ -959,6 +1038,62 @@ def verify_manifest(directory: Path) -> dict[str, str]:
     }
 
 
+def build_publish_manifest(
+    directory: Path,
+    *,
+    source_commit: str,
+    matrix_result: str,
+    artifact_metadata: dict | None = None,
+) -> dict:
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", source_commit):
+        raise ValueError("source commit must be a 40-character hexadecimal SHA")
+    if matrix_result not in {"success", "failure", "cancelled", "skipped", "local"}:
+        raise ValueError(f"unexpected matrix result: {matrix_result}")
+
+    hashes = verify_manifest(directory)
+    paths = {
+        path.name: path
+        for path in directory.rglob("requests-*")
+        if path.is_file() and path.name in hashes
+    }
+    source_names = {
+        "sdist" if path.name.endswith(".tar.gz") else path.parent.name
+        for path in paths.values()
+    }
+    github_artifacts = {}
+    if artifact_metadata is not None:
+        artifacts = artifact_metadata.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise ValueError("GitHub artifact metadata must contain an artifacts list")
+        for artifact in artifacts:
+            name = artifact.get("name")
+            if name in github_artifacts:
+                raise ValueError(f"duplicate GitHub artifact metadata: {name}")
+            github_artifacts[name] = artifact
+        if set(github_artifacts) != source_names:
+            raise ValueError("GitHub artifact metadata does not match release fan-out")
+
+    manifest_artifacts = []
+    for filename, sha256 in sorted(hashes.items()):
+        path = paths[filename]
+        source_artifact = "sdist" if filename.endswith(".tar.gz") else path.parent.name
+        github = github_artifacts.get(source_artifact, {})
+        manifest_artifacts.append(
+            {
+                "filename": filename,
+                "github_archive_digest": github.get("digest"),
+                "github_artifact_id": github.get("id"),
+                "sha256": sha256,
+                "source_artifact": source_artifact,
+            }
+        )
+    return {
+        "artifacts": manifest_artifacts,
+        "matrix_result": matrix_result,
+        "source_commit": source_commit.lower(),
+    }
+
+
 def write_complete_manifest_fixture(directory: Path) -> None:
     (directory / "requests-2.34.2.tar.gz").touch()
     for python, system in sorted(EXPECTED_WHEEL_KEYS):
@@ -1005,6 +1140,42 @@ def test_publish_manifest_accepts_only_the_complete_unique_matrix(
         ValueError, "duplicate wheel matrix key"
     ):
         verify_manifest(tmp_path)
+
+
+def test_publish_manifest_records_commit_matrix_and_github_artifacts(
+    tmp_path: Path,
+) -> None:
+    write_complete_manifest_fixture(tmp_path)
+    names = ["sdist", *sorted(path.name for path in tmp_path.glob("wheel-*"))]
+    metadata = {
+        "artifacts": [
+            {"name": name, "id": index, "digest": f"sha256:archive-{index}"}
+            for index, name in enumerate(names, 1)
+        ]
+    }
+
+    manifest = build_publish_manifest(
+        tmp_path,
+        source_commit="a" * 40,
+        matrix_result="success",
+        artifact_metadata=metadata,
+    )
+
+    assert manifest["source_commit"] == "a" * 40
+    assert manifest["matrix_result"] == "success"
+    assert len(manifest["artifacts"]) == 24
+    assert manifest["artifacts"] == sorted(
+        manifest["artifacts"], key=lambda artifact: artifact["filename"]
+    )
+    sdist = next(
+        artifact
+        for artifact in manifest["artifacts"]
+        if artifact["filename"].endswith(".tar.gz")
+    )
+    assert sdist["source_artifact"] == "sdist"
+    assert sdist["github_artifact_id"] == 1
+    assert sdist["github_archive_digest"] == "sha256:archive-1"
+    assert re.fullmatch(r"[0-9a-f]{64}", sdist["sha256"])
 
 
 def test_wheel_key_rejects_wrong_version_abi_and_platform() -> None:
@@ -1082,6 +1253,9 @@ def test_publish_manifest_rejects_duplicate_and_orphaned_free_threaded_evidence(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--verify-manifest", type=Path)
+    parser.add_argument("--source-commit")
+    parser.add_argument("--matrix-result")
+    parser.add_argument("--artifact-metadata", type=Path)
     parser.add_argument("--verify-wheel", type=Path)
     parser.add_argument("--verify-sdist", type=Path)
     parser.add_argument("--installed-smoke", type=Path)
@@ -1092,7 +1266,26 @@ def main() -> int:
     parser.add_argument("checkout", nargs="?", type=Path, default=ROOT)
     arguments = parser.parse_args()
     if arguments.verify_manifest:
-        print(json.dumps(verify_manifest(arguments.verify_manifest), sort_keys=True))
+        if arguments.source_commit is None or arguments.matrix_result is None:
+            parser.error(
+                "--verify-manifest requires --source-commit and --matrix-result"
+            )
+        metadata = (
+            json.loads(arguments.artifact_metadata.read_text())
+            if arguments.artifact_metadata
+            else None
+        )
+        print(
+            json.dumps(
+                build_publish_manifest(
+                    arguments.verify_manifest,
+                    source_commit=arguments.source_commit,
+                    matrix_result=arguments.matrix_result,
+                    artifact_metadata=metadata,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
     if arguments.verify_wheel:
         verify_wheel(arguments.verify_wheel)

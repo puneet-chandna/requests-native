@@ -8,11 +8,37 @@ name: "CodeQL"
 on:
   push:
     branches: [main]
+    paths:
+      - "docs/**/*.py"
+      - pyproject.toml
+      - "scripts/**/*.py"
+      - setup.py
+      - "src/**/*.py"
+      - "src/**/*.pyi"
+      - "tests/**/*.py"
+      - "tests_differential/**/*.py"
+      - "tests_rust/**/*.py"
+      - .github/workflows/codeql-analysis.yml
   pull_request:
     # The branches below must be a subset of the branches above
     branches: [main]
+    paths:
+      - "docs/**/*.py"
+      - pyproject.toml
+      - "scripts/**/*.py"
+      - setup.py
+      - "src/**/*.py"
+      - "src/**/*.pyi"
+      - "tests/**/*.py"
+      - "tests_differential/**/*.py"
+      - "tests_rust/**/*.py"
+      - .github/workflows/codeql-analysis.yml
   schedule:
     - cron: '0 23 * * 0'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

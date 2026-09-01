@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       test-pypi-only:
-        description: "Publish to Test PyPI only"
+        description: "Publish validated artifacts to Test PyPI"
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read
@@ -74,6 +74,9 @@ jobs:
     needs: [sdist, wheels]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -88,8 +91,12 @@ jobs:
         with:
           pattern: wheel-*
           path: artifacts/wheels
+      - name: Fetch GitHub artifact metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > artifact-metadata.json
       - name: Validate exact artifact fan-out
-        run: python tests_rust/test_distribution.py --verify-manifest artifacts > artifact-manifest.json
+        run: python tests_rust/test_distribution.py --verify-manifest artifacts --source-commit "$GITHUB_SHA" --matrix-result "${{ needs.wheels.result }}" --artifact-metadata artifact-metadata.json > artifact-manifest.json
       - name: Assemble validated release directory
         shell: bash
         run: |

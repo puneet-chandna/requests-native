@@ -9,8 +9,14 @@ on:
       - Cargo.toml
       - Cargo.lock
       - "crates/**"
+      - LICENSE
+      - NOTICE
       - pyproject.toml
+      - requirements-dev.txt
       - "src/**"
+      - "tests/**"
+      - "tests_differential/**"
+      - tests_rust/test_backend_boundary.py
       - tests_rust/test_distribution.py
       - .github/workflows/wheels.yml
   pull_request:
@@ -18,10 +24,20 @@ on:
       - Cargo.toml
       - Cargo.lock
       - "crates/**"
+      - LICENSE
+      - NOTICE
       - pyproject.toml
+      - requirements-dev.txt
       - "src/**"
+      - "tests/**"
+      - "tests_differential/**"
+      - tests_rust/test_backend_boundary.py
       - tests_rust/test_distribution.py
       - .github/workflows/wheels.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')) }}
 
 permissions:
   contents: read

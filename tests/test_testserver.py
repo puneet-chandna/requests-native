@@ -1,11 +1,31 @@
 import socket
 import threading
 import time
+from io import BytesIO
 
 import pytest
 
 import requests
-from tests.testserver.server import Server
+from tests.testserver.server import Server, buffer_wsgi_request_body
+
+
+def test_wsgi_body_buffer_drains_client_input_before_dispatch() -> None:
+    client_input = BytesIO(b"redirect body")
+    seen = []
+
+    def application(environ, start_response):
+        seen.append((client_input.tell(), environ["wsgi.input"]))
+        return [b"ok"]
+
+    environ = {"CONTENT_LENGTH": "13", "wsgi.input": client_input}
+    response = buffer_wsgi_request_body(application)(environ, lambda *args: None)
+
+    assert list(response) == [b"ok"]
+    assert client_input.tell() == len(b"redirect body")
+    client_position_at_dispatch, buffered_input = seen[0]
+    assert client_position_at_dispatch == len(b"redirect body")
+    assert buffered_input is not client_input
+    assert buffered_input.read() == b"redirect body"
 
 
 class TestTestServer:

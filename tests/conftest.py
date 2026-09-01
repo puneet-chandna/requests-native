@@ -10,9 +10,13 @@ import threading
 import pytest
 
 from requests.compat import urljoin
+from tests.testserver.server import buffer_wsgi_request_body
 
 
 def prepare_url(value):
+    if not getattr(value, "_requests_body_buffered", False):
+        value._server.set_app(buffer_wsgi_request_body(value._server.get_app()))
+        value._requests_body_buffered = True
     # Issue #1483: Make sure the URL always has a trailing slash
     httpbin_url = value.url.rstrip("/") + "/"
 

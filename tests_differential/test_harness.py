@@ -10,6 +10,29 @@ from tests_differential import runner
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_differential_children_use_a_finite_slow_platform_timeout(monkeypatch) -> None:
+    monkeypatch.delenv("REQUESTS_DIFFERENTIAL_TIMEOUT", raising=False)
+
+    assert runner._case_timeout() == 60.0
+
+
+def test_differential_timeout_accepts_an_explicit_override(monkeypatch) -> None:
+    monkeypatch.setenv("REQUESTS_DIFFERENTIAL_TIMEOUT", "12.5")
+
+    assert runner._case_timeout() == 12.5
+
+
+@pytest.mark.parametrize("value", ["", "zero", "0", "-1", "nan", "inf"])
+def test_differential_timeout_rejects_invalid_values(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("REQUESTS_DIFFERENTIAL_TIMEOUT", value)
+
+    with pytest.raises(
+        ValueError,
+        match="REQUESTS_DIFFERENTIAL_TIMEOUT must be a positive number",
+    ):
+        runner._case_timeout()
+
+
 def test_rewrite_root_can_target_an_installed_package(
     monkeypatch, tmp_path: Path
 ) -> None:

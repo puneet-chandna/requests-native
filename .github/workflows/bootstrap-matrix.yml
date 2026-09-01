@@ -2,25 +2,10 @@ name: Bootstrap Rust wheel matrix
 
 on:
   workflow_dispatch:
-  push:
-    branches: ["feature/requests-rust-port"]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - "pyproject.toml"
-      - "src/**"
-      - "tests_rust/**"
-      - ".github/workflows/bootstrap-matrix.yml"
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - "pyproject.toml"
-      - "src/**"
-      - "tests_rust/**"
-      - ".github/workflows/bootstrap-matrix.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
