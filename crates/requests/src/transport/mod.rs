@@ -238,7 +238,13 @@ struct ActiveExchangeGuard {
     lease: Option<SessionLeaseIdentity>,
     correlation: u64,
     released: bool,
-    response_remainder_wait: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
+    response_remainder_gate: ResponseRemainderGate,
+}
+
+enum ResponseRemainderGate {
+    Uninitialized,
+    Waiting(Box<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>),
+    Completed,
 }
 
 impl ActiveExchangeGuard {
@@ -253,7 +259,7 @@ impl ActiveExchangeGuard {
             lease: lease.session_lease_identity(),
             correlation,
             released: false,
-            response_remainder_wait: None,
+            response_remainder_gate: ResponseRemainderGate::Uninitialized,
         }
     }
 
@@ -278,16 +284,30 @@ impl ActiveExchangeGuard {
         let Some(harness) = &self.session_runtime else {
             return Poll::Ready(());
         };
-        let wait = self.response_remainder_wait.get_or_insert_with(|| {
+        if matches!(
+            self.response_remainder_gate,
+            ResponseRemainderGate::Uninitialized
+        ) {
             let checkpoint = harness.checkpoint(
                 SessionPhase::ResponseRemainder,
                 self.connection,
                 self.lease,
                 self.correlation,
             );
-            harness.wait_future(checkpoint)
-        });
-        wait.as_mut().poll(context)
+            self.response_remainder_gate =
+                ResponseRemainderGate::Waiting(Box::new(harness.wait_future(checkpoint)));
+        }
+        match &mut self.response_remainder_gate {
+            ResponseRemainderGate::Waiting(wait) => match wait.as_mut().as_mut().poll(context) {
+                Poll::Ready(()) => {
+                    self.response_remainder_gate = ResponseRemainderGate::Completed;
+                    Poll::Ready(())
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            ResponseRemainderGate::Completed => Poll::Ready(()),
+            ResponseRemainderGate::Uninitialized => unreachable!(),
+        }
     }
 }
 
@@ -1511,17 +1531,29 @@ mod tests {
     use std::future;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::{Context, Poll};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use bytes::Bytes;
     use http::{HeaderName, HeaderValue, Method};
 
-    use super::{ConnectionDriver, outgoing_request, validate_request};
+    use super::{
+        ActiveExchangeGuard, ConnectionDriver, ResponseRemainderGate, outgoing_request,
+        validate_request,
+    };
+    use crate::session_runtime::{SessionCheckpoint, SessionRuntimeHarness, SessionRuntimeHooks};
     use crate::{AsyncBody, BodySource, ErrorKind, RequestBuilder};
 
     struct NeverBody;
+
+    struct ImmediateRemainderHooks(Arc<AtomicUsize>);
+
+    impl SessionRuntimeHooks for ImmediateRemainderHooks {
+        fn checkpoint(&self, _checkpoint: SessionCheckpoint) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     impl AsyncBody for NeverBody {
         fn poll_next(
@@ -1534,6 +1566,26 @@ mod tests {
         fn size_hint(&self) -> Option<u64> {
             None
         }
+    }
+
+    #[test]
+    fn completed_response_remainder_gate_is_not_repolled() {
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        let runtime =
+            SessionRuntimeHarness::new(Arc::new(ImmediateRemainderHooks(Arc::clone(&checkpoints))));
+        let mut guard = ActiveExchangeGuard {
+            session_runtime: Some(runtime),
+            connection: None,
+            lease: None,
+            correlation: 1,
+            released: false,
+            response_remainder_gate: ResponseRemainderGate::Uninitialized,
+        };
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert_eq!(guard.poll_response_remainder(&mut context), Poll::Ready(()));
+        assert_eq!(guard.poll_response_remainder(&mut context), Poll::Ready(()));
+        assert_eq!(checkpoints.load(Ordering::Relaxed), 1);
     }
 
     #[test]
