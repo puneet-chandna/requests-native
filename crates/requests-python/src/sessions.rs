@@ -19,9 +19,10 @@ use pyo3::wrap_pyfunction;
 
 use crate::bridge::{ActionSender, WorkerPayload};
 use crate::runtime::{
-    last_origin_quarantine_token, origin_quarantine_is_terminal, origin_quarantine_retains_owner,
-    run_with_owned_actions, run_with_owned_actions_and_signal_checker, signal_wins_ready_result,
-    take_origin_quarantine_owner,
+    ActionReplyDisposition, SessionCancellationPhase, last_origin_quarantine_token,
+    origin_quarantine_is_terminal, origin_quarantine_retains_owner, run_with_owned_actions,
+    run_with_owned_actions_and_reply_disposition, run_with_owned_actions_and_signal_checker,
+    signal_wins_ready_result, take_origin_quarantine_owner,
 };
 use requests::blocking::BlockingRuntimeDriver;
 use requests::session_runtime::{
@@ -1550,7 +1551,9 @@ impl SessionRedirectCursor {
     ) -> PyResult<Bound<'py, PyAny>> {
         self.validate_token(py, token)?;
         let inner = self.lock_inner()?;
-        if inner.state.is_some() && inner.terminal == RedirectCursorTerminal::Live {
+        if inner.terminal == RedirectCursorTerminal::Live
+            && (inner.state.is_some() || self.running.load(Ordering::Acquire))
+        {
             Ok(self.frame_token.clone_ref(py).into_bound(py))
         } else {
             Ok(py.None().into_bound(py))
@@ -5382,9 +5385,9 @@ fn execute_runtime_cancellation_action(
     py: Python<'_>,
     action: SessionHarnessAction,
     owner: &mut RuntimeCancellationOwner,
-) -> SessionHarnessReply {
+) -> ActionReplyDisposition<SessionHarnessReply> {
     let SessionHarnessAction::Cancellation(phase) = action else {
-        return SessionHarnessReply::Failed;
+        return ActionReplyDisposition::Reply(SessionHarnessReply::Failed);
     };
     let result = (|| -> PyResult<()> {
         let case = owner.case.bind(py);
@@ -5392,7 +5395,7 @@ fn execute_runtime_cancellation_action(
             RuntimeCancellationPhase::BeforePoll => (0, 0, 0, false),
             RuntimeCancellationPhase::QueuedBeforeDequeue => (1, 0, 0, true),
             RuntimeCancellationPhase::ReplyObserved => (1, 1, 1, true),
-            RuntimeCancellationPhase::TerminalAfterTimeout => (1, 1, 1, true),
+            RuntimeCancellationPhase::TerminalAfterTimeout => (1, 1, 0, false),
             RuntimeCancellationPhase::PermanentlyNonterminal => (1, 1, 0, false),
         };
         case.setattr("queued", queued)?;
@@ -5404,10 +5407,12 @@ fn execute_runtime_cancellation_action(
         case.getattr("entered")?.call_method0("set")?;
         Ok(())
     })();
-    if result.is_ok() {
-        SessionHarnessReply::Ack
-    } else {
-        SessionHarnessReply::Failed
+    match (result, phase) {
+        (Ok(()), RuntimeCancellationPhase::TerminalAfterTimeout) => {
+            ActionReplyDisposition::Withhold(SessionCancellationPhase::CancelTerminalAfterTimeout)
+        }
+        (Ok(()), _) => ActionReplyDisposition::Reply(SessionHarnessReply::Ack),
+        (Err(_), _) => ActionReplyDisposition::Reply(SessionHarnessReply::Failed),
     }
 }
 
@@ -5419,19 +5424,24 @@ fn run_runtime_cancellation_case<'py>(
     let marker = case.getattr("marker")?;
     let entered = case.getattr("entered")?;
     let release = case.getattr("release")?;
-    runtime_exact_interrupt(py, &marker, &entered, &release, || {
+    let reply_delivered = Arc::new(AtomicBool::new(false));
+    let worker_reply_delivered = Arc::clone(&reply_delivered);
+    let record = runtime_exact_interrupt(py, &marker, &entered, &release, || {
         let owner = RuntimeCancellationOwner {
             case: case.clone().unbind(),
             _retained: case.getattr("owner")?.unbind(),
             _not_send_or_sync: PhantomData,
         };
-        let result = run_with_owned_actions(
+        let result = run_with_owned_actions_and_reply_disposition(
             py,
             owner,
             move |actions| async move {
-                let _ = actions
+                let reply = actions
                     .request(SessionHarnessAction::Cancellation(phase))
                     .await;
+                if phase == RuntimeCancellationPhase::TerminalAfterTimeout && reply.is_ok() {
+                    worker_reply_delivered.store(true, Ordering::Release);
+                }
                 if phase == RuntimeCancellationPhase::PermanentlyNonterminal {
                     loop {
                         thread::park();
@@ -5447,7 +5457,12 @@ fn run_runtime_cancellation_case<'py>(
             )),
             Err(error) => Err(error),
         }
-    })
+    })?;
+    if phase == RuntimeCancellationPhase::TerminalAfterTimeout {
+        case.setattr("reply_delivered", reply_delivered.load(Ordering::Acquire))?;
+        case.getattr("terminal")?.call_method0("set")?;
+    }
+    Ok(record)
 }
 
 fn runtime_cancellation_program(
@@ -5538,6 +5553,7 @@ fn runtime_cancellation_program(
                 executed.into_pyobject(py)?.into_any(),
                 replies.into_pyobject(py)?.into_any(),
                 owner_gone.bind(py).clone(),
+                case.getattr("reply_delivered")?,
                 case.getattr("terminal")?
                     .call_method0("is_set")?
                     .extract::<bool>()?
@@ -7253,7 +7269,11 @@ fn execute_session_harness_action(
     py: Python<'_>,
     action: SessionHarnessAction,
     owner: &mut SessionHarnessOriginOwner,
-) -> SessionHarnessReply {
+) -> ActionReplyDisposition<SessionHarnessReply> {
+    let withhold_reply = matches!(
+        &action,
+        SessionHarnessAction::Cancellation(RuntimeCancellationPhase::TerminalAfterTimeout)
+    );
     let result = (|| -> PyResult<()> {
         let subject = owner.subject.bind(py);
         let scenario = owner.scenario.bind(py);
@@ -7279,9 +7299,7 @@ fn execute_session_harness_action(
                     collaborator.call_method0("queued")?;
                     collaborator.call_method0("dequeued")?;
                     collaborator.call_method0("executed")?;
-                    collaborator.call_method0("reply_observed")?;
                     collaborator.call_method0("timeout")?;
-                    collaborator.call_method0("terminal")?;
                     collaborator.call_method0("phase_wait")?;
                 }
                 RuntimeCancellationPhase::PermanentlyNonterminal => {
@@ -7362,13 +7380,16 @@ fn execute_session_harness_action(
         }
         Ok(())
     })();
-    match result {
-        Ok(()) => SessionHarnessReply::Ack,
-        Err(error) => {
+    match (result, withhold_reply) {
+        (Ok(()), true) => {
+            ActionReplyDisposition::Withhold(SessionCancellationPhase::CancelTerminalAfterTimeout)
+        }
+        (Ok(()), false) => ActionReplyDisposition::Reply(SessionHarnessReply::Ack),
+        (Err(error), _) => {
             if owner.error.is_none() {
                 owner.error = Some(error);
             }
-            SessionHarnessReply::Failed
+            ActionReplyDisposition::Reply(SessionHarnessReply::Failed)
         }
     }
 }
@@ -7491,7 +7512,7 @@ fn run_session_harness_interrupt(
         }
         _ => None,
     };
-    let result = run_with_owned_actions(
+    let result = run_with_owned_actions_and_reply_disposition(
         py,
         owner,
         move |actions| {
@@ -7528,6 +7549,12 @@ fn run_session_harness_interrupt(
         },
         execute_session_harness_action,
     );
+    if cancellation_phase == Some(RuntimeCancellationPhase::TerminalAfterTimeout) && result.is_err()
+    {
+        let collaborator = runtime_scenario_item(scenario, "collaborator")?
+            .ok_or_else(|| PyValueError::new_err("missing harness collaborator"))?;
+        collaborator.call_method0("terminal")?;
+    }
     match result {
         Ok((_, owner)) => match owner.error {
             Some(error) => Err(error),
@@ -7860,27 +7887,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(test)]
-mod task16_session_payload_contract {
+mod session_public_pump_tests {
     use super::*;
-    use crate::bridge::WorkerPayload;
-
-    fn assert_worker_payload<T: WorkerPayload + Send + 'static>() {}
-
-    trait AmbiguousIfWorkerPayload<A> {
-        fn marker() {}
-    }
-
-    impl<T: ?Sized> AmbiguousIfWorkerPayload<()> for T {}
-    impl<T: ?Sized + WorkerPayload> AmbiguousIfWorkerPayload<u8> for T {}
-
-    trait AmbiguousIfSend<A> {
-        fn marker() {}
-    }
-
-    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
-    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
-
-    struct BorrowedValue<'a>(&'a str);
 
     #[test]
     fn nested_public_pump_guard_restores_the_prior_tls_submission() {
@@ -7911,6 +7919,31 @@ mod task16_session_payload_contract {
         PUBLIC_PUMP_SUBMISSION.with(|current| current.set(0));
         PUBLIC_PUMP_OBSERVATION_ENABLED.store(false, Ordering::Release);
     }
+}
+
+#[cfg(test)]
+#[rustfmt::skip]
+mod task16_session_payload_contract {
+    use super::*;
+    use crate::bridge::WorkerPayload;
+
+    fn assert_worker_payload<T: WorkerPayload + Send + 'static>() {}
+
+    trait AmbiguousIfWorkerPayload<A> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfWorkerPayload<()> for T {}
+    impl<T: ?Sized + WorkerPayload> AmbiguousIfWorkerPayload<u8> for T {}
+
+    trait AmbiguousIfSend<A> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+
+    struct BorrowedValue<'a>(&'a str);
 
     #[test]
     fn all_session_payload_variants_are_worker_payloads() {
@@ -7938,118 +7971,24 @@ mod task16_session_payload_contract {
         let _ = (cursor_id, opaque_value_id);
 
         let actions = [
-            SessionAction::ReadGlobal {
-                authority: GlobalAuthority::Sessions,
-                generation,
-                sequence,
-            },
-            SessionAction::ReadBody {
-                request_id,
-                generation,
-                sequence,
-            },
-            SessionAction::SendCustomAdapter {
-                adapter_id,
-                request_id,
-                generation,
-                correlation,
-                sequence,
-            },
-            SessionAction::DispatchHook {
-                hook_id,
-                response_id,
-                generation,
-                correlation,
-                sequence,
-            },
-            SessionAction::RunAuth {
-                auth_id,
-                request_id,
-                generation,
-                sequence,
-            },
-            SessionAction::ExtractCookies {
-                jar_id,
-                request_id,
-                response_id,
-                generation,
-                sequence,
-            },
-            SessionAction::NestedSubmit {
-                request_id,
-                generation,
-                parent_correlation: correlation,
-                correlation,
-                sequence,
-            },
+            SessionAction::ReadGlobal { authority: GlobalAuthority::Sessions, generation, sequence },
+            SessionAction::ReadBody { request_id, generation, sequence },
+            SessionAction::SendCustomAdapter { adapter_id, request_id, generation, correlation, sequence },
+            SessionAction::DispatchHook { hook_id, response_id, generation, correlation, sequence },
+            SessionAction::RunAuth { auth_id, request_id, generation, sequence },
+            SessionAction::ExtractCookies { jar_id, request_id, response_id, generation, sequence },
+            SessionAction::NestedSubmit { request_id, generation, parent_correlation: correlation, correlation, sequence },
         ];
 
         for action in actions {
             match action {
-                SessionAction::ReadGlobal {
-                    authority,
-                    generation,
-                    sequence,
-                } => {
-                    let _ = (authority, generation, sequence);
-                }
-                SessionAction::ReadBody {
-                    request_id,
-                    generation,
-                    sequence,
-                } => {
-                    let _ = (request_id, generation, sequence);
-                }
-                SessionAction::SendCustomAdapter {
-                    adapter_id,
-                    request_id,
-                    generation,
-                    correlation,
-                    sequence,
-                } => {
-                    let _ = (adapter_id, request_id, generation, correlation, sequence);
-                }
-                SessionAction::DispatchHook {
-                    hook_id,
-                    response_id,
-                    generation,
-                    correlation,
-                    sequence,
-                } => {
-                    let _ = (hook_id, response_id, generation, correlation, sequence);
-                }
-                SessionAction::RunAuth {
-                    auth_id,
-                    request_id,
-                    generation,
-                    sequence,
-                } => {
-                    let _ = (auth_id, request_id, generation, sequence);
-                }
-                SessionAction::ExtractCookies {
-                    jar_id,
-                    request_id,
-                    response_id,
-                    generation,
-                    sequence,
-                } => {
-                    let _ = (jar_id, request_id, response_id, generation, sequence);
-                }
-                SessionAction::NestedSubmit {
-                    request_id,
-                    generation,
-                    parent_correlation,
-                    correlation,
-                    sequence,
-                } => {
-                    let _ = (
-                        request_id,
-                        generation,
-                        parent_correlation,
-                        correlation,
-                        sequence,
-                    );
-                }
+                SessionAction::ReadGlobal { authority, generation, sequence } => { let _ = (authority, generation, sequence); }
+                SessionAction::ReadBody { request_id, generation, sequence } => { let _ = (request_id, generation, sequence); }
+                SessionAction::SendCustomAdapter { adapter_id, request_id, generation, correlation, sequence } => { let _ = (adapter_id, request_id, generation, correlation, sequence); }
+                SessionAction::DispatchHook { hook_id, response_id, generation, correlation, sequence } => { let _ = (hook_id, response_id, generation, correlation, sequence); }
+                SessionAction::RunAuth { auth_id, request_id, generation, sequence } => { let _ = (auth_id, request_id, generation, sequence); }
+                SessionAction::ExtractCookies { jar_id, request_id, response_id, generation, sequence } => { let _ = (jar_id, request_id, response_id, generation, sequence); }
+                SessionAction::NestedSubmit { request_id, generation, parent_correlation, correlation, sequence } => { let _ = (request_id, generation, parent_correlation, correlation, sequence); }
             }
         }
     }
@@ -8066,95 +8005,23 @@ mod task16_session_payload_contract {
         let error_id = OpaqueValueId::checked(43, generation).unwrap();
 
         let replies = [
-            SessionReply::Scalar {
-                value,
-                generation,
-                correlation,
-                sequence,
-            },
-            SessionReply::Response {
-                response_id,
-                generation,
-                correlation,
-                sequence,
-            },
-            SessionReply::Nested {
-                request_id,
-                generation,
-                correlation,
-                sequence,
-            },
-            SessionReply::Raised {
-                error_id,
-                generation,
-                correlation,
-                sequence,
-            },
+            SessionReply::Scalar { value, generation, correlation, sequence },
+            SessionReply::Response { response_id, generation, correlation, sequence },
+            SessionReply::Nested { request_id, generation, correlation, sequence },
+            SessionReply::Raised { error_id, generation, correlation, sequence },
         ];
         for reply in replies {
             match reply {
-                SessionReply::Scalar {
-                    value,
-                    generation,
-                    correlation,
-                    sequence,
-                } => {
-                    let _ = (value, generation, correlation, sequence);
-                }
-                SessionReply::Response {
-                    response_id,
-                    generation,
-                    correlation,
-                    sequence,
-                } => {
-                    let _ = (response_id, generation, correlation, sequence);
-                }
-                SessionReply::Nested {
-                    request_id,
-                    generation,
-                    correlation,
-                    sequence,
-                } => {
-                    let _ = (request_id, generation, correlation, sequence);
-                }
-                SessionReply::Raised {
-                    error_id,
-                    generation,
-                    correlation,
-                    sequence,
-                } => {
-                    let _ = (error_id, generation, correlation, sequence);
-                }
+                SessionReply::Scalar { value, generation, correlation, sequence } => { let _ = (value, generation, correlation, sequence); }
+                SessionReply::Response { response_id, generation, correlation, sequence } => { let _ = (response_id, generation, correlation, sequence); }
+                SessionReply::Nested { request_id, generation, correlation, sequence } => { let _ = (request_id, generation, correlation, sequence); }
+                SessionReply::Raised { error_id, generation, correlation, sequence } => { let _ = (error_id, generation, correlation, sequence); }
             }
         }
 
-        let transfer = NativeTransfer {
-            method: MethodId::Get,
-            url: UrlId::checked(47, generation).unwrap(),
-            headers: HeadersId::checked(53, generation).unwrap(),
-            body_id: value,
-            adapter_id,
-            generation,
-            correlation,
-        };
-        let NativeTransfer {
-            method,
-            url,
-            headers,
-            body_id,
-            adapter_id,
-            generation,
-            correlation,
-        } = transfer;
-        let _ = (
-            method,
-            url,
-            headers,
-            body_id,
-            adapter_id,
-            generation,
-            correlation,
-        );
+        let transfer = NativeTransfer { method: MethodId::Get, url: UrlId::checked(47, generation).unwrap(), headers: HeadersId::checked(53, generation).unwrap(), body_id: value, adapter_id, generation, correlation };
+        let NativeTransfer { method, url, headers, body_id, adapter_id, generation, correlation } = transfer;
+        let _ = (method, url, headers, body_id, adapter_id, generation, correlation);
     }
 
     #[test]

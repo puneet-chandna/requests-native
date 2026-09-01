@@ -675,7 +675,7 @@ def _run_b05_b09_native_interrupt_trial(
             "before-poll": (0, 0, 0, 0, 0, 0),
             "queued-before-dequeue": (1, 0, 0, 0, 0, 0),
             "reply-observed": (1, 1, 1, 1, 0, 0),
-            "terminal-after-timeout": (1, 1, 1, 1, 1, 1),
+            "terminal-after-timeout": (1, 1, 1, 0, 1, 1),
             "permanently-nonterminal": (1, 1, 1, 0, 0, 1),
         }[phase]
         assert (

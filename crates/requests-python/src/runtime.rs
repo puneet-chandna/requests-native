@@ -29,6 +29,11 @@ pub(crate) enum SessionCancellationPhase {
     CancelPermanentlyNonterminal,
 }
 
+pub(crate) enum ActionReplyDisposition<R> {
+    Reply(R),
+    Withhold(SessionCancellationPhase),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OriginQuarantineRetentionAudit {
     phase: SessionCancellationPhase,
@@ -432,6 +437,33 @@ impl PythonCallContext {
     fn drive_owned_with_signal_checker<T, A, R, O, F, S>(
         &self,
         py: Python<'_>,
+        submission: BlockingSubmission<T>,
+        actions: ActionReceiver<A, R>,
+        owner: O,
+        mut execute: F,
+        check_signals: S,
+    ) -> PyResult<(T, O)>
+    where
+        T: Send + 'static,
+        A: Send + 'static,
+        R: Send + 'static,
+        O: 'static,
+        F: for<'py> FnMut(Python<'py>, A, &mut O) -> R,
+        S: for<'py> FnMut(Python<'py>) -> PyResult<()>,
+    {
+        self.drive_owned_with_reply_disposition_and_signal_checker(
+            py,
+            submission,
+            actions,
+            owner,
+            move |py, action, owner| ActionReplyDisposition::Reply(execute(py, action, owner)),
+            check_signals,
+        )
+    }
+
+    fn drive_owned_with_reply_disposition_and_signal_checker<T, A, R, O, F, S>(
+        &self,
+        py: Python<'_>,
         mut submission: BlockingSubmission<T>,
         mut actions: ActionReceiver<A, R>,
         mut owner: O,
@@ -443,13 +475,14 @@ impl PythonCallContext {
         A: Send + 'static,
         R: Send + 'static,
         O: 'static,
-        F: for<'py> FnMut(Python<'py>, A, &mut O) -> R,
+        F: for<'py> FnMut(Python<'py>, A, &mut O) -> ActionReplyDisposition<R>,
         S: for<'py> FnMut(Python<'py>) -> PyResult<()>,
     {
         let _active_submission = ActiveOriginSubmissionGuard::enter(submission.id());
         self.ensure_affinity(py)?;
         reap_origin_quarantine();
         let mut cancellation_phase = SessionCancellationPhase::CancelBeforePoll;
+        let mut withheld_replies = Vec::new();
         loop {
             let task_state =
                 match signal_before_task_state(py, &mut check_signals, || submission.try_wait()) {
@@ -480,8 +513,16 @@ impl PythonCallContext {
                 Ok(request) => {
                     self.ensure_affinity(py)?;
                     let (action, reply) = request.into_parts();
-                    let _ = reply.send(execute(py, action, &mut owner));
-                    cancellation_phase = SessionCancellationPhase::CancelReplyObserved;
+                    match execute(py, action, &mut owner) {
+                        ActionReplyDisposition::Reply(value) => {
+                            let _ = reply.send(value);
+                            cancellation_phase = SessionCancellationPhase::CancelReplyObserved;
+                        }
+                        ActionReplyDisposition::Withhold(phase) => {
+                            withheld_replies.push(reply);
+                            cancellation_phase = phase;
+                        }
+                    }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -707,6 +748,35 @@ where
     Execute: for<'py> FnMut(Python<'py>, A, &mut O) -> R,
 {
     run_with_owned_actions_and_signal_checker(py, owner, build, execute, |py| py.check_signals())
+}
+
+pub(crate) fn run_with_owned_actions_and_reply_disposition<T, A, R, O, Fut, Build, Execute>(
+    py: Python<'_>,
+    owner: O,
+    build: Build,
+    execute: Execute,
+) -> PyResult<(T, O)>
+where
+    T: Send + 'static,
+    A: WorkerPayload,
+    R: WorkerPayload,
+    O: 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    Build: FnOnce(ActionSender<A, R>) -> Fut,
+    Execute: for<'py> FnMut(Python<'py>, A, &mut O) -> ActionReplyDisposition<R>,
+{
+    let context = PythonCallContext::capture(py)?;
+    let runtime = driver()?;
+    let (actions, receiver) = action_channel();
+    let submission = submit(&runtime, build(actions))?;
+    context.drive_owned_with_reply_disposition_and_signal_checker(
+        py,
+        submission,
+        receiver,
+        owner,
+        execute,
+        |py| py.check_signals(),
+    )
 }
 
 pub(crate) fn run_with_owned_actions_and_signal_checker<

@@ -674,6 +674,7 @@ for phase in phases:
         phase=phase, marker=KeyboardInterrupt("b09-" + phase), owner=Owner(phase),
         queued=0, executed=0, replies=0, entered=threading.Event(),
         dequeue=threading.Event(), release=threading.Event(), terminal=threading.Event(),
+        reply_delivered=None,
     ))
 subject = SimpleNamespace(cases=tuple(cases), events=events, leaked=leaked)
 scenario = {"id": CASE_ID, "operation": "diff-cancellation-quarantine-matrix", "generation": 9, "phases": phases}
@@ -699,6 +700,8 @@ def frozen_oracle(subject, scenario, gates):
                 current.entered.set()
                 threading.Event().wait()
                 return
+            if current.phase == "terminal-after-timeout":
+                current.reply_delivered = False
             current.entered.set()
             assert current.release.wait(2)
             current.terminal.set()
@@ -731,6 +734,7 @@ def frozen_oracle(subject, scenario, gates):
         records.append([
             case.phase, record, case.queued, case.executed, case.replies,
             None if owner_ref is None else owner_ref() is None,
+            case.reply_delivered,
             case.terminal.is_set(),
         ])
     recovery = [case.phase for case in subject.cases]

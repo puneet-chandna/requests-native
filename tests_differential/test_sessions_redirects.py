@@ -9691,7 +9691,6 @@ v6_controls = {{
 def v6_observer(
     subject,
     _all=all,
-    _list=list,
     _object=object,
     _ordered=OrderedDict,
     _dict=dict,
@@ -22601,19 +22600,46 @@ for v6_index, v6_mode in enumerate(v6_modes):
     v6_state.stale_auth_authority = V6T08Auth(v6_state, False)
     v6_state.live_auth_authority = V6T08Auth(v6_state, True)
     v6_state.session = V6T08Session(v6_state, v6_t08_module)
+    v6_first_hook_completed = v6_mode not in (
+        "stop-first-send", "stop-first-hook",
+    )
+    v6_copy_completed = v6_mode not in (
+        "stop-first-send", "stop-first-hook", "stop-extract-1",
+        "stop-copy", "stale-hooks", "stale-jar", "stale-extract",
+    )
     v6_context = ScenarioContext(
         {token!r} + ":" + str(v6_index),
         holders=OrderedDict([("state", v6_state)]),
-        observables=OrderedDict([(
-            "anchors",
+        observables=OrderedDict((
             (
-                v6_state, v6_state.q0, v6_state.q1,
-                v6_state.redirect, v6_state.final,
-                v6_state.seed_jar, v6_state.live_jar,
-                v6_state.first_adapter, v6_state.second_adapter,
-                v6_state.first_hook, v6_state.later_hook,
+                "anchors",
+                (
+                    v6_state, v6_state.q0, v6_state.q1,
+                    v6_state.redirect, v6_state.final,
+                    v6_state.seed_jar, v6_state.live_jar,
+                    v6_state.first_adapter, v6_state.second_adapter,
+                    v6_state.first_hook, v6_state.later_hook,
+                ),
             ),
-        )]),
+            (
+                "_opaque_authority_edge_postconditions",
+                ((
+                "slot", v6_state.session, "mounted_adapter",
+                v6_state.first_adapter,
+                v6_state.second_adapter if v6_first_hook_completed else v6_state.first_adapter,
+                ), (
+                "slot", v6_state.session, "rebuild_auth",
+                v6_state.stale_auth_authority,
+                v6_state.live_auth_authority if v6_first_hook_completed else v6_state.stale_auth_authority,
+                ), (
+                "object-dict", v6_state.q0, "hooks", v6_state.first_hooks,
+                v6_state.later_hooks if v6_first_hook_completed else v6_state.first_hooks,
+                ), (
+                "object-dict", v6_state.q1, "hooks", v6_state.first_hooks,
+                v6_state.later_hooks if v6_copy_completed else v6_state.first_hooks,
+                )),
+            ),
+        )),
         mutations=("events", "counters", "observables"),
     )
     v6_replacements = (v6_state.stale_extract, v6_state.stale_merge, v6_state.stale_proxy)
@@ -25517,6 +25543,8 @@ class V6R07Driver:
         entered = state.entered.value
         release = state.release.value
         assert entered.wait(2)
+        assert state.generator.gi_frame is not None
+        assert state.generator.registered is True
         try:
             next(state.generator)
         except BaseException as error:
@@ -31169,33 +31197,53 @@ def test_session_native_source_rejects_compatibility_escape_hatches() -> None:
     assert authority_lines == [
         (
             "crates/requests-python/src/adapters.rs",
-            528,
+            584,
             "6ff42154c2764506a496d48ac1e5df73c27a8d0497a8f549b92f750ffd29f5d0",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            580,
-            "dbd02a8d962c6f06d58591e0ccbc2a7cf0b2da4ec5049c4015e24beeeff1df8b",
+            643,
+            "572270f44d469f02c6c94dba4629b26ee1d1e842d5a9efc990b2cdffe95580e7",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            600,
+            670,
             "6550cc699a38280d9168af091d5760b035d535e8038316938a7ed0d5f352176e",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            1013,
+            1185,
             "00f28b5517641d3be07c8953c0edcc548c4512e64515a6b18fd8a1c7f9d51784",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            1200,
+            1372,
             "7775e84e0f087a8a48c391b14c6299a50d3d5b994d09693124a614c05cd465e9",
         ),
         (
             "crates/requests-python/src/body.rs",
             240,
             "fccf4046c978b0141bf990af6b61130923f910fdcde38f9aa5fa5ee1bc0bed97",
+        ),
+        (
+            "crates/requests-python/src/cookies.rs",
+            102,
+            "9374d5b46c6daf75b631599574529287383cc091b9f89f83fd543df3eaa9bb30",
+        ),
+        (
+            "crates/requests-python/src/lib.rs",
+            25,
+            "b9da086bbe6178c8b80c1061611f4dc4d3162837392d04a3fa53a6f9d0298c82",
+        ),
+        (
+            "crates/requests-python/src/models.rs",
+            282,
+            "d9a7fa995ac200a5208e563820f2cf98af54bf5cbfbda7f349f76d7f0c2e8b44",
+        ),
+        (
+            "crates/requests-python/src/models.rs",
+            352,
+            "ed68b5dea4d4582291a09260dc230b06da5e69acb94df758280cef4d822d069e",
         ),
         (
             "crates/requests-python/src/response.rs",
