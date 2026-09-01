@@ -9,9 +9,31 @@ visible, and let the existing tests define correctness.
 
 ## Status
 
-This repository is in the preparation stage. Do not add Cargo manifests, Rust
-source, extension-module code, or Python backend switches until the design and
-the implementation plan are approved.
+The public façade and side-by-side parity work are accepted through `7a89cde`.
+Commit `4d01c2c` is the current distribution candidate and has bounded
+PyPy/free-threaded qualification, but Task 19 is not closed: the complete
+Windows/macOS matrix is not green and no publish-manifest run exists for that
+commit. The copied Python façade remains the default backend; switching
+pristine built-in traffic to Rust is deliberately deferred to Task 20, and
+benchmarking remains Task 21. This is not a claim that the entire port is
+complete.
+
+Remote qualification of `4d01c2c` produced the following bounded result:
+
+| Workflow evidence | Result |
+| --- | --- |
+| Push-triggered Type Check `33337076507`, Lint `33337076601`, CodeQL `33337076512`, zizmor `33337076504` | Green |
+| PyPy 3.11 source jobs `99978604892`/`99978604941` and wheel jobs `99978612180`/`99978612190` on macOS/Linux | Green |
+| CPython 3.14t source jobs `99978604958`/`99978604985` and wheel jobs `99978612306`/`99978612060` on macOS/Linux | Green |
+| Tests workflow `33337076508` | Not globally green: default-Python Windows loopback jobs hit `WinError 10053` |
+| Wheels workflow `33337076517` | Not globally green: representative Windows job `99978612057` hit the same loopback failure and macOS job `99978611904` exceeded the 10-second differential-child timeout |
+
+The failing signatures are recorded as unresolved qualification issues; they
+are not hidden or converted into a global-green CI claim. Avoid another full
+remote matrix until a locally reviewed candidate addresses those failures or
+changes a meaningful boundary, so GitHub Actions usage remains controlled.
+A later scheduled CodeQL run, `33347254017`, failed on the same SHA and is not
+represented as part of the green push-triggered qualification set.
 
 Frozen oracle:
 
@@ -56,9 +78,17 @@ Ledger states are explicit:
 - `REVIEW_REQUIRED` and `UNKNOWN` lifetime rows block implementation of their
   owning component.
 
-Completion requires every applicable API and lifetime row to be `VERIFIED` or
-an approved `INSPECTION_ONLY`; it is not enough for a row to lack an
-`UNKNOWN` marker.
+Task 19 completion requires every applicable API and lifetime row to be
+`VERIFIED` or an approved `INSPECTION_ONLY`; the single allowed exception is
+the exact `cross-cutting/default backend/architecture` row, which stays
+`NOT_PORTED` with `future: Task 20` evidence until the one-time switch. It is
+not enough for a row to lack an `UNKNOWN` marker. Run
+`scripts/check_ledgers.py --completion` to enforce this boundary. Completion
+mode also rejects `VERIFIED` rows whose evidence or lifetime closure fields
+still say work is pending, incomplete, not ported, deferred to a numbered
+task, or future work. At the current candidate it intentionally fails on the
+`platform matrix` and `distribution surface` rows, which remain `IN_PROGRESS`
+until the failed matrix lanes and publish-manifest evidence are resolved.
 
 Ledger keys and evidence are also explicit:
 
