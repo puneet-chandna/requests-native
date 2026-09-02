@@ -118,9 +118,7 @@ def test_proxy_callback_sees_no_retained_body_ref_and_can_replace_exact_bytes(
                 callback_observed.append(other)
                 if getrefcount is not None:
                     assert baseline_refcount is not None
-                    refcount_deltas.append(
-                        getrefcount(original) - baseline_refcount
-                    )
+                    refcount_deltas.append(getrefcount(original) - baseline_refcount)
                 request.body = replacement
             return False
 
@@ -246,7 +244,9 @@ def test_urllib3_126_plain_http_remains_native(monkeypatch) -> None:
     assert server.requests == 1
 
 
-@pytest.mark.skipif(not urllib3.__version__.startswith("2."), reason="requires urllib3 2.x")
+@pytest.mark.skipif(
+    not urllib3.__version__.startswith("2."), reason="requires urllib3 2.x"
+)
 def test_urllib3_2_https_remains_native_eligible(monkeypatch) -> None:
     fallback_calls = []
 
