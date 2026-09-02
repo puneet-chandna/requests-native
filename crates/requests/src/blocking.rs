@@ -543,6 +543,14 @@ impl RequestBuilder {
         }
     }
 
+    #[doc(hidden)]
+    pub fn python_header_names(self, names: Vec<String>) -> Self {
+        Self {
+            inner: self.inner.python_header_names(names),
+            driver: self.driver,
+        }
+    }
+
     pub fn body(self, body: impl Into<BodySource>) -> Self {
         Self {
             inner: self.inner.body(body),
@@ -596,6 +604,11 @@ impl Response {
 
     pub fn headers(&self) -> &HeaderMap {
         self.inner.headers()
+    }
+
+    #[doc(hidden)]
+    pub fn raw_headers(&self) -> &[(String, Vec<u8>)] {
+        self.inner.raw_headers()
     }
 
     pub fn url(&self) -> &str {

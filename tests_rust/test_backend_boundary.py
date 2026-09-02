@@ -82,7 +82,7 @@ def test_pristine_trial_uses_one_native_pump_and_never_calls_python_send(
     assert runtime_observation["outstanding"] == 0
 
 
-def test_default_backend_calls_python_send_exactly_once(monkeypatch) -> None:
+def test_unsupported_default_calls_python_send_exactly_once(monkeypatch) -> None:
     marker = object()
     calls = []
 
@@ -94,6 +94,7 @@ def test_default_backend_calls_python_send_exactly_once(monkeypatch) -> None:
         adapters_module, "_HTTP_ADAPTER_COMPAT_SEND", compatibility_send
     )
     adapter = HTTPAdapter()
+    adapter.max_retries = object()
     pool_count = reset_native_telemetry()
     assert adapter.send(prepared("http://example.test/")) is marker
     assert len(calls) == 1
@@ -132,8 +133,7 @@ def test_subclass_and_custom_adapter_dispatch_to_python_once() -> None:
     session.mount("mock://", CustomAdapter())
     pool_count = reset_native_telemetry()
     try:
-        with requests._rust_public_trial():
-            response = session.get("mock://resource")
+        response = session.get("mock://resource")
     finally:
         session.close()
     assert response.content == b"custom"
@@ -160,24 +160,21 @@ def test_unsupported_retry_and_live_mutations_each_fall_back_once(monkeypatch) -
     pool_count = reset_native_telemetry()
     adapter = HTTPAdapter()
     adapter.max_retries = object()
-    with requests._rust_public_trial():
-        assert adapter.send(request) is marker
+    assert adapter.send(request) is marker
     assert_no_native_effects(pool_count)
 
     pool_count = reset_native_telemetry()
     with monkeypatch.context() as patched:
         patched.setattr(HTTPAdapter, "add_headers", lambda *args, **kwargs: None)
         adapter = HTTPAdapter()
-        with requests._rust_public_trial():
-            assert adapter.send(request) is marker
+        assert adapter.send(request) is marker
     assert_no_native_effects(pool_count)
 
     pool_count = reset_native_telemetry()
     with monkeypatch.context() as patched:
         patched.setattr(adapters_module, "select_proxy", lambda *args, **kwargs: None)
         adapter = HTTPAdapter()
-        with requests._rust_public_trial():
-            assert adapter.send(request) is marker
+        assert adapter.send(request) is marker
     assert_no_native_effects(pool_count)
 
     assert len(calls) == 3
@@ -189,8 +186,7 @@ def test_instance_method_monkeypatch_remains_authoritative() -> None:
     marker = object()
     adapter.send = lambda *args, **kwargs: calls.append((args, kwargs)) or marker
     pool_count = reset_native_telemetry()
-    with requests._rust_public_trial():
-        assert adapter.send(PreparedRequest()) is marker
+    assert adapter.send(PreparedRequest()) is marker
     assert len(calls) == 1
     assert_no_native_effects(pool_count)
 
@@ -207,8 +203,7 @@ def test_restored_dynamic_surfaces_readmit_the_exact_native_path(monkeypatch) ->
         session = Session()
         session.trust_env = False
         try:
-            with requests._rust_public_trial():
-                response = session.get(url)
+            response = session.get(url)
         finally:
             session.close()
     assert response.content == b"restored"

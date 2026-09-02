@@ -878,24 +878,6 @@ def _trial_http_adapter_send(
             )
             if result is not NotImplemented:
                 return result
-        if allowed and getattr(_ADAPTER_TRIAL_STATE, "enabled", False):
-            try:
-                from . import _requests_rust
-            except ImportError:
-                pass
-            else:
-                _register_rust_adapter_trial(self)
-                result = _requests_rust._adapter_send_trial(
-                    self,
-                    request,
-                    stream,
-                    timeout,
-                    verify,
-                    cert,
-                    proxies,
-                )
-                if result is not NotImplemented:
-                    return result
         return _HTTP_ADAPTER_COMPAT_SEND(
             self,
             request,

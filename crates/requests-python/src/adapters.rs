@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use pyo3::exceptions::{PyNameError, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyNameError, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -249,6 +249,7 @@ struct NativeAdapterRaw {
     status: u16,
     reason: String,
     headers: Py<PyAny>,
+    original_response: Py<PyAny>,
     closed: bool,
 }
 
@@ -1141,6 +1142,7 @@ struct NativeSendInput {
     url: String,
     urllib3_url: String,
     headers: HeaderMap,
+    header_names: Vec<String>,
     body: Option<Vec<u8>>,
     timeout: Timeout,
     tls: TlsConfig,
@@ -1520,8 +1522,10 @@ fn tls_value(
         let path = PathBuf::from(verify.extract::<String>()?);
         if path.is_dir() {
             CertificateSource::PemDirectory(path)
-        } else {
+        } else if path.is_file() {
             CertificateSource::PemBundle(path)
+        } else {
+            return Ok(None);
         }
     } else {
         return Ok(None);
@@ -1529,8 +1533,12 @@ fn tls_value(
     let identity = if cert.is_none() {
         None
     } else if cert.is_exact_instance_of::<PyString>() {
+        let certificate_chain = PathBuf::from(cert.extract::<String>()?);
+        if !certificate_chain.is_file() {
+            return Ok(None);
+        }
         Some(Identity {
-            certificate_chain: PathBuf::from(cert.extract::<String>()?),
+            certificate_chain,
             private_key: None,
         })
     } else if cert.is_exact_instance_of::<PyTuple>() {
@@ -1541,9 +1549,14 @@ fn tls_value(
         {
             return Ok(None);
         }
+        let certificate_chain = PathBuf::from(tuple.get_item(0)?.extract::<String>()?);
+        let private_key = PathBuf::from(tuple.get_item(1)?.extract::<String>()?);
+        if !certificate_chain.is_file() || !private_key.is_file() {
+            return Ok(None);
+        }
         Some(Identity {
-            certificate_chain: PathBuf::from(tuple.get_item(0)?.extract::<String>()?),
-            private_key: Some(PathBuf::from(tuple.get_item(1)?.extract::<String>()?)),
+            certificate_chain,
+            private_key: Some(private_key),
         })
     } else {
         return Ok(None);
@@ -1597,7 +1610,10 @@ fn proxy_value(
     Ok(Some((Some(proxy), Some(selected))))
 }
 
-fn request_headers(py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<Option<HeaderMap>> {
+fn request_headers(
+    py: Python<'_>,
+    request: &Bound<'_, PyAny>,
+) -> PyResult<Option<(HeaderMap, Vec<String>)>> {
     let headers = request.getattr("headers")?;
     let header_type = adapter_state(py)?
         .adapters_module
@@ -1613,6 +1629,7 @@ fn request_headers(py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<Optio
     }
     let items = store.call_method0("values")?;
     let mut native = HeaderMap::new();
+    let mut names = Vec::new();
     for item in items.try_iter()? {
         let item = item?;
         let pair = item.cast::<PyTuple>()?;
@@ -1622,7 +1639,8 @@ fn request_headers(py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<Optio
         {
             return Ok(None);
         }
-        let name = match HeaderName::from_bytes(pair.get_item(0)?.extract::<String>()?.as_bytes()) {
+        let spelling = pair.get_item(0)?.extract::<String>()?;
+        let name = match HeaderName::from_bytes(spelling.as_bytes()) {
             Ok(name) => name,
             Err(_) => return Ok(None),
         };
@@ -1631,8 +1649,9 @@ fn request_headers(py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<Optio
             Err(_) => return Ok(None),
         };
         native.append(name, value);
+        names.push(spelling);
     }
-    Ok(Some(native))
+    Ok(Some((native, names)))
 }
 
 fn request_body(request: &Bound<'_, PyAny>) -> PyResult<Option<Option<Vec<u8>>>> {
@@ -1698,7 +1717,10 @@ fn native_send_input(
     let Some(authority) = request_uri.authority() else {
         return Ok(Err("request URL is unsupported".to_owned()));
     };
-    let Some(headers) = request_headers(py, request)? else {
+    if authority.host().is_empty() {
+        return Ok(Err("request URL is unsupported".to_owned()));
+    }
+    let Some((headers, header_names)) = request_headers(py, request)? else {
         return Ok(Err("request headers are unsupported".to_owned()));
     };
     let Some(body) = request_body(request)? else {
@@ -1761,6 +1783,7 @@ fn native_send_input(
         url,
         urllib3_url,
         headers,
+        header_names,
         body,
         timeout,
         tls,
@@ -3208,7 +3231,7 @@ fn core_history(snapshot: &[HistorySnapshot]) -> Vec<RetryHistory> {
         .collect()
 }
 
-fn response_headers(py: Python<'_>, headers: &HeaderMap) -> PyResult<Py<PyAny>> {
+fn response_headers(py: Python<'_>, headers: &[(String, Vec<u8>)]) -> PyResult<Py<PyAny>> {
     let result = PyModule::import(py, "urllib3._collections")?
         .getattr("HTTPHeaderDict")?
         .call0()?;
@@ -3216,14 +3239,41 @@ fn response_headers(py: Python<'_>, headers: &HeaderMap) -> PyResult<Py<PyAny>> 
         result.call_method1(
             "add",
             (
-                name.as_str(),
-                value
-                    .to_str()
-                    .map_err(|error| PyValueError::new_err(error.to_string()))?,
+                name,
+                value.iter().copied().map(char::from).collect::<String>(),
             ),
         )?;
     }
     Ok(result.unbind())
+}
+
+fn normalized_response_headers(py: Python<'_>, headers: &HeaderMap) -> PyResult<Py<PyAny>> {
+    let raw = headers
+        .iter()
+        .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    response_headers(py, &raw)
+}
+
+fn original_response(py: Python<'_>, headers: &[(String, Vec<u8>)]) -> PyResult<Py<PyAny>> {
+    let message = PyModule::import(py, "http.client")?
+        .getattr("HTTPMessage")?
+        .call0()?;
+    for (name, value) in headers {
+        message.call_method1(
+            "add_header",
+            (
+                name,
+                value.iter().copied().map(char::from).collect::<String>(),
+            ),
+        )?;
+    }
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("msg", message)?;
+    Ok(PyModule::import(py, "types")?
+        .getattr("SimpleNamespace")?
+        .call((), Some(&kwargs))?
+        .unbind())
 }
 
 fn retry_after(py: Python<'_>, retry: &Bound<'_, PyAny>, headers: &HeaderMap) -> PyResult<f64> {
@@ -3231,7 +3281,7 @@ fn retry_after(py: Python<'_>, retry: &Bound<'_, PyAny>, headers: &HeaderMap) ->
         return Ok(0.0);
     }
     let kwargs = PyDict::new(py);
-    kwargs.set_item("headers", response_headers(py, headers)?)?;
+    kwargs.set_item("headers", normalized_response_headers(py, headers)?)?;
     let response = PyModule::import(py, "types")?
         .getattr("SimpleNamespace")?
         .call((), Some(&kwargs))?;
@@ -3349,8 +3399,18 @@ fn canonical_adapter_surrogate(
     pool: &Bound<'_, PyAny>,
     url: &str,
     urllib3_version: &str,
+    proxied: bool,
 ) -> PyResult<PyErr> {
-    let kind = error.kind();
+    let transport_kind = error.kind();
+    let kind = if proxied
+        && matches!(
+            error.kind(),
+            ErrorKind::Connect | ErrorKind::ConnectTimeout | ErrorKind::Dns
+        ) {
+        ErrorKind::Proxy
+    } else {
+        error.kind()
+    };
     let message = error.to_string();
     let urllib3_v2 = !urllib3_version.starts_with("1.26.");
     let direct = |name: &str, arguments: &Bound<'_, PyTuple>| -> PyResult<PyErr> {
@@ -3374,14 +3434,28 @@ fn canonical_adapter_surrogate(
         class.call((host,), Some(&kwargs))
     };
     let os_error = || -> PyResult<PyErr> {
-        let errno = error.raw_os_error().unwrap_or(1);
-        let message = PyModule::import(py, "os")?
+        let class = PyModule::import(py, "builtins")?.getattr("OSError")?;
+        let value = if let Some(errno) = error.raw_os_error() {
+            let detail = PyModule::import(py, "os")?
+                .getattr("strerror")?
+                .call1((errno,))?;
+            class.call1((errno, detail))?
+        } else {
+            class.call1((message.clone(),))?
+        };
+        Ok(PyErr::from_value(value))
+    };
+    let dns_error = || -> PyResult<PyErr> {
+        let socket = PyModule::import(py, "socket")?;
+        let errno = match error.raw_os_error() {
+            Some(errno) => errno,
+            None => socket.getattr("EAI_NONAME")?.extract()?,
+        };
+        let detail = PyModule::import(py, "os")?
             .getattr("strerror")?
             .call1((errno,))?;
         Ok(PyErr::from_value(
-            PyModule::import(py, "builtins")?
-                .getattr("OSError")?
-                .call1((errno, message))?,
+            socket.getattr("gaierror")?.call1((errno, detail))?,
         ))
     };
     let max_retry = |reason: PyErr| -> PyResult<PyErr> {
@@ -3398,6 +3472,7 @@ fn canonical_adapter_surrogate(
         ErrorKind::InvalidUrl | ErrorKind::MissingSchema => {
             direct("LocationValueError", &PyTuple::new(py, [message])?)
         }
+        ErrorKind::InvalidHeader => direct("_InvalidHeader", &PyTuple::new(py, [message])?),
         ErrorKind::ReadTimeout => {
             let class = canonical_adapter_global(py, state, "ReadTimeoutError")?;
             Ok(PyErr::from_value(class.call1((
@@ -3409,15 +3484,7 @@ fn canonical_adapter_surrogate(
         ErrorKind::Connect | ErrorKind::Dns => {
             let connection = connection()?;
             let source = if kind == ErrorKind::Dns {
-                let errno = error.raw_os_error().unwrap_or(-2);
-                let message = PyModule::import(py, "os")?
-                    .getattr("strerror")?
-                    .call1((errno,))?;
-                PyErr::from_value(
-                    PyModule::import(py, "socket")?
-                        .getattr("gaierror")?
-                        .call1((errno, message))?,
-                )
+                dns_error()?
             } else {
                 os_error()?
             };
@@ -3442,21 +3509,72 @@ fn canonical_adapter_surrogate(
         ErrorKind::ConnectTimeout | ErrorKind::Proxy | ErrorKind::Tls | ErrorKind::Handshake => {
             let (reason_name, reason) = match kind {
                 ErrorKind::ConnectTimeout => ("ConnectTimeoutError", message.clone()),
-                ErrorKind::Proxy => ("_ProxyError", message.clone()),
+                ErrorKind::Proxy => ("_ProxyError", "Unable to connect to proxy".to_owned()),
                 ErrorKind::Tls | ErrorKind::Handshake => ("_SSLError", message.clone()),
                 _ => unreachable!(),
             };
             let reason = if reason_name == "_ProxyError" {
-                let nested =
-                    canonical_adapter_global(py, state, "ProtocolError")?.call1((message,))?;
-                canonical_adapter_global(py, state, reason_name)?.call1((reason, nested))?
+                let nested = match transport_kind {
+                    ErrorKind::Connect | ErrorKind::Dns => {
+                        let connection = connection()?;
+                        let source = if transport_kind == ErrorKind::Dns {
+                            dns_error()?
+                        } else {
+                            os_error()?
+                        };
+                        let nested = if transport_kind == ErrorKind::Dns && urllib3_v2 {
+                            let host = pool.getattr("host")?;
+                            PyErr::from_value(
+                                PyModule::import(py, "urllib3.exceptions")?
+                                    .getattr("NameResolutionError")?
+                                    .call1((host, connection, source.value(py)))?,
+                            )
+                        } else {
+                            let detail = format!(
+                                "Failed to establish a new connection: {}",
+                                source.value(py)
+                            );
+                            PyErr::from_value(
+                                canonical_adapter_global(py, state, "NewConnectionError")?
+                                    .call1((connection, detail))?,
+                            )
+                        };
+                        with_source(nested, &source, urllib3_v2)
+                    }
+                    ErrorKind::ConnectTimeout => PyErr::from_value(
+                        canonical_adapter_global(py, state, "ConnectTimeoutError")?.call1((
+                            pool,
+                            py.None(),
+                            message,
+                        ))?,
+                    ),
+                    _ => PyErr::from_value(
+                        canonical_adapter_global(py, state, "ProtocolError")?.call1((message,))?,
+                    ),
+                };
+                let proxy = PyErr::from_value(
+                    canonical_adapter_global(py, state, reason_name)?
+                        .call1((reason, nested.value(py)))?,
+                );
+                proxy.set_cause(py, Some(nested));
+                proxy
             } else {
-                canonical_adapter_global(py, state, reason_name)?.call1((reason,))?
+                PyErr::from_value(
+                    canonical_adapter_global(py, state, reason_name)?.call1((reason,))?,
+                )
             };
-            max_retry(PyErr::from_value(reason))
+            max_retry(reason)
         }
         ErrorKind::Send | ErrorKind::Connection => {
-            let source = os_error()?;
+            let source = if error.raw_os_error().is_some() {
+                os_error()?
+            } else {
+                PyErr::from_value(
+                    PyModule::import(py, "http.client")?
+                        .getattr("RemoteDisconnected")?
+                        .call1(("Remote end closed connection without response",))?,
+                )
+            };
             let protocol = PyErr::from_value(
                 canonical_adapter_global(py, state, "ProtocolError")?
                     .call1(("Connection aborted.", source.value(py)))?,
@@ -3596,16 +3714,17 @@ fn mapped_transport_error(
     pool: &Bound<'_, PyAny>,
     url: &str,
     urllib3_version: &str,
+    proxied: bool,
 ) -> PyErr {
     let state = match adapter_state(py) {
         Ok(state) => state,
         Err(error) => return error,
     };
-    let original = match canonical_adapter_surrogate(py, state, &error, pool, url, urllib3_version)
-    {
-        Ok(original) => original,
-        Err(error) => return error,
-    };
+    let original =
+        match canonical_adapter_surrogate(py, state, &error, pool, url, urllib3_version, proxied) {
+            Ok(original) => original,
+            Err(error) => return error,
+        };
     map_adapter_surrogate(py, state, original, request)
 }
 
@@ -3635,7 +3754,9 @@ fn build_python_response(
         .get("content-encoding")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let headers = response_headers(py, response.headers())?;
+    let raw_headers = response.raw_headers().to_vec();
+    let headers = response_headers(py, &raw_headers)?;
+    let original_response = original_response(py, &raw_headers)?;
     let raw = Py::new(
         py,
         NativeAdapterRaw {
@@ -3651,6 +3772,7 @@ fn build_python_response(
             status,
             reason,
             headers,
+            original_response,
             closed: false,
         },
     )?;
@@ -3722,6 +3844,7 @@ fn native_adapter_leaf(
         let method = input.method.clone();
         let url = input.url.clone();
         let headers = input.headers.clone();
+        let header_names = input.header_names.clone();
         let body = input
             .body
             .clone()
@@ -3730,7 +3853,10 @@ fn native_adapter_leaf(
         let pool = Arc::clone(&pool);
         let attempt = run_with_actions_and_signal_checker(
             py,
-            move |_actions| async move { pool.send_async(method, &url, headers, body, timeout).await },
+            move |_actions| async move {
+                pool.send_async(method, &url, headers, header_names, body, timeout)
+                    .await
+            },
             |_py, action: AdapterSendAction| -> AdapterSendReply { match action {} },
             |py| py.check_signals(),
         )?;
@@ -3738,6 +3864,17 @@ fn native_adapter_leaf(
             Ok(response) => response,
             Err(error) => {
                 let reason = retry_reason(&error);
+                if error.kind() == ErrorKind::InvalidHeader {
+                    return Err(mapped_transport_error(
+                        py,
+                        error,
+                        request,
+                        &python_pool,
+                        &input.urllib3_url,
+                        &input.retry.version,
+                        input.selected_proxy.is_some(),
+                    ));
+                }
                 if matches!(reason, RetryReason::Read)
                     && !retry_state.allows_method(&input.method_name)
                 {
@@ -3748,6 +3885,7 @@ fn native_adapter_leaf(
                         &python_pool,
                         &input.urllib3_url,
                         &input.retry.version,
+                        input.selected_proxy.is_some(),
                     ));
                 }
                 match retry_state.increment(reason, &input.method_name, &input.url, None) {
@@ -3764,6 +3902,7 @@ fn native_adapter_leaf(
                             &python_pool,
                             &input.urllib3_url,
                             &input.retry.version,
+                            input.selected_proxy.is_some(),
                         ));
                     }
                 }
@@ -4401,6 +4540,11 @@ impl NativeAdapterRaw {
     #[getter]
     fn headers(&self, py: Python<'_>) -> Py<PyAny> {
         self.headers.clone_ref(py)
+    }
+
+    #[getter]
+    fn _original_response(&self, py: Python<'_>) -> Py<PyAny> {
+        self.original_response.clone_ref(py)
     }
 
     #[getter]

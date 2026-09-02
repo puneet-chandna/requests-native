@@ -91,6 +91,10 @@ impl Error {
         )
     }
 
+    pub(crate) fn invalid_response_header(message: impl Into<String>) -> Self {
+        Self::plain(ErrorKind::InvalidHeader, message.into())
+    }
+
     pub(crate) fn invalid_proxy(message: impl fmt::Display) -> Self {
         Self::transport(
             ErrorKind::Proxy,

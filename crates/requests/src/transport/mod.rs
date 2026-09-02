@@ -10,8 +10,10 @@ mod proxy;
 mod timeout_tests;
 mod tls;
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
+use std::io;
 use std::net::Shutdown;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -24,7 +26,7 @@ use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, HOST, PROXY_AUTHORIZATION};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
 use self::pool::{
@@ -224,6 +226,7 @@ pub(crate) struct TransportResponse {
     pub total_timeout: Option<Duration>,
     pub total_deadline: Option<Instant>,
     pub content_codecs: ContentCodecs,
+    pub raw_headers: Vec<(String, Vec<u8>)>,
 }
 
 pub(crate) struct TransportLease {
@@ -311,9 +314,378 @@ impl ActiveExchangeGuard {
     }
 }
 
+const MAX_RESPONSE_HEAD_BYTES: usize = 8192 + 4096 * 100;
+const MAX_RESPONSE_HEADERS: usize = 100;
+
+#[derive(Clone, Default)]
+struct ResponseHeadObservation(Arc<Mutex<ResponseHeadState>>);
+
+#[derive(Default)]
+struct ResponseHeadState {
+    generation: u64,
+    active: bool,
+    captured: Vec<u8>,
+    conflicting_content_length: bool,
+    raw_headers: Vec<(String, Vec<u8>)>,
+    python_header_names: Option<HashMap<String, String>>,
+}
+
+impl ResponseHeadObservation {
+    fn begin(&self, python_header_names: Option<Vec<String>>) {
+        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let generation = state.generation.wrapping_add(1);
+        *state = ResponseHeadState {
+            generation,
+            active: true,
+            captured: Vec::new(),
+            conflicting_content_length: false,
+            raw_headers: Vec::new(),
+            python_header_names: python_header_names.map(|names| {
+                names
+                    .into_iter()
+                    .map(|name| (name.to_ascii_lowercase(), name))
+                    .collect()
+            }),
+        };
+    }
+
+    fn observe(&self, bytes: &[u8]) {
+        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        if !state.active {
+            return;
+        }
+        let remaining = MAX_RESPONSE_HEAD_BYTES.saturating_sub(state.captured.len());
+        state
+            .captured
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        inspect_complete_response_head(&mut state);
+    }
+
+    fn complete_on_eof(&self) -> Option<Vec<u8>> {
+        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        if !state.active || state.captured.is_empty() {
+            return None;
+        }
+        let suffix = if state.captured.ends_with(b"\r\n") {
+            b"\r\n".as_slice()
+        } else {
+            b"\r\n\r\n".as_slice()
+        };
+        if state.captured.len() + suffix.len() > MAX_RESPONSE_HEAD_BYTES {
+            return None;
+        }
+        let mut completed = state.captured.clone();
+        completed.extend_from_slice(suffix);
+        let parsed = parsed_response_head(&completed)?;
+        if (100..200).contains(&parsed.status) && parsed.status != 101 {
+            return None;
+        }
+        state.conflicting_content_length = parsed.conflicting_content_length;
+        state.raw_headers = parsed.raw_headers;
+        state.active = false;
+        Some(suffix.to_vec())
+    }
+
+    fn conflicting_content_length(&self) -> bool {
+        self.0
+            .lock()
+            .expect("response-head observer lock poisoned")
+            .conflicting_content_length
+    }
+
+    fn raw_headers(&self) -> Vec<(String, Vec<u8>)> {
+        self.0
+            .lock()
+            .expect("response-head observer lock poisoned")
+            .raw_headers
+            .clone()
+    }
+
+    fn generation(&self) -> u64 {
+        self.0
+            .lock()
+            .expect("response-head observer lock poisoned")
+            .generation
+    }
+
+    fn rewrite_python_request_head(&self, bytes: &mut [u8]) {
+        let state = self.0.lock().expect("response-head observer lock poisoned");
+        let Some(names) = &state.python_header_names else {
+            return;
+        };
+        let Some(head_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return;
+        };
+        let Some(first_line_end) = bytes[..head_end]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        else {
+            return;
+        };
+        let mut start = first_line_end + 2;
+        while start < head_end {
+            let Some(relative_end) = bytes[start..head_end]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+            else {
+                break;
+            };
+            let end = start + relative_end;
+            if let Some(colon) = bytes[start..end].iter().position(|byte| *byte == b':') {
+                let name_end = start + colon;
+                let lower = String::from_utf8_lossy(&bytes[start..name_end]).to_ascii_lowercase();
+                let spelling = names
+                    .get(&lower)
+                    .cloned()
+                    .unwrap_or_else(|| python_default_header_spelling(&lower));
+                if spelling.len() == name_end - start {
+                    bytes[start..name_end].copy_from_slice(spelling.as_bytes());
+                }
+            }
+            start = end + 2;
+        }
+    }
+}
+
+struct ParsedResponseHead {
+    consumed: usize,
+    status: u16,
+    conflicting_content_length: bool,
+    raw_headers: Vec<(String, Vec<u8>)>,
+}
+
+fn parsed_response_head(bytes: &[u8]) -> Option<ParsedResponseHead> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+    let mut response = httparse::Response::new(&mut headers);
+    let httparse::Status::Complete(consumed) = response.parse(bytes).ok()? else {
+        return None;
+    };
+    let status = response.code?;
+    let mut content_lengths = Vec::new();
+    let mut content_lengths_are_valid = true;
+    let mut chunked = false;
+    let raw_headers = response
+        .headers
+        .iter()
+        .map(|header| (header.name.to_owned(), header.value.to_vec()))
+        .collect();
+    for header in response.headers.iter() {
+        if header.name.eq_ignore_ascii_case("content-length") {
+            for token in header.value.split(|byte| *byte == b',') {
+                let token = trim_ascii(token);
+                if token.is_empty() || !token.iter().all(u8::is_ascii_digit) {
+                    content_lengths_are_valid = false;
+                    continue;
+                }
+                match std::str::from_utf8(token)
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                {
+                    Some(value) => content_lengths.push(value),
+                    None => content_lengths_are_valid = false,
+                }
+            }
+        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked |= header
+                .value
+                .split(|byte| *byte == b',')
+                .any(|coding| trim_ascii(coding).eq_ignore_ascii_case(b"chunked"));
+        }
+    }
+    let conflicting_content_length = content_lengths_are_valid
+        && !chunked
+        && content_lengths
+            .first()
+            .is_some_and(|first| content_lengths.iter().any(|value| value != first));
+    Some(ParsedResponseHead {
+        consumed,
+        status,
+        conflicting_content_length,
+        raw_headers,
+    })
+}
+
+fn inspect_complete_response_head(state: &mut ResponseHeadState) {
+    while let Some(parsed) = parsed_response_head(&state.captured) {
+        if (100..200).contains(&parsed.status) && parsed.status != 101 {
+            state.captured.drain(..parsed.consumed);
+            continue;
+        }
+        state.conflicting_content_length = parsed.conflicting_content_length;
+        state.raw_headers = parsed.raw_headers;
+        state.active = false;
+        return;
+    }
+}
+
+fn python_default_header_spelling(lower: &str) -> String {
+    lower
+        .split('-')
+        .map(|part| {
+            let mut bytes = part.as_bytes().to_vec();
+            if let Some(first) = bytes.first_mut() {
+                first.make_ascii_uppercase();
+            }
+            String::from_utf8(bytes).expect("HTTP header names are ASCII")
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+struct ResponseHeadIo<IO> {
+    inner: IO,
+    observation: ResponseHeadObservation,
+    injected: VecDeque<u8>,
+    outgoing: Vec<u8>,
+    outgoing_offset: usize,
+    outgoing_head_complete: bool,
+    generation: u64,
+}
+
+impl<IO> ResponseHeadIo<IO> {
+    fn new(inner: IO, observation: ResponseHeadObservation) -> Self {
+        Self {
+            inner,
+            observation,
+            injected: VecDeque::new(),
+            outgoing: Vec::new(),
+            outgoing_offset: 0,
+            outgoing_head_complete: false,
+            generation: 0,
+        }
+    }
+
+    fn fill_injected(&mut self, buffer: &mut ReadBuf<'_>) {
+        let amount = buffer.remaining().min(self.injected.len());
+        let bytes = self.injected.drain(..amount).collect::<Vec<_>>();
+        buffer.put_slice(&bytes);
+    }
+
+    fn poll_drain_outgoing(&mut self, context: &mut Context<'_>) -> Poll<io::Result<()>>
+    where
+        IO: AsyncWrite + Unpin,
+    {
+        while self.outgoing_offset < self.outgoing.len() {
+            match Pin::new(&mut self.inner)
+                .poll_write(context, &self.outgoing[self.outgoing_offset..])
+            {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+                Poll::Ready(Ok(written)) => self.outgoing_offset += written,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.outgoing.clear();
+        self.outgoing_offset = 0;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<IO: AsyncRead + Unpin> AsyncRead for ResponseHeadIo<IO> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let generation = this.observation.generation();
+        if generation != this.generation {
+            debug_assert_eq!(this.outgoing_offset, this.outgoing.len());
+            this.outgoing.clear();
+            this.outgoing_offset = 0;
+            this.outgoing_head_complete = false;
+            this.generation = generation;
+        }
+        if !this.injected.is_empty() {
+            this.fill_injected(buffer);
+            return Poll::Ready(Ok(()));
+        }
+        let before = buffer.filled().len();
+        match Pin::new(&mut this.inner).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) => {
+                let read = &buffer.filled()[before..];
+                if read.is_empty() {
+                    if let Some(injected) = this.observation.complete_on_eof() {
+                        this.injected.extend(injected);
+                        this.fill_injected(buffer);
+                    }
+                } else {
+                    this.observation.observe(read);
+                }
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+impl<IO: AsyncWrite + Unpin> AsyncWrite for ResponseHeadIo<IO> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let generation = this.observation.generation();
+        if generation != this.generation {
+            debug_assert_eq!(this.outgoing_offset, this.outgoing.len());
+            this.outgoing.clear();
+            this.outgoing_offset = 0;
+            this.outgoing_head_complete = false;
+            this.generation = generation;
+        }
+        if this.outgoing_offset < this.outgoing.len() {
+            match this.poll_drain_outgoing(context) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if this.outgoing_head_complete {
+            return Pin::new(&mut this.inner).poll_write(context, buffer);
+        }
+        this.outgoing.extend_from_slice(buffer);
+        if this.outgoing.windows(4).any(|window| window == b"\r\n\r\n") {
+            this.observation
+                .rewrite_python_request_head(&mut this.outgoing);
+            this.outgoing_head_complete = true;
+        }
+        Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_drain_outgoing(context) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_flush(context),
+            result => result,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_drain_outgoing(context) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_shutdown(context),
+            result => result,
+        }
+    }
+}
+
 pub(crate) struct ConnectionDriver {
     task: Option<JoinHandle<Result<()>>>,
     shutdown: Option<std::net::TcpStream>,
+    response_head: Option<ResponseHeadObservation>,
     #[cfg(test)]
     shutdown_observer: Option<Arc<dyn EstablishmentControl>>,
 }
@@ -333,6 +705,7 @@ impl ConnectionDriver {
         Self {
             task: None,
             shutdown,
+            response_head: None,
             #[cfg(test)]
             shutdown_observer: None,
         }
@@ -341,6 +714,28 @@ impl ConnectionDriver {
     fn start(&mut self, task: impl Future<Output = Result<()>> + Send + 'static) {
         debug_assert!(self.task.is_none());
         self.task = Some(tokio::spawn(task));
+    }
+
+    fn observe_response_head(&mut self, observation: ResponseHeadObservation) {
+        self.response_head = Some(observation);
+    }
+
+    fn begin_response_head(&self, python_header_names: Option<Vec<String>>) {
+        if let Some(observation) = &self.response_head {
+            observation.begin(python_header_names);
+        }
+    }
+
+    fn conflicting_content_length(&self) -> bool {
+        self.response_head
+            .as_ref()
+            .is_some_and(ResponseHeadObservation::conflicting_content_length)
+    }
+
+    fn raw_response_headers(&self) -> Vec<(String, Vec<u8>)> {
+        self.response_head
+            .as_ref()
+            .map_or_else(Vec::new, ResponseHeadObservation::raw_headers)
     }
 
     #[cfg(test)]
@@ -740,6 +1135,7 @@ impl Transport {
             .expect("derived pool-key observation lock poisoned")
             .push(key.clone());
         let mut request = request.into_parts();
+        let python_header_names = request.python_header_names.clone();
         if absolute_form
             && let Some(proxy) = &self.proxy
             && let Some(authorization) = proxy::authorization(proxy)?
@@ -797,6 +1193,7 @@ impl Transport {
             let session_connection_identity = lease.session_connection_identity();
             let session_lease_identity = lease.session_lease_identity();
             let (sender, driver) = lease.connection_mut().network_parts_mut();
+            driver.begin_response_head(python_header_names);
             let response_head_correlation = self
                 .session_runtime
                 .as_ref()
@@ -882,7 +1279,17 @@ impl Transport {
                     }
                     ExchangeEvent::Response(result) => {
                         debug_assert!(head_wait.permits_post_head());
-                        break result.map_err(Error::send_hyper);
+                        break result
+                            .map(|response| (response, driver.raw_response_headers()))
+                            .map_err(|error| {
+                                if driver.conflicting_content_length() && error.is_parse() {
+                                    Error::invalid_response_header(
+                                        "conflicting Content-Length headers in response",
+                                    )
+                                } else {
+                                    Error::send_hyper(error)
+                                }
+                            });
                     }
                     ExchangeEvent::UploadComplete(completed_at) => {
                         completion_pending = false;
@@ -918,6 +1325,7 @@ impl Transport {
                 };
             }
         };
+        let (response, raw_headers) = response;
         let (head, body) = response.into_parts();
 
         Ok(TransportResponse {
@@ -929,6 +1337,7 @@ impl Transport {
             total_timeout,
             total_deadline,
             content_codecs: self.content_codecs,
+            raw_headers,
         })
     }
 
@@ -1186,9 +1595,13 @@ async fn start_http1<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (sender, connection) = http1::handshake(TokioIo::new(stream))
+    let observation = ResponseHeadObservation::default();
+    let stream = ResponseHeadIo::new(stream, observation.clone());
+    let (sender, connection) = http1::Builder::new()
+        .handshake(TokioIo::new(stream))
         .await
         .map_err(Error::handshake)?;
+    driver.observe_response_head(observation);
     driver.start(async move { connection.await.map_err(Error::connection_hyper) });
     Ok(IdleConnection::network(sender, driver, session_identity))
 }
@@ -1539,8 +1952,8 @@ mod tests {
     use http::{HeaderName, HeaderValue, Method};
 
     use super::{
-        ActiveExchangeGuard, ConnectionDriver, ResponseRemainderGate, outgoing_request,
-        validate_request,
+        ActiveExchangeGuard, ConnectionDriver, ResponseHeadObservation, ResponseRemainderGate,
+        outgoing_request, validate_request,
     };
     use crate::session_runtime::{SessionCheckpoint, SessionRuntimeHarness, SessionRuntimeHooks};
     use crate::{AsyncBody, BodySource, ErrorKind, RequestBuilder};
@@ -1593,16 +2006,48 @@ mod tests {
         let driver = ConnectionDriver {
             task: None,
             shutdown: None,
+            response_head: None,
             shutdown_observer: None,
         };
         let ConnectionDriver {
             task,
             shutdown,
+            response_head,
             shutdown_observer,
         } = &driver;
         let _: &Option<std::net::TcpStream> = shutdown;
         assert!(task.is_none());
         assert!(shutdown_observer.is_none());
+        assert!(response_head.is_none());
+    }
+
+    #[test]
+    fn eof_completes_only_a_valid_partial_response_head() {
+        let observation = ResponseHeadObservation::default();
+        observation.begin(None);
+        observation.observe(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n");
+
+        assert_eq!(observation.complete_on_eof(), Some(b"\r\n".to_vec()));
+        assert!(!observation.conflicting_content_length());
+
+        let empty = ResponseHeadObservation::default();
+        empty.begin(None);
+        assert_eq!(empty.complete_on_eof(), None);
+    }
+
+    #[test]
+    fn conflicting_numeric_content_lengths_are_observed_unless_chunked_wins() {
+        let conflict = ResponseHeadObservation::default();
+        conflict.begin(None);
+        conflict.observe(b"HTTP/1.1 200 OK\r\nContent-Length: 016\r\nContent-Length: 32\r\n\r\n");
+        assert!(conflict.conflicting_content_length());
+
+        let chunked = ResponseHeadObservation::default();
+        chunked.begin(None);
+        chunked.observe(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 16, 32\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert!(!chunked.conflicting_content_length());
     }
 
     #[test]
@@ -1616,7 +2061,9 @@ mod tests {
             .expect("transport source keeps one final cfg(test) module");
 
         assert_eq!(
-            production.matches("http1::handshake(").count(),
+            production
+                .matches(".handshake(TokioIo::new(stream))")
+                .count(),
             1,
             "plain and TLS streams must share exactly one Hyper HTTP/1 handshake"
         );

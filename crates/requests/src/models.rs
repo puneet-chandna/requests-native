@@ -330,6 +330,7 @@ pub struct Request {
     url: String,
     uri: Uri,
     headers: HeaderMap,
+    python_header_names: Option<Vec<String>>,
     body: BodySource,
     timeout: Option<Timeout>,
 }
@@ -365,6 +366,7 @@ impl Request {
             url: self.url,
             uri: self.uri,
             headers: self.headers,
+            python_header_names: self.python_header_names,
             body: self.body,
         }
     }
@@ -375,6 +377,7 @@ pub(crate) struct RequestParts {
     pub url: String,
     pub uri: Uri,
     pub headers: HeaderMap,
+    pub python_header_names: Option<Vec<String>>,
     pub body: BodySource,
 }
 
@@ -400,6 +403,7 @@ impl RequestBuilder {
                 url,
                 uri,
                 headers: HeaderMap::new(),
+                python_header_names: None,
                 body: BodySource::Empty,
                 timeout: None,
             }),
@@ -433,6 +437,14 @@ impl RequestBuilder {
     pub fn headers(mut self, headers: HeaderMap) -> Self {
         if let Ok(request) = &mut self.request {
             request.headers = headers;
+        }
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn python_header_names(mut self, names: Vec<String>) -> Self {
+        if let Ok(request) = &mut self.request {
+            request.python_header_names = Some(names);
         }
         self
     }

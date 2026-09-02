@@ -9,8 +9,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 BACKEND_NODE_IDS = [
+    "tests_rust/test_default_backend.py",
     "tests_rust/test_backend_boundary.py",
-    "tests_differential/test_public_types.py::test_task17_default_backend_remains_python_outside_explicit_trial",
     "tests_differential/test_import_api.py::test_task17_red_root_one_shot_uses_explicit_semantic_session_trial",
     "tests_differential/test_adapters.py::test_exact_admission_falls_back_before_native_pool_creation",
     "tests_differential/test_adapters.py::test_restored_instance_class_and_module_state_readmits_native_trial",
@@ -32,7 +32,7 @@ def static_check() -> None:
         raise ValueError("trial activation must remain thread-local and explicit")
     if "os.environ" in source or "REQUESTS_RUST_BACKEND" in source:
         raise ValueError(
-            "environment/global backend selector is forbidden before Task 20"
+            "environment/global backend selector is forbidden at the backend boundary"
         )
     sessions = (ROOT / "src" / "requests" / "sessions.py").read_text(encoding="utf-8")
     if "def _rust_public_trial" not in sessions:
@@ -41,7 +41,7 @@ def static_check() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Prove the explicit Requests backend boundary"
+        description="Prove the default Rust and explicit compatibility boundary"
     )
     parser.add_argument("--static-only", action="store_true")
     arguments = parser.parse_args()

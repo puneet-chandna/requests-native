@@ -63,6 +63,7 @@ impl AdapterPool {
         method: Method,
         url: &str,
         headers: HeaderMap,
+        header_names: Vec<String>,
         body: BodySource,
         timeout: Timeout,
     ) -> Result<AdapterResponse> {
@@ -71,6 +72,7 @@ impl AdapterPool {
             .client
             .request(method, url)
             .headers(headers)
+            .python_header_names(header_names)
             .body(body)
             .timeout(timeout)
             .send_async()
@@ -109,6 +111,11 @@ impl AdapterResponse {
 
     pub fn headers(&self) -> &HeaderMap {
         self.inner.headers()
+    }
+
+    #[doc(hidden)]
+    pub fn raw_headers(&self) -> &[(String, Vec<u8>)] {
+        self.inner.raw_headers()
     }
 
     pub fn into_raw_body(self) -> AdapterResponseBody {

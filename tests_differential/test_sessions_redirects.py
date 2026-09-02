@@ -31197,27 +31197,27 @@ def test_session_native_source_rejects_compatibility_escape_hatches() -> None:
     assert authority_lines == [
         (
             "crates/requests-python/src/adapters.rs",
-            584,
+            585,
             "6ff42154c2764506a496d48ac1e5df73c27a8d0497a8f549b92f750ffd29f5d0",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            643,
+            644,
             "572270f44d469f02c6c94dba4629b26ee1d1e842d5a9efc990b2cdffe95580e7",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            670,
+            671,
             "6550cc699a38280d9168af091d5760b035d535e8038316938a7ed0d5f352176e",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            1185,
+            1187,
             "00f28b5517641d3be07c8953c0edcc548c4512e64515a6b18fd8a1c7f9d51784",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            1372,
+            1374,
             "7775e84e0f087a8a48c391b14c6299a50d3d5b994d09693124a614c05cd465e9",
         ),
         (

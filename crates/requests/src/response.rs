@@ -65,6 +65,7 @@ pub struct Response {
     total_deadline: Option<Instant>,
     disposition: Option<ResponseDispositionState>,
     content_codecs: ContentCodecs,
+    raw_headers: Vec<(String, Vec<u8>)>,
 }
 
 impl Response {
@@ -79,6 +80,7 @@ impl Response {
             total_deadline: response.total_deadline,
             disposition: Some(ResponseDispositionState::default()),
             content_codecs: response.content_codecs,
+            raw_headers: response.raw_headers,
         }
     }
 
@@ -115,6 +117,11 @@ impl Response {
 
     pub fn headers(&self) -> &HeaderMap {
         &self.head.headers
+    }
+
+    #[doc(hidden)]
+    pub fn raw_headers(&self) -> &[(String, Vec<u8>)] {
+        &self.raw_headers
     }
 
     pub fn url(&self) -> &str {
@@ -209,6 +216,9 @@ enum ResponseBodySource {
     Pending,
 }
 
+// The size difference exists only in test builds: `Controlled` is a small,
+// deterministic test double, while production has only the `Network` variant.
+#[cfg_attr(test, allow(clippy::large_enum_variant))]
 enum ResponseBodyDriver {
     Network(TransportLease),
     #[cfg(test)]

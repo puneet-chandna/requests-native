@@ -780,7 +780,10 @@ fn production_https_establishment_inventory_is_ordered_and_typed() {
         violations.push("read timeout must not govern connection establishment");
     }
     if !production.contains("fn start_http1<")
-        || production.matches("http1::handshake(").count() != 1
+        || production
+            .matches(".handshake(TokioIo::new(stream))")
+            .count()
+            != 1
         || !production.contains(".map_err(Error::handshake)")
     {
         violations.push("one shared private Hyper HTTP/1 seam must retain Handshake mapping");

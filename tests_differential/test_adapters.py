@@ -210,8 +210,11 @@ def mutated_manager_behavior(manager, mutation):
     raise AssertionError(f"unknown mutation {mutation}")
 
 
-def test_default_path_and_visible_urllib3_state_remain_python_compatible(monkeypatch):
+def test_unsupported_default_path_and_visible_urllib3_state_remain_python_compatible(
+    monkeypatch,
+):
     adapter = HTTPAdapter(pool_connections=3, pool_maxsize=4, pool_block=True)
+    adapter.max_retries = object()
     original_retry = adapter.max_retries
     original_manager = adapter.poolmanager
     marker = object()

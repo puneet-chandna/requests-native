@@ -169,12 +169,14 @@ def test_ledger_completion_rejects_unfinished_lifetime_rows(
     assert f"unfinished lifetime status {status!r}" in completed.stderr
 
 
-def test_task_19_completion_allows_only_the_documented_task_20_boundary(
+@pytest.mark.parametrize("status", ["NOT_PORTED", "IN_PROGRESS"])
+def test_task_20_candidate_default_backend_is_not_a_completion_exception(
     tmp_path: Path,
+    status: str,
 ) -> None:
     api, lifetime = write_minimal_ledgers(
         tmp_path,
-        api_status="NOT_PORTED",
+        api_status=status,
         lifetime_status="VERIFIED",
         future=True,
     )
@@ -188,7 +190,25 @@ def test_task_19_completion_allows_only_the_documented_task_20_boundary(
         str(lifetime),
     )
 
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode == 1
+    assert f"unfinished API status {status!r}" in completed.stderr
+
+
+def test_current_default_backend_row_records_local_candidate_and_remote_deferral() -> (
+    None
+):
+    with (ROOT / "API_COMPATIBILITY.tsv").open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream, delimiter="\t"))
+
+    row = next(
+        row
+        for row in rows
+        if (row["module"], row["symbol"], row["kind"])
+        == ("cross-cutting", "default backend", "architecture")
+    )
+    assert row["port_status"] == "IN_PROGRESS"
+    assert "tests_rust/test_default_backend.py" in row["evidence"]
+    assert "Task 21 v1.0.0-beta gate" in row["evidence"]
 
 
 def test_ledger_completion_rejects_verified_api_with_unfinished_evidence(

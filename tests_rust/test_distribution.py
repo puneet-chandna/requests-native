@@ -169,20 +169,18 @@ worker.start()
 url = f"http://127.0.0.1:{server.server_port}/"
 default_session = requests.Session()
 default_session.trust_env = False
+original = adapters._HTTP_ADAPTER_COMPAT_SEND
+adapters._HTTP_ADAPTER_COMPAT_SEND = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Python fallback"))
 try:
     default_response = default_session.get(url)
     assert default_response.content == b"native"
-    assert type(default_response.raw).__module__.startswith("urllib3")
+    assert type(default_response.raw).__module__ == "requests._requests_rust"
     assert server.requests == 1
 finally:
     default_session.close()
-assert extension._public_facade_pump_trial("snapshot")["submission_ids"] == []
-assert extension._runtime_submission_trial("snapshot")["events"] == []
 
 session = requests.Session()
 session.trust_env = False
-original = adapters._HTTP_ADAPTER_COMPAT_SEND
-adapters._HTTP_ADAPTER_COMPAT_SEND = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Python fallback"))
 try:
     with requests._rust_public_trial():
         response = session.get(url)

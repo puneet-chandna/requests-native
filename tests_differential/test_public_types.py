@@ -521,96 +521,6 @@ _PYTHON_COMPOSED_OPERATIONS = MappingProxyType(
     }
 )
 
-_DEFAULT_SOURCE = r"""
-from types import SimpleNamespace
-import requests
-import requests.adapters as adapters_module
-import requests.api as api_module
-from requests.adapters import HTTPAdapter
-from requests.adapters import BaseAdapter
-from requests.models import PreparedRequest, Response
-from requests.sessions import Session
-
-events = []
-extension = requests._requests_rust
-seam_names = (
-    "_model_facade_trial", "_response_facade_trial",
-    "_session_facade_trial", "_adapter_facade_trial",
-)
-missing = object()
-originals = {name: getattr(extension, name, missing) for name in seam_names}
-def forbidden(name):
-    def dispatch(*args, **kwargs):
-        events.append(name)
-        raise AssertionError("semantic facade ran outside explicit trial: " + name)
-    return dispatch
-for name in seam_names:
-    setattr(extension, name, forbidden(name))
-
-class ScriptedAdapter(BaseAdapter):
-    def send(self, request, **kwargs):
-        response = Response()
-        response.status_code = 200
-        response.url = request.url
-        response.request = request
-        response.raw = SimpleNamespace(_original_response=None)
-        response._content = request.url.encode()
-        response._content_consumed = True
-        response.history = []
-        return response
-    def close(self):
-        pass
-
-session = Session()
-session.adapters.clear()
-session.mount("mock://", ScriptedAdapter())
-prepared = PreparedRequest()
-prepared.prepare(method="GET", url="mock://session")
-response_probe = Response()
-response_probe._content = b"response"
-response_probe._content_consumed = True
-compat = adapters_module._HTTP_ADAPTER_COMPAT_SEND
-factory = api_module.sessions.Session
-adapters_module._HTTP_ADAPTER_COMPAT_SEND = lambda *args, **kwargs: "python-adapter"
-api_module.sessions.Session = lambda: session
-try:
-    prepared.prepare_method("PATCH")
-    response_content = response_probe.content.decode()
-    session_response = session.send(prepared, allow_redirects=False)
-    adapter_result = HTTPAdapter().send(prepared)
-    root_response = requests.get("mock://root")
-finally:
-    adapters_module._HTTP_ADAPTER_COMPAT_SEND = compat
-    api_module.sessions.Session = factory
-    for name, original in originals.items():
-        if original is missing:
-            delattr(extension, name)
-        else:
-            setattr(extension, name, original)
-result = SimpleNamespace(**{
-    "semantic_events": events,
-    "model": prepared.method,
-    "response": response_content,
-    "session": session_response.content.decode(),
-    "adapter": adapter_result,
-    "root": root_response.content.decode(),
-})
-"""
-
-
-def test_task17_default_backend_remains_python_outside_explicit_trial() -> None:
-    run = run_rewrite_case({"source": dedent(_DEFAULT_SOURCE)})
-    assert run.observations["exception"] is None
-    assert run.observations["result"]["public_state"] == {
-        "semantic_events": [],
-        "model": "PATCH",
-        "response": "response",
-        "session": "mock://session",
-        "adapter": "python-adapter",
-        "root": "mock://root",
-    }
-
-
 _INVENTORY_SOURCE = r"""
 import pickle
 from types import SimpleNamespace
@@ -1176,7 +1086,6 @@ def test_task17_public_type_inventory_and_mutation_guards_are_consolidated() -> 
         ]
         assert len(assignments) == 1
     for source in (
-        _DEFAULT_SOURCE,
         _INVENTORY_SOURCE,
         _REAL_SOURCE,
         _SIDE_SOURCE,

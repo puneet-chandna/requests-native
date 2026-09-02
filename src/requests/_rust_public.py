@@ -429,7 +429,7 @@ def dispatch(
     kwargs: dict[str, Any],
 ) -> Any:
     if (
-        not _trial_enabled()
+        (not _trial_enabled() and group not in {"session", "adapter"})
         or getattr(_TRIAL_STATE, "suspended", False)
         or group in getattr(_TRIAL_STATE, "native_dispatch_groups", ())
     ):

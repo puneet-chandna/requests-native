@@ -41,9 +41,6 @@ UNFINISHED_COMPLETION = re.compile(
     r"|\b(?:future\s*:|deferred\s+to)\s*tasks?\s*\d+(?:/\d+)?\b",
     re.IGNORECASE,
 )
-FUTURE_TASK = re.compile(
-    r"\b(?:future\s*:|deferred\s+to)\s*task\s*(\d+)\b", re.IGNORECASE
-)
 EXECUTABLE_TEST_PATH = re.compile(
     r"(?:tests|tests_differential|tests_rust)/[A-Za-z0-9_./-]+\.py\b"
     r"|crates/[A-Za-z0-9_-]+/tests/[A-Za-z0-9_./-]+\.rs\b"
@@ -57,15 +54,6 @@ PLACEHOLDER_TEST_EVIDENCE = re.compile(
     re.IGNORECASE,
 )
 REVIEW_COMMIT = re.compile(r"(?:^|;\s*)review:[^;]*\b[0-9a-f]{7,40}\b")
-DEFAULT_BACKEND_EXCEPTION = {
-    "module": "cross-cutting",
-    "symbol": "default backend",
-    "kind": "architecture",
-    "signature_or_shape": "built-in HTTPAdapter sends through Rust",
-    "compatibility_requirement": "Do not route default network I/O through urllib3",
-    "oracle_source": "approved design",
-    "port_status": "NOT_PORTED",
-}
 
 
 def read_rows(path: Path, headers: tuple[str, ...]) -> list[dict[str, str]]:
@@ -139,20 +127,6 @@ def require_review_commit(path: Path, number: int, evidence: str) -> None:
         raise ValueError(f"{path}:{number}: review evidence missing exact commit")
 
 
-def is_allowed_default_backend_exception(row: dict[str, str]) -> bool:
-    if any(
-        row[name] != expected for name, expected in DEFAULT_BACKEND_EXCEPTION.items()
-    ):
-        return False
-    matches = list(FUTURE_TASK.finditer(row["evidence"]))
-    if len(matches) != 1 or matches[0].group(0) != "future: Task 20":
-        return False
-    remaining = (
-        row["evidence"][: matches[0].start()] + row["evidence"][matches[0].end() :]
-    )
-    return UNFINISHED_COMPLETION.search(remaining) is None
-
-
 def check_api(path: Path, *, completion: bool = False) -> Counter[str]:
     rows = read_rows(path, API_HEADERS)
     if completion and not rows:
@@ -179,8 +153,7 @@ def check_api(path: Path, *, completion: bool = False) -> Counter[str]:
         elif status == "INSPECTION_ONLY":
             require_tokens(path, number, row["evidence"], ("reason:", "review:"))
         if completion and status not in {"VERIFIED", "INSPECTION_ONLY"}:
-            if not is_allowed_default_backend_exception(row):
-                raise ValueError(f"{path}:{number}: unfinished API status {status!r}")
+            raise ValueError(f"{path}:{number}: unfinished API status {status!r}")
     return Counter(row["port_status"] for row in rows)
 
 
@@ -237,7 +210,7 @@ def main() -> int:
     parser.add_argument(
         "--completion",
         action="store_true",
-        help="require Task 19 ledger closure while preserving the Task 20 switch",
+        help="require every compatibility and lifetime row to be closed",
     )
     arguments = parser.parse_args()
     try:

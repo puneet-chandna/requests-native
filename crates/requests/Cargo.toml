@@ -27,6 +27,7 @@ futures-core = "0.3"
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
+httparse = "1"
 indexmap = "2"
 md-5 = "0.10"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"], optional = true }

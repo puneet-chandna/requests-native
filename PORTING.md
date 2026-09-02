@@ -10,13 +10,18 @@ visible, and let the existing tests define correctness.
 ## Status
 
 The public façade and side-by-side parity work are accepted through `7a89cde`.
-Commit `4d01c2c` is the current distribution candidate and has bounded
-PyPy/free-threaded qualification, but Task 19 is not closed: the complete
-Windows/macOS matrix is not green and no publish-manifest run exists for that
-commit. The copied Python façade remains the default backend; switching
-pristine built-in traffic to Rust is deliberately deferred to Task 20, and
-benchmarking remains Task 21. This is not a claim that the entire port is
-complete.
+Commit `4d01c2c` remains the remotely tested distribution candidate and has
+bounded PyPy/free-threaded qualification, but Task 19 is not closed: the
+complete Windows/macOS matrix is not green and no publish-manifest run exists
+for that commit. The local Task 20 candidate now routes only exact pristine
+built-in Session/HTTPAdapter traffic through Rust by default; unsupported,
+subclassed, custom, and dynamically mutated surfaces retain Python authority.
+Its unchanged, differential, default-boundary, and fresh local artifact gates
+are green. Task 20 remains `IN_PROGRESS`: final boundary reviews are pending,
+and the user explicitly deferred the full exact-commit remote artifact matrix
+and publish evidence to the final Task 21 v1.0.0-beta gate to conserve GitHub
+Actions usage. Benchmarking remains Task 21. This is not a claim that the
+entire port is complete.
 
 Remote qualification of `4d01c2c` produced the following bounded result:
 
@@ -78,17 +83,16 @@ Ledger states are explicit:
 - `REVIEW_REQUIRED` and `UNKNOWN` lifetime rows block implementation of their
   owning component.
 
-Task 19 completion requires every applicable API and lifetime row to be
-`VERIFIED` or an approved `INSPECTION_ONLY`; the single allowed exception is
-the exact `cross-cutting/default backend/architecture` row, which stays
-`NOT_PORTED` with `future: Task 20` evidence until the one-time switch. It is
+Final completion requires every applicable API and lifetime row to be
+`VERIFIED` or an approved `INSPECTION_ONLY`; the former Task 20 default-backend
+exception no longer applies now that the local switch candidate exists. It is
 not enough for a row to lack an `UNKNOWN` marker. Run
 `scripts/check_ledgers.py --completion` to enforce this boundary. Completion
 mode also rejects `VERIFIED` rows whose evidence or lifetime closure fields
 still say work is pending, incomplete, not ported, deferred to a numbered
 task, or future work. At the current candidate it intentionally fails on the
-`platform matrix` and `distribution surface` rows, which remain `IN_PROGRESS`
-until the failed matrix lanes and publish-manifest evidence are resolved.
+`platform matrix`, `distribution surface`, and `default backend` rows, which
+remain `IN_PROGRESS` until their final review and remote evidence is recorded.
 
 Ledger keys and evidence are also explicit:
 
