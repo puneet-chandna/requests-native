@@ -41,13 +41,48 @@ def is_urllib3_126() -> bool:
     )
 
 
-def test_legacy_tls_fallback_precedes_body_materialization() -> None:
+def test_body_validation_precedes_retry_and_legacy_fallback_precedes_copy() -> None:
     source = Path("crates/requests-python/src/adapters.rs").read_text()
     start = source.index("fn native_send_input")
     native_send = source[start : source.index("fn adapter_id", start)]
-    assert native_send.index("is_stable_urllib3_126(&retry.version)") < (
-        native_send.index("request_body(request)?")
+    validation = native_send.index("request_body(request)?")
+    retry = native_send.index('adapter.getattr("max_retries")?')
+    fallback = native_send.index("is_stable_urllib3_126(&retry.version)")
+    copy = native_send.index("as_bytes().to_vec()")
+    assert validation < retry < fallback < copy
+
+
+def test_unsupported_body_falls_back_before_proxy_observation(monkeypatch) -> None:
+    events = []
+
+    class ObservedProxyKey:
+        def __hash__(self):
+            return hash("http")
+
+        def __eq__(self, other):
+            events.append(other)
+            return False
+
+    marker = object()
+    calls = []
+
+    def compatibility_send(*args, **kwargs):
+        calls.append((args, kwargs))
+        return marker
+
+    request = prepared("http://example.test/")
+    request.body = object()
+    proxies = {ObservedProxyKey(): "https://proxy.test:8443"}
+    events.clear()
+    monkeypatch.setattr(
+        adapters_module, "_HTTP_ADAPTER_COMPAT_SEND", compatibility_send
     )
+    pool_count = reset_native_telemetry()
+
+    assert HTTPAdapter().send(request, proxies=proxies) is marker
+    assert events == []
+    assert len(calls) == 1
+    assert_no_native_effects(pool_count)
 
 
 @pytest.mark.skipif(not is_urllib3_126(), reason="requires urllib3 1.26.x")
