@@ -250,6 +250,7 @@ struct NativeAdapterRaw {
     reason: String,
     headers: Py<PyAny>,
     original_response: Py<PyAny>,
+    overflowing_content_length: Option<String>,
     closed: bool,
 }
 
@@ -3755,6 +3756,7 @@ fn build_python_response(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let raw_headers = response.raw_headers().to_vec();
+    let overflowing_content_length = overflowing_content_length(&raw_headers);
     let headers = response_headers(py, &raw_headers)?;
     let original_response = original_response(py, &raw_headers)?;
     let raw = Py::new(
@@ -3773,12 +3775,65 @@ fn build_python_response(
             reason,
             headers,
             original_response,
+            overflowing_content_length,
             closed: false,
         },
     )?;
     Ok(adapter
         .call_method1("build_response", (request, raw))?
         .unbind())
+}
+
+fn overflowing_content_length(headers: &[(String, Vec<u8>)]) -> Option<String> {
+    if headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(|byte| *byte == b',')
+                .any(|coding| trim_http_ows(coding).eq_ignore_ascii_case(b"chunked"))
+    }) {
+        return None;
+    }
+    let mut declared: Option<&[u8]> = None;
+    for (_, value) in headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+        for token in value.split(|byte| *byte == b',') {
+            let token = trim_http_ows(token);
+            if token.is_empty() || !token.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let canonical = token
+                .iter()
+                .position(|byte| *byte != b'0')
+                .map_or(&token[token.len() - 1..], |start| &token[start..]);
+            if declared.is_some_and(|declared| declared != canonical) {
+                return None;
+            }
+            declared = Some(canonical);
+        }
+    }
+    let declared = std::str::from_utf8(declared?).ok()?;
+    declared
+        .parse::<u64>()
+        .is_err()
+        .then(|| declared.to_owned())
+}
+
+fn trim_http_ows(mut bytes: &[u8]) -> &[u8] {
+    while bytes
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        bytes = &bytes[1..];
+    }
+    while bytes
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
 }
 
 #[allow(clippy::too_many_arguments)] // Mirrors HTTPAdapter.send's public signature.
@@ -4262,7 +4317,14 @@ impl NativeAdapterRaw {
             .and_then(|source| source.downcast_ref::<requests::Error>())
             .map_or_else(
                 || PyRuntimeError::new_err(error.to_string()),
-                |source| map_typed_raw_response_error(py, source, Some(self.pool.bind(py))),
+                |source| {
+                    map_typed_raw_response_error(
+                        py,
+                        source,
+                        Some(self.pool.bind(py)),
+                        self.overflowing_content_length.as_deref(),
+                    )
+                },
             );
         self.finish_body_failure();
         mapped

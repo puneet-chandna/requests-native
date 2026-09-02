@@ -325,9 +325,20 @@ struct ResponseHeadState {
     generation: u64,
     active: bool,
     captured: Vec<u8>,
-    conflicting_content_length: bool,
+    final_head_start: usize,
+    final_head_consumed: usize,
+    content_length_normalization: ContentLengthNormalization,
+    conflicting_content_length: Option<String>,
     raw_headers: Vec<(String, Vec<u8>)>,
     python_header_names: Option<HashMap<String, String>>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum ContentLengthNormalization {
+    #[default]
+    None,
+    Ignore,
+    Overflow,
 }
 
 impl ResponseHeadObservation {
@@ -338,7 +349,10 @@ impl ResponseHeadObservation {
             generation,
             active: true,
             captured: Vec::new(),
-            conflicting_content_length: false,
+            final_head_start: 0,
+            final_head_consumed: 0,
+            content_length_normalization: ContentLengthNormalization::None,
+            conflicting_content_length: None,
             raw_headers: Vec::new(),
             python_header_names: python_header_names.map(|names| {
                 names
@@ -359,6 +373,44 @@ impl ResponseHeadObservation {
             .captured
             .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
         inspect_complete_response_head(&mut state);
+    }
+
+    fn buffers_python_response_head(&self) -> bool {
+        let state = self.0.lock().expect("response-head observer lock poisoned");
+        state.active && state.python_header_names.is_some()
+    }
+
+    fn buffer_python_response_bytes(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let remaining = MAX_RESPONSE_HEAD_BYTES.saturating_sub(state.captured.len());
+        if bytes.len() > remaining {
+            let mut passthrough = std::mem::take(&mut state.captured);
+            passthrough.extend_from_slice(bytes);
+            state.active = false;
+            state.python_header_names = None;
+            return Some(passthrough);
+        }
+        state.captured.extend_from_slice(bytes);
+        inspect_complete_response_head(&mut state);
+        take_normalized_python_response(&mut state)
+    }
+
+    fn complete_python_response_on_eof(&self) -> Option<Vec<u8>> {
+        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        if !state.active || state.captured.is_empty() {
+            return None;
+        }
+        let suffix = if state.captured.ends_with(b"\r\n") {
+            b"\r\n".as_slice()
+        } else {
+            b"\r\n\r\n".as_slice()
+        };
+        if state.captured.len() + suffix.len() > MAX_RESPONSE_HEAD_BYTES {
+            return None;
+        }
+        state.captured.extend_from_slice(suffix);
+        inspect_complete_response_head(&mut state);
+        take_normalized_python_response(&mut state)
     }
 
     fn complete_on_eof(&self) -> Option<Vec<u8>> {
@@ -386,19 +438,19 @@ impl ResponseHeadObservation {
         Some(suffix.to_vec())
     }
 
-    fn conflicting_content_length(&self) -> bool {
+    fn conflicting_content_length(&self) -> Option<String> {
         self.0
             .lock()
             .expect("response-head observer lock poisoned")
             .conflicting_content_length
+            .clone()
     }
 
-    fn raw_headers(&self) -> Vec<(String, Vec<u8>)> {
-        self.0
-            .lock()
-            .expect("response-head observer lock poisoned")
-            .raw_headers
-            .clone()
+    fn take_raw_headers(&self) -> Vec<(String, Vec<u8>)> {
+        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        state.captured = Vec::new();
+        state.python_header_names = None;
+        std::mem::take(&mut state.raw_headers)
     }
 
     fn generation(&self) -> u64 {
@@ -408,7 +460,7 @@ impl ResponseHeadObservation {
             .generation
     }
 
-    fn rewrite_python_request_head(&self, bytes: &mut [u8]) {
+    fn rewrite_python_request_head(&self, bytes: &mut Vec<u8>) {
         let state = self.0.lock().expect("response-head observer lock poisoned");
         let Some(names) = &state.python_header_names else {
             return;
@@ -422,35 +474,56 @@ impl ResponseHeadObservation {
         else {
             return;
         };
+        let request_line = bytes[..first_line_end].to_vec();
+        let tail = bytes[head_end + 4..].to_vec();
+        let mut headers = Vec::new();
         let mut start = first_line_end + 2;
         while start < head_end {
-            let Some(relative_end) = bytes[start..head_end]
+            let Some(relative_end) = bytes[start..head_end + 2]
                 .windows(2)
                 .position(|window| window == b"\r\n")
             else {
                 break;
             };
             let end = start + relative_end;
-            if let Some(colon) = bytes[start..end].iter().position(|byte| *byte == b':') {
-                let name_end = start + colon;
-                let lower = String::from_utf8_lossy(&bytes[start..name_end]).to_ascii_lowercase();
+            let mut line = bytes[start..end].to_vec();
+            let mut host = false;
+            if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+                let lower = String::from_utf8_lossy(&line[..colon]).to_ascii_lowercase();
+                host = lower == "host" && !names.contains_key("host");
                 let spelling = names
                     .get(&lower)
                     .cloned()
                     .unwrap_or_else(|| python_default_header_spelling(&lower));
-                if spelling.len() == name_end - start {
-                    bytes[start..name_end].copy_from_slice(spelling.as_bytes());
+                if spelling.len() == colon {
+                    line[..colon].copy_from_slice(spelling.as_bytes());
                 }
             }
+            headers.push((host, line));
             start = end + 2;
         }
+        let mut rewritten = Vec::with_capacity(bytes.len());
+        rewritten.extend_from_slice(&request_line);
+        rewritten.extend_from_slice(b"\r\n");
+        for (_, line) in headers.iter().filter(|(host, _)| *host) {
+            rewritten.extend_from_slice(line);
+            rewritten.extend_from_slice(b"\r\n");
+        }
+        for (_, line) in headers.iter().filter(|(host, _)| !*host) {
+            rewritten.extend_from_slice(line);
+            rewritten.extend_from_slice(b"\r\n");
+        }
+        rewritten.extend_from_slice(b"\r\n");
+        rewritten.extend_from_slice(&tail);
+        *bytes = rewritten;
     }
 }
 
 struct ParsedResponseHead {
     consumed: usize,
     status: u16,
-    conflicting_content_length: bool,
+    content_length_normalization: ContentLengthNormalization,
+    conflicting_content_length: Option<String>,
     raw_headers: Vec<(String, Vec<u8>)>,
 }
 
@@ -462,7 +535,9 @@ fn parsed_response_head(bytes: &[u8]) -> Option<ParsedResponseHead> {
     };
     let status = response.code?;
     let mut content_lengths = Vec::new();
-    let mut content_lengths_are_valid = true;
+    let mut content_length_values = Vec::new();
+    let mut invalid_content_length = false;
+    let mut overflowing_content_length = false;
     let mut chunked = false;
     let raw_headers = response
         .headers
@@ -471,19 +546,19 @@ fn parsed_response_head(bytes: &[u8]) -> Option<ParsedResponseHead> {
         .collect();
     for header in response.headers.iter() {
         if header.name.eq_ignore_ascii_case("content-length") {
+            content_length_values.push(String::from_utf8_lossy(header.value).into_owned());
             for token in header.value.split(|byte| *byte == b',') {
                 let token = trim_ascii(token);
                 if token.is_empty() || !token.iter().all(u8::is_ascii_digit) {
-                    content_lengths_are_valid = false;
+                    invalid_content_length = true;
                     continue;
                 }
-                match std::str::from_utf8(token)
+                let canonical = trim_leading_ascii_zeroes(token);
+                overflowing_content_length |= std::str::from_utf8(canonical)
                     .ok()
                     .and_then(|value| value.parse::<u64>().ok())
-                {
-                    Some(value) => content_lengths.push(value),
-                    None => content_lengths_are_valid = false,
-                }
+                    .is_none();
+                content_lengths.push(canonical.to_vec());
             }
         } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
             chunked |= header
@@ -492,29 +567,92 @@ fn parsed_response_head(bytes: &[u8]) -> Option<ParsedResponseHead> {
                 .any(|coding| trim_ascii(coding).eq_ignore_ascii_case(b"chunked"));
         }
     }
-    let conflicting_content_length = content_lengths_are_valid
+    let conflicting = !invalid_content_length
         && !chunked
         && content_lengths
             .first()
             .is_some_and(|first| content_lengths.iter().any(|value| value != first));
+    let conflicting_content_length = conflicting.then(|| {
+        format!(
+            "Content-Length contained multiple unmatching values ({})",
+            content_length_values.join(", ")
+        )
+    });
+    let content_length_normalization = if invalid_content_length {
+        ContentLengthNormalization::Ignore
+    } else if overflowing_content_length && !conflicting {
+        if chunked {
+            ContentLengthNormalization::Ignore
+        } else {
+            ContentLengthNormalization::Overflow
+        }
+    } else {
+        ContentLengthNormalization::None
+    };
     Some(ParsedResponseHead {
         consumed,
         status,
+        content_length_normalization,
         conflicting_content_length,
         raw_headers,
     })
 }
 
 fn inspect_complete_response_head(state: &mut ResponseHeadState) {
-    while let Some(parsed) = parsed_response_head(&state.captured) {
+    let mut start = 0;
+    while let Some(parsed) = parsed_response_head(&state.captured[start..]) {
         if (100..200).contains(&parsed.status) && parsed.status != 101 {
-            state.captured.drain(..parsed.consumed);
+            start += parsed.consumed;
             continue;
         }
+        state.final_head_start = start;
+        state.final_head_consumed = parsed.consumed;
+        state.content_length_normalization = parsed.content_length_normalization;
         state.conflicting_content_length = parsed.conflicting_content_length;
         state.raw_headers = parsed.raw_headers;
         state.active = false;
         return;
+    }
+}
+
+fn take_normalized_python_response(state: &mut ResponseHeadState) -> Option<Vec<u8>> {
+    if state.active {
+        return None;
+    }
+    let captured = std::mem::take(&mut state.captured);
+    match state.content_length_normalization {
+        ContentLengthNormalization::None => Some(captured),
+        normalization => {
+            let start = state.final_head_start;
+            let end = start + state.final_head_consumed;
+            let final_head = &captured[start..end];
+            let first_line_end = final_head.windows(2).position(|window| window == b"\r\n")?;
+            let mut normalized = Vec::with_capacity(captured.len());
+            normalized.extend_from_slice(&captured[..start]);
+            normalized.extend_from_slice(&final_head[..first_line_end + 2]);
+            let mut wrote_overflow = false;
+            for (name, value) in &state.raw_headers {
+                if name.eq_ignore_ascii_case("content-length") {
+                    if matches!(normalization, ContentLengthNormalization::Overflow)
+                        && !wrote_overflow
+                    {
+                        // Hyper rejects larger lengths at the response-head boundary. This
+                        // framing-only sentinel still guarantees an incomplete body; the Python
+                        // adapter reports the original, arbitrarily large decimal value.
+                        normalized.extend_from_slice(b"Content-Length: 9223372036854775807\r\n");
+                        wrote_overflow = true;
+                    }
+                    continue;
+                }
+                normalized.extend_from_slice(name.as_bytes());
+                normalized.extend_from_slice(b": ");
+                normalized.extend_from_slice(value);
+                normalized.extend_from_slice(b"\r\n");
+            }
+            normalized.extend_from_slice(b"\r\n");
+            normalized.extend_from_slice(&captured[end..]);
+            Some(normalized)
+        }
     }
 }
 
@@ -540,6 +678,14 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
         bytes = &bytes[..bytes.len() - 1];
     }
     bytes
+}
+
+fn trim_leading_ascii_zeroes(bytes: &[u8]) -> &[u8] {
+    let first_nonzero = bytes
+        .iter()
+        .position(|byte| *byte != b'0')
+        .unwrap_or(bytes.len().saturating_sub(1));
+    &bytes[first_nonzero..]
 }
 
 struct ResponseHeadIo<IO> {
@@ -587,7 +733,11 @@ impl<IO> ResponseHeadIo<IO> {
                 Poll::Pending => return Poll::Pending,
             }
         }
-        self.outgoing.clear();
+        if self.outgoing_head_complete {
+            self.outgoing = Vec::new();
+        } else {
+            self.outgoing.clear();
+        }
         self.outgoing_offset = 0;
         Poll::Ready(Ok(()))
     }
@@ -603,7 +753,7 @@ impl<IO: AsyncRead + Unpin> AsyncRead for ResponseHeadIo<IO> {
         let generation = this.observation.generation();
         if generation != this.generation {
             debug_assert_eq!(this.outgoing_offset, this.outgoing.len());
-            this.outgoing.clear();
+            this.outgoing = Vec::new();
             this.outgoing_offset = 0;
             this.outgoing_head_complete = false;
             this.generation = generation;
@@ -611,6 +761,34 @@ impl<IO: AsyncRead + Unpin> AsyncRead for ResponseHeadIo<IO> {
         if !this.injected.is_empty() {
             this.fill_injected(buffer);
             return Poll::Ready(Ok(()));
+        }
+        if this.observation.buffers_python_response_head() {
+            let mut bytes = [0_u8; 8192];
+            let mut incoming = ReadBuf::new(&mut bytes);
+            return match Pin::new(&mut this.inner).poll_read(context, &mut incoming) {
+                Poll::Ready(Ok(())) if incoming.filled().is_empty() => {
+                    if let Some(injected) = this.observation.complete_python_response_on_eof() {
+                        this.injected.extend(injected);
+                        this.fill_injected(buffer);
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Ok(())) => {
+                    if let Some(injected) = this
+                        .observation
+                        .buffer_python_response_bytes(incoming.filled())
+                    {
+                        this.injected.extend(injected);
+                        this.fill_injected(buffer);
+                        Poll::Ready(Ok(()))
+                    } else {
+                        context.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            };
         }
         let before = buffer.filled().len();
         match Pin::new(&mut this.inner).poll_read(context, buffer) {
@@ -641,7 +819,7 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for ResponseHeadIo<IO> {
         let generation = this.observation.generation();
         if generation != this.generation {
             debug_assert_eq!(this.outgoing_offset, this.outgoing.len());
-            this.outgoing.clear();
+            this.outgoing = Vec::new();
             this.outgoing_offset = 0;
             this.outgoing_head_complete = false;
             this.generation = generation;
@@ -726,16 +904,16 @@ impl ConnectionDriver {
         }
     }
 
-    fn conflicting_content_length(&self) -> bool {
+    fn conflicting_content_length(&self) -> Option<String> {
         self.response_head
             .as_ref()
-            .is_some_and(ResponseHeadObservation::conflicting_content_length)
+            .and_then(ResponseHeadObservation::conflicting_content_length)
     }
 
-    fn raw_response_headers(&self) -> Vec<(String, Vec<u8>)> {
+    fn take_raw_response_headers(&self) -> Vec<(String, Vec<u8>)> {
         self.response_head
             .as_ref()
-            .map_or_else(Vec::new, ResponseHeadObservation::raw_headers)
+            .map_or_else(Vec::new, ResponseHeadObservation::take_raw_headers)
     }
 
     #[cfg(test)]
@@ -1279,17 +1457,20 @@ impl Transport {
                     }
                     ExchangeEvent::Response(result) => {
                         debug_assert!(head_wait.permits_post_head());
-                        break result
-                            .map(|response| (response, driver.raw_response_headers()))
-                            .map_err(|error| {
-                                if driver.conflicting_content_length() && error.is_parse() {
-                                    Error::invalid_response_header(
-                                        "conflicting Content-Length headers in response",
-                                    )
+                        break match result {
+                            Ok(response) => Ok((response, driver.take_raw_response_headers())),
+                            Err(error) => {
+                                if error.is_parse() {
+                                    if let Some(message) = driver.conflicting_content_length() {
+                                        Err(Error::invalid_response_header(message))
+                                    } else {
+                                        Err(Error::send_hyper(error))
+                                    }
                                 } else {
-                                    Error::send_hyper(error)
+                                    Err(Error::send_hyper(error))
                                 }
-                            });
+                            }
+                        };
                     }
                     ExchangeEvent::UploadComplete(completed_at) => {
                         completion_pending = false;
@@ -1952,8 +2133,8 @@ mod tests {
     use http::{HeaderName, HeaderValue, Method};
 
     use super::{
-        ActiveExchangeGuard, ConnectionDriver, ResponseHeadObservation, ResponseRemainderGate,
-        outgoing_request, validate_request,
+        ActiveExchangeGuard, ConnectionDriver, MAX_RESPONSE_HEAD_BYTES, ResponseHeadIo,
+        ResponseHeadObservation, ResponseRemainderGate, outgoing_request, validate_request,
     };
     use crate::session_runtime::{SessionCheckpoint, SessionRuntimeHarness, SessionRuntimeHooks};
     use crate::{AsyncBody, BodySource, ErrorKind, RequestBuilder};
@@ -2028,7 +2209,7 @@ mod tests {
         observation.observe(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n");
 
         assert_eq!(observation.complete_on_eof(), Some(b"\r\n".to_vec()));
-        assert!(!observation.conflicting_content_length());
+        assert_eq!(observation.conflicting_content_length(), None);
 
         let empty = ResponseHeadObservation::default();
         empty.begin(None);
@@ -2040,14 +2221,55 @@ mod tests {
         let conflict = ResponseHeadObservation::default();
         conflict.begin(None);
         conflict.observe(b"HTTP/1.1 200 OK\r\nContent-Length: 016\r\nContent-Length: 32\r\n\r\n");
-        assert!(conflict.conflicting_content_length());
+        assert_eq!(
+            conflict.conflicting_content_length().as_deref(),
+            Some("Content-Length contained multiple unmatching values (016, 32)")
+        );
 
         let chunked = ResponseHeadObservation::default();
         chunked.begin(None);
         chunked.observe(
             b"HTTP/1.1 200 OK\r\nContent-Length: 16, 32\r\nTransfer-Encoding: chunked\r\n\r\n",
         );
-        assert!(!chunked.conflicting_content_length());
+        assert_eq!(chunked.conflicting_content_length(), None);
+    }
+
+    #[test]
+    fn completed_observer_transfers_headers_and_discards_large_buffers() {
+        let observation = ResponseHeadObservation::default();
+        observation.begin(Some(Vec::new()));
+        let mut response = Vec::with_capacity(MAX_RESPONSE_HEAD_BYTES / 2);
+        response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\nx");
+
+        assert_eq!(
+            observation.buffer_python_response_bytes(&response),
+            Some(b"HTTP/1.1 200 OK\r\n\r\nx".to_vec())
+        );
+        assert_eq!(
+            observation.take_raw_headers(),
+            vec![("Content-Length".to_owned(), b"nope".to_vec())]
+        );
+        {
+            let state = observation
+                .0
+                .lock()
+                .expect("response-head observer lock poisoned");
+            assert_eq!(state.captured.capacity(), 0);
+            assert!(state.raw_headers.is_empty());
+            assert!(state.python_header_names.is_none());
+        }
+        observation.begin(Some(Vec::new()));
+        assert!(observation.take_raw_headers().is_empty());
+
+        let mut io = ResponseHeadIo::new(tokio::io::sink(), ResponseHeadObservation::default());
+        io.outgoing = Vec::with_capacity(MAX_RESPONSE_HEAD_BYTES);
+        io.outgoing_head_complete = true;
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            io.poll_drain_outgoing(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(io.outgoing.capacity(), 0);
     }
 
     #[test]

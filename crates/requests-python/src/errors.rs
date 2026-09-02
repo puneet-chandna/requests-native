@@ -177,7 +177,7 @@ pub(crate) fn map_typed_response_error(
     error: &Error,
     pool: Option<&Bound<'_, PyAny>>,
 ) -> PyErr {
-    let original = match canonical_response_error(py, error, pool) {
+    let original = match canonical_response_error(py, error, pool, None) {
         Ok(original) => original,
         Err(error) => return error,
     };
@@ -192,8 +192,10 @@ pub(crate) fn map_typed_raw_response_error(
     py: Python<'_>,
     error: &Error,
     pool: Option<&Bound<'_, PyAny>>,
+    overflowing_content_length: Option<&str>,
 ) -> PyErr {
-    canonical_response_error(py, error, pool).unwrap_or_else(|error| error)
+    canonical_response_error(py, error, pool, overflowing_content_length)
+        .unwrap_or_else(|error| error)
 }
 
 fn urllib3_v2(py: Python<'_>) -> PyResult<bool> {
@@ -215,6 +217,7 @@ fn canonical_response_error(
     py: Python<'_>,
     error: &Error,
     pool: Option<&Bound<'_, PyAny>>,
+    overflowing_content_length: Option<&str>,
 ) -> PyResult<PyErr> {
     let exceptions = PyModule::import(py, "urllib3.exceptions")?;
     let v2 = urllib3_v2(py)?;
@@ -245,11 +248,23 @@ fn canonical_response_error(
         )),
         _ => {
             if let Some((received, remaining)) = error.incomplete_body() {
-                let incomplete = PyErr::from_value(
-                    exceptions
-                        .getattr("IncompleteRead")?
-                        .call1((received, remaining))?,
-                );
+                let incomplete = if let Some(declared) = overflowing_content_length {
+                    let remaining = PyModule::import(py, "builtins")?
+                        .getattr("int")?
+                        .call1((declared,))?
+                        .call_method1("__sub__", (received,))?;
+                    PyErr::from_value(
+                        exceptions
+                            .getattr("IncompleteRead")?
+                            .call1((received, remaining))?,
+                    )
+                } else {
+                    PyErr::from_value(
+                        exceptions
+                            .getattr("IncompleteRead")?
+                            .call1((received, remaining))?,
+                    )
+                };
                 let message = format!("Connection broken: {:?}", incomplete.value(py));
                 let protocol = PyErr::from_value(
                     exceptions
