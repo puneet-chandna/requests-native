@@ -15,6 +15,7 @@ import os
 import pathlib
 import platform
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -34,8 +35,6 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 ORACLE_ROOT = ROOT.parent / "requests"
 NATIVE_BINARY = ROOT / "target" / "release" / "requests-benchmark-native"
 NATIVE_MANIFEST = ROOT / "benchmarks" / "rust-native" / "Cargo.toml"
-PYTHON_EXTENSION_BUILD = ROOT / "target" / "release" / "lib_requests_rust.so"
-VENV_ROOT = ROOT / ".venv"
 SCHEMA_VERSION = 2
 SURFACES = ("python-oracle", "python-rust", "rust-async", "rust-blocking")
 
@@ -55,6 +54,67 @@ def split_work(requests: int, concurrency: int) -> list[int]:
     workers = min(requests, concurrency)
     quotient, remainder = divmod(requests, workers)
     return [quotient + (index < remainder) for index in range(workers)]
+
+
+def value_or_default(value: int | None, default: int) -> int:
+    return default if value is None else value
+
+
+def resolve_workload(arguments: argparse.Namespace) -> tuple[int, int, int, int]:
+    profile = {
+        "smoke": (2, 64, 32 * 1024, 2),
+        "default": (12, 128, 256 * 1024, 4),
+    }[arguments.profile]
+    requests = value_or_default(arguments.requests, profile[0])
+    small_size = value_or_default(arguments.small_bytes, profile[1])
+    large_size = value_or_default(arguments.large_bytes, profile[2])
+    maximum_concurrency = value_or_default(arguments.concurrency, profile[3])
+    if (
+        min(requests, small_size, large_size, maximum_concurrency, arguments.chunk_size)
+        < 1
+        or arguments.case_timeout_seconds <= 0
+    ):
+        raise ValueError("all workload sizes and deadlines must be positive")
+    return requests, small_size, large_size, maximum_concurrency
+
+
+def find_release_library(
+    release_directory: pathlib.Path, system: str = sys.platform
+) -> pathlib.Path:
+    patterns = {
+        "linux": "*requests_rust.so",
+        "darwin": "*requests_rust.dylib",
+        "win32": "*requests_rust.dll",
+    }
+    try:
+        pattern = patterns[system]
+    except KeyError as error:
+        raise RuntimeError(f"unsupported extension-build platform: {system}") from error
+    candidates = sorted(
+        path.resolve() for path in release_directory.glob(pattern) if path.is_file()
+    )
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"expected exactly one release extension matching {pattern}, "
+            f"found {len(candidates)} in {release_directory}"
+        )
+    return candidates[0]
+
+
+def resolve_maturin(
+    environment: pathlib.Path,
+    system: str = sys.platform,
+    *,
+    which=shutil.which,
+) -> pathlib.Path:
+    scripts = environment / ("Scripts" if system == "win32" else "bin")
+    names = ("maturin.exe", "maturin") if system == "win32" else ("maturin",)
+    for search_path in (str(scripts), None):
+        for name in names:
+            executable = which(name, path=search_path)
+            if executable is not None:
+                return pathlib.Path(executable).resolve()
+    raise RuntimeError(f"maturin was not found for Python environment {environment}")
 
 
 def body_checksum(body: bytes) -> int:
@@ -342,25 +402,42 @@ def build_native(command_log: list[str]) -> None:
         raise RuntimeError(f"native benchmark binary missing: {NATIVE_BINARY}")
 
 
-def build_python_extension(command_log: list[str]) -> None:
+def build_python_extension(
+    command_log: list[str],
+) -> tuple[pathlib.Path, dict[str, Any]]:
     environment = pathlib.Path(sys.prefix).resolve()
-    if environment != VENV_ROOT.resolve():
-        raise RuntimeError(f"benchmark must use the rewrite venv, not {environment}")
+    if environment == pathlib.Path(sys.base_prefix).resolve():
+        raise RuntimeError("benchmark must run in an isolated Python environment")
     temporary = ROOT / "target" / "benchmark-tmp"
     temporary.mkdir(parents=True, exist_ok=True)
+    environment_overrides = {
+        "TEMP": str(temporary),
+        "TMP": str(temporary),
+        "TMPDIR": str(temporary),
+        "UV_CACHE_DIR": str(ROOT / "target" / "benchmark-uv-cache"),
+    }
     command = [
-        "env",
-        f"TMPDIR={temporary}",
-        f"UV_CACHE_DIR={ROOT / 'target' / 'benchmark-uv-cache'}",
-        str(VENV_ROOT / "bin" / "maturin"),
+        str(resolve_maturin(environment)),
         "develop",
         "--release",
         "--offline",
     ]
-    command_log.append(shlex.join(command))
-    subprocess.run(command, cwd=ROOT, check=True)
-    if not PYTHON_EXTENSION_BUILD.is_file():
-        raise RuntimeError(f"release extension build missing: {PYTHON_EXTENSION_BUILD}")
+    command_log.append(
+        shlex.join(
+            [
+                *(f"{name}={value}" for name, value in environment_overrides.items()),
+                *command,
+            ]
+        )
+    )
+    process_environment = os.environ.copy()
+    process_environment.update(environment_overrides)
+    subprocess.run(command, cwd=ROOT, check=True, env=process_environment)
+    release_build = find_release_library(ROOT / "target" / "release")
+    return release_build, {
+        "command": command,
+        "environment": environment_overrides,
+    }
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -372,7 +449,10 @@ def sha256(path: pathlib.Path) -> str:
 
 
 def python_artifact_provenance(
-    command_log: list[str], timeout_seconds: float
+    command_log: list[str],
+    timeout_seconds: float,
+    release_build: pathlib.Path,
+    build_record: dict[str, Any],
 ) -> dict[str, Any]:
     script = """
 import importlib.metadata as metadata
@@ -401,8 +481,9 @@ print(json.dumps({
     command = [sys.executable, "-c", script]
     command_log.append(shlex.join(command))
     provenance = run_json_command(command, cwd=ROOT, timeout_seconds=timeout_seconds)
-    if pathlib.Path(provenance["python_prefix"]).resolve() != VENV_ROOT.resolve():
-        raise RuntimeError("provenance probe did not run inside the rewrite venv")
+    active_environment = pathlib.Path(sys.prefix).resolve()
+    if pathlib.Path(provenance["python_prefix"]).resolve() != active_environment:
+        raise RuntimeError("provenance probe left the active Python environment")
     extension = pathlib.Path(provenance["extension_module"]).resolve()
     expected_directory = ROOT / "src" / "requests"
     expected_suffix = provenance["extension_suffix"]
@@ -414,15 +495,17 @@ print(json.dumps({
             f"loaded unexpected Rust-backed Python extension: {extension}"
         )
     loaded_digest = sha256(extension)
-    build_digest = sha256(PYTHON_EXTENSION_BUILD)
+    build_digest = sha256(release_build)
     if loaded_digest != build_digest:
         raise RuntimeError(
             "loaded Python extension digest differs from the release build"
         )
     if provenance["extension_backend"] != "requests-rust":
         raise RuntimeError("loaded Python extension reports the wrong backend")
+    provenance["build_command"] = build_record["command"]
+    provenance["build_environment"] = build_record["environment"]
     provenance["extension_sha256"] = loaded_digest
-    provenance["release_build"] = str(PYTHON_EXTENSION_BUILD)
+    provenance["release_build"] = str(release_build)
     provenance["release_build_sha256"] = build_digest
     return provenance
 
@@ -603,19 +686,7 @@ def summarize(
 
 
 def orchestrate(arguments: argparse.Namespace) -> int:
-    profile = {
-        "smoke": (2, 64, 32 * 1024, 2),
-        "default": (12, 128, 256 * 1024, 4),
-    }[arguments.profile]
-    requests = arguments.requests or profile[0]
-    small_size = arguments.small_bytes or profile[1]
-    large_size = arguments.large_bytes or profile[2]
-    maximum_concurrency = arguments.concurrency or profile[3]
-    if (
-        min(requests, small_size, large_size, maximum_concurrency, arguments.chunk_size)
-        < 1
-    ) or arguments.case_timeout_seconds <= 0:
-        raise ValueError("all workload sizes must be positive")
+    requests, small_size, large_size, maximum_concurrency = resolve_workload(arguments)
     concurrencies = sorted({1, min(requests, maximum_concurrency)})
     surfaces = arguments.surfaces or list(SURFACES)
     unknown = set(surfaces) - set(SURFACES)
@@ -630,10 +701,13 @@ def orchestrate(arguments: argparse.Namespace) -> int:
             [sys.executable, str(pathlib.Path(__file__).resolve()), *sys.argv[1:]]
         )
     ]
-    build_python_extension(commands)
+    release_build, build_record = build_python_extension(commands)
     build_native(commands)
     python_provenance = python_artifact_provenance(
-        commands, arguments.case_timeout_seconds
+        commands,
+        arguments.case_timeout_seconds,
+        release_build,
+        build_record,
     )
     metadata = {
         "schema_version": SCHEMA_VERSION,

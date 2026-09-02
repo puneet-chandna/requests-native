@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
+import benchmarks.run as benchmark
 from benchmarks.run import (
     enable_tcp_nodelay,
     normalize_peak_rss,
@@ -16,6 +19,73 @@ from benchmarks.run import (
 
 
 class BenchmarkHarnessTests(unittest.TestCase):
+    def test_release_library_selection_is_platform_specific(self) -> None:
+        resolver = getattr(benchmark, "find_release_library", lambda *_: None)
+        for system, filename in (
+            ("linux", "lib_requests_rust.so"),
+            ("darwin", "lib_requests_rust.dylib"),
+            ("win32", "_requests_rust.dll"),
+        ):
+            with (
+                self.subTest(system=system),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                release = Path(directory)
+                expected = release / filename
+                expected.touch()
+                self.assertEqual(resolver(release, system), expected.resolve())
+
+    def test_release_library_selection_rejects_ambiguous_matches(self) -> None:
+        resolver = getattr(benchmark, "find_release_library", lambda *_: None)
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory)
+            (release / "lib_requests_rust.so").touch()
+            (release / "copy_requests_rust.so").touch()
+            with self.assertRaisesRegex(RuntimeError, "exactly one"):
+                resolver(release, "linux")
+
+    def test_maturin_is_resolved_from_the_active_environment_layout(self) -> None:
+        resolver = getattr(benchmark, "resolve_maturin", lambda *_args, **_kwargs: None)
+        for system, scripts, executable in (
+            ("linux", "bin", "maturin"),
+            ("darwin", "bin", "maturin"),
+            ("win32", "Scripts", "maturin.exe"),
+        ):
+            with self.subTest(system=system):
+                environment = Path("/active-python")
+                expected_directory = str(environment / scripts)
+                expected = str(environment / scripts / executable)
+
+                def fake_which(name: str, path: str | None = None) -> str | None:
+                    if name == executable and path == expected_directory:
+                        return expected
+                    return None
+
+                self.assertEqual(
+                    resolver(environment, system, which=fake_which), Path(expected)
+                )
+
+    def test_explicit_zero_workload_values_are_not_replaced_by_defaults(self) -> None:
+        selector = getattr(
+            benchmark, "value_or_default", lambda value, default: value or default
+        )
+        self.assertEqual(selector(0, 12), 0)
+
+    def test_each_explicit_zero_workload_value_fails_validation(self) -> None:
+        resolver = getattr(benchmark, "resolve_workload", lambda _arguments: None)
+        for option in (
+            "--requests",
+            "--concurrency",
+            "--small-bytes",
+            "--large-bytes",
+            "--chunk-size",
+            "--case-timeout-seconds",
+        ):
+            with self.subTest(option=option):
+                arguments = benchmark.parser().parse_args([option, "0"])
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    resolver(arguments)
+
     def test_percentile_uses_nearest_rank(self) -> None:
         values = [1.0, 2.0, 3.0, 4.0]
         self.assertEqual(percentile(values, 0.50), 2.0)

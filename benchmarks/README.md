@@ -43,6 +43,12 @@ to match the release library byte-for-byte. The native driver is not a member
 of the release workspace. `--case-timeout-seconds` sets the orchestrator's
 deadline for each child workload; the default is 30 seconds.
 
+The build locates `maturin` from the active isolated Python environment (with
+`PATH` lookup as a fallback), uses `bin` on Unix and `Scripts` on Windows, and
+selects the unique release `cdylib` for Linux, macOS, or Windows. Those platform
+paths have focused unit coverage; the checked-in result and live provenance
+smoke were collected on Linux, not on macOS or Windows.
+
 ## Fail-fast checks
 
 The harness stops before writing a result if:
