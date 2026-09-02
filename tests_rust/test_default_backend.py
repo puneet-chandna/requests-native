@@ -191,8 +191,7 @@ def test_default_overflowing_content_length_returns_head_then_body_error() -> No
     def handler(sock):
         request = consume_socket_content(sock, timeout=0.5)
         sock.sendall(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Length: 18446744073709551616\r\n\r\nx"
+            b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\nx"
         )
         return request
 
@@ -219,9 +218,7 @@ def test_default_overflowing_content_length_returns_head_then_body_error() -> No
 def test_default_conflicting_numeric_content_length_is_exact_invalid_header() -> None:
     def handler(sock):
         request = consume_socket_content(sock, timeout=0.5)
-        sock.sendall(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 1, 2\r\n\r\nx"
-        )
+        sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1, 2\r\n\r\nx")
         return request
 
     server = Server(handler)
