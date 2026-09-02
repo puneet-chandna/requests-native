@@ -374,6 +374,13 @@ Pickling omits Rust shadow state and recreates it lazily. `close()` clears both
 visible and Rust pool generations but does not make the adapter permanently
 unusable.
 
+Stable urllib3 1.26 releases keep Python transport authority for direct HTTPS
+and HTTP routed through an HTTPS proxy. That version accepts some legacy TLS
+behavior, including common-name fallback with `SubjectAltNameWarning`, which
+rustls intentionally rejects. The admission check uses the already validated
+exact retry-version snapshot and runs before any Rust pool, manager, or socket
+effect. Plain HTTP under urllib3 1.26 and HTTPS under urllib3 2.x remain native.
+
 Deferred minor-issue boundary coverage: class-dictionary admission may allow
 only a lazily materialized, empty `__annotations__` cache (or the existing
 empty `__slotnames__` cache). A non-empty cache, replacement, or any additional

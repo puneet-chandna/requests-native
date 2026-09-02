@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+import urllib3
 from tests_differential.test_adapters import loopback, prepared
 
 import requests
@@ -27,6 +29,97 @@ def assert_no_native_effects(pool_count: int) -> None:
     assert runtime["events"] == []
     assert runtime["outstanding"] == 0
     assert extension._adapter_pool_side_table_trial() == pool_count
+
+
+def is_urllib3_126() -> bool:
+    components = urllib3.__version__.split(".")
+    return (
+        len(components) == 3
+        and components[:2] == ["1", "26"]
+        and components[2].isdecimal()
+    )
+
+
+@pytest.mark.skipif(not is_urllib3_126(), reason="requires urllib3 1.26.x")
+def test_urllib3_126_https_falls_back_once_before_native_effects(
+    monkeypatch,
+) -> None:
+    marker = object()
+    calls = []
+
+    def compatibility_send(*args, **kwargs):
+        calls.append((args, kwargs))
+        return marker
+
+    monkeypatch.setattr(
+        adapters_module, "_HTTP_ADAPTER_COMPAT_SEND", compatibility_send
+    )
+    pool_count = reset_native_telemetry()
+
+    assert HTTPAdapter().send(prepared("https://example.test/")) is marker
+    assert len(calls) == 1
+    assert_no_native_effects(pool_count)
+
+
+@pytest.mark.skipif(not is_urllib3_126(), reason="requires urllib3 1.26.x")
+def test_urllib3_126_http_through_https_proxy_falls_back_once_before_native_effects(
+    monkeypatch,
+) -> None:
+    marker = object()
+    calls = []
+
+    def compatibility_send(*args, **kwargs):
+        calls.append((args, kwargs))
+        return marker
+
+    monkeypatch.setattr(
+        adapters_module, "_HTTP_ADAPTER_COMPAT_SEND", compatibility_send
+    )
+    pool_count = reset_native_telemetry()
+
+    assert (
+        HTTPAdapter().send(
+            prepared("http://example.test/"),
+            proxies={"http": "https://proxy.test:8443"},
+        )
+        is marker
+    )
+    assert len(calls) == 1
+    assert_no_native_effects(pool_count)
+
+
+@pytest.mark.skipif(not is_urllib3_126(), reason="requires urllib3 1.26.x")
+def test_urllib3_126_plain_http_remains_native(monkeypatch) -> None:
+    def forbidden(*args, **kwargs):
+        raise AssertionError("legacy plain HTTP reached compatibility send")
+
+    monkeypatch.setattr(adapters_module, "_HTTP_ADAPTER_COMPAT_SEND", forbidden)
+    with loopback((200, {}, b"native")) as (server, url):
+        response = HTTPAdapter().send(prepared(url))
+
+    assert response.content == b"native"
+    assert type(response.raw).__module__ == "requests._requests_rust"
+    assert server.requests == 1
+
+
+@pytest.mark.skipif(is_urllib3_126(), reason="requires urllib3 2.x")
+def test_urllib3_2_https_remains_native_eligible(monkeypatch) -> None:
+    fallback_calls = []
+
+    def forbidden(*args, **kwargs):
+        fallback_calls.append((args, kwargs))
+        raise AssertionError("modern HTTPS reached compatibility send")
+
+    monkeypatch.setattr(adapters_module, "_HTTP_ADAPTER_COMPAT_SEND", forbidden)
+    reset_native_telemetry()
+
+    with loopback((200, {}, b"plaintext")) as (server, url):
+        with pytest.raises(requests.exceptions.SSLError):
+            HTTPAdapter().send(prepared(url.replace("http://", "https://", 1)))
+
+    assert fallback_calls == []
+    assert server.requests == 0
+    assert requests._requests_rust._runtime_submission_trial("snapshot")["events"]
 
 
 def test_pristine_trial_uses_one_native_pump_and_never_calls_python_send(

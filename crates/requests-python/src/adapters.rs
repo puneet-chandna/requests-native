@@ -37,6 +37,15 @@ struct RetrySnapshot {
     retry_after_max: Option<u64>,
 }
 
+fn is_stable_urllib3_126(version: &str) -> bool {
+    let mut components = version.split('.');
+    matches!(
+        (components.next(), components.next(), components.next()),
+        (Some("1"), Some("26"), Some(patch))
+            if !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit())
+    ) && components.next().is_none()
+}
+
 #[derive(PartialEq)]
 struct HistorySnapshot {
     method: String,
@@ -1764,6 +1773,13 @@ fn native_send_input(
         return Ok(Err("Retry state changed during admission".to_owned()));
     }
     let normalized_scheme = scheme.to_ascii_lowercase();
+    if is_stable_urllib3_126(&retry.version)
+        && (normalized_scheme == "https" || matches!(proxy.as_ref(), Some(Proxy::Https(_))))
+    {
+        return Ok(Err(
+            "urllib3 1.26 TLS requires the compatibility transport".to_owned()
+        ));
+    }
     let normalized_host = request_uri
         .host()
         .unwrap_or(authority.host())
@@ -4738,4 +4754,19 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_adapter_pool_side_table_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_fork_reset_trial, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_stable_urllib3_126;
+
+    #[test]
+    fn stable_urllib3_126_version_boundary_is_exact() {
+        assert!(is_stable_urllib3_126("1.26.0"));
+        assert!(is_stable_urllib3_126("1.26.20"));
+        assert!(!is_stable_urllib3_126("1.260.0"));
+        assert!(!is_stable_urllib3_126("1.26.20rc1"));
+        assert!(!is_stable_urllib3_126("1.26.20.post1"));
+        assert!(!is_stable_urllib3_126("2.0.0"));
+    }
 }
