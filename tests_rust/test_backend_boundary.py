@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -41,17 +43,6 @@ def is_urllib3_126() -> bool:
     )
 
 
-def test_body_validation_precedes_retry_and_legacy_fallback_precedes_copy() -> None:
-    source = Path("crates/requests-python/src/adapters.rs").read_text()
-    start = source.index("fn native_send_input")
-    native_send = source[start : source.index("fn adapter_id", start)]
-    validation = native_send.index("request_body(request)?")
-    retry = native_send.index('adapter.getattr("max_retries")?')
-    fallback = native_send.index("is_stable_urllib3_126(&retry.version)")
-    copy = native_send.index("as_bytes().to_vec()")
-    assert validation < retry < fallback < copy
-
-
 def test_unsupported_body_falls_back_before_proxy_observation(monkeypatch) -> None:
     events = []
 
@@ -81,6 +72,106 @@ def test_unsupported_body_falls_back_before_proxy_observation(monkeypatch) -> No
 
     assert HTTPAdapter().send(request, proxies=proxies) is marker
     assert events == []
+    assert len(calls) == 1
+    assert_no_native_effects(pool_count)
+
+
+def test_proxy_callback_sees_no_retained_body_ref_and_can_replace_exact_bytes(
+    monkeypatch,
+) -> None:
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            received.append(self.rfile.read(int(self.headers["Content-Length"])))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    original = bytes(range(32))
+    replacement = bytes(reversed(range(32)))
+    request = prepared(
+        f"http://127.0.0.1:{server.server_port}/",
+        body=original,
+        method="POST",
+    )
+    baseline_refcount = sys.getrefcount(original)
+    refcount_deltas = []
+
+    class ObservedProxyKey:
+        def __hash__(self):
+            return hash("http")
+
+        def __eq__(self, other):
+            if not refcount_deltas:
+                refcount_deltas.append(sys.getrefcount(original) - baseline_refcount)
+                request.body = replacement
+            return False
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("live exact body mutation reached compatibility send")
+
+    monkeypatch.setattr(adapters_module, "_HTTP_ADAPTER_COMPAT_SEND", forbidden)
+    adapter = HTTPAdapter()
+    try:
+        response = adapter.send(
+            request, proxies={ObservedProxyKey(): "https://proxy.test:8443"}
+        )
+        assert response.content == b"ok"
+    finally:
+        adapter.close()
+        server.shutdown()
+        server.server_close()
+        worker.join(5)
+
+    assert refcount_deltas == [0]
+    assert received == [replacement]
+
+
+def test_proxy_callback_can_make_body_unsupported_before_native_effects(
+    monkeypatch,
+) -> None:
+    request = prepared("http://example.test/", body=b"initial", method="POST")
+    mutations = []
+
+    class ObservedProxyKey:
+        def __hash__(self):
+            return hash("http")
+
+        def __eq__(self, other):
+            if not mutations:
+                request.body = object()
+                mutations.append(other)
+            return False
+
+    marker = object()
+    calls = []
+
+    def compatibility_send(*args, **kwargs):
+        calls.append((args, kwargs))
+        return marker
+
+    monkeypatch.setattr(
+        adapters_module, "_HTTP_ADAPTER_COMPAT_SEND", compatibility_send
+    )
+    pool_count = reset_native_telemetry()
+
+    assert (
+        HTTPAdapter().send(
+            request, proxies={ObservedProxyKey(): "https://proxy.test:8443"}
+        )
+        is marker
+    )
+    assert mutations == ["http"]
     assert len(calls) == 1
     assert_no_native_effects(pool_count)
 

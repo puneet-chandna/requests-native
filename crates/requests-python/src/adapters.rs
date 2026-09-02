@@ -1664,13 +1664,18 @@ fn request_headers(
     Ok(Some((native, names)))
 }
 
-fn request_body(request: &Bound<'_, PyAny>) -> PyResult<Option<Option<Py<PyBytes>>>> {
+fn request_body_is_supported(request: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let body = request.getattr("body")?;
+    Ok(body.is_none() || body.is_exact_instance_of::<PyBytes>())
+}
+
+fn request_body(request: &Bound<'_, PyAny>) -> PyResult<Option<Option<Vec<u8>>>> {
     let body = request.getattr("body")?;
     if body.is_none() {
         return Ok(Some(None));
     }
     if body.is_exact_instance_of::<PyBytes>() {
-        return Ok(Some(Some(body.cast_into::<PyBytes>()?.unbind())));
+        return Ok(Some(Some(body.cast::<PyBytes>()?.as_bytes().to_vec())));
     }
     Ok(None)
 }
@@ -1733,9 +1738,9 @@ fn native_send_input(
     let Some((headers, header_names)) = request_headers(py, request)? else {
         return Ok(Err("request headers are unsupported".to_owned()));
     };
-    let Some(body) = request_body(request)? else {
+    if !request_body_is_supported(request)? {
         return Ok(Err("request body is not proven replayable".to_owned()));
-    };
+    }
     let retry_object = adapter.getattr("max_retries")?;
     let retry = match retry_snapshot(py, &retry_object)? {
         Ok(retry) => retry,
@@ -1780,7 +1785,9 @@ fn native_send_input(
             "urllib3 1.26 TLS requires the compatibility transport".to_owned()
         ));
     }
-    let body = body.map(|body| body.bind(py).as_bytes().to_vec());
+    let Some(body) = request_body(request)? else {
+        return Ok(Err("request body is not proven replayable".to_owned()));
+    };
     let normalized_host = request_uri
         .host()
         .unwrap_or(authority.host())

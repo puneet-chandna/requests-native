@@ -380,7 +380,10 @@ behavior, including common-name fallback with `SubjectAltNameWarning`, which
 rustls intentionally rejects. The admission check uses the already validated
 exact retry-version snapshot and runs before any Rust pool, manager, or socket
 effect or request-body materialization. Plain HTTP under urllib3 1.26 and HTTPS
-under urllib3 2.x remain native.
+under urllib3 2.x remain native. Body eligibility stays in its original
+pre-callback position, but no fetched body reference is retained across proxy
+callbacks; admitted native traffic resnapshots and copies the current exact
+body only after the legacy decision.
 
 Deferred minor-issue boundary coverage: class-dictionary admission may allow
 only a lazily materialized, empty `__annotations__` cache (or the existing
