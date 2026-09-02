@@ -379,7 +379,8 @@ and HTTP routed through an HTTPS proxy. That version accepts some legacy TLS
 behavior, including common-name fallback with `SubjectAltNameWarning`, which
 rustls intentionally rejects. The admission check uses the already validated
 exact retry-version snapshot and runs before any Rust pool, manager, or socket
-effect. Plain HTTP under urllib3 1.26 and HTTPS under urllib3 2.x remain native.
+effect or request-body materialization. Plain HTTP under urllib3 1.26 and HTTPS
+under urllib3 2.x remain native.
 
 Deferred minor-issue boundary coverage: class-dictionary admission may allow
 only a lazily materialized, empty `__annotations__` cache (or the existing

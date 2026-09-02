@@ -1733,9 +1733,6 @@ fn native_send_input(
     let Some((headers, header_names)) = request_headers(py, request)? else {
         return Ok(Err("request headers are unsupported".to_owned()));
     };
-    let Some(body) = request_body(request)? else {
-        return Ok(Err("request body is not proven replayable".to_owned()));
-    };
     let retry_object = adapter.getattr("max_retries")?;
     let retry = match retry_snapshot(py, &retry_object)? {
         Ok(retry) => retry,
@@ -1780,6 +1777,9 @@ fn native_send_input(
             "urllib3 1.26 TLS requires the compatibility transport".to_owned()
         ));
     }
+    let Some(body) = request_body(request)? else {
+        return Ok(Err("request body is not proven replayable".to_owned()));
+    };
     let normalized_host = request_uri
         .host()
         .unwrap_or(authority.host())

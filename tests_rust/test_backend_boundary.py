@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +38,15 @@ def is_urllib3_126() -> bool:
         len(components) == 3
         and components[:2] == ["1", "26"]
         and components[2].isdecimal()
+    )
+
+
+def test_legacy_tls_fallback_precedes_body_materialization() -> None:
+    source = Path("crates/requests-python/src/adapters.rs").read_text()
+    start = source.index("fn native_send_input")
+    native_send = source[start : source.index("fn adapter_id", start)]
+    assert native_send.index("is_stable_urllib3_126(&retry.version)") < (
+        native_send.index("request_body(request)?")
     )
 
 
@@ -102,7 +112,7 @@ def test_urllib3_126_plain_http_remains_native(monkeypatch) -> None:
     assert server.requests == 1
 
 
-@pytest.mark.skipif(is_urllib3_126(), reason="requires urllib3 2.x")
+@pytest.mark.skipif(not urllib3.__version__.startswith("2."), reason="requires urllib3 2.x")
 def test_urllib3_2_https_remains_native_eligible(monkeypatch) -> None:
     fallback_calls = []
 
