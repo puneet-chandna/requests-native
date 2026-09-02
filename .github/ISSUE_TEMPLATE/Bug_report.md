@@ -1,36 +1,37 @@
 ---
 name: Bug report
-about: Create a report to help us improve
-
+about: Report a reproducible Requests Rust beta defect
+labels: bug
 ---
 
-<!-- Summary. -->
+<!-- Security issue? Stop and use .github/SECURITY.md instead. -->
 
-## Expected Result
+## Summary
 
-<!-- What you expected. -->
+## Expected result
 
-## Actual Result
+## Actual result
 
-<!-- What happened instead. -->
-
-## Reproduction Steps
+## Minimal reproduction
 
 ```python
 import requests
-
 ```
 
-## System Information
+## Environment
 
-    $ python -m requests.help
+- Requests Rust commit/tag:
+- Install method:
+- OS and architecture:
+- Python implementation/version:
+- Rust version:
+- Default Rust path or compatibility fallback:
+- Proxy/TLS/streaming/retry/custom adapter/subclass/monkeypatch details:
 
-```json
-{
-  "paste": "here"
-}
+```console
+python -m requests.help
 ```
 
-<!-- This command is only available on Requests v2.16.4 and greater. Otherwise,
-please provide some basic information about your system (Python version,
-operating system, &c). -->
+## Upstream comparison
+
+<!-- Does the same reproduction differ in unmodified PSF Requests 2.34.2? -->

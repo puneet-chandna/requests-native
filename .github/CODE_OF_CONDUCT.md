@@ -1,6 +1,14 @@
-# Treat each other well
+# Code of conduct
 
-Everyone participating in the _requests_ project, and in particular in the issue tracker,
-pull requests, and social media activity, is expected to treat other people with respect
-and more generally to follow the guidelines articulated in the
-[Python Community Code of Conduct](https://www.python.org/psf/codeofconduct/).
+Requests Rust welcomes respectful, good-faith participation. Be considerate,
+focus criticism on the work, respect privacy and boundaries, and do not engage
+in harassment, discrimination, threats, sexualized conduct, or sustained
+disruption.
+
+Maintainers may edit or remove contributions and temporarily or permanently
+restrict participation when behavior harms the community. Enforcement will be
+proportionate and will avoid public disclosure of sensitive reports.
+
+For ordinary moderation concerns, contact the repository owner privately
+through the [Puneet Chandna GitHub profile](https://github.com/puneet-chandna).
+Do not place sensitive conduct reports in a public issue.

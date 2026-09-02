@@ -1,36 +1,28 @@
 .. _install:
 
-Installation of Requests
-========================
+Installing Requests Rust from source
+=====================================
 
-This part of the documentation covers the installation of Requests.
-The first step to using any software package is getting it properly installed.
+Requests Rust is beta software and is not published to PyPI or crates.io.
+There is no ``pip install requests-rust`` package. The distribution and import
+names intentionally remain ``requests`` for compatibility.
 
+Install Python 3.10 or later, Rust, and Maturin, then build from this
+repository::
 
-$ python -m pip install requests
---------------------------------
+    $ git clone https://github.com/puneet-chandna/requests-rust.git
+    $ cd requests-rust
+    $ python -m venv .venv
+    $ . .venv/bin/activate
+    $ python -m pip install "maturin>=1.13,<2"
+    $ python -m maturin develop
 
-To install Requests, simply run this simple command in your terminal of choice::
+On Windows, activate the environment with
+``.venv\Scripts\activate`` before running Maturin.
 
-    $ python -m pip install requests
+The resulting package reports compatibility version ``2.34.2``. The GitHub
+tag ``v1.0.0-beta`` names the Rust-rewrite milestone and does not change that
+Python package version.
 
-Get the Source Code
--------------------
-
-Requests is actively developed on GitHub, where the code is
-`always available <https://github.com/psf/requests>`_.
-
-You can either clone the public repository::
-
-    $ git clone https://github.com/psf/requests.git
-
-Or, download the `tarball <https://github.com/psf/requests/tarball/main>`_::
-
-    $ curl -OL https://github.com/psf/requests/tarball/main
-    # optionally, zipball is also available (for Windows users).
-
-Once you have a copy of the source, you can embed it in your own Python
-package, or install it into your site-packages easily::
-
-    $ cd requests
-    $ python -m pip install .
+To install official PSF Requests from PyPI instead, follow the
+`upstream installation guide <https://requests.readthedocs.io/en/latest/user/install/>`_.

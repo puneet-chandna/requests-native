@@ -12,15 +12,15 @@ visible, and let the existing tests define correctness.
 The public façade and side-by-side parity work are accepted through `7a89cde`.
 Commit `4d01c2c` remains the remotely tested distribution candidate and has
 bounded PyPy/free-threaded qualification, but Task 19 is not closed: the
-complete Windows/macOS matrix is not green and no publish-manifest run exists
+complete Windows/macOS matrix is not green and no validation-manifest run exists
 for that commit. The local Task 20 candidate now routes only exact pristine
 built-in Session/HTTPAdapter traffic through Rust by default; unsupported,
 subclassed, custom, and dynamically mutated surfaces retain Python authority.
 Its unchanged, differential, default-boundary, and fresh local artifact gates
-are green. Task 20 remains `IN_PROGRESS`: final boundary reviews are pending,
-and the user explicitly deferred the full exact-commit remote artifact matrix
-and publish evidence to the final Task 21 v1.0.0-beta gate to conserve GitHub
-Actions usage. Benchmarking is tracked as Task 21. This is not a claim that the
+are green, and both local boundary reviews accepted the corrected candidate.
+Task 20 remains `IN_PROGRESS` because the user explicitly deferred the full
+exact-commit remote artifact matrix and validation manifest to the final
+v1.0.0-beta gate to conserve GitHub Actions usage. This is not a claim that the
 entire port is complete.
 
 Task 21 now has a dependency-free local loopback harness covering the frozen
@@ -30,8 +30,9 @@ bounded default run and raw command/result record are in
 gate and have not changed compatibility behavior. Its schema records the exact
 release-built Python extension path and digest, Python ABI/dependency versions,
 per-case deadlines, exact streaming application chunks, platform-normalized
-RSS, and untimed allocation replays. Remote artifact and publish qualification
-remains deferred to the single final v1.0.0-beta gate.
+RSS, and untimed allocation replays. Both local benchmark reviews accepted the
+corrected harness. Remote artifact qualification remains deferred to the
+single final v1.0.0-beta gate.
 
 Remote qualification of `4d01c2c` produced the following bounded result:
 
@@ -988,12 +989,12 @@ Preserve the current test matrix:
 - the existing PyPy/Windows exclusion;
 - no-character-detector and urllib3 1.x compatibility jobs.
 
-The complete 23-cell compiled wheel matrix is an automatic path-filtered push
-and pull-request gate. `workflow_dispatch` and `workflow_call` remain additional
-entry points, not substitutes for that gate. Control Actions usage by batching
-phase commits before pushing and by keeping the source/editable workflow to its
-single Ubuntu anchor plus the two compatibility jobs; do not remove automatic
-artifact-matrix coverage.
+The complete 23-cell compiled wheel matrix is a reusable and manually
+dispatched release-validation gate and remains a path-filtered pull-request
+gate. It is intentionally not triggered by direct pushes to `main`: the final
+manual artifact-validation workflow calls it once, avoiding duplicate wheel
+fan-out. The source/editable workflow remains the push gate with its single
+Ubuntu anchor plus the two compatibility jobs.
 
 Add Rust checks without deleting Python compatibility jobs. Test both source
 builds and installed wheels. A wheel test must run from outside the checkout so
@@ -1007,10 +1008,14 @@ only the rewrite comparison for I04 because importing the extension
 intentionally enables the process-global GIL and changes that case's warning
 and logging observation; the ABI evidence step records this before the suite.
 
-Preserve the frozen distribution surface:
+Preserve the compatibility distribution surface, except for this reviewed
+derivative-identity correction:
 
-- project metadata, Python requirement, classifiers, URLs, dependencies, and
-  the `security`, `socks`, and `use_chardet_on_py3` extras;
+- the distribution/import name and version remain `requests` 2.34.2 solely for
+  drop-in validation, while description, author/maintainer, project URLs, and
+  development status identify Requests Rust and its owner;
+- Python requirement, language/platform classifiers, dependencies, and the
+  `security`, `socks`, and `use_chardet_on_py3` extras remain unchanged;
 - `requests/py.typed`, `LICENSE`, `NOTICE`, and expected artifact contents;
 - an sdist plus the compiled wheel fan-out required by the platform/interpreter
   matrix;
@@ -1056,8 +1061,8 @@ The backend switch is allowed only when:
 - Python waits remain signal-interruptible and evidence-backed post-fork cases
   use a fresh child driver;
 - supported source builds and wheels pass the matrix;
-- frozen metadata/package data, sdist installs, editable installs, and publish
-  artifact fan-out pass;
+- derivative-safe metadata, package data, sdist installs, editable installs,
+  and validation artifact fan-out pass;
 - no reachable placeholder remains;
 - close, close-then-reuse, repeated close, cancellation, drop, streaming, and
   clean-EOF-only pool reuse are verified;

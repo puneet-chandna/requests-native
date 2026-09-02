@@ -57,9 +57,9 @@ source_suffix = ".rst"
 root_doc = "index"
 
 # General information about the project.
-project = u"Requests"
-copyright = u"Kenneth Reitz and contributors"
-author = u"Kenneth Reitz"
+project = u"Requests Rust"
+copyright = u"Puneet Chandna, Kenneth Reitz, and contributors"
+author = u"Puneet Chandna"
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -126,8 +126,8 @@ html_theme = "alabaster"
 # documentation.
 html_theme_options = {
     "show_powered_by": False,
-    "github_user": "psf",
-    "github_repo": "requests",
+    "github_user": "puneet-chandna",
+    "github_repo": "requests-rust",
     "github_banner": True,
     "show_related": False,
     "note_bg": "#FFF59C",
@@ -227,7 +227,7 @@ html_show_copyright = True
 # html_search_scorer = 'scorer.js'
 
 # Output file base name for HTML help builder.
-htmlhelp_basename = "Requestsdoc"
+htmlhelp_basename = "RequestsRustdoc"
 
 # -- Options for LaTeX output ---------------------------------------------
 
@@ -246,7 +246,7 @@ latex_elements = {
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
-    (root_doc, "Requests.tex", u"Requests Documentation", u"Kenneth Reitz", "manual")
+    (root_doc, "RequestsRust.tex", u"Requests Rust Documentation", author, "manual")
 ]
 
 # The name of an image file (relative to this directory) to place at the top of
@@ -274,7 +274,7 @@ latex_documents = [
 
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
-man_pages = [(root_doc, "requests", u"Requests Documentation", [author], 1)]
+man_pages = [(root_doc, "requests-rust", u"Requests Rust Documentation", [author], 1)]
 
 # If true, show URL addresses after external links.
 # man_show_urls = False
@@ -288,11 +288,11 @@ man_pages = [(root_doc, "requests", u"Requests Documentation", [author], 1)]
 texinfo_documents = [
     (
         root_doc,
-        "Requests",
-        u"Requests Documentation",
+        "RequestsRust",
+        u"Requests Rust Documentation",
         author,
-        "Requests",
-        "One line description of project.",
+        "Requests Rust",
+        "Unofficial Rust-backed rewrite of Requests.",
         "Miscellaneous",
     )
 ]

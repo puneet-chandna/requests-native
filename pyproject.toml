@@ -4,17 +4,12 @@ build-backend = "maturin"
 
 [project]
 name = "requests"
-description = "Python HTTP for Humans."
+description = "Unofficial Rust-backed rewrite of Requests with strict Python API compatibility."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-authors = [
-    { name = "Kenneth Reitz", email = "me@kennethreitz.org" },
-]
-maintainers = [
-    {name = "Ian Stapleton Cordasco", email="graffatcolmingov@gmail.com"},
-    {name = "Nate Prewitt", email="nate.prewitt@gmail.com"}
-]
+authors = [{ name = "Puneet Chandna" }]
+maintainers = [{ name = "Puneet Chandna" }]
 requires-python = ">=3.10"
 dependencies = [
     "charset_normalizer>=2,<4",
@@ -25,7 +20,7 @@ dependencies = [
 dynamic = ["version"]
 
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Environment :: Web Environment",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
@@ -48,8 +43,11 @@ classifiers = [
 ]
 
 [project.urls]
-Documentation = "https://requests.readthedocs.io"
-Source = "https://github.com/psf/requests"
+Homepage = "https://github.com/puneet-chandna/requests-rust"
+Documentation = "https://github.com/puneet-chandna/requests-rust/tree/main/docs"
+Source = "https://github.com/puneet-chandna/requests-rust"
+Issues = "https://github.com/puneet-chandna/requests-rust/issues"
+Upstream = "https://github.com/psf/requests"
 
 [project.optional-dependencies]
 security = []

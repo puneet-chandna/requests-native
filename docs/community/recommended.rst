@@ -3,8 +3,9 @@
 Recommended Packages and Extensions
 ===================================
 
-Requests has a great variety of powerful and useful third-party extensions.
-This page provides an overview of some of the best of them.
+The packages below are part of the broader Requests ecosystem. They are listed
+for API compatibility context, not as independently verified Requests Rust
+integrations.
 
 Certifi CA Bundle
 -----------------
@@ -27,10 +28,9 @@ whenever you're making a lot of web requests.
 Requests-Toolbelt
 -----------------
 
-`Requests-Toolbelt`_ is a collection of utilities that some users of Requests may desire,
-but do not belong in Requests proper. This library is actively maintained
-by members of the Requests core team, and reflects the functionality most
-requested by users within the community.
+`Requests-Toolbelt`_ is a collection of utilities used with Requests. Its
+compatibility with Requests Rust depends on the extension behavior it uses;
+report rewrite-specific differences with a minimal upstream comparison.
 
 .. _Requests-Toolbelt: https://toolbelt.readthedocs.io/en/latest/index.html
 

@@ -1,8 +1,5 @@
-# Restrict all files related to deploying to
-# require lead maintainer approval.
-
-.github/workflows/            @nateprewitt @sigmavirus24
-.github/CODEOWNERS            @nateprewitt @sigmavirus24
-src/requests/__version__.py   @nateprewitt @sigmavirus24
-HISTORY.md                    @nateprewitt @sigmavirus24
-pyproject.toml                @nateprewitt @sigmavirus24
+*                            @puneet-chandna
+.github/workflows/           @puneet-chandna
+.github/CODEOWNERS           @puneet-chandna
+src/requests/__version__.py  @puneet-chandna
+pyproject.toml               @puneet-chandna

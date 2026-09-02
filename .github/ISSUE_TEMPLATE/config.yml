@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Upstream Requests support
+    url: https://requests.readthedocs.io/
+    about: Use upstream documentation for general Requests questions.
+  - name: Private security report
+    url: https://github.com/puneet-chandna/requests-rust/security/advisories/new
+    about: Report suspected Requests Rust vulnerabilities privately.

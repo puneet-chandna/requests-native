@@ -1,76 +1,81 @@
-# Requests
+# Requests Rust
 
-[![Version](https://img.shields.io/pypi/v/requests.svg?maxAge=86400)](https://pypi.org/project/requests/)
-[![Supported Versions](https://img.shields.io/pypi/pyversions/requests.svg)](https://pypi.org/project/requests)
-[![Downloads](https://static.pepy.tech/badge/requests/month)](https://pepy.tech/project/requests)
-[![Contributors](https://img.shields.io/github/contributors/psf/requests.svg)](https://github.com/psf/requests/graphs/contributors)
-[![Documentation](https://readthedocs.org/projects/requests/badge/?version=latest)](https://requests.readthedocs.io)
+[![Tests](https://github.com/puneet-chandna/requests-rust/actions/workflows/run-tests.yml/badge.svg?branch=main)](https://github.com/puneet-chandna/requests-rust/actions/workflows/run-tests.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/status-beta-orange.svg)](https://github.com/puneet-chandna/requests-rust/releases)
 
-**Requests** is a simple, yet elegant, HTTP library.
+Requests Rust is an unofficial, independent Rust rewrite of
+[PSF Requests](https://github.com/psf/requests), maintained by
+[Puneet Chandna](https://github.com/puneet-chandna). Its goal is strict
+drop-in compatibility with the Requests Python API while moving pristine
+built-in HTTP traffic through a native Rust transport.
 
-```python
->>> import requests
->>> r = requests.get('https://httpbin.org/basic-auth/user/pass', auth=('user', 'pass'))
->>> r.status_code
-200
->>> r.headers['content-type']
-'application/json; charset=utf8'
->>> r.encoding
-'utf-8'
->>> r.text
-'{"authenticated": true, ...'
->>> r.json()
-{'authenticated': True, ...}
-```
+> **Beta:** this repository is under compatibility qualification. It is not an
+> official PSF Requests release, is not affiliated with the Python Software
+> Foundation, and is not published to PyPI or crates.io. Do not replace a
+> production Requests installation without testing your workload.
 
-Requests allows you to send HTTP/1.1 requests extremely easily. There’s no need to manually add query strings to your URLs, or to form-encode your `PUT` & `POST` data — but nowadays, just use the `json` method!
+The Python import and distribution names intentionally remain `requests`, and
+the compatibility version remains `2.34.2`. The GitHub tag `v1.0.0-beta`
+identifies this rewrite milestone; it is not a Python package version.
 
-Requests is one of the most downloaded Python packages today, pulling in around `300M downloads / week` — according to GitHub, Requests is currently [depended upon](https://github.com/psf/requests/network/dependents?package_id=UGFja2FnZS01NzA4OTExNg%3D%3D) by `4,000,000+` repositories.
+## Use from source
 
-## Installing Requests and Supported Versions
-
-Requests is available on PyPI:
+There is no `pip install requests-rust` package. To test the beta, clone this
+repository and build it with Python 3.10+, Rust, and Maturin:
 
 ```console
-$ python -m pip install requests
+git clone https://github.com/puneet-chandna/requests-rust.git
+cd requests-rust
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install "maturin>=1.13,<2"
+python -m maturin develop
 ```
 
-Requests officially supports Python 3.10+.
+The familiar API is preserved:
 
-## Supported Features & Best–Practices
+```python
+import requests
 
-Requests is ready for the demands of building robust and reliable HTTP–speaking applications, for the needs of today.
-
-- Keep-Alive & Connection Pooling
-- International Domains and URLs
-- Sessions with Cookie Persistence
-- Browser-style TLS/SSL Verification
-- Basic & Digest Authentication
-- Familiar `dict`–like Cookies
-- Automatic Content Decompression and Decoding
-- Multi-part File Uploads
-- SOCKS Proxy Support
-- Connection Timeouts
-- Streaming Downloads
-- Automatic honoring of `.netrc`
-- Chunked HTTP Requests
-
-## Cloning the repository
-
-When cloning the Requests repository, you may need to add the `-c
-fetch.fsck.badTimezone=ignore` flag to avoid an error about a bad commit timestamp (see
-[this issue](https://github.com/psf/requests/issues/2690) for more background):
-
-```shell
-git clone -c fetch.fsck.badTimezone=ignore https://github.com/psf/requests.git
+response = requests.get("https://httpbin.org/get", timeout=10)
+response.raise_for_status()
+print(response.json())
 ```
 
-You can also apply this setting to your global Git config:
+Exact pristine `Session` and `HTTPAdapter` traffic uses the Rust path by
+default. Unsupported extension, mutation, subclass, or custom-adapter behavior
+falls back to the compatibility implementation before native I/O begins. See
+[PORTING.md](PORTING.md) for the verified boundary and open qualification work.
 
-```shell
-git config --global fetch.fsck.badTimezone ignore
-```
+## Current performance evidence
 
----
+Performance is not a release gate and no target has been set. In the checked-in
+Linux loopback run, median throughput across the 16 rows per surface was:
 
-[![Kenneth Reitz](https://raw.githubusercontent.com/psf/requests/main/ext/kr.png)](https://kennethreitz.org) [![Python Software Foundation](https://raw.githubusercontent.com/psf/requests/main/ext/psf.png)](https://www.python.org/psf)
+| Surface | Median requests/s |
+| --- | ---: |
+| Frozen Python Requests oracle | 672.374 |
+| Rust-backed Python API | 23.931 |
+| Native Rust async API | 3,052.193 |
+| Native Rust blocking API | 2,616.302 |
+
+The Rust-backed Python surface was slower than the oracle in this run; the
+native Rust surfaces were faster. These are local loopback measurements, not
+universal claims. See the [benchmark method](benchmarks/README.md) and
+[raw result](benchmarks/results/20260902-local-default.json).
+
+## Contributing and security
+
+Read the [contribution guide](.github/CONTRIBUTING.md) before opening a pull
+request. Report suspected vulnerabilities privately according to the
+[security policy](.github/SECURITY.md), never in a public issue.
+
+## Attribution and license
+
+This derivative retains Requests' Apache License 2.0, notice, history, API
+documentation, and original contributor record. See [LICENSE](LICENSE),
+[NOTICE](NOTICE), [AUTHORS.rst](AUTHORS.rst), and [HISTORY.md](HISTORY.md).
+Requests itself was created by Kenneth Reitz and is maintained upstream by the
+PSF Requests project. Changes specific to this Rust rewrite are maintained by
+Puneet Chandna.

@@ -43,7 +43,7 @@ EXPECTED_FREE_THREADED_EVIDENCE = {
     f"free-threaded-evidence-{system}.json" for system in SYSTEMS
 }
 EXPECTED_CLASSIFIERS = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Environment :: Web Environment",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
@@ -65,8 +65,11 @@ EXPECTED_CLASSIFIERS = [
     "Topic :: Software Development :: Libraries",
 ]
 EXPECTED_URLS = {
-    "Documentation": "https://requests.readthedocs.io",
-    "Source": "https://github.com/psf/requests",
+    "Documentation": "https://github.com/puneet-chandna/requests-rust/tree/main/docs",
+    "Homepage": "https://github.com/puneet-chandna/requests-rust",
+    "Issues": "https://github.com/puneet-chandna/requests-rust/issues",
+    "Source": "https://github.com/puneet-chandna/requests-rust",
+    "Upstream": "https://github.com/psf/requests",
 }
 EXPECTED_DEPENDENCIES = [
     "charset_normalizer>=2,<4",
@@ -222,12 +225,30 @@ def artifact_paths() -> tuple[Path, Path]:
 
 def test_project_metadata_declares_license_files_dependencies_and_extras() -> None:
     project = load_toml(ROOT / "pyproject.toml")["project"]
+    assert project["name"] == "requests"
+    assert project["description"] == (
+        "Unofficial Rust-backed rewrite of Requests with strict Python API "
+        "compatibility."
+    )
+    assert project["authors"] == [{"name": "Puneet Chandna"}]
+    assert project["maintainers"] == [{"name": "Puneet Chandna"}]
     assert project["license"] == "Apache-2.0"
     assert project["license-files"] == ["LICENSE", "NOTICE"]
     assert project["dependencies"] == EXPECTED_DEPENDENCIES
     assert project["optional-dependencies"] == EXPECTED_EXTRAS
     assert project["classifiers"] == EXPECTED_CLASSIFIERS
     assert project["urls"] == EXPECTED_URLS
+
+    workspace = load_toml(ROOT / "Cargo.toml")["workspace"]["package"]
+    assert workspace["authors"] == ["Puneet Chandna"]
+    assert workspace["homepage"] == "https://github.com/puneet-chandna/requests-rust"
+    assert workspace["repository"] == workspace["homepage"]
+    for crate in ("requests", "requests-python"):
+        package = load_toml(ROOT / f"crates/{crate}/Cargo.toml")["package"]
+        assert package["publish"] is False
+        assert package["authors"]["workspace"] is True
+        assert package["homepage"]["workspace"] is True
+        assert package["repository"]["workspace"] is True
 
 
 def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> None:
@@ -236,11 +257,8 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert set(triggers) == {
         "workflow_call",
         "workflow_dispatch",
-        "push",
         "pull_request",
     }
-    assert triggers["push"]["branches"] == ["main"]
-    assert triggers["push"]["paths"] == triggers["pull_request"]["paths"]
     assert {
         "Cargo.lock",
         "Cargo.toml",
@@ -254,9 +272,9 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
         "tests_differential/**",
         "tests_rust/test_backend_boundary.py",
         "tests_rust/test_distribution.py",
-    } <= set(triggers["push"]["paths"])
+    } <= set(triggers["pull_request"]["paths"])
     porting = " ".join((ROOT / "PORTING.md").read_text().split())
-    assert "automatic path-filtered push and pull-request gate" in porting
+    assert "reusable and manually dispatched release-validation gate" in porting
     assert "complete 23-cell compiled wheel matrix" in porting
     job = workflow["jobs"]["wheels"]
     assert job["strategy"]["fail-fast"] is False
@@ -559,6 +577,7 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     None
 ):
     jobs = load_workflow("publish.yml")["jobs"]
+    assert set(jobs) == {"sdist", "wheels", "manifest"}
     assert jobs["wheels"]["uses"] == "./.github/workflows/wheels.yml"
     sdist_steps = jobs["sdist"]["steps"]
     sdist_by_name = {step.get("name"): step for step in sdist_steps}
@@ -593,18 +612,42 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
         in manifest_by_name["Fetch GitHub artifact metadata"]["run"]
     )
     assert manifest["steps"][-1]["with"]["name"] == "release-dist"
-    for name in ("publish", "publish-test-pypi"):
-        download = jobs[name]["steps"][0]
-        assert download["with"]["name"] == "release-dist"
-        assert jobs[name]["permissions"] == {"id-token": "write"}
-        assert all(
-            "checkout" not in step.get("uses", "") for step in jobs[name]["steps"]
-        )
-    assert "github.ref == 'refs/heads/main'" in jobs["publish-test-pypi"]["if"]
     triggers = load_workflow("publish.yml").get(
         "on", load_workflow("publish.yml").get(True)
     )
-    assert triggers["workflow_dispatch"]["inputs"]["test-pypi-only"]["default"] is False
+    assert set(triggers) == {"workflow_dispatch"}
+    assert triggers["workflow_dispatch"] is None
+    workflow_text = (ROOT / ".github/workflows/publish.yml").read_text()
+    assert "id-token: write" not in workflow_text
+    assert "gh-action-pypi-publish" not in workflow_text
+    assert "test.pypi.org" not in workflow_text
+    assert "tags:" not in workflow_text
+
+
+def test_public_project_identity_is_derivative_and_registry_safe() -> None:
+    public_files = [
+        ROOT / "README.md",
+        ROOT / ".github/CONTRIBUTING.md",
+        ROOT / ".github/CODE_OF_CONDUCT.md",
+        ROOT / ".github/SECURITY.md",
+        ROOT / "docs/index.rst",
+        ROOT / "docs/dev/contributing.rst",
+        ROOT / "docs/community/support.rst",
+        ROOT / "docs/community/vulnerabilities.rst",
+        ROOT / "docs/community/release-process.rst",
+        ROOT / "docs/user/install.rst",
+    ]
+    combined = "\n".join(path.read_text() for path in public_files)
+    assert "Requests Rust" in combined
+    assert "https://github.com/puneet-chandna/requests-rust" in combined
+    assert "unofficial" in combined.lower()
+    assert "not published to PyPI" in combined
+    assert "github.com/psf/requests/security/advisories/new" not in combined
+    assert "python.org/psf/sponsorship" not in combined
+    assert not (ROOT / ".github/FUNDING.yml").exists()
+    assert not (ROOT / ".github/ISSUE_TEMPLATE.md").exists()
+    assert not (ROOT / ".github/workflows/close-issues.yml").exists()
+    assert not (ROOT / ".github/workflows/lock-issues.yml").exists()
 
 
 def verify_wheel(wheel: Path) -> None:
@@ -652,15 +695,17 @@ def verify_wheel(wheel: Path) -> None:
 
     assert metadata["Name"] == "requests"
     assert metadata["Version"] == "2.34.2"
-    assert metadata["Summary"] == "Python HTTP for Humans."
+    assert metadata["Summary"] == (
+        "Unofficial Rust-backed rewrite of Requests with strict Python API "
+        "compatibility."
+    )
     assert metadata["Requires-Python"] == ">=3.10"
     assert metadata["License-Expression"] == "Apache-2.0"
     assert metadata.get_all("License-File") == ["LICENSE", "NOTICE"]
-    assert metadata["Author-email"] == "Kenneth Reitz <me@kennethreitz.org>"
-    assert metadata["Maintainer-email"] == (
-        "Ian Stapleton Cordasco <graffatcolmingov@gmail.com>, "
-        "Nate Prewitt <nate.prewitt@gmail.com>"
-    )
+    assert metadata["Author"] == "Puneet Chandna"
+    assert metadata["Maintainer"] == "Puneet Chandna"
+    assert metadata["Author-email"] is None
+    assert metadata["Maintainer-email"] is None
     assert metadata.get_all("Classifier") == EXPECTED_CLASSIFIERS
     assert sorted(metadata.get_all("Project-URL")) == sorted(
         f"{name}, {url}" for name, url in EXPECTED_URLS.items()

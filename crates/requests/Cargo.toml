@@ -3,6 +3,11 @@ name = "requests"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+description = "Native HTTP transport for the unofficial Requests Rust rewrite"
+homepage.workspace = true
+repository.workspace = true
+publish = false
 exclude = ["fuzz-corpus/**"]
 
 [lints]

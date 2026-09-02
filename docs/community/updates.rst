@@ -4,15 +4,15 @@
 Community Updates
 =================
 
-If you'd like to stay up to date on the community and development of Requests,
-there are several options:
+Follow development of Requests Rust through this repository. The history below
+is retained from upstream Requests for compatibility and attribution.
 
 
 GitHub
 ------
 
-The best way to track the development of Requests is through
-`the GitHub repo <https://github.com/psf/requests>`_.
+Track the rewrite in
+`the Requests Rust repository <https://github.com/puneet-chandna/requests-rust>`_.
 
 
 .. include:: ../../HISTORY.md

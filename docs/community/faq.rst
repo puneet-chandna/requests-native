@@ -1,90 +1,49 @@
 .. _faq:
 
-Frequently Asked Questions
+Frequently asked questions
 ==========================
 
-This part of the documentation answers common questions about Requests.
+Is this official Requests?
+--------------------------
 
-Encoded Data?
--------------
+No. Requests Rust is an unofficial, independent rewrite and is not affiliated
+with PSF Requests or the Python Software Foundation. Upstream Requests remains
+at `github.com/psf/requests <https://github.com/psf/requests>`_.
 
-Requests automatically decompresses gzip-encoded responses, and does
-its best to decode response content to unicode when possible.
+Can I install it from PyPI?
+---------------------------
 
-When either the `brotli <https://pypi.org/project/Brotli/>`_ or `brotlicffi <https://pypi.org/project/brotlicffi/>`_
-package is installed, requests also decodes Brotli-encoded responses.
+No. Requests Rust is not published to PyPI or crates.io. Build it from this
+repository by following :ref:`install`. There is no ``requests-rust`` package
+on PyPI maintained by this project.
 
-You can get direct access to the raw response (and even the socket),
-if needed as well.
+Why does it report version 2.34.2?
+----------------------------------
 
+The Python distribution and import surfaces retain Requests version ``2.34.2``
+for strict compatibility testing. The GitHub milestone ``v1.0.0-beta`` tracks
+the rewrite itself and is not a Python package version.
 
-Custom User-Agents?
--------------------
+Does every request use Rust?
+----------------------------
 
-Requests allows you to easily override User-Agent strings, along with
-any other HTTP Header. See :ref:`documentation about headers <custom-headers>`.
+Pristine built-in ``Session`` and ``HTTPAdapter`` traffic uses the native Rust
+transport. Unsupported custom adapters, subclasses, monkeypatches, and dynamic
+extension behavior fall back before native I/O begins. See ``PORTING.md`` in
+the repository for the current evidence and boundary.
 
+Is it faster than Requests?
+---------------------------
 
+No general performance claim is made. The checked-in loopback result found the
+Rust-backed Python surface slower than the frozen Python oracle while both
+native Rust surfaces were faster. See the benchmark README and raw result;
+repeat representative workloads before drawing conclusions.
 
-Why not Httplib2?
------------------
+Where should I ask a general Requests question?
+------------------------------------------------
 
-Chris Adams gave an excellent summary on
-`Hacker News <https://news.ycombinator.com/item?id=2884406>`_:
-
-    httplib2 is part of why you should use requests: it's far more respectable
-    as a client but not as well documented and it still takes way too much code
-    for basic operations. I appreciate what httplib2 is trying to do, that
-    there's a ton of hard low-level annoyances in building a modern HTTP
-    client, but really, just use requests instead. Kenneth Reitz is very
-    motivated and he gets the degree to which simple things should be simple
-    whereas httplib2 feels more like an academic exercise than something
-    people should use to build production systems[1].
-
-    Disclosure: I'm listed in the requests AUTHORS file but can claim credit
-    for, oh, about 0.0001% of the awesomeness.
-
-    1. https://code.google.com/p/httplib2/issues/detail?id=96 is a good example:
-    an annoying bug that affected many people, there was a fix available for
-    months, which worked great when I applied it in a fork and pounded a couple
-    TB of data through it, but it took over a year to make it into trunk and
-    even longer to make it onto PyPI where any other project which required "
-    httplib2" would get the working version.
-
-
-Python 3 Support?
------------------
-
-Yes! Requests supports all `officially supported versions of Python <https://devguide.python.org/versions/>`_
-and recent releases of PyPy.
-
-Python 2 Support?
------------------
-
-No! As of Requests 2.28.0, Requests no longer supports Python 2.7. Users who
-have been unable to migrate should pin to `requests<2.28`. Full information
-can be found in `psf/requests#6023 <https://github.com/psf/requests/issues/6023>`_.
-
-It is *highly* recommended users migrate to a supported Python 3.x version now since
-Python 2.7 is no longer receiving bug fixes or security updates as of January 1, 2020.
-
-What are "hostname doesn't match" errors?
------------------------------------------
-
-These errors occur when :ref:`SSL certificate verification <verification>`
-fails to match the certificate the server responds with to the hostname
-Requests thinks it's contacting. If you're certain the server's SSL setup is
-correct (for example, because you can visit the site with your browser) and
-you're using Python 2.7, a possible explanation is that you need
-Server-Name-Indication.
-
-`Server-Name-Indication`_, or SNI, is an official extension to SSL where the
-client tells the server what hostname it is contacting. This is important
-when servers are using `Virtual Hosting`_. When such servers are hosting
-more than one SSL site they need to be able to return the appropriate
-certificate based on the hostname the client is connecting to.
-
-Python 3 already includes native support for SNI in their SSL modules.
-
-.. _`Server-Name-Indication`: https://en.wikipedia.org/wiki/Server_Name_Indication
-.. _`virtual hosting`: https://en.wikipedia.org/wiki/Virtual_hosting
+Use the `upstream Requests documentation <https://requests.readthedocs.io/>`_
+or the `python-requests Stack Overflow tag
+<https://stackoverflow.com/questions/tagged/python-requests>`_. This issue
+tracker is for rewrite-specific defects and improvements.
