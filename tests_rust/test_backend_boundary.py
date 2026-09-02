@@ -104,7 +104,9 @@ def test_proxy_callback_sees_no_retained_body_ref_and_can_replace_exact_bytes(
         body=original,
         method="POST",
     )
-    baseline_refcount = sys.getrefcount(original)
+    getrefcount = getattr(sys, "getrefcount", None)
+    baseline_refcount = getrefcount(original) if getrefcount is not None else None
+    callback_observed = []
     refcount_deltas = []
 
     class ObservedProxyKey:
@@ -112,8 +114,13 @@ def test_proxy_callback_sees_no_retained_body_ref_and_can_replace_exact_bytes(
             return hash("http")
 
         def __eq__(self, other):
-            if not refcount_deltas:
-                refcount_deltas.append(sys.getrefcount(original) - baseline_refcount)
+            if not callback_observed:
+                callback_observed.append(other)
+                if getrefcount is not None:
+                    assert baseline_refcount is not None
+                    refcount_deltas.append(
+                        getrefcount(original) - baseline_refcount
+                    )
                 request.body = replacement
             return False
 
@@ -133,7 +140,8 @@ def test_proxy_callback_sees_no_retained_body_ref_and_can_replace_exact_bytes(
         server.server_close()
         worker.join(5)
 
-    assert refcount_deltas == [0]
+    assert callback_observed == ["http"]
+    assert refcount_deltas == ([0] if getrefcount is not None else [])
     assert received == [replacement]
 
 
