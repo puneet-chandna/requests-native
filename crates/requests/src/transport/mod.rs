@@ -715,6 +715,9 @@ impl<IO> ResponseHeadIo<IO> {
         let amount = buffer.remaining().min(self.injected.len());
         let bytes = self.injected.drain(..amount).collect::<Vec<_>>();
         buffer.put_slice(&bytes);
+        if self.injected.is_empty() {
+            self.injected = VecDeque::new();
+        }
     }
 
     fn poll_drain_outgoing(&mut self, context: &mut Context<'_>) -> Poll<io::Result<()>>
@@ -2122,6 +2125,7 @@ impl Body for OutgoingBody {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -2131,6 +2135,7 @@ mod tests {
 
     use bytes::Bytes;
     use http::{HeaderName, HeaderValue, Method};
+    use tokio::io::ReadBuf;
 
     use super::{
         ActiveExchangeGuard, ConnectionDriver, MAX_RESPONSE_HEAD_BYTES, ResponseHeadIo,
@@ -2270,6 +2275,14 @@ mod tests {
             Poll::Ready(Ok(()))
         ));
         assert_eq!(io.outgoing.capacity(), 0);
+
+        io.injected = VecDeque::with_capacity(MAX_RESPONSE_HEAD_BYTES);
+        io.injected.extend(b"head");
+        let mut bytes = [0_u8; 4];
+        let mut buffer = ReadBuf::new(&mut bytes);
+        io.fill_injected(&mut buffer);
+        assert_eq!(buffer.filled(), b"head");
+        assert_eq!(io.injected.capacity(), 0);
     }
 
     #[test]
