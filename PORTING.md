@@ -27,8 +27,11 @@ Task 21 now has a dependency-free local loopback harness covering the frozen
 Python oracle, Rust-backed Python, and native Rust async/blocking surfaces. The
 bounded default run and raw command/result record are in
 `benchmarks/results/20260902-local-default.json`; measurements carry no numeric
-gate and have not changed compatibility behavior. Remote artifact and publish
-qualification remains deferred to the single final v1.0.0-beta gate.
+gate and have not changed compatibility behavior. Its schema records the exact
+release-built Python extension path and digest, Python ABI/dependency versions,
+per-case deadlines, exact streaming application chunks, platform-normalized
+RSS, and untimed allocation replays. Remote artifact and publish qualification
+remains deferred to the single final v1.0.0-beta gate.
 
 Remote qualification of `4d01c2c` produced the following bounded result:
 

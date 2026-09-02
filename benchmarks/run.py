@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import datetime as dt
+import hashlib
 import http.client
 import json
 import math
@@ -14,6 +15,7 @@ import os
 import pathlib
 import platform
 import shlex
+import socket
 import subprocess
 import sys
 import threading
@@ -32,7 +34,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 ORACLE_ROOT = ROOT.parent / "requests"
 NATIVE_BINARY = ROOT / "target" / "release" / "requests-benchmark-native"
 NATIVE_MANIFEST = ROOT / "benchmarks" / "rust-native" / "Cargo.toml"
-SCHEMA_VERSION = 1
+PYTHON_EXTENSION_BUILD = ROOT / "target" / "release" / "lib_requests_rust.so"
+VENV_ROOT = ROOT / ".venv"
+SCHEMA_VERSION = 2
 SURFACES = ("python-oracle", "python-rust", "rust-async", "rust-blocking")
 
 
@@ -57,12 +61,63 @@ def body_checksum(body: bytes) -> int:
     return sum(body)
 
 
+def enable_tcp_nodelay(connection) -> None:
+    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    if connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != 1:
+        raise RuntimeError("loopback fixture could not enable TCP_NODELAY")
+
+
+def normalize_peak_rss(value: int, system: str = sys.platform) -> int:
+    return value if system == "darwin" else value * 1024
+
+
+def validate_allocations(worker: dict[str, Any], surface: str) -> None:
+    python_peak = worker["python_peak_alloc_bytes"]
+    native_total = worker["native_total_allocated_bytes"]
+    if surface.startswith("python-"):
+        if not isinstance(python_peak, int) or python_peak <= 0:
+            raise ValueError("Python allocation replay did not return a positive peak")
+        if native_total is not None:
+            raise ValueError("Python allocation replay returned a native allocation")
+    elif not isinstance(native_total, int) or native_total <= 0:
+        raise ValueError("native allocation replay did not return a positive total")
+
+
+def validate_result_row(row: dict[str, Any]) -> None:
+    required = {
+        "surface",
+        "mode",
+        "body",
+        "read",
+        "concurrency",
+        "requests",
+        "allocation_replay_concurrency",
+        "latency_ns_samples",
+        "latency_ms",
+        "throughput_requests_per_second",
+        "python_peak_alloc_bytes",
+        "native_total_allocated_bytes",
+        "body_bytes_total",
+        "checksum_total",
+        "application_chunks",
+        "connections_opened",
+        "requests_reusing_connections",
+    }
+    missing = required - row.keys()
+    if missing:
+        raise ValueError(f"result row missing keys: {sorted(missing)}")
+    if len(row["latency_ns_samples"]) != row["requests"]:
+        raise ValueError("result row has the wrong latency sample count")
+    validate_allocations(row, row["surface"])
+
+
 def validate_worker_result(
     worker: dict[str, Any],
     *,
     requests: int,
     expected_bytes: int,
     expected_checksum: int,
+    expected_application_chunks: int,
     require_native: bool,
 ) -> None:
     required = {
@@ -75,6 +130,8 @@ def validate_worker_result(
         "rss_peak_bytes",
         "python_peak_alloc_bytes",
         "native_responses",
+        "application_chunks",
+        "native_total_allocated_bytes",
         "implementation",
     }
     missing = required - worker.keys()
@@ -87,6 +144,8 @@ def validate_worker_result(
         raise ValueError("worker body bytes differ from the fixture contract")
     if worker["checksum"] != requests * expected_checksum:
         raise ValueError("worker checksum differs from the fixture contract")
+    if worker["application_chunks"] != expected_application_chunks:
+        raise ValueError("worker application chunks differ from the read contract")
     if require_native and worker["native_responses"] != requests:
         raise ValueError("Rust-backed Python did not route every response natively")
     if worker["elapsed_ns"] <= 0 or (
@@ -110,6 +169,7 @@ class FixtureServer(ThreadingHTTPServer):
 
     def get_request(self):
         connection, address = super().get_request()
+        enable_tcp_nodelay(connection)
         with self._lock:
             self.accepted += 1
             self._connection_ids[id(connection)] = self.accepted
@@ -177,7 +237,7 @@ def python_worker(arguments: argparse.Namespace) -> int:
     native_responses = 0
     lock = threading.Lock()
 
-    def consume(session, url: str) -> tuple[int, int, int, int]:
+    def consume(session, url: str) -> tuple[int, int, int, int, int]:
         nonlocal native_responses
         start = time.perf_counter_ns()
         with session.get(url, stream=arguments.read == "streaming") as response:
@@ -188,19 +248,22 @@ def python_worker(arguments: argparse.Namespace) -> int:
                 body = response.content
                 size = len(body)
                 checksum = body_checksum(body)
+                application_chunks = 0
             else:
                 size = 0
                 checksum = 0
+                application_chunks = 0
                 for chunk in response.iter_content(arguments.chunk_size):
                     size += len(chunk)
                     checksum += body_checksum(chunk)
+                    application_chunks += 1
         latency = time.perf_counter_ns() - start
         if is_native:
             with lock:
                 native_responses += 1
-        return latency, size, checksum, connection_id
+        return latency, size, checksum, connection_id, application_chunks
 
-    def run_client(count: int) -> list[tuple[int, int, int, int]]:
+    def run_client(count: int) -> list[tuple[int, int, int, int, int]]:
         pooled = None
         if arguments.mode == "pooled":
             pooled = requests.Session()
@@ -240,7 +303,7 @@ def python_worker(arguments: argparse.Namespace) -> int:
 
     observations = [item for group in nested for item in group]
     rss_peak_bytes = (
-        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        normalize_peak_rss(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
         if resource is not None
         else None
     )
@@ -254,6 +317,8 @@ def python_worker(arguments: argparse.Namespace) -> int:
         "rss_peak_bytes": rss_peak_bytes,
         "python_peak_alloc_bytes": allocation_peak,
         "native_responses": native_responses,
+        "application_chunks": sum(item[4] for item in observations),
+        "native_total_allocated_bytes": None,
         "implementation": str(implementation),
     }
     print(json.dumps(result, sort_keys=True))
@@ -277,14 +342,107 @@ def build_native(command_log: list[str]) -> None:
         raise RuntimeError(f"native benchmark binary missing: {NATIVE_BINARY}")
 
 
-def run_json_command(command: list[str], *, cwd: pathlib.Path) -> dict[str, Any]:
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        check=False,
-        text=True,
-        capture_output=True,
-    )
+def build_python_extension(command_log: list[str]) -> None:
+    environment = pathlib.Path(sys.prefix).resolve()
+    if environment != VENV_ROOT.resolve():
+        raise RuntimeError(f"benchmark must use the rewrite venv, not {environment}")
+    temporary = ROOT / "target" / "benchmark-tmp"
+    temporary.mkdir(parents=True, exist_ok=True)
+    command = [
+        "env",
+        f"TMPDIR={temporary}",
+        f"UV_CACHE_DIR={ROOT / 'target' / 'benchmark-uv-cache'}",
+        str(VENV_ROOT / "bin" / "maturin"),
+        "develop",
+        "--release",
+        "--offline",
+    ]
+    command_log.append(shlex.join(command))
+    subprocess.run(command, cwd=ROOT, check=True)
+    if not PYTHON_EXTENSION_BUILD.is_file():
+        raise RuntimeError(f"release extension build missing: {PYTHON_EXTENSION_BUILD}")
+
+
+def sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def python_artifact_provenance(
+    command_log: list[str], timeout_seconds: float
+) -> dict[str, Any]:
+    script = """
+import importlib.metadata as metadata
+import json
+import pathlib
+import sys
+import sysconfig
+import requests
+import requests._requests_rust as extension
+
+names = ("requests", "urllib3", "certifi", "idna", "charset-normalizer")
+print(json.dumps({
+    "python_executable": sys.executable,
+    "python_prefix": sys.prefix,
+    "python_base_prefix": sys.base_prefix,
+    "python_version": sys.version,
+    "python_cache_tag": sys.implementation.cache_tag,
+    "python_soabi": sysconfig.get_config_var("SOABI"),
+    "extension_suffix": sysconfig.get_config_var("EXT_SUFFIX"),
+    "requests_module": requests.__file__,
+    "extension_module": extension.__file__,
+    "extension_backend": extension.backend_name(),
+    "versions": {name: metadata.version(name) for name in names},
+}, sort_keys=True))
+"""
+    command = [sys.executable, "-c", script]
+    command_log.append(shlex.join(command))
+    provenance = run_json_command(command, cwd=ROOT, timeout_seconds=timeout_seconds)
+    if pathlib.Path(provenance["python_prefix"]).resolve() != VENV_ROOT.resolve():
+        raise RuntimeError("provenance probe did not run inside the rewrite venv")
+    extension = pathlib.Path(provenance["extension_module"]).resolve()
+    expected_directory = ROOT / "src" / "requests"
+    expected_suffix = provenance["extension_suffix"]
+    if (
+        extension.parent != expected_directory
+        or extension.name != f"_requests_rust{expected_suffix}"
+    ):
+        raise RuntimeError(
+            f"loaded unexpected Rust-backed Python extension: {extension}"
+        )
+    loaded_digest = sha256(extension)
+    build_digest = sha256(PYTHON_EXTENSION_BUILD)
+    if loaded_digest != build_digest:
+        raise RuntimeError(
+            "loaded Python extension digest differs from the release build"
+        )
+    if provenance["extension_backend"] != "requests-rust":
+        raise RuntimeError("loaded Python extension reports the wrong backend")
+    provenance["extension_sha256"] = loaded_digest
+    provenance["release_build"] = str(PYTHON_EXTENSION_BUILD)
+    provenance["release_build_sha256"] = build_digest
+    return provenance
+
+
+def run_json_command(
+    command: list[str], *, cwd: pathlib.Path | None, timeout_seconds: float
+) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"subprocess timed out after {timeout_seconds:g}s: {shlex.join(command)}"
+        ) from error
     if completed.returncode:
         raise RuntimeError(
             f"command failed ({completed.returncode}): {shlex.join(command)}\n"
@@ -405,16 +563,18 @@ def summarize(
     concurrency: int,
     requests: int,
     accepted_connections: int,
+    allocation_replay_concurrency: int,
 ) -> dict[str, Any]:
     milliseconds = [value / 1_000_000 for value in worker["latencies_ns"]]
     elapsed_seconds = worker["elapsed_ns"] / 1_000_000_000
-    return {
+    row = {
         "surface": surface,
         "mode": mode,
         "body": body,
         "read": read,
         "concurrency": concurrency,
         "requests": requests,
+        "allocation_replay_concurrency": allocation_replay_concurrency,
         "elapsed_seconds": elapsed_seconds,
         "throughput_requests_per_second": requests / elapsed_seconds,
         "latency_ns_samples": worker["latencies_ns"],
@@ -429,13 +589,17 @@ def summarize(
         "cpu_seconds": worker["cpu_seconds"],
         "rss_peak_bytes": worker["rss_peak_bytes"],
         "python_peak_alloc_bytes": worker["python_peak_alloc_bytes"],
+        "native_total_allocated_bytes": worker["native_total_allocated_bytes"],
         "body_bytes_total": worker["body_bytes"],
         "checksum_total": worker["checksum"],
+        "application_chunks": worker["application_chunks"],
         "connections_opened": accepted_connections,
         "connection_ids": worker["connection_ids"],
         "requests_reusing_connections": requests - accepted_connections,
         "implementation": worker["implementation"],
     }
+    validate_result_row(row)
+    return row
 
 
 def orchestrate(arguments: argparse.Namespace) -> int:
@@ -450,7 +614,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
     if (
         min(requests, small_size, large_size, maximum_concurrency, arguments.chunk_size)
         < 1
-    ):
+    ) or arguments.case_timeout_seconds <= 0:
         raise ValueError("all workload sizes must be positive")
     concurrencies = sorted({1, min(requests, maximum_concurrency)})
     surfaces = arguments.surfaces or list(SURFACES)
@@ -466,7 +630,11 @@ def orchestrate(arguments: argparse.Namespace) -> int:
             [sys.executable, str(pathlib.Path(__file__).resolve()), *sys.argv[1:]]
         )
     ]
+    build_python_extension(commands)
     build_native(commands)
+    python_provenance = python_artifact_provenance(
+        commands, arguments.case_timeout_seconds
+    )
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "generated_at_utc": dt.datetime.now(dt.UTC).isoformat(),
@@ -482,6 +650,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
             "cargo": tool_version(["cargo", "--version"]),
         },
         "git": git_metadata(),
+        "python_artifact": python_provenance,
         "config": {
             "profile": arguments.profile,
             "requests_per_case": requests,
@@ -513,7 +682,20 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                             )
                             before_requests, before_connections = server.snapshot()
                             commands.append(shlex.join(command))
-                            worker = run_json_command(command, cwd=ROOT)
+                            case_name = (
+                                f"{surface}/{mode}/{body_name}/{read}/"
+                                f"concurrency-{concurrency}"
+                            )
+                            try:
+                                worker = run_json_command(
+                                    command,
+                                    cwd=ROOT,
+                                    timeout_seconds=arguments.case_timeout_seconds,
+                                )
+                            except RuntimeError as error:
+                                raise RuntimeError(
+                                    f"case failed: {case_name}: {error}"
+                                ) from error
                             after_requests, after_connections = server.snapshot()
                             request_delta = after_requests - before_requests
                             accepted_delta = after_connections - before_connections
@@ -530,6 +712,14 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                                 requests=requests,
                                 expected_bytes=len(expected_body),
                                 expected_checksum=body_checksum(expected_body),
+                                expected_application_chunks=(
+                                    0
+                                    if read == "buffered"
+                                    else requests
+                                    * math.ceil(
+                                        len(expected_body) / arguments.chunk_size
+                                    )
+                                ),
                                 require_native=surface == "python-rust",
                             )
                             if (
@@ -539,37 +729,69 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                                 raise RuntimeError(
                                     "frozen Python oracle unexpectedly used a native response"
                                 )
-                            if surface.startswith("python-"):
-                                allocation_command = [*command, "--measure-allocations"]
-                                allocation_before, _ = server.snapshot()
-                                commands.append(shlex.join(allocation_command))
+                            allocation_concurrency = (
+                                1 if surface.startswith("python-") else concurrency
+                            )
+                            allocation_command = [
+                                *worker_command(
+                                    surface,
+                                    url=url,
+                                    requests=requests,
+                                    concurrency=allocation_concurrency,
+                                    mode=mode,
+                                    read=read,
+                                    chunk_size=arguments.chunk_size,
+                                ),
+                                "--measure-allocations",
+                            ]
+                            allocation_before, _ = server.snapshot()
+                            commands.append(shlex.join(allocation_command))
+                            try:
                                 allocation_worker = run_json_command(
-                                    allocation_command, cwd=ROOT
+                                    allocation_command,
+                                    cwd=ROOT,
+                                    timeout_seconds=arguments.case_timeout_seconds,
                                 )
-                                allocation_after, _ = server.snapshot()
-                                if allocation_after - allocation_before != requests:
-                                    raise RuntimeError(
-                                        "allocation replay sent the wrong request count"
-                                    )
-                                try:
-                                    validate_worker_result(
-                                        allocation_worker,
-                                        requests=requests,
-                                        expected_bytes=len(expected_body),
-                                        expected_checksum=body_checksum(expected_body),
-                                        require_native=surface == "python-rust",
-                                    )
-                                except ValueError as error:
-                                    raise RuntimeError(
-                                        "allocation replay failed for "
-                                        f"{surface}/{mode}/{body_name}/{read}/"
-                                        f"concurrency-{concurrency}: {error}; "
-                                        "native responses="
-                                        f"{allocation_worker['native_responses']}"
-                                    ) from error
+                            except RuntimeError as error:
+                                raise RuntimeError(
+                                    f"allocation replay failed: {case_name}: {error}"
+                                ) from error
+                            allocation_after, _ = server.snapshot()
+                            if allocation_after - allocation_before != requests:
+                                raise RuntimeError(
+                                    f"allocation replay sent the wrong request count: {case_name}"
+                                )
+                            try:
+                                validate_worker_result(
+                                    allocation_worker,
+                                    requests=requests,
+                                    expected_bytes=len(expected_body),
+                                    expected_checksum=body_checksum(expected_body),
+                                    expected_application_chunks=(
+                                        0
+                                        if read == "buffered"
+                                        else requests
+                                        * math.ceil(
+                                            len(expected_body) / arguments.chunk_size
+                                        )
+                                    ),
+                                    require_native=surface == "python-rust",
+                                )
+                                validate_allocations(allocation_worker, surface)
+                            except ValueError as error:
+                                raise RuntimeError(
+                                    f"allocation replay failed for {case_name}: {error}; "
+                                    "native responses="
+                                    f"{allocation_worker['native_responses']}"
+                                ) from error
+                            if surface.startswith("python-"):
                                 worker["python_peak_alloc_bytes"] = allocation_worker[
                                     "python_peak_alloc_bytes"
                                 ]
+                            else:
+                                worker["native_total_allocated_bytes"] = (
+                                    allocation_worker["native_total_allocated_bytes"]
+                                )
                             rows.append(
                                 summarize(
                                     worker,
@@ -580,6 +802,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                                     concurrency=concurrency,
                                     requests=requests,
                                     accepted_connections=accepted_delta,
+                                    allocation_replay_concurrency=allocation_concurrency,
                                 )
                             )
 
@@ -608,6 +831,7 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--small-bytes", type=int)
     command.add_argument("--large-bytes", type=int)
     command.add_argument("--chunk-size", type=int, default=16 * 1024)
+    command.add_argument("--case-timeout-seconds", type=float, default=30.0)
     command.add_argument("--output", type=pathlib.Path)
     command.add_argument("--surface", choices=SURFACES, help=argparse.SUPPRESS)
     command.add_argument("--url", help=argparse.SUPPRESS)

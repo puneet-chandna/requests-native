@@ -6,9 +6,6 @@ publish = false
 
 [workspace]
 
-[lints.rust]
-unsafe_code = "forbid"
-
 [dependencies]
 futures-core = "0.3"
 requests = { path = "../../crates/requests" }
