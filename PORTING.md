@@ -20,8 +20,15 @@ Its unchanged, differential, default-boundary, and fresh local artifact gates
 are green. Task 20 remains `IN_PROGRESS`: final boundary reviews are pending,
 and the user explicitly deferred the full exact-commit remote artifact matrix
 and publish evidence to the final Task 21 v1.0.0-beta gate to conserve GitHub
-Actions usage. Benchmarking remains Task 21. This is not a claim that the
+Actions usage. Benchmarking is tracked as Task 21. This is not a claim that the
 entire port is complete.
+
+Task 21 now has a dependency-free local loopback harness covering the frozen
+Python oracle, Rust-backed Python, and native Rust async/blocking surfaces. The
+bounded default run and raw command/result record are in
+`benchmarks/results/20260902-local-default.json`; measurements carry no numeric
+gate and have not changed compatibility behavior. Remote artifact and publish
+qualification remains deferred to the single final v1.0.0-beta gate.
 
 Remote qualification of `4d01c2c` produced the following bounded result:
 

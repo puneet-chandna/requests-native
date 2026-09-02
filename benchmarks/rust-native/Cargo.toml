@@ -1,0 +1,15 @@
+[package]
+name = "requests-benchmark-native"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+futures-core = "0.3"
+requests = { path = "../../crates/requests" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
