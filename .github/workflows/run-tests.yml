@@ -2,6 +2,7 @@ name: Tests
 
 on:
   push:
+    branches: [main]
     paths:
       - Cargo.toml
       - Cargo.lock
@@ -73,9 +74,9 @@ jobs:
     - name: Install dependencies
       run: |
         make
-    - name: Run default Python backend tests
+    - name: Run Rust default backend tests
       run: |
-        echo "Default Python backend"
+        echo "Rust default backend"
         make ci
     - name: Check out frozen Python oracle
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -110,9 +111,9 @@ jobs:
         run: |
           make
           python -m pip uninstall -y "charset_normalizer" "chardet"
-      - name: Run default Python backend tests
+      - name: Run Rust default backend tests
         run: |
-          echo "Default Python backend"
+          echo "Rust default backend"
           python tests_rust/test_distribution.py --compatibility-smoke no-detector --backend default
           make ci
       - name: Check out frozen Python oracle
@@ -149,9 +150,9 @@ jobs:
         run: |
           make
           python  -m pip install "urllib3<2"
-      - name: Run default Python backend tests
+      - name: Run Rust default backend tests
         run: |
-          echo "Default Python backend"
+          echo "Rust default backend"
           python tests_rust/test_distribution.py --compatibility-smoke urllib3-1 --backend default
           make ci
       - name: Check out frozen Python oracle

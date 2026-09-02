@@ -17,3 +17,14 @@ The ``v1.0.0-beta`` milestone may be created as a GitHub prerelease only after:
 The workflow stores validation artifacts for review. It contains no PyPI or
 TestPyPI deployment job. A future registry release requires a separate design,
 version decision, ownership review, and explicit maintainer approval.
+
+Public repository gate
+----------------------
+
+Repository visibility is an owner-controlled step and is separate from the
+GitHub beta prerelease. Before making the repository public, the owner must
+enable GitHub private vulnerability reporting and confirm that the
+``Report a vulnerability`` path is available. Security reports use that path;
+confidential conduct reports use the same path with ``Conduct:`` at the start
+of the title. Until then, invited collaborators use an already-agreed private
+channel with the owner and never public Issues.

@@ -2,11 +2,14 @@
 
 Requests Rust is beta software and is not published to PyPI or crates.io.
 
-Report a suspected vulnerability privately through this repository's
-[GitHub security advisory form](https://github.com/puneet-chandna/requests-rust/security/advisories/new).
-If GitHub does not make that form available, contact the repository owner
-privately through the [Puneet Chandna GitHub profile](https://github.com/puneet-chandna).
-Do not disclose the issue in a public GitHub issue, discussion, or pull request.
+While this repository is private, invited collaborators must use an
+already-agreed private channel with the owner. Never disclose a suspected
+vulnerability in a GitHub issue, discussion, or pull request.
+
+Before making this repository public, the owner must enable GitHub private
+vulnerability reporting. This policy does not claim that it is enabled now.
+After it is enabled, use the repository's **Security** tab and choose
+**Report a vulnerability** to open a private report.
 
 Include the affected commit or tag, impact, environment, minimal reproduction,
 and any proposed mitigation. The maintainer will acknowledge and investigate

@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: beta-artifact-validation-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   sdist:
     name: Build sdist

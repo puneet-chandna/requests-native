@@ -4,6 +4,7 @@ import argparse
 import email.parser
 import hashlib
 import importlib
+import inspect
 import json
 import os
 import re
@@ -314,13 +315,14 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert steps["Upload wheel"]["with"]["if-no-files-found"] == "error"
 
 
-def test_test_and_lint_workflows_cover_python_default_and_explicit_rust_trial() -> None:
+def test_source_workflows_cover_rust_default_and_explicit_trial() -> None:
     tests = load_workflow("run-tests.yml")["jobs"]
     for name in ("build", "no_chardet", "urllib3"):
         steps = {step.get("name"): step for step in tests[name]["steps"]}
         ordered_names = [step.get("name") for step in tests[name]["steps"]]
         run_steps = "\n".join(str(step.get("run", "")) for step in tests[name]["steps"])
-        assert "Default Python backend" in run_steps
+        assert "Rust default backend" in run_steps
+        assert "Default Python backend" not in run_steps
         assert "Explicit Rust trial backend" in run_steps
         oracle = steps["Check out frozen Python oracle"]
         assert oracle["with"] == {
@@ -330,7 +332,7 @@ def test_test_and_lint_workflows_cover_python_default_and_explicit_rust_trial() 
             "persist-credentials": False,
         }
         assert (
-            ordered_names.index("Run default Python backend tests")
+            ordered_names.index("Run Rust default backend tests")
             < ordered_names.index("Check out frozen Python oracle")
             < ordered_names.index("Run explicit Rust trial backend tests")
         )
@@ -355,6 +357,9 @@ def test_test_and_lint_workflows_cover_python_default_and_explicit_rust_trial() 
     assert "--compatibility-smoke urllib3-1 --backend trial" in "\n".join(
         str(step.get("run", "")) for step in tests["urllib3"]["steps"]
     )
+    smoke_source = inspect.getsource(compatibility_smoke)
+    assert 'type(response.raw).__module__ == "requests._requests_rust"' in smoke_source
+    assert '.startswith("urllib3")' not in smoke_source
 
     lint_runs = "\n".join(
         str(step.get("run", ""))
@@ -373,6 +378,7 @@ def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> No
     assert tests["concurrency"]["cancel-in-progress"] is True
     assert set(tests["jobs"]) == {"build", "no_chardet", "urllib3"}
     assert test_triggers["push"]["paths"] == test_triggers["pull_request"]["paths"]
+    assert test_triggers["push"]["branches"] == ["main"]
     assert {
         ".github/workflows/**",
         "API_COMPATIBILITY.tsv",
@@ -390,6 +396,10 @@ def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> No
     for name in ("lint.yml", "typecheck.yml", "codeql-analysis.yml", "zizmor.yml"):
         workflow = load_workflow(name)
         assert workflow["concurrency"]["cancel-in-progress"] is True
+    for name in ("lint.yml", "typecheck.yml"):
+        workflow = load_workflow(name)
+        triggers = workflow.get("on", workflow.get(True))
+        assert triggers["push"]["branches"] == ["main"]
 
     codeql = load_workflow("codeql-analysis.yml")
     codeql_triggers = codeql.get("on", codeql.get(True))
@@ -576,7 +586,8 @@ def test_security_workflows_use_private_repository_safe_reporting() -> None:
 def test_publish_workflow_validates_one_shared_release_artifact_without_publishing() -> (
     None
 ):
-    jobs = load_workflow("publish.yml")["jobs"]
+    workflow = load_workflow("publish.yml")
+    jobs = workflow["jobs"]
     assert set(jobs) == {"sdist", "wheels", "manifest"}
     assert jobs["wheels"]["uses"] == "./.github/workflows/wheels.yml"
     sdist_steps = jobs["sdist"]["steps"]
@@ -612,16 +623,38 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
         in manifest_by_name["Fetch GitHub artifact metadata"]["run"]
     )
     assert manifest["steps"][-1]["with"]["name"] == "release-dist"
-    triggers = load_workflow("publish.yml").get(
-        "on", load_workflow("publish.yml").get(True)
-    )
+    triggers = workflow.get("on", workflow.get(True))
     assert set(triggers) == {"workflow_dispatch"}
     assert triggers["workflow_dispatch"] is None
+    assert workflow["concurrency"] == {
+        "group": "beta-artifact-validation-${{ github.ref }}",
+        "cancel-in-progress": True,
+    }
+    assert workflow["permissions"] == {"contents": "read"}
+    for job in jobs.values():
+        assert "environment" not in job
+        job_permissions = job.get("permissions") or {}
+        assert isinstance(job_permissions, dict)
+        assert "id-token" not in job_permissions
+        assert set(job_permissions.values()) <= {"read"}
     workflow_text = (ROOT / ".github/workflows/publish.yml").read_text()
-    assert "id-token: write" not in workflow_text
-    assert "gh-action-pypi-publish" not in workflow_text
-    assert "test.pypi.org" not in workflow_text
-    assert "tags:" not in workflow_text
+    lowered = workflow_text.lower()
+    for forbidden in (
+        "id-token: write",
+        "write-all",
+        "gh-action-pypi-publish",
+        "maturin-action",
+        "pypi.org",
+        "test.pypi.org",
+        "crates.io",
+        "twine upload",
+        "maturin publish",
+        "pip upload",
+        "gh release upload",
+        "gh release create",
+        "tags:",
+    ):
+        assert forbidden not in lowered
 
 
 def test_public_project_identity_is_derivative_and_registry_safe() -> None:
@@ -648,6 +681,23 @@ def test_public_project_identity_is_derivative_and_registry_safe() -> None:
     assert not (ROOT / ".github/ISSUE_TEMPLATE.md").exists()
     assert not (ROOT / ".github/workflows/close-issues.yml").exists()
     assert not (ROOT / ".github/workflows/lock-issues.yml").exists()
+    makefile = (ROOT / "Makefile").read_text()
+    assert ".publishenv" not in makefile
+    assert "twine" not in makefile
+    assert "publish:" not in makefile
+
+    security = (ROOT / ".github/SECURITY.md").read_text()
+    conduct = (ROOT / ".github/CODE_OF_CONDUCT.md").read_text()
+    release = (ROOT / "docs/community/release-process.rst").read_text()
+    security_flat = " ".join(security.split())
+    conduct_flat = " ".join(conduct.split())
+    release_flat = " ".join(release.split())
+    assert "private through the" not in conduct
+    assert "profile as a private fallback" not in security
+    assert "must enable GitHub private vulnerability reporting" in security_flat
+    assert "Report a vulnerability" in security_flat
+    assert "prefix the report title with `Conduct:`" in conduct_flat
+    assert "private vulnerability reporting" in release_flat
 
 
 def verify_wheel(wheel: Path) -> None:
@@ -1019,10 +1069,9 @@ def compatibility_smoke(kind: str, backend: str) -> None:
         if backend == "trial":
             with requests._rust_public_trial():
                 response = session.get(f"http://127.0.0.1:{server.server_port}/")
-            assert type(response.raw).__module__ == "requests._requests_rust"
         else:
             response = session.get(f"http://127.0.0.1:{server.server_port}/")
-            assert type(response.raw).__module__.startswith("urllib3")
+        assert type(response.raw).__module__ == "requests._requests_rust"
         assert response.content == b"ok"
     finally:
         session.close()
