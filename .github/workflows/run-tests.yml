@@ -12,7 +12,6 @@ on:
       - HISTORY.md
       - LICENSE
       - LIFETIMES.tsv
-      - MANIFEST.in
       - Makefile
       - NOTICE
       - ORACLE.lock
@@ -20,7 +19,6 @@ on:
       - pyproject.toml
       - requirements-dev.txt
       - "scripts/**"
-      - setup.py
       - "src/**"
       - "tests/**"
       - "tests_differential/**"
@@ -35,7 +33,6 @@ on:
       - HISTORY.md
       - LICENSE
       - LIFETIMES.tsv
-      - MANIFEST.in
       - Makefile
       - NOTICE
       - ORACLE.lock
@@ -43,7 +40,6 @@ on:
       - pyproject.toml
       - requirements-dev.txt
       - "scripts/**"
-      - setup.py
       - "src/**"
       - "tests/**"
       - "tests_differential/**"

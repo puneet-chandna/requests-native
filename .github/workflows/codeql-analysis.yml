@@ -12,7 +12,6 @@ on:
       - "docs/**/*.py"
       - pyproject.toml
       - "scripts/**/*.py"
-      - setup.py
       - "src/**/*.py"
       - "src/**/*.pyi"
       - "tests/**/*.py"
@@ -26,7 +25,6 @@ on:
       - "docs/**/*.py"
       - pyproject.toml
       - "scripts/**/*.py"
-      - setup.py
       - "src/**/*.py"
       - "src/**/*.pyi"
       - "tests/**/*.py"

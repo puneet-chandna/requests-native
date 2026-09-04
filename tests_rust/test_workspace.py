@@ -57,11 +57,6 @@ def test_maturin_mixed_project_preserves_requests_metadata() -> None:
         "bindings": "pyo3",
         "include": [
             {"path": "HISTORY.md", "format": "sdist"},
-            {"path": "MANIFEST.in", "format": "sdist"},
-            {"path": "requirements-dev.txt", "format": "sdist"},
-            {"path": "setup.py", "format": "sdist"},
-            {"path": "tests/**/*.py", "format": "sdist"},
-            {"path": "tests/certs/**/*", "format": "sdist"},
         ],
     }
 

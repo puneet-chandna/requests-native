@@ -333,6 +333,8 @@ def test_project_metadata_declares_license_files_dependencies_and_extras() -> No
 
 
 def test_release_sources_are_allow_listed_and_legal_files_are_canonical() -> None:
+    assert not (ROOT / "setup.py").exists()
+    assert not (ROOT / "MANIFEST.in").exists()
     maturin = load_toml(ROOT / "pyproject.toml")["tool"]["maturin"]
     assert maturin["include"] == [{"path": "HISTORY.md", "format": "sdist"}]
 
