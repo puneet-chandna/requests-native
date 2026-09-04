@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import json
 import secrets
 import symtable
@@ -29729,7 +29730,7 @@ def test_v6_environment_oracles_restore_all_patched_authorities(
     assert oracle.stderr == ""
 
 
-def test_v6_e06_observation_and_artifacts_do_not_project_credentials() -> None:
+def test_v6_e06_observation_does_not_project_credentials() -> None:
     oracle = run_oracle_case({"source": dedent(_SESSION_HELPERS + _CASES["E06"])})
     serialized = json.dumps(oracle.observations, sort_keys=True)
     assert _V6_E06_CREDENTIAL_CANARY not in serialized
@@ -29744,11 +29745,12 @@ def test_v6_e06_observation_and_artifacts_do_not_project_credentials() -> None:
     )
     assert _V6_E06_CREDENTIAL_CANARY not in ast.unparse(observer)
 
-    artifact_root = Path(
-        ".superpowers/sdd/2026-07-24-requests-rust-rewrite/task-16-phasea-artifacts"
+
+def test_v6_e06_privacy_check_has_no_local_artifact_dependency() -> None:
+    privacy_check = inspect.getsource(
+        test_v6_e06_observation_does_not_project_credentials
     )
-    for artifact in artifact_root.glob("*.md"):
-        assert _V6_E06_CREDENTIAL_CANARY not in artifact.read_text()
+    assert "artifact_root" not in privacy_check
 
 
 def _mutation_free_names(mutation_source: str) -> set[str]:

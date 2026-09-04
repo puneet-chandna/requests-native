@@ -14,6 +14,7 @@ import math
 import os
 import pathlib
 import platform
+import re
 import shlex
 import shutil
 import socket
@@ -37,6 +38,36 @@ NATIVE_BINARY = ROOT / "target" / "release" / "requests-benchmark-native"
 NATIVE_MANIFEST = ROOT / "benchmarks" / "rust-native" / "Cargo.toml"
 SCHEMA_VERSION = 2
 SURFACES = ("python-oracle", "python-rust", "rust-async", "rust-blocking")
+_PERSONAL_HOME = re.compile(
+    r"(?:/(?:home|Users)/[^/\s]+|[A-Za-z]:[\\/]Users[\\/][^\\/\s]+)"
+)
+
+
+def sanitize_public_report(
+    value: Any,
+    *,
+    repository: pathlib.Path = ROOT,
+    oracle: pathlib.Path = ORACLE_ROOT,
+) -> Any:
+    replacements = (
+        (str(repository.resolve()), "{repository}"),
+        (str(oracle.resolve()), "{oracle}"),
+    )
+
+    def sanitize(item: Any) -> Any:
+        if isinstance(item, str):
+            for source, replacement in replacements:
+                item = item.replace(source, replacement)
+            if _PERSONAL_HOME.search(item):
+                raise ValueError("benchmark report contains a personal home path")
+            return item
+        if isinstance(item, list):
+            return [sanitize(member) for member in item]
+        if isinstance(item, dict):
+            return {key: sanitize(member) for key, member in item.items()}
+        return item
+
+    return sanitize(value)
 
 
 def percentile(values: list[float], quantile: float) -> float:
@@ -880,7 +911,9 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                                 )
                             )
 
-    document = {**metadata, "commands": commands, "results": rows}
+    document = sanitize_public_report(
+        {**metadata, "commands": commands, "results": rows}
+    )
     output = arguments.output
     if output is None:
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")

@@ -14,25 +14,25 @@ except ModuleNotFoundError:  # Python 3.10
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tests_differential.runner import (  # noqa: E402
-    DEFAULT_ORACLE_ROOT,
-    run_oracle_case,
-)
+from tests_differential.runner import run_oracle_case  # noqa: E402
+
+
+def resolve_oracle_root(
+    lock: dict,
+    environment: dict[str, str] = os.environ,
+    *,
+    root: Path = ROOT,
+) -> Path:
+    configured = Path(environment.get("REQUESTS_ORACLE_ROOT", lock["oracle_path"]))
+    if not configured.is_absolute():
+        configured = root / configured
+    return configured.resolve()
 
 
 def main() -> int:
     with (ROOT / "ORACLE.lock").open("rb") as stream:
         lock = tomllib.load(stream)
-    oracle_root = Path(
-        os.environ.get("REQUESTS_ORACLE_ROOT", DEFAULT_ORACLE_ROOT)
-    ).resolve()
-    expected_root = Path(lock["oracle_path"]).resolve()
-    if oracle_root != expected_root:
-        print(
-            f"oracle path differs from ORACLE.lock: {oracle_root} != {expected_root}",
-            file=sys.stderr,
-        )
-        return 1
+    oracle_root = resolve_oracle_root(lock)
     try:
         head = _git(oracle_root, "rev-parse", "HEAD")
         source_tree = _git(

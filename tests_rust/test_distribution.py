@@ -252,6 +252,26 @@ def test_project_metadata_declares_license_files_dependencies_and_extras() -> No
         assert package["repository"]["workspace"] is True
 
 
+def test_oracle_lock_resolves_relative_to_the_repository_or_explicit_override(
+    tmp_path: Path,
+) -> None:
+    from scripts import check_oracle
+
+    resolver = getattr(check_oracle, "resolve_oracle_root", None)
+    assert resolver is not None
+
+    repository = tmp_path / "rewrite"
+    repository.mkdir()
+    lock = {"oracle_path": "../oracle"}
+    assert resolver(lock, {}, root=repository) == tmp_path / "oracle"
+    override = tmp_path / "explicit-oracle"
+    assert resolver(
+        lock,
+        {"REQUESTS_ORACLE_ROOT": str(override)},
+        root=repository,
+    ) == override
+
+
 def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> None:
     workflow = load_workflow("wheels.yml")
     triggers = workflow.get("on", workflow.get(True))

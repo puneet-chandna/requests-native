@@ -19,6 +19,29 @@ from benchmarks.run import (
 
 
 class BenchmarkHarnessTests(unittest.TestCase):
+    def test_public_report_replaces_checkout_paths_and_rejects_home_paths(self) -> None:
+        sanitizer = getattr(benchmark, "sanitize_public_report", None)
+        self.assertIsNotNone(sanitizer)
+        repository = Path("/home/example/projects/requests-rewrite")
+        oracle = Path("/home/example/projects/requests")
+        report = {
+            "command": f"{repository}/.venv/bin/python {repository}/benchmarks/run.py",
+            "implementation": f"{oracle}/src/requests/__init__.py",
+        }
+        self.assertEqual(
+            sanitizer(report, repository=repository, oracle=oracle),
+            {
+                "command": "{repository}/.venv/bin/python {repository}/benchmarks/run.py",
+                "implementation": "{oracle}/src/requests/__init__.py",
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "personal home path"):
+            sanitizer(
+                {"unrelated": "/home/another-user/private/file"},
+                repository=repository,
+                oracle=oracle,
+            )
+
     def test_release_library_selection_is_platform_specific(self) -> None:
         resolver = getattr(benchmark, "find_release_library", lambda *_: None)
         for system, filename in (

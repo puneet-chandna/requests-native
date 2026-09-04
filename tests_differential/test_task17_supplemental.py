@@ -1757,28 +1757,67 @@ finally:
 
 
 def test_task17_malformed_declared_length_does_not_strand_pool_capacity() -> None:
-    from tests_differential.test_adapters import loopback, prepared
+    source = r"""
+from contextlib import nullcontext
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+import threading
 
-    import requests
-    from requests.adapters import HTTPAdapter
+import requests
+from requests.adapters import HTTPAdapter
+from requests.models import PreparedRequest
 
-    with loopback(
-        (200, {"Content-Length": "malformed", "Connection": "close"}, b"x", None, True),
-        (200, {}, b"second"),
-    ) as (_server, url):
-        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, pool_block=True)
-        try:
-            with requests._rust_public_trial():
-                try:
-                    adapter.send(prepared(url), stream=True)
-                except BaseException as error:
-                    first_error = type(error).__name__
-                second = adapter.send(prepared(url))
-                assert second.content == b"second"
-            assert first_error
-            assert type(second.raw).__module__ == "requests._requests_rust"
-        finally:
-            adapter.close()
+request_count = 0
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        global request_count
+        request_count += 1
+        body = b"x" if request_count == 1 else b"second"
+        self.send_response(200)
+        self.send_header(
+            "Content-Length", "malformed" if request_count == 1 else str(len(body))
+        )
+        if request_count == 1:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+    def log_message(self, format, *args):
+        pass
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+worker = threading.Thread(target=server.serve_forever, daemon=True)
+worker.start()
+url = f"http://127.0.0.1:{server.server_port}/"
+def prepared():
+    request = PreparedRequest()
+    request.prepare(method="GET", url=url)
+    return request
+
+trial = getattr(requests, "_rust_public_trial", nullcontext)
+adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, pool_block=True)
+try:
+    with trial():
+        first = adapter.send(prepared(), stream=True)
+        assert first.content == b"x"
+        second = adapter.send(prepared())
+        assert second.content == b"second"
+    result = SimpleNamespace(second_raw_module=type(second.raw).__module__)
+finally:
+    adapter.close()
+    server.shutdown()
+    server.server_close()
+    worker.join(5)
+"""
+    oracle = run_oracle_case({"source": dedent(source)})
+    rewrite = run_rewrite_case({"source": dedent(source)})
+    assert oracle.observations["exception"] is None
+    assert rewrite.observations["exception"] is None
+    assert rewrite.observations["result"]["public_state"]["second_raw_module"] == (
+        "requests._requests_rust"
+    )
 
 
 def test_task17_encoded_raw_and_decoded_completion_own_capacity_correctly() -> None:

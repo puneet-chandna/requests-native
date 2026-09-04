@@ -9,47 +9,28 @@ visible, and let the existing tests define correctness.
 
 ## Status
 
-The public façade and side-by-side parity work are accepted through `7a89cde`.
-Commit `4d01c2c` remains the remotely tested distribution candidate and has
-bounded PyPy/free-threaded qualification, but Task 19 is not closed: the
-complete Windows/macOS matrix is not green and no validation-manifest run exists
-for that commit. The local Task 20 candidate now routes only exact pristine
-built-in Session/HTTPAdapter traffic through Rust by default; unsupported,
-subclassed, custom, and dynamically mutated surfaces retain Python authority.
-Its unchanged, differential, default-boundary, and fresh local artifact gates
-are green, and both local boundary reviews accepted the corrected candidate.
-Task 20 remains `IN_PROGRESS` because the user explicitly deferred the full
-exact-commit remote artifact matrix and validation manifest to the final
-v1.0.0-beta gate to conserve GitHub Actions usage. This is not a claim that the
-entire port is complete.
+The rewrite is qualified locally and through a complete 23-cell compiled wheel
+matrix, one sdist, and one validation manifest from an exact commit. That remote
+workflow reported success, but later cross-platform inspection found that all
+seven Windows wheels contained CRLF-normalized `LICENSE` and `NOTICE` bytes and
+the per-runner verifier compared against the normalized checkout. The artifact
+set is therefore qualified evidence, not release-ready evidence.
 
-Task 21 now has a dependency-free local loopback harness covering the frozen
-Python oracle, Rust-backed Python, and native Rust async/blocking surfaces. The
-bounded default run and raw command/result record are in
-`benchmarks/results/20260902-local-default.json`; measurements carry no numeric
-gate and have not changed compatibility behavior. Its schema records the exact
-release-built Python extension path and digest, Python ABI/dependency versions,
-per-case deadlines, exact streaming application chunks, platform-normalized
-RSS, and untimed allocation replays. Both local benchmark reviews accepted the
-corrected harness. Remote artifact qualification remains deferred to the
-single final v1.0.0-beta gate.
+Exact pristine built-in `Session` and `HTTPAdapter` traffic uses the Rust
+backend by default. Unsupported, subclassed, custom, and dynamically mutated
+surfaces retain Python authority. The API ledger still has exactly three
+`IN_PROGRESS` cross-cutting rows: `platform matrix`, `distribution surface`, and
+`default backend`. They remain open until the final immutable release candidate
+passes the reusable and manually dispatched release-validation gate with
+canonical legal bytes and receives its recorded review. This is not a claim
+that the entire port is complete or releasable.
 
-Remote qualification of `4d01c2c` produced the following bounded result:
-
-| Workflow evidence | Result |
-| --- | --- |
-| Push-triggered Type Check `33337076507`, Lint `33337076601`, CodeQL `33337076512`, zizmor `33337076504` | Green |
-| PyPy 3.11 source jobs `99978604892`/`99978604941` and wheel jobs `99978612180`/`99978612190` on macOS/Linux | Green |
-| CPython 3.14t source jobs `99978604958`/`99978604985` and wheel jobs `99978612306`/`99978612060` on macOS/Linux | Green |
-| Tests workflow `33337076508` | Not globally green: default-Python Windows loopback jobs hit `WinError 10053` |
-| Wheels workflow `33337076517` | Not globally green: representative Windows job `99978612057` hit the same loopback failure and macOS job `99978611904` exceeded the 10-second differential-child timeout |
-
-The failing signatures are recorded as unresolved qualification issues; they
-are not hidden or converted into a global-green CI claim. Avoid another full
-remote matrix until a locally reviewed candidate addresses those failures or
-changes a meaningful boundary, so GitHub Actions usage remains controlled.
-A later scheduled CodeQL run, `33347254017`, failed on the same SHA and is not
-represented as part of the green push-triggered qualification set.
+The dependency-free loopback benchmark covers the frozen Python oracle,
+Rust-backed Python, and native Rust async/blocking surfaces. Its bounded default
+result is in `benchmarks/results/20260902-local-default.json`; measurements have
+no numeric acceptance gate and do not change compatibility behavior. Paths in
+the public record use portable repository/oracle placeholders while preserving
+the measured values, toolchain versions, build hashes, and workload details.
 
 Frozen oracle:
 
@@ -75,8 +56,7 @@ not produce a valid behavioral baseline.
 
 ## Companion artifacts
 
-- `docs/superpowers/specs/2026-07-24-requests-rust-port-design.md` states the
-  approved architecture and scope.
+- The architecture and scope are summarized in this public guide.
 - `API_COMPATIBILITY.tsv` inventories observable Python compatibility.
 - `LIFETIMES.tsv` inventories state, ownership, cross-object references,
   threading, and cleanup.
