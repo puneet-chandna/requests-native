@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import email.parser
 import hashlib
 import importlib
 import inspect
+import io
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -856,14 +859,51 @@ def canonical_legal_bytes(source_commit: str) -> dict[str, bytes]:
     }
 
 
+def _archive_member_name(name: str) -> tuple[str, bool]:
+    is_directory = name.endswith("/")
+    normalized = name[:-1] if is_directory else name
+    if (
+        not normalized
+        or "\\" in normalized
+        or normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:", normalized)
+        or any(part in {"", ".", ".."} for part in normalized.split("/"))
+    ):
+        raise ValueError(f"unsafe archive member name: {name!r}")
+    return normalized, is_directory
+
+
+def _expected_archive_directories(files: set[str]) -> set[str]:
+    directories = set()
+    for filename in files:
+        parts = filename.split("/")[:-1]
+        for length in range(1, len(parts) + 1):
+            directories.add("/".join(parts[:length]))
+    return directories
+
+
 def verify_wheel(wheel: Path, source_commit: str) -> None:
     legal = canonical_legal_bytes(source_commit)
     with zipfile.ZipFile(wheel) as archive:
-        members = archive.namelist()
-        metadata_name = next(
-            name for name in members if name.endswith(".dist-info/METADATA")
-        )
-        metadata = email.parser.BytesParser().parsebytes(archive.read(metadata_name))
+        file_members = []
+        directory_members = set()
+        seen_members = set()
+        for member in archive.infolist():
+            name, is_directory = _archive_member_name(member.filename)
+            if name in seen_members:
+                raise ValueError(f"duplicate normalized archive member: {name}")
+            seen_members.add(name)
+            file_type = stat.S_IFMT(member.external_attr >> 16)
+            if is_directory:
+                if file_type not in {0, stat.S_IFDIR}:
+                    raise ValueError(f"non-directory wheel member: {member.filename}")
+                directory_members.add(name)
+            else:
+                if file_type not in {0, stat.S_IFREG}:
+                    raise ValueError(f"non-regular wheel member: {member.filename}")
+                file_members.append(name)
+
+        metadata_name = "requests-2.34.2.dist-info/METADATA"
         expected_python = {
             path.removeprefix("src/")
             for path in EXPECTED_PYTHON_MEMBERS
@@ -872,11 +912,12 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
         assert len(expected_python) == 20
         extension = [
             name
-            for name in members
+            for name in file_members
             if re.fullmatch(r"requests/_requests_rust.*\.(so|pyd|dylib)", name)
         ]
-        assert len(extension) == 1
-        dist_info = metadata_name.removesuffix("METADATA")
+        if len(extension) != 1:
+            raise ValueError("wheel must contain exactly one native extension")
+        dist_info = "requests-2.34.2.dist-info/"
         sbom_name = f"{dist_info}sboms/requests-python.cyclonedx.json"
         expected_members = expected_python | {
             "requests/_requests_rust.pyi",
@@ -889,7 +930,15 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
             f"{dist_info}licenses/NOTICE",
             sbom_name,
         }
-        assert set(members) == expected_members
+        if set(file_members) != expected_members:
+            raise ValueError("wheel inventory does not match the canonical package")
+        allowed_directories = _expected_archive_directories(expected_members)
+        unexpected_directories = directory_members - allowed_directories
+        if unexpected_directories:
+            raise ValueError(
+                f"unexpected wheel directory entries: {sorted(unexpected_directories)!r}"
+            )
+        metadata = email.parser.BytesParser().parsebytes(archive.read(metadata_name))
         assert archive.read(f"{dist_info}licenses/LICENSE") == legal["LICENSE"]
         assert archive.read(f"{dist_info}licenses/NOTICE") == legal["NOTICE"]
         sbom = json.loads(archive.read(sbom_name))
@@ -945,16 +994,31 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
 
 def verify_sdist(sdist: Path, source_commit: str) -> None:
     legal = canonical_legal_bytes(source_commit)
+    root = "requests-2.34.2"
+    expected_files = {f"{root}/{name}" for name in EXPECTED_SDIST_MEMBERS}
+    allowed_directories = {root} | _expected_archive_directories(expected_files)
     with tarfile.open(sdist, "r:gz") as archive:
-        members = {
-            member.name.split("/", 1)[-1]: member
-            for member in archive.getmembers()
-            if member.isfile()
-        }
+        members = {}
+        seen_members = set()
+        for member in archive.getmembers():
+            name, name_is_directory = _archive_member_name(member.name)
+            if name in seen_members:
+                raise ValueError(f"duplicate normalized archive member: {name}")
+            seen_members.add(name)
+            if name != root and not name.startswith(f"{root}/"):
+                raise ValueError(f"sdist root must be exactly {root}: {member.name}")
+            if member.isdir():
+                if name not in allowed_directories:
+                    raise ValueError(f"unexpected sdist directory: {member.name}")
+                continue
+            if name_is_directory or not member.isfile():
+                raise ValueError(f"non-regular sdist member: {member.name}")
+            members[name] = member
         assert len(EXPECTED_SDIST_MEMBERS) == 67
-        assert set(members) == EXPECTED_SDIST_MEMBERS
-        license_stream = archive.extractfile(members["LICENSE"])
-        notice_stream = archive.extractfile(members["NOTICE"])
+        if set(members) != expected_files:
+            raise ValueError("sdist inventory does not match the canonical source tree")
+        license_stream = archive.extractfile(members[f"{root}/LICENSE"])
+        notice_stream = archive.extractfile(members[f"{root}/NOTICE"])
         assert license_stream is not None and license_stream.read() == legal["LICENSE"]
         assert notice_stream is not None and notice_stream.read() == legal["NOTICE"]
 
@@ -963,6 +1027,195 @@ def test_built_wheel_and_sdist_have_complete_clean_inventory_and_metadata() -> N
     wheel, sdist = artifact_paths()
     verify_wheel(wheel, "HEAD")
     verify_sdist(sdist, "HEAD")
+
+
+def _rewrite_wheel(
+    source: Path,
+    destination: Path,
+    *,
+    renamed: dict[str, str] | None = None,
+    duplicate: str | None = None,
+) -> None:
+    renamed = renamed or {}
+    with zipfile.ZipFile(source) as original, zipfile.ZipFile(destination, "w") as output:
+        for member in original.infolist():
+            replacement = copy.copy(member)
+            replacement.filename = renamed.get(member.filename, member.filename)
+            output.writestr(replacement, original.read(member))
+        if duplicate is not None:
+            output.writestr(duplicate, original.read(duplicate))
+
+
+def _tar_member(name: str, *, kind: bytes = tarfile.REGTYPE) -> tarfile.TarInfo:
+    member = tarfile.TarInfo(name)
+    member.type = kind
+    member.mode = 0o644
+    if kind in {tarfile.SYMTYPE, tarfile.LNKTYPE}:
+        member.linkname = "requests-2.34.2/LICENSE"
+    if kind in {tarfile.CHRTYPE, tarfile.BLKTYPE}:
+        member.devmajor = 1
+        member.devminor = 3
+    return member
+
+
+def _rewrite_sdist(
+    source: Path,
+    destination: Path,
+    *,
+    renamed: dict[str, str] | None = None,
+    additions: tuple[tuple[tarfile.TarInfo, bytes | None], ...] = (),
+) -> None:
+    renamed = renamed or {}
+    with tarfile.open(source, "r:gz") as original, tarfile.open(
+        destination, "w:gz"
+    ) as output:
+        for member in original.getmembers():
+            replacement = copy.copy(member)
+            replacement.name = renamed.get(member.name, member.name)
+            stream = original.extractfile(member) if member.isfile() else None
+            output.addfile(replacement, stream)
+        for member, data in additions:
+            member.size = len(data) if data is not None else 0
+            output.addfile(member, io.BytesIO(data) if data is not None else None)
+
+
+def test_wheel_validator_rejects_duplicate_member(tmp_path: Path) -> None:
+    wheel, _ = artifact_paths()
+    invalid = tmp_path / wheel.name
+    _rewrite_wheel(wheel, invalid, duplicate="requests/__init__.py")
+
+    with unittest.TestCase().assertRaisesRegex(ValueError, "duplicate"):
+        verify_wheel(invalid, "HEAD")
+
+
+def test_wheel_validator_rejects_noncanonical_member_names(tmp_path: Path) -> None:
+    wheel, _ = artifact_paths()
+    for index, invalid_name in enumerate(
+        ("/requests/__init__.py", "requests/../requests/__init__.py")
+    ):
+        invalid = tmp_path / f"invalid-{index}.whl"
+        _rewrite_wheel(
+            wheel,
+            invalid,
+            renamed={"requests/__init__.py": invalid_name},
+        )
+        with unittest.TestCase().assertRaisesRegex(ValueError, "archive member"):
+            verify_wheel(invalid, "HEAD")
+
+
+def test_wheel_validator_requires_exact_dist_info_root(tmp_path: Path) -> None:
+    wheel, _ = artifact_paths()
+    with zipfile.ZipFile(wheel) as archive:
+        renamed = {
+            name: name.replace(
+                "requests-2.34.2.dist-info/", "not-requests.dist-info/", 1
+            )
+            for name in archive.namelist()
+            if name.startswith("requests-2.34.2.dist-info/")
+        }
+    invalid = tmp_path / wheel.name
+    _rewrite_wheel(wheel, invalid, renamed=renamed)
+
+    with unittest.TestCase().assertRaisesRegex(ValueError, "wheel inventory"):
+        verify_wheel(invalid, "HEAD")
+
+
+def test_sdist_validator_rejects_duplicate_regular_member(tmp_path: Path) -> None:
+    _, sdist = artifact_paths()
+    invalid = tmp_path / sdist.name
+    license_bytes = canonical_legal_bytes("HEAD")["LICENSE"]
+    _rewrite_sdist(
+        sdist,
+        invalid,
+        additions=((_tar_member("requests-2.34.2/LICENSE"), license_bytes),),
+    )
+
+    with unittest.TestCase().assertRaisesRegex(ValueError, "duplicate"):
+        verify_sdist(invalid, "HEAD")
+
+
+def test_sdist_validator_requires_one_exact_root(tmp_path: Path) -> None:
+    _, sdist = artifact_paths()
+    with tarfile.open(sdist, "r:gz") as archive:
+        names = [member.name for member in archive.getmembers()]
+
+    wrong_root = tmp_path / "wrong-root.tar.gz"
+    _rewrite_sdist(
+        sdist,
+        wrong_root,
+        renamed={
+            name: name.replace("requests-2.34.2/", "wrong-2.34.2/", 1)
+            for name in names
+        },
+    )
+    with unittest.TestCase().assertRaisesRegex(ValueError, "sdist root"):
+        verify_sdist(wrong_root, "HEAD")
+
+    multiple_roots = tmp_path / "multiple-roots.tar.gz"
+    _rewrite_sdist(
+        sdist,
+        multiple_roots,
+        renamed={"requests-2.34.2/LICENSE": "other-root/LICENSE"},
+    )
+    with unittest.TestCase().assertRaisesRegex(ValueError, "sdist root"):
+        verify_sdist(multiple_roots, "HEAD")
+
+
+def test_sdist_validator_rejects_absolute_and_traversal_names(
+    tmp_path: Path,
+) -> None:
+    _, sdist = artifact_paths()
+    for index, invalid_name in enumerate(("/LICENSE", "../LICENSE")):
+        invalid = tmp_path / f"invalid-name-{index}.tar.gz"
+        _rewrite_sdist(
+            sdist,
+            invalid,
+            renamed={"requests-2.34.2/LICENSE": invalid_name},
+        )
+        with unittest.TestCase().assertRaisesRegex(ValueError, "archive member"):
+            verify_sdist(invalid, "HEAD")
+
+
+def test_sdist_validator_rejects_every_non_regular_member(tmp_path: Path) -> None:
+    _, sdist = artifact_paths()
+    cases = (
+        ("symlink", tarfile.SYMTYPE),
+        ("hardlink", tarfile.LNKTYPE),
+        ("character-device", tarfile.CHRTYPE),
+        ("block-device", tarfile.BLKTYPE),
+        ("fifo", tarfile.FIFOTYPE),
+    )
+    for label, kind in cases:
+        invalid = tmp_path / f"{label}.tar.gz"
+        _rewrite_sdist(
+            sdist,
+            invalid,
+            additions=((_tar_member(f"requests-2.34.2/{label}", kind=kind), None),),
+        )
+        with unittest.TestCase().assertRaisesRegex(ValueError, "non-regular"):
+            verify_sdist(invalid, "HEAD")
+
+
+def test_sdist_validator_allows_only_expected_directory_entries(
+    tmp_path: Path,
+) -> None:
+    _, sdist = artifact_paths()
+    expected = tmp_path / "expected-directory.tar.gz"
+    _rewrite_sdist(
+        sdist,
+        expected,
+        additions=((_tar_member("requests-2.34.2/src/requests/", kind=tarfile.DIRTYPE), None),),
+    )
+    verify_sdist(expected, "HEAD")
+
+    unexpected = tmp_path / "unexpected-directory.tar.gz"
+    _rewrite_sdist(
+        sdist,
+        unexpected,
+        additions=((_tar_member("requests-2.34.2/unexpected/", kind=tarfile.DIRTYPE), None),),
+    )
+    with unittest.TestCase().assertRaisesRegex(ValueError, "directory"):
+        verify_sdist(unexpected, "HEAD")
 
 
 def _clean_environment() -> dict[str, str]:
@@ -1292,9 +1545,16 @@ def build_publish_manifest(
         if not isinstance(artifacts, list):
             raise ValueError("GitHub artifact metadata must contain an artifacts list")
         for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                raise ValueError("GitHub artifact metadata entries must be objects")
             name = artifact.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError("GitHub artifact name must be a non-empty string")
             if name in github_artifacts:
                 raise ValueError(f"duplicate GitHub artifact metadata: {name}")
+            _validate_github_artifact_provenance(
+                artifact.get("id"), artifact.get("digest"), context="GitHub artifact"
+            )
             github_artifacts[name] = artifact
         if set(github_artifacts) != source_names:
             raise ValueError("GitHub artifact metadata does not match release fan-out")
@@ -1318,6 +1578,23 @@ def build_publish_manifest(
         "matrix_result": matrix_result,
         "source_commit": source_commit.lower(),
     }
+
+
+def _validate_github_artifact_provenance(
+    artifact_id: object, archive_digest: object, *, context: str
+) -> None:
+    if (
+        isinstance(artifact_id, bool)
+        or not isinstance(artifact_id, int)
+        or artifact_id <= 0
+    ):
+        raise ValueError(f"{context} id must be a positive integer")
+    if not isinstance(archive_digest, str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", archive_digest
+    ):
+        raise ValueError(
+            f"{context} digest must be sha256 followed by 64 lowercase hex digits"
+        )
 
 
 def verify_release_set(
@@ -1371,6 +1648,11 @@ def verify_release_set(
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if record["sha256"] != digest:
             raise ValueError(f"release manifest hash mismatch: {path.name}")
+        _validate_github_artifact_provenance(
+            record["github_artifact_id"],
+            record["github_archive_digest"],
+            context="GitHub artifact provenance",
+        )
     verify_sdist(sdists[0], source_commit)
     for wheel in wheels:
         verify_wheel(wheel, source_commit)
@@ -1403,6 +1685,16 @@ def write_complete_manifest_fixture(directory: Path) -> None:
             )
 
 
+def github_metadata_for(directory: Path) -> dict:
+    names = ["sdist", *sorted(path.name for path in directory.glob("wheel-*"))]
+    return {
+        "artifacts": [
+            {"name": name, "id": index, "digest": f"sha256:{index:064x}"}
+            for index, name in enumerate(names, 1)
+        ]
+    }
+
+
 def test_publish_manifest_accepts_only_the_complete_unique_matrix(
     tmp_path: Path,
 ) -> None:
@@ -1428,13 +1720,7 @@ def test_publish_manifest_records_commit_matrix_and_github_artifacts(
     tmp_path: Path,
 ) -> None:
     write_complete_manifest_fixture(tmp_path)
-    names = ["sdist", *sorted(path.name for path in tmp_path.glob("wheel-*"))]
-    metadata = {
-        "artifacts": [
-            {"name": name, "id": index, "digest": f"sha256:archive-{index}"}
-            for index, name in enumerate(names, 1)
-        ]
-    }
+    metadata = github_metadata_for(tmp_path)
 
     manifest = build_publish_manifest(
         tmp_path,
@@ -1456,8 +1742,36 @@ def test_publish_manifest_records_commit_matrix_and_github_artifacts(
     )
     assert sdist["source_artifact"] == "sdist"
     assert sdist["github_artifact_id"] == 1
-    assert sdist["github_archive_digest"] == "sha256:archive-1"
+    assert sdist["github_archive_digest"] == f"sha256:{1:064x}"
     assert re.fullmatch(r"[0-9a-f]{64}", sdist["sha256"])
+
+
+def test_publish_manifest_rejects_invalid_github_artifact_provenance(
+    tmp_path: Path,
+) -> None:
+    write_complete_manifest_fixture(tmp_path)
+    invalid_values = (
+        ("id", 0),
+        ("id", -1),
+        ("id", True),
+        ("id", "1"),
+        ("digest", None),
+        ("digest", "sha256:abcd"),
+        ("digest", "sha256:" + "A" * 64),
+        ("digest", "SHA256:" + "a" * 64),
+    )
+    for field, value in invalid_values:
+        metadata = github_metadata_for(tmp_path)
+        metadata["artifacts"][0][field] = value
+        with unittest.TestCase().assertRaisesRegex(
+            ValueError, f"GitHub artifact {field}"
+        ):
+            build_publish_manifest(
+                tmp_path,
+                source_commit="a" * 40,
+                matrix_result="success",
+                artifact_metadata=metadata,
+            )
 
 
 def test_release_set_verifies_one_manifest_and_all_24_archives(
@@ -1471,6 +1785,7 @@ def test_release_set_verifies_one_manifest_and_all_24_archives(
         artifacts,
         source_commit=source_commit,
         matrix_result="success",
+        artifact_metadata=github_metadata_for(artifacts),
     )
     release = tmp_path / "release"
     release.mkdir()
@@ -1487,6 +1802,44 @@ def test_release_set_verifies_one_manifest_and_all_24_archives(
     (release / "unexpected.txt").touch()
     with unittest.TestCase().assertRaisesRegex(ValueError, "exactly 23 wheels"):
         verify_release_set(release, manifest_path, source_commit)
+
+
+def test_release_set_rejects_invalid_github_artifact_provenance(
+    monkeypatch, tmp_path: Path
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    write_complete_manifest_fixture(artifacts)
+    source_commit = "a" * 40
+    manifest = build_publish_manifest(
+        artifacts,
+        source_commit=source_commit,
+        matrix_result="success",
+        artifact_metadata=github_metadata_for(artifacts),
+    )
+    release = tmp_path / "release"
+    release.mkdir()
+    for path in artifacts.rglob("requests-*"):
+        if path.is_file():
+            shutil.copy2(path, release / path.name)
+    manifest_path = release / "artifact-manifest.json"
+    monkeypatch.setitem(globals(), "verify_wheel", lambda *args: None)
+    monkeypatch.setitem(globals(), "verify_sdist", lambda *args: None)
+
+    invalid_values = (
+        ("github_artifact_id", 0),
+        ("github_artifact_id", True),
+        ("github_archive_digest", "sha256:abcd"),
+        ("github_archive_digest", "sha256:" + "A" * 64),
+    )
+    for field, value in invalid_values:
+        invalid_manifest = copy.deepcopy(manifest)
+        invalid_manifest["artifacts"][0][field] = value
+        manifest_path.write_text(json.dumps(invalid_manifest, sort_keys=True) + "\n")
+        with unittest.TestCase().assertRaisesRegex(
+            ValueError, "GitHub artifact provenance"
+        ):
+            verify_release_set(release, manifest_path, source_commit)
 
 
 def test_wheel_key_rejects_wrong_version_abi_and_platform() -> None:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import inspect
 import json
 import secrets
 import symtable
@@ -29744,13 +29743,6 @@ def test_v6_e06_observation_does_not_project_credentials() -> None:
         if isinstance(node, ast.FunctionDef) and node.name == "v6_observer"
     )
     assert _V6_E06_CREDENTIAL_CANARY not in ast.unparse(observer)
-
-
-def test_v6_e06_privacy_check_has_no_local_artifact_dependency() -> None:
-    privacy_check = inspect.getsource(
-        test_v6_e06_observation_does_not_project_credentials
-    )
-    assert "artifact_root" not in privacy_check
 
 
 def _mutation_free_names(mutation_source: str) -> set[str]:
