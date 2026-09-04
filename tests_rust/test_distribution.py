@@ -83,6 +83,86 @@ EXPECTED_EXTRAS = {
     "socks": ["PySocks>=1.5.6, !=1.5.7"],
     "use_chardet_on_py3": ["chardet>=3.0.2,<8"],
 }
+EXPECTED_PYTHON_MEMBERS = {
+    "src/requests/__init__.py",
+    "src/requests/__version__.py",
+    "src/requests/_internal_utils.py",
+    "src/requests/_requests_rust.pyi",
+    "src/requests/_rust_public.py",
+    "src/requests/_types.py",
+    "src/requests/adapters.py",
+    "src/requests/api.py",
+    "src/requests/auth.py",
+    "src/requests/certs.py",
+    "src/requests/compat.py",
+    "src/requests/cookies.py",
+    "src/requests/exceptions.py",
+    "src/requests/help.py",
+    "src/requests/hooks.py",
+    "src/requests/models.py",
+    "src/requests/packages.py",
+    "src/requests/py.typed",
+    "src/requests/sessions.py",
+    "src/requests/status_codes.py",
+    "src/requests/structures.py",
+    "src/requests/utils.py",
+}
+EXPECTED_REQUESTS_RUST_SOURCES = {
+    "crates/requests/src/adapters.rs",
+    "crates/requests/src/auth.rs",
+    "crates/requests/src/blocking.rs",
+    "crates/requests/src/body.rs",
+    "crates/requests/src/client.rs",
+    "crates/requests/src/cookies.rs",
+    "crates/requests/src/error.rs",
+    "crates/requests/src/hooks.rs",
+    "crates/requests/src/lib.rs",
+    "crates/requests/src/models.rs",
+    "crates/requests/src/response.rs",
+    "crates/requests/src/retry.rs",
+    "crates/requests/src/session_runtime.rs",
+    "crates/requests/src/structures.rs",
+    "crates/requests/src/transport/connect.rs",
+    "crates/requests/src/transport/decode.rs",
+    "crates/requests/src/transport/mod.rs",
+    "crates/requests/src/transport/pool.rs",
+    "crates/requests/src/transport/proxy.rs",
+    "crates/requests/src/transport/tls.rs",
+    "crates/requests/src/utils.rs",
+}
+EXPECTED_REQUESTS_PYTHON_SOURCES = {
+    "crates/requests-python/src/adapters.rs",
+    "crates/requests-python/src/auth.rs",
+    "crates/requests-python/src/body.rs",
+    "crates/requests-python/src/bridge.rs",
+    "crates/requests-python/src/callbacks.rs",
+    "crates/requests-python/src/cookies.rs",
+    "crates/requests-python/src/errors.rs",
+    "crates/requests-python/src/lib.rs",
+    "crates/requests-python/src/models.rs",
+    "crates/requests-python/src/response.rs",
+    "crates/requests-python/src/runtime.rs",
+    "crates/requests-python/src/sessions.rs",
+    "crates/requests-python/src/structures.rs",
+}
+EXPECTED_SDIST_MEMBERS = (
+    {
+        "Cargo.lock",
+        "Cargo.toml",
+        "HISTORY.md",
+        "LICENSE",
+        "NOTICE",
+        "PKG-INFO",
+        "README.md",
+        "pyproject.toml",
+        "crates/requests/Cargo.toml",
+        "crates/requests-python/Cargo.toml",
+        "crates/requests-python/build.rs",
+    }
+    | EXPECTED_PYTHON_MEMBERS
+    | EXPECTED_REQUESTS_RUST_SOURCES
+    | EXPECTED_REQUESTS_PYTHON_SOURCES
+)
 INSTALLED_SMOKE = r"""
 import importlib
 import os
@@ -252,6 +332,41 @@ def test_project_metadata_declares_license_files_dependencies_and_extras() -> No
         assert package["repository"]["workspace"] is True
 
 
+def test_release_sources_are_allow_listed_and_legal_files_are_canonical() -> None:
+    maturin = load_toml(ROOT / "pyproject.toml")["tool"]["maturin"]
+    assert maturin["include"] == [{"path": "HISTORY.md", "format": "sdist"}]
+
+    requests_package = load_toml(ROOT / "crates/requests/Cargo.toml")["package"]
+    assert requests_package["include"] == [
+        "Cargo.toml",
+        "src/**/*.rs",
+        "!src/**/*_tests.rs",
+    ]
+    requests_python_package = load_toml(ROOT / "crates/requests-python/Cargo.toml")[
+        "package"
+    ]
+    assert requests_python_package["include"] == [
+        "Cargo.toml",
+        "build.rs",
+        "src/**/*.rs",
+    ]
+
+    assert (ROOT / ".gitattributes").read_text() == (
+        "LICENSE text eol=lf\nNOTICE text eol=lf\n"
+    )
+    completed = subprocess.run(
+        [
+            os.fspath(ROOT / ".venv/bin/python"),
+            os.fspath(ROOT / "scripts/generate_third_party_notices.py"),
+            "--check",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
 def test_oracle_lock_resolves_relative_to_the_repository_or_explicit_override(
     tmp_path: Path,
 ) -> None:
@@ -265,11 +380,14 @@ def test_oracle_lock_resolves_relative_to_the_repository_or_explicit_override(
     lock = {"oracle_path": "../oracle"}
     assert resolver(lock, {}, root=repository) == tmp_path / "oracle"
     override = tmp_path / "explicit-oracle"
-    assert resolver(
-        lock,
-        {"REQUESTS_ORACLE_ROOT": str(override)},
-        root=repository,
-    ) == override
+    assert (
+        resolver(
+            lock,
+            {"REQUESTS_ORACLE_ROOT": str(override)},
+            root=repository,
+        )
+        == override
+    )
 
 
 def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> None:
@@ -310,6 +428,7 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert "python -m maturin build" in steps["Build wheel"]["run"]
     assert "--manylinux 2_34" in steps["Build wheel"]["run"]
     assert "--verify-wheel" in steps["Verify exact wheel contents"]["run"]
+    assert "--source-commit" in steps["Verify exact wheel contents"]["run"]
     install = steps["Install wheel and explicit test dependencies"]["run"]
     assert "pytest-httpbin==2.1.0" in install
     assert "PySocks>=1.5.6,!=1.5.7" in install
@@ -405,12 +524,10 @@ def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> No
         "HISTORY.md",
         "LICENSE",
         "LIFETIMES.tsv",
-        "MANIFEST.in",
         "NOTICE",
         "ORACLE.lock",
         "README.md",
         "requirements-dev.txt",
-        "setup.py",
     } <= set(test_triggers["push"]["paths"])
 
     for name in ("lint.yml", "typecheck.yml", "codeql-analysis.yml", "zizmor.yml"):
@@ -426,7 +543,6 @@ def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> No
     assert {
         "docs/**/*.py",
         "scripts/**/*.py",
-        "setup.py",
         "src/**/*.py",
         "src/**/*.pyi",
         "tests/**/*.py",
@@ -614,6 +730,7 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     sdist_by_name = {step.get("name"): step for step in sdist_steps}
     sdist_names = [step.get("name") for step in sdist_steps]
     assert "--verify-sdist" in sdist_by_name["Verify exact sdist contents"]["run"]
+    assert "--source-commit" in sdist_by_name["Verify exact sdist contents"]["run"]
     sdist_install = sdist_by_name["Install sdist and explicit test dependencies"]["run"]
     assert "pytest-httpbin==2.1.0" in sdist_install
     assert "-e ." not in sdist_install and "--editable" not in sdist_install
@@ -638,11 +755,16 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     assert "--source-commit" in runs
     assert "--matrix-result" in runs
     assert "--artifact-metadata" in runs
+    assert "--verify-release-set" in runs
     assert (
         "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100"
         in manifest_by_name["Fetch GitHub artifact metadata"]["run"]
     )
-    assert manifest["steps"][-1]["with"]["name"] == "release-dist"
+    assert manifest["runs-on"] == "ubuntu-24.04"
+    assert manifest["steps"][-1]["name"] == "Verify complete release set"
+    assert all(
+        "upload-artifact" not in str(step.get("uses", "")) for step in manifest["steps"]
+    )
     triggers = workflow.get("on", workflow.get(True))
     assert set(triggers) == {"workflow_dispatch"}
     assert triggers["workflow_dispatch"] is None
@@ -720,7 +842,20 @@ def test_public_project_identity_is_derivative_and_registry_safe() -> None:
     assert "private vulnerability reporting" in release_flat
 
 
-def verify_wheel(wheel: Path) -> None:
+def canonical_legal_bytes(source_commit: str) -> dict[str, bytes]:
+    return {
+        name: subprocess.run(
+            ["git", "show", f"{source_commit}:{name}"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+        for name in ("LICENSE", "NOTICE")
+    }
+
+
+def verify_wheel(wheel: Path, source_commit: str) -> None:
+    legal = canonical_legal_bytes(source_commit)
     with zipfile.ZipFile(wheel) as archive:
         members = archive.namelist()
         metadata_name = next(
@@ -728,7 +863,9 @@ def verify_wheel(wheel: Path) -> None:
         )
         metadata = email.parser.BytesParser().parsebytes(archive.read(metadata_name))
         expected_python = {
-            f"requests/{path.name}" for path in (ROOT / "src/requests").glob("*.py")
+            path.removeprefix("src/")
+            for path in EXPECTED_PYTHON_MEMBERS
+            if path.endswith(".py")
         }
         assert len(expected_python) == 20
         extension = [
@@ -751,17 +888,26 @@ def verify_wheel(wheel: Path) -> None:
             sbom_name,
         }
         assert set(members) == expected_members
-        assert (
-            archive.read(f"{dist_info}licenses/LICENSE")
-            == (ROOT / "LICENSE").read_bytes()
-        )
-        assert (
-            archive.read(f"{dist_info}licenses/NOTICE")
-            == (ROOT / "NOTICE").read_bytes()
-        )
+        assert archive.read(f"{dist_info}licenses/LICENSE") == legal["LICENSE"]
+        assert archive.read(f"{dist_info}licenses/NOTICE") == legal["NOTICE"]
         sbom = json.loads(archive.read(sbom_name))
         assert sbom["bomFormat"] == "CycloneDX"
         assert sbom["metadata"]["component"]["name"] == "requests-python"
+        required_components = {
+            (component["name"], component["version"])
+            for component in sbom["components"]
+            if component.get("scope") == "required" and component["name"] != "requests"
+        }
+        notice_components = set(
+            re.findall(
+                rb"^----- BEGIN ([^ ]+) ([^ ]+) -----$",
+                legal["NOTICE"],
+                flags=re.MULTILINE,
+            )
+        )
+        assert notice_components == {
+            (name.encode(), version.encode()) for name, version in required_components
+        }
 
     assert metadata["Name"] == "requests"
     assert metadata["Version"] == "2.34.2"
@@ -795,60 +941,26 @@ def verify_wheel(wheel: Path) -> None:
     }
 
 
-def verify_sdist(sdist: Path) -> None:
+def verify_sdist(sdist: Path, source_commit: str) -> None:
+    legal = canonical_legal_bytes(source_commit)
     with tarfile.open(sdist, "r:gz") as archive:
-        names = {
-            member.name.split("/", 1)[-1]
+        members = {
+            member.name.split("/", 1)[-1]: member
             for member in archive.getmembers()
             if member.isfile()
         }
-    semantic = {
-        "HISTORY.md",
-        "LICENSE",
-        "MANIFEST.in",
-        "NOTICE",
-        "README.md",
-        "pyproject.toml",
-        "requirements-dev.txt",
-        "setup.py",
-    }
-    semantic |= {
-        path.relative_to(ROOT).as_posix()
-        for path in (ROOT / "src/requests").iterdir()
-        if path.is_file()
-        and (path.suffix in {".py", ".pyi"} or path.name == "py.typed")
-    }
-    semantic |= {
-        path.relative_to(ROOT).as_posix()
-        for path in (ROOT / "tests").rglob("*.py")
-        if "__pycache__" not in path.parts
-    }
-    semantic |= {
-        path.relative_to(ROOT).as_posix()
-        for path in (ROOT / "tests/certs").rglob("*")
-        if path.is_file()
-    }
-    ca_files = [path.name for path in (ROOT / "tests/certs/expired/ca").iterdir()]
-    semantic |= {
-        f"tests/certs/{alias}/{name}"
-        for alias in ("mtls/client/ca", "valid/ca")
-        for name in ca_files
-    }
-    assert len(semantic) == 80
-    rust_inputs = {"Cargo.toml", "Cargo.lock"} | {
-        path.relative_to(ROOT).as_posix()
-        for path in (ROOT / "crates").rglob("*")
-        if path.is_file()
-        and "__fuzz__" not in path.parts
-        and (path.name == "Cargo.toml" or path.suffix == ".rs")
-    }
-    assert names == semantic | rust_inputs | {"PKG-INFO"}
+        assert len(EXPECTED_SDIST_MEMBERS) == 67
+        assert set(members) == EXPECTED_SDIST_MEMBERS
+        license_stream = archive.extractfile(members["LICENSE"])
+        notice_stream = archive.extractfile(members["NOTICE"])
+        assert license_stream is not None and license_stream.read() == legal["LICENSE"]
+        assert notice_stream is not None and notice_stream.read() == legal["NOTICE"]
 
 
 def test_built_wheel_and_sdist_have_complete_clean_inventory_and_metadata() -> None:
     wheel, sdist = artifact_paths()
-    verify_wheel(wheel)
-    verify_sdist(sdist)
+    verify_wheel(wheel, "HEAD")
+    verify_sdist(sdist, "HEAD")
 
 
 def _clean_environment() -> dict[str, str]:
@@ -1206,6 +1318,62 @@ def build_publish_manifest(
     }
 
 
+def verify_release_set(
+    directory: Path, manifest_path: Path, source_commit: str
+) -> None:
+    files = {path.resolve() for path in directory.rglob("*") if path.is_file()}
+    wheels = sorted(directory.rglob("requests-*.whl"))
+    sdists = sorted(directory.rglob("requests-*.tar.gz"))
+    if len(wheels) != 23 or len(sdists) != 1:
+        raise ValueError(
+            f"expected 23 wheels and one sdist, found {len(wheels)} and {len(sdists)}"
+        )
+    if files != {
+        manifest_path.resolve(),
+        *(path.resolve() for path in wheels),
+        sdists[0].resolve(),
+    }:
+        raise ValueError(
+            "release set must contain exactly 23 wheels, one sdist, and one manifest"
+        )
+    keys = [wheel_key(path) for path in wheels]
+    if len(keys) != len(set(keys)) or set(keys) != EXPECTED_WHEEL_KEYS:
+        raise ValueError("release-set wheel matrix mismatch")
+
+    manifest = json.loads(manifest_path.read_text())
+    if set(manifest) != {"artifacts", "matrix_result", "source_commit"}:
+        raise ValueError("unexpected release manifest fields")
+    if manifest["matrix_result"] != "success":
+        raise ValueError("release matrix did not succeed")
+    if manifest["source_commit"] != source_commit.lower():
+        raise ValueError("release manifest source commit mismatch")
+    records = manifest["artifacts"]
+    if not isinstance(records, list) or len(records) != 24:
+        raise ValueError("release manifest must contain exactly 24 archives")
+    records_by_name = {record.get("filename"): record for record in records}
+    archives = [sdists[0], *wheels]
+    if len(records_by_name) != 24 or set(records_by_name) != {
+        path.name for path in archives
+    }:
+        raise ValueError("release manifest archive inventory mismatch")
+    for path in archives:
+        record = records_by_name[path.name]
+        if set(record) != {
+            "filename",
+            "github_archive_digest",
+            "github_artifact_id",
+            "sha256",
+            "source_artifact",
+        }:
+            raise ValueError(f"unexpected manifest record fields: {path.name}")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if record["sha256"] != digest:
+            raise ValueError(f"release manifest hash mismatch: {path.name}")
+    verify_sdist(sdists[0], source_commit)
+    for wheel in wheels:
+        verify_wheel(wheel, source_commit)
+
+
 def write_complete_manifest_fixture(directory: Path) -> None:
     (directory / "requests-2.34.2.tar.gz").touch()
     for python, system in sorted(EXPECTED_WHEEL_KEYS):
@@ -1290,6 +1458,35 @@ def test_publish_manifest_records_commit_matrix_and_github_artifacts(
     assert re.fullmatch(r"[0-9a-f]{64}", sdist["sha256"])
 
 
+def test_release_set_verifies_one_manifest_and_all_24_archives(
+    monkeypatch, tmp_path: Path
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    write_complete_manifest_fixture(artifacts)
+    source_commit = "a" * 40
+    manifest = build_publish_manifest(
+        artifacts,
+        source_commit=source_commit,
+        matrix_result="success",
+    )
+    release = tmp_path / "release"
+    release.mkdir()
+    for path in artifacts.rglob("requests-*"):
+        if path.is_file():
+            shutil.copy2(path, release / path.name)
+    manifest_path = release / "artifact-manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+    monkeypatch.setitem(globals(), "verify_wheel", lambda *args: None)
+    monkeypatch.setitem(globals(), "verify_sdist", lambda *args: None)
+
+    verify_release_set(release, manifest_path, source_commit)
+
+    (release / "unexpected.txt").touch()
+    with unittest.TestCase().assertRaisesRegex(ValueError, "exactly 23 wheels"):
+        verify_release_set(release, manifest_path, source_commit)
+
+
 def test_wheel_key_rejects_wrong_version_abi_and_platform() -> None:
     cases = [
         ("requests-9.9.9-cp310-cp310-manylinux_2_17_x86_64.whl", "project/version"),
@@ -1368,6 +1565,8 @@ def main() -> int:
     parser.add_argument("--source-commit")
     parser.add_argument("--matrix-result")
     parser.add_argument("--artifact-metadata", type=Path)
+    parser.add_argument("--verify-release-set", type=Path)
+    parser.add_argument("--manifest", type=Path)
     parser.add_argument("--verify-wheel", type=Path)
     parser.add_argument("--verify-sdist", type=Path)
     parser.add_argument("--installed-smoke", type=Path)
@@ -1399,11 +1598,24 @@ def main() -> int:
             )
         )
         return 0
+    if arguments.verify_release_set:
+        if arguments.manifest is None or arguments.source_commit is None:
+            parser.error("--verify-release-set requires --manifest and --source-commit")
+        verify_release_set(
+            arguments.verify_release_set,
+            arguments.manifest,
+            arguments.source_commit,
+        )
+        return 0
     if arguments.verify_wheel:
-        verify_wheel(arguments.verify_wheel)
+        if arguments.source_commit is None:
+            parser.error("--verify-wheel requires --source-commit")
+        verify_wheel(arguments.verify_wheel, arguments.source_commit)
         return 0
     if arguments.verify_sdist:
-        verify_sdist(arguments.verify_sdist)
+        if arguments.source_commit is None:
+            parser.error("--verify-sdist requires --source-commit")
+        verify_sdist(arguments.verify_sdist, arguments.source_commit)
         return 0
     if arguments.installed_smoke:
         run_installed_smoke(

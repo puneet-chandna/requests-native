@@ -63,7 +63,7 @@ jobs:
         shell: bash
         run: |
           wheel="$(find wheelhouse -maxdepth 1 -type f -name '*.whl' -print -quit)"
-          python tests_rust/test_distribution.py --verify-wheel "$wheel"
+          python tests_rust/test_distribution.py --verify-wheel "$wheel" --source-commit "$GITHUB_SHA"
       - name: Install wheel and explicit test dependencies
         shell: bash
         run: |

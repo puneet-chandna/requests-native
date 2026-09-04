@@ -8,7 +8,7 @@ description = "Native HTTP transport for the unofficial Requests Rust rewrite"
 homepage.workspace = true
 repository.workspace = true
 publish = false
-exclude = ["fuzz-corpus/**"]
+include = ["Cargo.toml", "src/**/*.rs", "!src/**/*_tests.rs"]
 
 [lints]
 workspace = true

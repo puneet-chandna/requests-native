@@ -82,11 +82,6 @@ module-name = "requests._requests_rust"
 bindings = "pyo3"
 include = [
     { path = "HISTORY.md", format = "sdist" },
-    { path = "MANIFEST.in", format = "sdist" },
-    { path = "requirements-dev.txt", format = "sdist" },
-    { path = "setup.py", format = "sdist" },
-    { path = "tests/**/*.py", format = "sdist" },
-    { path = "tests/certs/**/*", format = "sdist" },
 ]
 
 [tool.ruff]

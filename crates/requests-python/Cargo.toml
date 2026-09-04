@@ -8,6 +8,7 @@ description = "Python extension for the unofficial Requests Rust rewrite"
 homepage.workspace = true
 repository.workspace = true
 publish = false
+include = ["Cargo.toml", "build.rs", "src/**/*.rs"]
 
 [lib]
 name = "_requests_rust"
