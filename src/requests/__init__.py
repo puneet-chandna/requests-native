@@ -1,3 +1,4 @@
+# Modified by Requests Rust in 2026 to add native dispatch with Python fallbacks.
 #   __
 #  /__)  _  _     _   _ _/   _
 # / (   (- (/ (/ (- _)  /  _)

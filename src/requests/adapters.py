@@ -1,3 +1,4 @@
+# Modified by Requests Rust in 2026 to add native dispatch with Python fallbacks.
 """
 requests.adapters
 ~~~~~~~~~~~~~~~~~
@@ -912,14 +913,3 @@ HTTPAdapter.__setstate__ = _trial_http_adapter_setstate
 HTTPAdapter.send = _trial_http_adapter_send
 HTTPAdapter.close = _trial_http_adapter_close
 _HTTP_ADAPTER_FACADE_TYPE = HTTPAdapter
-
-
-# Static inventory marker for the compiled extension dispatch seam.
-_ADAPTER_FACADE_SEAM = "_adapter_facade_trial"
-_ADAPTER_FACADE_INVENTORY = (
-    "construct",
-    "send",
-    "close",
-    "state",
-    "pickle",
-)

@@ -1,3 +1,4 @@
+# Modified by Requests Rust in 2026 to add native dispatch with Python fallbacks.
 """
 requests.sessions
 ~~~~~~~~~~~~~~~~~
@@ -1005,23 +1006,6 @@ def session() -> Session:
     return Session()
 
 
-_SESSION_REDIRECT_FACADE_OPERATIONS = {
-    "get_redirect_target": "get_redirect_target",
-    "should_strip_auth": "should_strip_auth",
-    "resolve_redirects": "resolve_redirects",
-    "rebuild_proxies": "rebuild_proxies",
-    "rebuild_method": "rebuild_method",
-}
-_SESSION_FACADE_OPERATIONS = {
-    "__enter__": "enter",
-    "__exit__": "exit",
-    "prepare_request": "prepare_request",
-    "request": "request",
-    "send": "send",
-    "merge_environment_settings": "merge_environment_settings",
-    "get_adapter": "get_adapter",
-    "mount": "mount",
-}
 _SESSION_FACADE_COMPAT_SEND = Session.send
 _SESSION_FACADE_TYPE = Session
 _SESSION_FACADE_COMPAT_INIT = Session.__init__
@@ -1054,27 +1038,3 @@ Session.request = _session_facade_request
 def _rust_public_trial():  # pyright: ignore[reportUnusedFunction]
     with _rust_public_trial_context():
         yield
-
-
-# Static inventory marker for the compiled extension dispatch seam.
-_SESSION_FACADE_SEAM = "_session_facade_trial"
-_SESSION_FACADE_INVENTORY = (
-    "construct",
-    "prepare_request",
-    "request",
-    "send",
-    "get_redirect_target",
-    "should_strip_auth",
-    "resolve_redirects",
-    "merge_environment_settings",
-    "rebuild_auth",
-    "rebuild_proxies",
-    "rebuild_method",
-    "mount",
-    "get_adapter",
-    "enter",
-    "exit",
-    "close",
-    "state",
-    "pickle",
-)

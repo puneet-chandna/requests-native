@@ -1,3 +1,4 @@
+# Modified by Requests Rust in 2026 to add native dispatch with Python fallbacks.
 """
 requests.models
 ~~~~~~~~~~~~~~~
@@ -1268,35 +1269,3 @@ class Response:
         release_conn = getattr(self.raw, "release_conn", None)
         if release_conn is not None:
             release_conn()
-
-
-# Task 17 keeps these ordinary Python heap types authoritative.  The private
-# seams are consulted only inside requests._rust_public_trial(), and a
-# NotImplemented reply falls through exactly once to the captured Python code.
-_MODEL_FACADE_OPERATIONS = {
-    Request: {"prepare": "request.prepare"},
-    PreparedRequest: {
-        "prepare": "prepared.prepare",
-        "prepare_method": "prepare_method",
-        "prepare_url": "prepare_url",
-        "prepare_headers": "prepare_headers",
-        "prepare_body": "prepare_body",
-        "prepare_content_length": "prepare_content_length",
-        "prepare_auth": "prepare_auth",
-        "prepare_cookies": "prepare_cookies",
-        "prepare_hooks": "prepare_hooks",
-    },
-}
-_RESPONSE_FACADE_OPERATIONS = {
-    "__iter__": "iter",
-    "iter_lines": "iter_lines",
-    "json": "json",
-    "raise_for_status": "raise_for_status",
-    "close": "close",
-}
-
-
-# Static inventory markers for the compiled extension dispatch seam.
-_MODEL_FACADE_SEAM = "_model_facade_trial"
-_RESPONSE_FACADE_SEAM = "_response_facade_trial"
-_RESPONSE_FACADE_INVENTORY = ("state", "pickle")
