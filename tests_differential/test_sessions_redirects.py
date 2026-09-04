@@ -31191,7 +31191,6 @@ def test_session_native_source_rejects_compatibility_escape_hatches() -> None:
                 authority_lines.append(
                     (
                         relative,
-                        line_number,
                         hashlib.sha256(line.encode()).hexdigest(),
                     )
                 )
@@ -31199,82 +31198,66 @@ def test_session_native_source_rejects_compatibility_escape_hatches() -> None:
     assert authority_lines == [
         (
             "crates/requests-python/src/adapters.rs",
-            585,
             "6ff42154c2764506a496d48ac1e5df73c27a8d0497a8f549b92f750ffd29f5d0",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            644,
             "572270f44d469f02c6c94dba4629b26ee1d1e842d5a9efc990b2cdffe95580e7",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            671,
             "6550cc699a38280d9168af091d5760b035d535e8038316938a7ed0d5f352176e",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            1187,
             "00f28b5517641d3be07c8953c0edcc548c4512e64515a6b18fd8a1c7f9d51784",
         ),
         (
             "crates/requests-python/src/adapters.rs",
-            1374,
             "7775e84e0f087a8a48c391b14c6299a50d3d5b994d09693124a614c05cd465e9",
         ),
         (
             "crates/requests-python/src/body.rs",
-            240,
             "fccf4046c978b0141bf990af6b61130923f910fdcde38f9aa5fa5ee1bc0bed97",
         ),
         (
             "crates/requests-python/src/cookies.rs",
-            102,
             "9374d5b46c6daf75b631599574529287383cc091b9f89f83fd543df3eaa9bb30",
         ),
         (
             "crates/requests-python/src/lib.rs",
-            25,
             "b9da086bbe6178c8b80c1061611f4dc4d3162837392d04a3fa53a6f9d0298c82",
         ),
         (
             "crates/requests-python/src/models.rs",
-            282,
             "d9a7fa995ac200a5208e563820f2cf98af54bf5cbfbda7f349f76d7f0c2e8b44",
         ),
         (
             "crates/requests-python/src/models.rs",
-            352,
             "ed68b5dea4d4582291a09260dc230b06da5e69acb94df758280cef4d822d069e",
         ),
         (
             "crates/requests-python/src/response.rs",
-            183,
             "e986a68cd11f4ce75b6ec6262e23b91fa3b4f4da5a6980cfb37718cb9971b0d3",
         ),
         (
             "crates/requests-python/src/response.rs",
-            184,
             "bff01f428f2e9c2f50cbd3f987a2321913d60edef40e76e812dbc0c4bd5f4ce9",
         ),
         (
             "crates/requests-python/src/structures.rs",
-            55,
             "0bd5dda86fc04a15d64fcaa6bb4be56004700562a6068f68c6ce5180cbacdec7",
         ),
         (
             "crates/requests-python/src/structures.rs",
-            56,
             "c900a941ca0a2c20227dd1b3ba7a7065939feb0fe99283ad8f15900beb2d27ca",
         ),
         (
             "crates/requests-python/src/structures.rs",
-            72,
             "d5d0f93825118502c9f38a16912723c6479f6cc6bf4243c549d72fa64b74ab22",
         ),
         (
             "crates/requests-python/src/structures.rs",
-            73,
             "03d820d956d4529f342bb0816e6fd0e794eef32fb3b393790d97645299cfa908",
         ),
     ]
