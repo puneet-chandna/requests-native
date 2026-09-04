@@ -13,8 +13,11 @@ The rewrite is qualified locally and through a complete 23-cell compiled wheel
 matrix, one sdist, and one validation manifest from an exact commit. That remote
 workflow reported success, but later cross-platform inspection found that all
 seven Windows wheels contained CRLF-normalized `LICENSE` and `NOTICE` bytes and
-the per-runner verifier compared against the normalized checkout. The artifact
-set is therefore qualified evidence, not release-ready evidence.
+the per-runner verifier compared against the normalized checkout. The current
+source forces LF for both legal files and verifies every archive against its
+source-commit Git blobs on one LF runner, but that corrected contract has not
+yet been rerun across the full matrix. The prior artifact set is therefore
+qualified evidence, not release-ready evidence.
 
 Exact pristine built-in `Session` and `HTTPAdapter` traffic uses the Rust
 backend by default. Unsupported, subclassed, custom, and dynamically mutated
