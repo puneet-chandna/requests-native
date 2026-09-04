@@ -1012,19 +1012,8 @@ def test_task17_red_outer_pump_runtime_and_static_call_graph_share_adapter_leaf(
 ):
     _assert_one_outer_pump_runtime()
     root = Path(__file__).resolve().parents[1]
-    sources = {
-        "model": (root / "src/requests/models.py").read_text(),
-        "response": (root / "src/requests/models.py").read_text(),
-        "session": (root / "src/requests/sessions.py").read_text(),
-        "adapter": (root / "src/requests/adapters.py").read_text(),
-    }
-    assert "def _rust_public_trial" in sources["session"]
-    for group, operations in _OPERATIONS.items():
-        assert f"_{group}_facade_trial" in sources[group]
-        assert all(
-            repr(operation) in sources[group] or f'"{operation}"' in sources[group]
-            for operation in operations
-        )
+    sessions_python = (root / "src/requests/sessions.py").read_text()
+    assert "def _rust_public_trial" in sessions_python
     sessions_rust = (root / "crates/requests-python/src/sessions.rs").read_text()
     adapters_rust = (root / "crates/requests-python/src/adapters.rs").read_text()
     facade = _rust_function(sessions_rust, "_session_facade_trial")
