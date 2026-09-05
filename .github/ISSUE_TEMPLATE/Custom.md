@@ -1,4 +1,5 @@
 ---
+# Requests Native modification notice: this retained file differs from Requests 2.34.2.
 name: Compatibility question
 about: Ask whether behavior is specific to the Rust rewrite
 labels: question

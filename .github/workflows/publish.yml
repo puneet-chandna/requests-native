@@ -1,3 +1,4 @@
+# Requests Native modification notice: this retained file differs from Requests 2.34.2.
 name: Validate beta artifacts
 
 on:
@@ -23,7 +24,7 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install maturin
-        run: python -m pip install "maturin>=1.13,<2"
+        run: python -m pip install "maturin==1.15.0"
       - name: Build sdist
         run: python -m maturin sdist --out dist
       - name: Verify exact sdist contents

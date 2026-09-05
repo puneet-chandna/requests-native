@@ -1,3 +1,5 @@
+.. Requests Native modification notice: this retained file differs from Requests 2.34.2.
+
 .. _install:
 
 Installing Requests Native from source
@@ -15,7 +17,7 @@ repository::
     $ cd requests-native
     $ python -m venv .venv
     $ . .venv/bin/activate
-    $ python -m pip install "maturin>=1.13,<2"
+    $ python -m pip install "maturin>=1.15,<2"
     $ python -m maturin develop
 
 On Windows, activate the environment with

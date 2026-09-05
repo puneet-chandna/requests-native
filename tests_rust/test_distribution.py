@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
+import csv
 import email.parser
+import functools
 import hashlib
 import importlib
 import inspect
@@ -25,6 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
 DIST = Path(os.environ.get("REQUESTS_DISTRIBUTION_DIR", ROOT / "dist")).resolve()
 PYTHONS = [
     "3.10",
@@ -45,6 +50,7 @@ COMPATIBILITY_VERSION = "2.34.2"
 BACKEND_NAME = "requests-native"
 CORE_CARGO_PACKAGE = "requests-native"
 BINDING_CARGO_PACKAGE = "requests-native-python"
+VALIDATOR_SOURCE_COMMIT = os.environ.get("REQUESTS_VALIDATOR_SOURCE_COMMIT", "HEAD")
 EXPECTED_WHEEL_KEYS = {
     (python, system)
     for python in PYTHONS
@@ -58,7 +64,6 @@ EXPECTED_CLASSIFIERS = [
     "Development Status :: 4 - Beta",
     "Environment :: Web Environment",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python",
@@ -94,6 +99,56 @@ EXPECTED_EXTRAS = {
     "socks": ["PySocks>=1.5.6, !=1.5.7"],
     "use_chardet_on_py3": ["chardet>=3.0.2,<8"],
 }
+LEGAL_FILES = (
+    "LICENSE",
+    "NOTICE",
+    "AUTHORS.rst",
+    "RUST_RUNTIME_NOTICES.html",
+)
+MODIFICATION_MARKER = "Requests Native modification notice:"
+MODIFIED_UPSTREAM_PATHS = (
+    ".github/AI_POLICY.md",
+    ".github/CODEOWNERS",
+    ".github/CODE_OF_CONDUCT.md",
+    ".github/CONTRIBUTING.md",
+    ".github/ISSUE_TEMPLATE/Bug_report.md",
+    ".github/ISSUE_TEMPLATE/Custom.md",
+    ".github/ISSUE_TEMPLATE/Feature_request.md",
+    ".github/SECURITY.md",
+    ".github/dependabot.yml",
+    ".github/workflows/codeql-analysis.yml",
+    ".github/workflows/lint.yml",
+    ".github/workflows/publish.yml",
+    ".github/workflows/run-tests.yml",
+    ".github/workflows/typecheck.yml",
+    ".github/workflows/zizmor.yml",
+    ".gitignore",
+    ".pre-commit-config.yaml",
+    "AUTHORS.rst",
+    "Makefile",
+    "NOTICE",
+    "README.md",
+    "docs/_templates/sidebar.html",
+    "docs/community/faq.rst",
+    "docs/community/out-there.rst",
+    "docs/community/recommended.rst",
+    "docs/community/release-process.rst",
+    "docs/community/support.rst",
+    "docs/community/updates.rst",
+    "docs/community/vulnerabilities.rst",
+    "docs/conf.py",
+    "docs/dev/contributing.rst",
+    "docs/index.rst",
+    "docs/user/install.rst",
+    "pyproject.toml",
+    "src/requests/__init__.py",
+    "src/requests/adapters.py",
+    "src/requests/models.py",
+    "src/requests/sessions.py",
+    "tests/conftest.py",
+    "tests/test_testserver.py",
+    "tests/testserver/server.py",
+)
 EXPECTED_PYTHON_MEMBERS = {
     "src/requests/__init__.py",
     "src/requests/__version__.py",
@@ -160,12 +215,17 @@ EXPECTED_SDIST_MEMBERS = (
     {
         "Cargo.lock",
         "Cargo.toml",
+        "AUTHORS.rst",
         "HISTORY.md",
         "LICENSE",
         "NOTICE",
         "PKG-INFO",
         "README.md",
+        "RUST_RUNTIME_NOTICES.html",
         "pyproject.toml",
+        "rust-toolchain.toml",
+        "scripts/build_release_wheel.py",
+        "scripts/generate_release_sbom.py",
         "crates/requests/Cargo.toml",
         "crates/requests-python/Cargo.toml",
         "crates/requests-python/build.rs",
@@ -221,9 +281,16 @@ assert requests.packages.chardet is compat.chardet
 assert requests.utils is importlib.import_module("requests.utils")
 assert requests.codes is status_codes.codes
 assert requests.help.info()["requests"]["version"] == requests.__version__
-distribution_files = {str(path).replace("\\", "/") for path in distribution.files or ()}
-assert any(path.endswith(".dist-info/licenses/LICENSE") for path in distribution_files)
-assert any(path.endswith(".dist-info/licenses/NOTICE") for path in distribution_files)
+distribution_paths = tuple(distribution.files or ())
+distribution_files = {str(path).replace("\\", "/") for path in distribution_paths}
+for legal_name in ("LICENSE", "NOTICE", "AUTHORS.rst", "RUST_RUNTIME_NOTICES.html"):
+    matches = [
+        path
+        for path in distribution_paths
+        if str(path).replace("\\", "/").endswith(f".dist-info/licenses/{legal_name}")
+    ]
+    assert len(matches) == 1, (legal_name, matches)
+    assert Path(distribution.locate_file(matches[0])).read_bytes() == (checkout / legal_name).read_bytes()
 if os.environ["REQUESTS_EDITABLE"] == "0":
     assert "requests/py.typed" in distribution_files
     assert "requests/__init__.py" in distribution_files
@@ -317,7 +384,12 @@ def artifact_paths() -> tuple[Path, Path]:
 
 
 def test_project_metadata_declares_license_files_dependencies_and_extras() -> None:
-    project = load_toml(ROOT / "pyproject.toml")["project"]
+    pyproject = load_toml(ROOT / "pyproject.toml")
+    assert pyproject["build-system"] == {
+        "requires": ["maturin>=1.15,<2"],
+        "build-backend": "maturin",
+    }
+    project = pyproject["project"]
     assert project["name"] == PYTHON_DISTRIBUTION
     assert project["description"] == (
         "Unofficial native Rust implementation of Requests with strict Python API "
@@ -325,8 +397,9 @@ def test_project_metadata_declares_license_files_dependencies_and_extras() -> No
     )
     assert project["authors"] == [{"name": "Puneet Chandna"}]
     assert project["maintainers"] == [{"name": "Puneet Chandna"}]
-    assert project["license"] == "Apache-2.0"
-    assert project["license-files"] == ["LICENSE", "NOTICE"]
+    assert "license" not in project
+    assert "license" not in project["dynamic"]
+    assert project["license-files"] == list(LEGAL_FILES)
     assert project["dependencies"] == EXPECTED_DEPENDENCIES
     assert project["optional-dependencies"] == EXPECTED_EXTRAS
     assert project["classifiers"] == EXPECTED_CLASSIFIERS
@@ -353,7 +426,14 @@ def test_release_sources_are_allow_listed_and_legal_files_are_canonical() -> Non
     assert not (ROOT / "setup.py").exists()
     assert not (ROOT / "MANIFEST.in").exists()
     maturin = load_toml(ROOT / "pyproject.toml")["tool"]["maturin"]
-    assert maturin["include"] == [{"path": "HISTORY.md", "format": "sdist"}]
+    assert maturin["include"] == [
+        {"path": "HISTORY.md", "format": "sdist"},
+        {"path": "rust-toolchain.toml", "format": "sdist"},
+        {"path": "scripts/build_release_wheel.py", "format": "sdist"},
+        {"path": "scripts/generate_release_sbom.py", "format": "sdist"},
+    ]
+    assert maturin["sbom"] == {"rust": False}
+    assert "include" not in maturin["sbom"]
 
     requests_package = load_toml(ROOT / "crates/requests/Cargo.toml")["package"]
     assert requests_package["include"] == [
@@ -371,7 +451,10 @@ def test_release_sources_are_allow_listed_and_legal_files_are_canonical() -> Non
     ]
 
     assert (ROOT / ".gitattributes").read_text() == (
-        "LICENSE text eol=lf\nNOTICE text eol=lf\n"
+        "LICENSE text eol=lf\n"
+        "NOTICE text eol=lf\n"
+        "AUTHORS.rst text eol=lf\n"
+        "RUST_RUNTIME_NOTICES.html text eol=lf -whitespace\n"
     )
     completed = subprocess.run(
         [
@@ -384,6 +467,481 @@ def test_release_sources_are_allow_listed_and_legal_files_are_canonical() -> Non
         capture_output=True,
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_all_modified_upstream_paths_have_prominent_source_notices() -> None:
+    assert len(MODIFIED_UPSTREAM_PATHS) == 41
+    for relative in MODIFIED_UPSTREAM_PATHS:
+        path = ROOT / relative
+        assert path.is_file(), relative
+        head = "\n".join(path.read_text(encoding="utf-8").splitlines()[:15])
+        assert MODIFICATION_MARKER in head, relative
+
+
+def test_dependabot_updates_are_frozen_during_release_validation() -> None:
+    import yaml
+
+    config = yaml.safe_load(
+        (ROOT / ".github/dependabot.yml").read_text(encoding="utf-8")
+    )
+    updates = config["updates"]
+    assert updates
+    assert all(update["open-pull-requests-limit"] == 0 for update in updates)
+
+
+def test_internal_agent_paths_are_not_exposed_in_tracked_ignore_policy() -> None:
+    marker = (
+        f"# {MODIFICATION_MARKER} this retained file differs from Requests 2.34.2.\n"
+    )
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert gitignore.startswith(marker)
+    retained_body = gitignore.removeprefix(marker)
+    assert hashlib.sha256(retained_body.encode()).hexdigest() == (
+        "f96e598d7ed339da8cba1e31a5bb1d74989c1da607257423761c6deb0fdb349f"
+    )
+    rust_patterns = (
+        ".worktrees/\n",
+        "/target/\n",
+        "src/requests/_requests_rust.*\n",
+        "!src/requests/_requests_rust.pyi\n",
+    )
+    oracle_body = retained_body
+    for pattern in rust_patterns:
+        assert retained_body.count(pattern) == 1
+        oracle_body = oracle_body.replace(pattern, "")
+    assert hashlib.sha256(oracle_body.encode()).hexdigest() == (
+        "0d87c78c285d5f3a9f83c7b9a09c42aa566c771a7e35d0da1ed0dabcd5831b6c"
+    )
+    lint = (ROOT / ".github/workflows/lint.yml").read_text(encoding="utf-8")
+    assert "/.superpowers/" not in gitignore
+    assert "/docs/superpowers/" not in gitignore
+    assert ".superpowers/**" not in lint
+
+
+def test_notice_closes_curated_and_runtime_attribution_requirements() -> None:
+    from scripts import generate_third_party_notices as notices
+
+    rendered = notices.render_notice().decode("utf-8")
+    notices.validate_notice(rendered)
+    assert notices.RUNTIME_TOOLCHAIN == "1.98.0"
+    runtime = (ROOT / "RUST_RUNTIME_NOTICES.html").read_bytes()
+    assert hashlib.sha256(runtime).hexdigest() == notices.RUNTIME_NOTICE_SHA256
+    assert b"Copyright notices for The Rust Standard Library" in runtime
+    assert b"Unicode-3.0" in runtime
+
+    required = (
+        "ae42d22078b98549e987d2f03d12df7b984fde47",
+        "cd496ba72eb37e83a44958358d1f89a8a28cbc15",
+        "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae",
+        "Meta Platforms, Inc. and affiliates",
+        "Neither the name Facebook, nor Meta, nor the names of its contributors",
+        "Copyright 2013 Google Inc. All Rights Reserved.",
+        "Copyright (c) 2014, Intel Corporation.",
+        "Copyright 2016 David Judd.",
+        "Copyright 2018 Trent Clarke.",
+        "Copyright 2016 Simon Sapin.",
+        "Copyright (c) 2019, Google Inc.",
+        "Copyright 2015-2020 the fiat-crypto authors",
+        "Andres Erbsen <andreser@mit.edu>",
+        "Reviewed obligations: BSD-3-Clause AND MIT",
+        "Reviewed obligations: Apache-2.0 AND ISC",
+        "Bundled Zstandard C library selection: BSD-3-Clause",
+        "Python dependencies are not bundled in the",
+        "Platform system libraries are not bundled",
+    )
+    for marker in required:
+        assert marker in rendered, marker
+
+    brotli_section = rendered.split("----- BEGIN brotli-decompressor 5.0.3 -----", 1)[
+        1
+    ].split("----- END brotli-decompressor 5.0.3 -----", 1)[0]
+    assert "src/context.rs" in brotli_section
+    assert "Permission is hereby granted, free of charge" in brotli_section
+    zstd_section = rendered.split("----- BEGIN zstd-sys 2.0.16+zstd.1.5.7 -----", 1)[
+        1
+    ].split("----- END zstd-sys 2.0.16+zstd.1.5.7 -----", 1)[0]
+    assert "LICENSE.BSD-3-Clause" in zstd_section
+    assert "zstd/LICENSE" in zstd_section
+    assert "--- zstd/COPYING" not in zstd_section
+
+    for marker in (
+        "Meta Platforms, Inc. and affiliates",
+        "Copyright 2013 Google Inc. All Rights Reserved.",
+        "Copyright (c) 2014, Intel Corporation.",
+        "Copyright 2016 David Judd.",
+        "Copyright 2018 Trent Clarke.",
+        "Copyright 2016 Simon Sapin.",
+    ):
+        with unittest.TestCase().assertRaisesRegex(ValueError, "required notice"):
+            notices.validate_notice(rendered.replace(marker, ""))
+
+
+def test_history_separates_derivative_release_from_preserved_upstream_history() -> None:
+    history = (ROOT / "HISTORY.md").read_text(encoding="utf-8")
+    derivative = history.index("Requests Native 1.0.0b1")
+    boundary = history.index("Preserved upstream Requests history")
+    upstream = history.index("2.34.2 (2026-05-14)")
+    assert derivative < boundary < upstream
+
+
+def test_release_sbom_is_deterministic_and_matches_locked_runtime_graph() -> None:
+    from scripts import generate_release_sbom as release_sbom
+
+    metadata = release_sbom.cargo_metadata(offline=True)
+    checksums = release_sbom.cargo_lock_checksums()
+    first = release_sbom.render_sbom(metadata, checksums=checksums)
+    assert (
+        release_sbom.render_sbom(copy.deepcopy(metadata), checksums=checksums) == first
+    )
+
+    relocated = json.loads(
+        json.dumps(metadata).replace(os.fspath(ROOT), "/different/source/root")
+    )
+    assert release_sbom.render_sbom(relocated, checksums=checksums) == first
+
+    document = json.loads(first)
+    release_sbom.validate_sbom(document)
+    assert document["bomFormat"] == "CycloneDX"
+    assert document["specVersion"] == "1.5"
+    assert document["version"] == 1
+    assert "serialNumber" not in document
+    assert "timestamp" not in document["metadata"]
+
+    packages = {package["id"]: package for package in metadata["packages"]}
+    nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
+    root_id = next(
+        package["id"]
+        for package in metadata["packages"]
+        if package["name"] == BINDING_CARGO_PACKAGE and package["source"] is None
+    )
+
+    def closure(kinds: set[str | None]) -> tuple[set[str], dict[str, set[str]]]:
+        pending = [root_id]
+        visited = set()
+        edges = {}
+        while pending:
+            package_id = pending.pop()
+            if package_id in visited:
+                continue
+            visited.add(package_id)
+            dependencies = {
+                dependency["pkg"]
+                for dependency in nodes[package_id]["deps"]
+                if any(kind["kind"] in kinds for kind in dependency["dep_kinds"])
+            }
+            edges[package_id] = dependencies
+            pending.extend(dependencies)
+        return visited, edges
+
+    required, _ = closure({None})
+    visited, expected_edges = closure({None, "build"})
+
+    root_component = document["metadata"]["component"]
+    components = [root_component, *document["components"]]
+    by_key = {
+        (component["name"], component["version"]): component for component in components
+    }
+    assert len(by_key) == len(components) == len(visited) == 136
+    assert sum(component["scope"] == "required" for component in components) == 126
+    assert sum(component["scope"] == "excluded" for component in components) == 10
+    assert set(by_key) == {
+        (packages[package_id]["name"], packages[package_id]["version"])
+        for package_id in visited
+    }
+    refs = {component["bom-ref"] for component in components}
+    assert len(refs) == len(components)
+    assert all(component["purl"].startswith("pkg:cargo/") for component in components)
+
+    locked_checksums = checksums
+    cargo_links = {
+        package["links"] for package in packages.values() if package.get("links")
+    }
+    external_urls = set()
+    for package_id in visited:
+        package = packages[package_id]
+        component = by_key[package["name"], package["version"]]
+        assert component["scope"] == (
+            "required" if package_id in required else "excluded"
+        )
+        assert component["licenses"] == [
+            {"expression": package["license"].replace("/", " OR ")}
+        ]
+        assert component.get("author") == (
+            ", ".join(package["authors"]) if package["authors"] else None
+        )
+        assert component["description"] == (package["description"] or "").replace(
+            "\n", " "
+        )
+        expected_references = []
+        for reference_type, field in (
+            ("documentation", "documentation"),
+            ("website", "homepage"),
+            ("vcs", "repository"),
+        ):
+            if package.get(field):
+                expected_references.append(
+                    {"type": reference_type, "url": package[field]}
+                )
+        assert component.get("externalReferences") == (expected_references or None)
+        external_urls.update(
+            reference["url"] for reference in component.get("externalReferences", [])
+        )
+        checksum = locked_checksums[
+            package["name"], package["version"], package.get("source")
+        ]
+        assert component.get("hashes") == (
+            [{"alg": "SHA-256", "content": checksum}] if checksum else None
+        )
+        if package["source"] is None:
+            assert component["bom-ref"] == component["purl"]
+        else:
+            assert component["bom-ref"] == package_id
+
+    assert cargo_links == {"pyo3-python", "python", "ring_core_0_17_14_", "zstd"}
+    assert cargo_links.isdisjoint(external_urls)
+
+    target_components = root_component["components"]
+    assert len(target_components) == 1
+    assert target_components[0] == {
+        "bom-ref": root_component["bom-ref"] + " bin-target-0",
+        "name": "_requests_rust",
+        "purl": root_component["purl"] + "#src/lib.rs",
+        "type": "library",
+        "version": root_component["version"],
+    }
+
+    actual_edges = {
+        dependency["ref"]: set(dependency.get("dependsOn", []))
+        for dependency in document["dependencies"]
+    }
+    package_refs = {
+        package_id: by_key[
+            packages[package_id]["name"], packages[package_id]["version"]
+        ]["bom-ref"]
+        for package_id in visited
+    }
+    assert actual_edges == {
+        package_refs[package_id]: {
+            package_refs[dependency]
+            for dependency in expected_edges[package_id]
+            if dependency in visited
+        }
+        for package_id in visited
+    }
+    assert b"path+file:" not in first
+    assert os.fspath(ROOT).encode() not in first
+
+
+def test_release_sbom_cargo_lock_fallback_matches_tomllib(
+    monkeypatch,
+) -> None:
+    from scripts import generate_release_sbom as release_sbom
+
+    expected = release_sbom.cargo_lock_checksums()
+    monkeypatch.setattr(release_sbom, "tomllib", None)
+    fallback = release_sbom.cargo_lock_checksums()
+    assert fallback == expected
+    assert (
+        fallback[
+            (
+                "serde",
+                "1.0.229",
+                "registry+https://github.com/rust-lang/crates.io-index",
+            )
+        ]
+        == "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+    )
+
+
+def test_release_sbom_cargo_lock_fallback_is_narrow_and_strict() -> None:
+    from scripts import generate_release_sbom as release_sbom
+
+    quoted = """
+version = 4
+
+[[package]]
+name = "quoted\\\"name"
+version = "1.0.0"
+source = "registry+https://example.invalid/index"
+checksum = "abc123"
+dependencies = [
+ "ignored",
+]
+
+[[package]]
+name = "workspace"
+version = "2.0.0"
+"""
+    assert release_sbom.parse_generated_cargo_lock(quoted) == {
+        (
+            'quoted"name',
+            "1.0.0",
+            "registry+https://example.invalid/index",
+        ): "abc123",
+        ("workspace", "2.0.0", None): None,
+    }
+
+    invalid = (
+        """
+[[package]]
+name = "duplicate"
+version = "1"
+[[package]]
+name = "duplicate"
+version = "1"
+""",
+        """
+[[package]]
+name = "first"
+name = "second"
+version = "1"
+""",
+        """
+[[package]]
+name = unquoted
+version = "1"
+""",
+        """
+[[package]]
+name = "missing-version"
+""",
+    )
+    for content in invalid:
+        with unittest.TestCase().assertRaises(ValueError):
+            release_sbom.parse_generated_cargo_lock(content)
+
+
+def test_release_sbom_metadata_offline_mode_is_explicit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from scripts import generate_release_sbom as release_sbom
+
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout='{"packages": []}')
+
+    monkeypatch.setattr(release_sbom.subprocess, "run", fake_run)
+    release_sbom.cargo_metadata(root=tmp_path)
+    release_sbom.cargo_metadata(root=tmp_path, offline=True)
+    assert "--offline" not in commands[0]
+    assert "--offline" in commands[1]
+
+
+def test_release_wheel_helper_forwards_metadata_offline_mode(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from scripts import build_release_wheel as release_wheel
+
+    class StopAfterMetadata(Exception):
+        pass
+
+    modes = []
+
+    def fake_metadata(**kwargs):
+        modes.append(kwargs.get("offline"))
+        raise StopAfterMetadata
+
+    for name in (*release_wheel.RUSTFLAG_NAMES,):
+        monkeypatch.delenv(name, raising=False)
+    for name in tuple(os.environ):
+        if release_wheel.TARGET_RUSTFLAGS.fullmatch(name):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("SOURCE_DATE_EPOCH", "1")
+    monkeypatch.setattr(release_wheel, "_rustc_sysroot", lambda environment: tmp_path)
+    monkeypatch.setattr(
+        release_wheel.generate_release_sbom, "cargo_metadata", fake_metadata
+    )
+    for offline in (False, True):
+        with unittest.TestCase().assertRaises(StopAfterMetadata):
+            release_wheel.build_release_wheel(
+                interpreter=sys.executable,
+                output=tmp_path / "out",
+                manylinux=None,
+                offline=offline,
+            )
+    assert modes == [False, True]
+
+
+def test_release_wheel_helper_rejects_flag_injection_and_cargo_config(
+    tmp_path: Path,
+) -> None:
+    from scripts import build_release_wheel as release_wheel
+
+    forbidden = (
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+    )
+    for name in forbidden:
+        with unittest.TestCase().assertRaisesRegex(ValueError, name):
+            release_wheel.reject_preexisting_rustflags({name: ""})
+
+    repository = tmp_path / "repository"
+    config = repository / ".cargo/config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('[build]\nrustflags = ["-C", "debuginfo=0"]\n')
+    with unittest.TestCase().assertRaisesRegex(ValueError, "Cargo rustflags"):
+        release_wheel.reject_repository_rustflags(repository)
+
+
+def test_release_wheel_helper_builds_portable_broad_to_specific_remaps(
+    tmp_path: Path,
+) -> None:
+    from scripts import build_release_wheel as release_wheel
+
+    windows = set(release_wheel.path_spellings(r"C:\Users\Builder\source"))
+    assert r"C:\Users\Builder\source" in windows
+    assert "C:/Users/Builder/source" in windows
+    assert r"c:\Users\Builder\source" in windows
+    assert "c:/Users/Builder/source" in windows
+    assert r"\\?\C:\Users\Builder\source" in windows
+    assert "//?/C:/Users/Builder/source" in windows
+
+    home = tmp_path / "home"
+    repository = home / "source"
+    staging = tmp_path / "temp" / "stage"
+    environment = {
+        "CARGO_HOME": os.fspath(home / ".cargo"),
+        "CARGO_TARGET_DIR": os.fspath(repository / "target-custom"),
+        "RUNNER_TEMP": os.fspath(tmp_path / "runner-temp"),
+        "GITHUB_WORKSPACE": os.fspath(repository),
+    }
+    if os.name != "nt":
+        environment["TMPDIR"] = "/tmp"
+    rules = release_wheel.computed_remap_rules(
+        repository=repository,
+        home=home,
+        sysroot=home / ".rustup/toolchains/1.98.0",
+        staging=staging,
+        environment=environment,
+    )
+    assert rules
+    assert [len(source) for source, _ in rules] == sorted(
+        len(source) for source, _ in rules
+    )
+    assert len({source for source, _ in rules}) == len(rules)
+    assert all(source and "=" not in target for source, target in rules)
+    assert any(source == os.fspath(repository) for source, _ in rules)
+    assert any(source == os.fspath(home / ".cargo") for source, _ in rules)
+    if os.name != "nt":
+        assert all(source != "/tmp" for source, _ in rules)
+
+    needles = release_wheel.encoded_path_needles("/private/builder/root")
+    assert b"/private/builder/root" in needles
+    assert "/private/builder/root".encode("utf-16le") in needles
+
+
+def test_release_documentation_scopes_path_sanitization_to_release_helper() -> None:
+    release = " ".join(
+        (ROOT / "docs/community/release-process.rst").read_text().split()
+    )
+    assert "scripts/build_release_wheel.py" in release
+    assert "release wheels" in release
+    assert "Direct Maturin, editable, and PEP 517 builds" in release
+    assert "do not carry the release path-sanitization guarantee" in release
 
 
 def test_oracle_lock_resolves_relative_to_the_repository_or_explicit_override(
@@ -420,11 +978,16 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert {
         "Cargo.lock",
         "Cargo.toml",
+        "AUTHORS.rst",
         "LICENSE",
         "NOTICE",
+        "RUST_RUNTIME_NOTICES.html",
         "crates/**",
         "pyproject.toml",
         "requirements-dev.txt",
+        "rust-toolchain.toml",
+        "scripts/build_release_wheel.py",
+        "scripts/generate_release_sbom.py",
         "src/**",
         "tests/**",
         "tests_differential/**",
@@ -444,8 +1007,12 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert len(PYTHONS) * len(SYSTEMS) - 1 == 23
     ordered_names = [step.get("name") for step in job["steps"]]
     steps = {step.get("name"): step for step in job["steps"]}
-    assert "python -m maturin build" in steps["Build wheel"]["run"]
+    assert "scripts/build_release_wheel.py" in steps["Build wheel"]["run"]
     assert "--manylinux 2_34" in steps["Build wheel"]["run"]
+    assert steps["Install maturin"]["run"] == (
+        'python -m pip install "maturin==1.15.0"'
+    )
+    assert "SOURCE_DATE_EPOCH" in steps["Set reproducible build epoch"]["run"]
     assert "--verify-wheel" in steps["Verify exact wheel contents"]["run"]
     assert "--source-commit" in steps["Verify exact wheel contents"]["run"]
     install = steps["Install wheel and explicit test dependencies"]["run"]
@@ -471,6 +1038,22 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
         "Record free-threaded ABI evidence"
     ) < ordered_names.index("Run installed artifact suite once")
     assert steps["Upload wheel"]["with"]["if-no-files-found"] == "error"
+
+
+def test_bootstrap_matrix_uses_the_release_helper_and_validates_each_wheel() -> None:
+    workflow = load_workflow("bootstrap-matrix.yml")
+    job = workflow["jobs"]["wheel-smoke"]
+    steps = {step.get("name"): step for step in job["steps"]}
+    build = steps["Build version-specific wheel"]["run"]
+    verify = steps["Verify exact wheel contents"]["run"]
+    assert "scripts/build_release_wheel.py" in build
+    assert "--manylinux 2_34" in build
+    assert "--verify-wheel" in verify
+    assert '--source-commit "$GITHUB_SHA"' in verify
+    assert steps["Install maturin"]["run"] == (
+        'python -m pip install --upgrade "maturin==1.15.0"'
+    )
+    assert "SOURCE_DATE_EPOCH" in steps["Set reproducible build epoch"]["run"]
 
 
 def test_source_workflows_cover_rust_default_and_explicit_trial() -> None:
@@ -540,13 +1123,16 @@ def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> No
     assert {
         ".github/workflows/**",
         "API_COMPATIBILITY.tsv",
+        "AUTHORS.rst",
         "HISTORY.md",
         "LICENSE",
         "LIFETIMES.tsv",
         "NOTICE",
         "ORACLE.lock",
         "README.md",
+        "RUST_RUNTIME_NOTICES.html",
         "requirements-dev.txt",
+        "rust-toolchain.toml",
     } <= set(test_triggers["push"]["paths"])
 
     for name in (
@@ -756,6 +1342,9 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     sdist_steps = jobs["sdist"]["steps"]
     sdist_by_name = {step.get("name"): step for step in sdist_steps}
     sdist_names = [step.get("name") for step in sdist_steps]
+    assert sdist_by_name["Install maturin"]["run"] == (
+        'python -m pip install "maturin==1.15.0"'
+    )
     assert "--verify-sdist" in sdist_by_name["Verify exact sdist contents"]["run"]
     assert "--source-commit" in sdist_by_name["Verify exact sdist contents"]["run"]
     sdist_install = sdist_by_name["Install sdist and explicit test dependencies"]["run"]
@@ -829,6 +1418,7 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
 def test_public_project_identity_is_derivative_and_registry_safe() -> None:
     public_files = [
         ROOT / "README.md",
+        ROOT / "NOTICE",
         ROOT / ".github/CONTRIBUTING.md",
         ROOT / ".github/CODE_OF_CONDUCT.md",
         ROOT / ".github/SECURITY.md",
@@ -838,9 +1428,15 @@ def test_public_project_identity_is_derivative_and_registry_safe() -> None:
         ROOT / "docs/community/vulnerabilities.rst",
         ROOT / "docs/community/release-process.rst",
         ROOT / "docs/user/install.rst",
+        ROOT / "scripts/generate_third_party_notices.py",
+        ROOT / "src/requests/__init__.py",
+        ROOT / "src/requests/adapters.py",
+        ROOT / "src/requests/models.py",
+        ROOT / "src/requests/sessions.py",
     ]
     combined = "\n".join(path.read_text() for path in public_files)
     assert "Requests Native" in combined
+    assert "Requests Rust" not in combined
     assert "https://github.com/puneet-chandna/requests-native" in combined
     assert "unofficial" in combined.lower()
     assert "not published to PyPI" in combined
@@ -870,6 +1466,8 @@ def test_public_project_identity_is_derivative_and_registry_safe() -> None:
 
 
 def canonical_legal_bytes(source_commit: str) -> dict[str, bytes]:
+    if source_commit == "WORKTREE":
+        return {name: (ROOT / name).read_bytes() for name in LEGAL_FILES}
     return {
         name: subprocess.run(
             ["git", "show", f"{source_commit}:{name}"],
@@ -877,7 +1475,7 @@ def canonical_legal_bytes(source_commit: str) -> dict[str, bytes]:
             check=True,
             capture_output=True,
         ).stdout
-        for name in ("LICENSE", "NOTICE")
+        for name in LEGAL_FILES
     }
 
 
@@ -902,6 +1500,89 @@ def _expected_archive_directories(files: set[str]) -> set[str]:
         for length in range(1, len(parts) + 1):
             directories.add("/".join(parts[:length]))
     return directories
+
+
+@functools.lru_cache(maxsize=1)
+def _detected_private_path_spellings() -> tuple[bytes, ...]:
+    from scripts import build_release_wheel as release_wheel
+
+    roots = {
+        ROOT,
+        Path.home(),
+        Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")),
+        ROOT / "target",
+    }
+    for name in (
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "RUNNER_TEMP",
+        "RUNNER_TOOL_CACHE",
+        "GITHUB_WORKSPACE",
+        "CARGO_TARGET_DIR",
+    ):
+        if os.environ.get(name) and not (
+            name in {"TMPDIR", "TEMP", "TMP"}
+            and release_wheel.is_generic_temp_namespace(os.environ[name])
+        ):
+            roots.add(Path(os.environ[name]))
+    sysroot = subprocess.run(
+        ["rustc", "--print", "sysroot"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    roots.add(Path(sysroot))
+    spellings = set()
+    for root in roots:
+        expanded = root.expanduser()
+        if not expanded.is_absolute():
+            expanded = ROOT / expanded
+        for variant in {expanded.absolute(), expanded.resolve(strict=False)}:
+            spellings.update(release_wheel.path_spellings(variant))
+    return tuple(
+        needle
+        for spelling in sorted(spellings, key=lambda item: (len(item), item))
+        if spelling
+        for needle in release_wheel.encoded_path_needles(spelling)
+    )
+
+
+def _reject_private_path_bytes(name: str, content: bytes) -> None:
+    if any(spelling in content for spelling in _detected_private_path_spellings()):
+        raise ValueError(f"archive member contains a private build path: {name}")
+
+
+def _record_digest(content: bytes) -> str:
+    digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest())
+    return "sha256=" + digest.rstrip(b"=").decode("ascii")
+
+
+def _verify_wheel_record(contents: dict[str, bytes], record_name: str) -> None:
+    try:
+        rows = list(csv.reader(io.StringIO(contents[record_name].decode("utf-8"))))
+    except (KeyError, UnicodeDecodeError, csv.Error) as error:
+        raise ValueError("wheel RECORD is missing or invalid") from error
+    if any(len(row) != 3 for row in rows):
+        raise ValueError("wheel RECORD row has the wrong shape")
+    records = {row[0]: (row[1], row[2]) for row in rows}
+    if len(records) != len(rows) or set(records) != set(contents):
+        raise ValueError("wheel RECORD inventory mismatch")
+    for name, content in contents.items():
+        digest, size = records[name]
+        if name == record_name:
+            if digest or size:
+                raise ValueError("wheel RECORD must not hash itself")
+        elif digest != _record_digest(content) or size != str(len(content)):
+            raise ValueError(f"wheel RECORD hash or size mismatch: {name}")
+
+
+@functools.lru_cache(maxsize=1)
+def _expected_release_sbom() -> bytes:
+    from scripts import generate_release_sbom as release_sbom
+
+    return release_sbom.render_sbom(release_sbom.cargo_metadata(offline=True))
 
 
 def verify_wheel(wheel: Path, source_commit: str) -> None:
@@ -948,8 +1629,7 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
             f"{dist_info}METADATA",
             f"{dist_info}WHEEL",
             f"{dist_info}RECORD",
-            f"{dist_info}licenses/LICENSE",
-            f"{dist_info}licenses/NOTICE",
+            *(f"{dist_info}licenses/{name}" for name in LEGAL_FILES),
             sbom_name,
         }
         if set(file_members) != expected_members:
@@ -960,10 +1640,19 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
             raise ValueError(
                 f"unexpected wheel directory entries: {sorted(unexpected_directories)!r}"
             )
-        metadata = email.parser.BytesParser().parsebytes(archive.read(metadata_name))
-        assert archive.read(f"{dist_info}licenses/LICENSE") == legal["LICENSE"]
-        assert archive.read(f"{dist_info}licenses/NOTICE") == legal["NOTICE"]
-        sbom = json.loads(archive.read(sbom_name))
+        contents = {name: archive.read(name) for name in file_members}
+        for name, content in contents.items():
+            _reject_private_path_bytes(name, content)
+        metadata = email.parser.BytesParser().parsebytes(contents[metadata_name])
+        for name in LEGAL_FILES:
+            assert contents[f"{dist_info}licenses/{name}"] == legal[name]
+        from scripts import generate_release_sbom as release_sbom
+
+        expected_sbom = _expected_release_sbom()
+        if contents[sbom_name] != expected_sbom:
+            raise ValueError("wheel SBOM does not match the deterministic Cargo graph")
+        sbom = json.loads(contents[sbom_name])
+        release_sbom.validate_sbom(sbom)
         assert sbom["bomFormat"] == "CycloneDX"
         assert sbom["metadata"]["component"]["name"] == BINDING_CARGO_PACKAGE
         required_components = {
@@ -982,6 +1671,7 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
         assert notice_components == {
             (name.encode(), version.encode()) for name, version in required_components
         }
+        _verify_wheel_record(contents, f"{dist_info}RECORD")
 
     assert metadata["Name"] == PYTHON_DISTRIBUTION
     assert metadata["Version"] == PYTHON_DISTRIBUTION_VERSION
@@ -990,8 +1680,9 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
         "compatibility."
     )
     assert metadata["Requires-Python"] == ">=3.10"
-    assert metadata["License-Expression"] == "Apache-2.0"
-    assert metadata.get_all("License-File") == ["LICENSE", "NOTICE"]
+    assert metadata["License"] is None
+    assert metadata["License-Expression"] is None
+    assert metadata.get_all("License-File") == list(LEGAL_FILES)
     assert metadata["Author"] == "Puneet Chandna"
     assert metadata["Maintainer"] == "Puneet Chandna"
     assert metadata["Author-email"] is None
@@ -1037,19 +1728,101 @@ def verify_sdist(sdist: Path, source_commit: str) -> None:
             if name_is_directory or not member.isfile():
                 raise ValueError(f"non-regular sdist member: {member.name}")
             members[name] = member
-        assert len(EXPECTED_SDIST_MEMBERS) == 67
+        assert len(EXPECTED_SDIST_MEMBERS) == 72
         if set(members) != expected_files:
             raise ValueError("sdist inventory does not match the canonical source tree")
-        license_stream = archive.extractfile(members[f"{root}/LICENSE"])
-        notice_stream = archive.extractfile(members[f"{root}/NOTICE"])
-        assert license_stream is not None and license_stream.read() == legal["LICENSE"]
-        assert notice_stream is not None and notice_stream.read() == legal["NOTICE"]
+        contents = {}
+        for name, member in members.items():
+            stream = archive.extractfile(member)
+            assert stream is not None
+            contents[name] = stream.read()
+            _reject_private_path_bytes(name, contents[name])
+        for filename in LEGAL_FILES:
+            assert contents[f"{root}/{filename}"] == legal[filename]
+        metadata = email.parser.BytesParser().parsebytes(contents[f"{root}/PKG-INFO"])
+        assert metadata["License"] is None
+        assert metadata["License-Expression"] is None
+        assert metadata.get_all("License-File") == list(LEGAL_FILES)
 
 
 def test_built_wheel_and_sdist_have_complete_clean_inventory_and_metadata() -> None:
     wheel, sdist = artifact_paths()
-    verify_wheel(wheel, "HEAD")
-    verify_sdist(sdist, "HEAD")
+    verify_wheel(wheel, VALIDATOR_SOURCE_COMMIT)
+    verify_sdist(sdist, VALIDATOR_SOURCE_COMMIT)
+
+
+def test_distribution_validator_cli_runs_outside_the_checkout(tmp_path: Path) -> None:
+    wheel, _ = artifact_paths()
+    environment = dict(os.environ)
+    environment["RUSTUP_TOOLCHAIN"] = "stable"
+    subprocess.run(
+        [
+            sys.executable,
+            os.fspath(Path(__file__).resolve()),
+            "--verify-wheel",
+            os.fspath(wheel),
+            "--source-commit",
+            "WORKTREE",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+    )
+
+
+@unittest.skipUnless(
+    sys.platform.startswith("linux")
+    and os.environ.get("REQUESTS_RUN_RELEASE_REPRO") == "1",
+    "set REQUESTS_RUN_RELEASE_REPRO=1 for the two-root release-wheel proof",
+)
+def test_release_wheel_is_reproducible_from_two_extracted_sdist_roots(
+    tmp_path: Path,
+) -> None:
+    _, sdist = artifact_paths()
+    verify_sdist(sdist, VALIDATOR_SOURCE_COMMIT)
+    built = []
+    for index in range(2):
+        parent = tmp_path / f"checkout-{index}"
+        parent.mkdir()
+        shutil.unpack_archive(sdist, parent)
+        checkout = parent / ARTIFACT_STEM
+        output = tmp_path / f"wheelhouse-{index}"
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if name
+            not in {
+                "RUSTFLAGS",
+                "CARGO_ENCODED_RUSTFLAGS",
+                "CARGO_BUILD_RUSTFLAGS",
+            }
+            and not re.fullmatch(r"CARGO_TARGET_.+_RUSTFLAGS", name)
+        }
+        environment["SOURCE_DATE_EPOCH"] = "1788567917"
+        environment["RUSTUP_TOOLCHAIN"] = "stable"
+        subprocess.run(
+            [
+                sys.executable,
+                os.fspath(checkout / "scripts/build_release_wheel.py"),
+                "--interpreter",
+                sys.executable,
+                "--manylinux",
+                "2_34",
+                "--offline",
+                "--out",
+                os.fspath(output),
+            ],
+            cwd=checkout,
+            env=environment,
+            check=True,
+        )
+        wheels = sorted(output.glob("*.whl"))
+        assert len(wheels) == 1
+        verify_wheel(wheels[0], "WORKTREE")
+        built.append(wheels[0])
+
+    assert built[0].name == built[1].name
+    assert built[0].read_bytes() == built[1].read_bytes()
 
 
 def _rewrite_wheel(
@@ -1057,14 +1830,22 @@ def _rewrite_wheel(
     destination: Path,
     *,
     renamed: dict[str, str] | None = None,
+    replaced_content: dict[str, bytes] | None = None,
     duplicate: str | None = None,
 ) -> None:
     renamed = renamed or {}
-    with zipfile.ZipFile(source) as original, zipfile.ZipFile(destination, "w") as output:
+    replaced_content = replaced_content or {}
+    with (
+        zipfile.ZipFile(source) as original,
+        zipfile.ZipFile(destination, "w") as output,
+    ):
         for member in original.infolist():
             replacement = copy.copy(member)
             replacement.filename = renamed.get(member.filename, member.filename)
-            output.writestr(replacement, original.read(member))
+            output.writestr(
+                replacement,
+                replaced_content.get(member.filename, original.read(member)),
+            )
         if duplicate is not None:
             output.writestr(duplicate, original.read(duplicate))
 
@@ -1086,16 +1867,24 @@ def _rewrite_sdist(
     destination: Path,
     *,
     renamed: dict[str, str] | None = None,
+    replaced_content: dict[str, bytes] | None = None,
     additions: tuple[tuple[tarfile.TarInfo, bytes | None], ...] = (),
 ) -> None:
     renamed = renamed or {}
-    with tarfile.open(source, "r:gz") as original, tarfile.open(
-        destination, "w:gz"
-    ) as output:
+    replaced_content = replaced_content or {}
+    with (
+        tarfile.open(source, "r:gz") as original,
+        tarfile.open(destination, "w:gz") as output,
+    ):
         for member in original.getmembers():
             replacement = copy.copy(member)
             replacement.name = renamed.get(member.name, member.name)
-            stream = original.extractfile(member) if member.isfile() else None
+            if member.isfile() and member.name in replaced_content:
+                content = replaced_content[member.name]
+                replacement.size = len(content)
+                stream = io.BytesIO(content)
+            else:
+                stream = original.extractfile(member) if member.isfile() else None
             output.addfile(replacement, stream)
         for member, data in additions:
             member.size = len(data) if data is not None else 0
@@ -1108,7 +1897,7 @@ def test_wheel_validator_rejects_duplicate_member(tmp_path: Path) -> None:
     _rewrite_wheel(wheel, invalid, duplicate="requests/__init__.py")
 
     with unittest.TestCase().assertRaisesRegex(ValueError, "duplicate"):
-        verify_wheel(invalid, "HEAD")
+        verify_wheel(invalid, VALIDATOR_SOURCE_COMMIT)
 
 
 def test_wheel_validator_rejects_noncanonical_member_names(tmp_path: Path) -> None:
@@ -1123,7 +1912,7 @@ def test_wheel_validator_rejects_noncanonical_member_names(tmp_path: Path) -> No
             renamed={"requests/__init__.py": invalid_name},
         )
         with unittest.TestCase().assertRaisesRegex(ValueError, "archive member"):
-            verify_wheel(invalid, "HEAD")
+            verify_wheel(invalid, VALIDATOR_SOURCE_COMMIT)
 
 
 def test_wheel_validator_requires_exact_dist_info_root(tmp_path: Path) -> None:
@@ -1140,13 +1929,43 @@ def test_wheel_validator_requires_exact_dist_info_root(tmp_path: Path) -> None:
     _rewrite_wheel(wheel, invalid, renamed=renamed)
 
     with unittest.TestCase().assertRaisesRegex(ValueError, "wheel inventory"):
-        verify_wheel(invalid, "HEAD")
+        verify_wheel(invalid, VALIDATOR_SOURCE_COMMIT)
+
+
+def test_wheel_validator_rejects_private_build_path_bytes(tmp_path: Path) -> None:
+    wheel, _ = artifact_paths()
+    with zipfile.ZipFile(wheel) as archive:
+        extension = next(name for name in archive.namelist() if name.endswith(".so"))
+        original = archive.read(extension)
+
+    for encoding in ("utf-8", "utf-16le"):
+        infected = original + b"\0" + os.fspath(ROOT).encode(encoding)
+        invalid = tmp_path / f"{encoding}-{wheel.name}"
+        _rewrite_wheel(wheel, invalid, replaced_content={extension: infected})
+
+        with unittest.TestCase().assertRaisesRegex(ValueError, "private build path"):
+            verify_wheel(invalid, "WORKTREE")
+
+
+def test_wheel_validator_verifies_every_record_hash_and_size(tmp_path: Path) -> None:
+    wheel, _ = artifact_paths()
+    with zipfile.ZipFile(wheel) as archive:
+        original = archive.read("requests/__init__.py")
+    invalid = tmp_path / wheel.name
+    _rewrite_wheel(
+        wheel,
+        invalid,
+        replaced_content={"requests/__init__.py": original + b"\n# record drift\n"},
+    )
+
+    with unittest.TestCase().assertRaisesRegex(ValueError, "RECORD"):
+        verify_wheel(invalid, "WORKTREE")
 
 
 def test_sdist_validator_rejects_duplicate_regular_member(tmp_path: Path) -> None:
     _, sdist = artifact_paths()
     invalid = tmp_path / sdist.name
-    license_bytes = canonical_legal_bytes("HEAD")["LICENSE"]
+    license_bytes = canonical_legal_bytes(VALIDATOR_SOURCE_COMMIT)["LICENSE"]
     _rewrite_sdist(
         sdist,
         invalid,
@@ -1154,7 +1973,7 @@ def test_sdist_validator_rejects_duplicate_regular_member(tmp_path: Path) -> Non
     )
 
     with unittest.TestCase().assertRaisesRegex(ValueError, "duplicate"):
-        verify_sdist(invalid, "HEAD")
+        verify_sdist(invalid, VALIDATOR_SOURCE_COMMIT)
 
 
 def test_sdist_validator_requires_one_exact_root(tmp_path: Path) -> None:
@@ -1172,7 +1991,7 @@ def test_sdist_validator_requires_one_exact_root(tmp_path: Path) -> None:
         },
     )
     with unittest.TestCase().assertRaisesRegex(ValueError, "sdist root"):
-        verify_sdist(wrong_root, "HEAD")
+        verify_sdist(wrong_root, VALIDATOR_SOURCE_COMMIT)
 
     multiple_roots = tmp_path / "multiple-roots.tar.gz"
     _rewrite_sdist(
@@ -1181,7 +2000,24 @@ def test_sdist_validator_requires_one_exact_root(tmp_path: Path) -> None:
         renamed={f"{ARTIFACT_STEM}/LICENSE": "other-root/LICENSE"},
     )
     with unittest.TestCase().assertRaisesRegex(ValueError, "sdist root"):
-        verify_sdist(multiple_roots, "HEAD")
+        verify_sdist(multiple_roots, VALIDATOR_SOURCE_COMMIT)
+
+
+def test_sdist_validator_rejects_private_build_path_bytes(tmp_path: Path) -> None:
+    _, sdist = artifact_paths()
+    member = f"{ARTIFACT_STEM}/README.md"
+    for encoding in ("utf-8", "utf-16le"):
+        invalid = tmp_path / f"{encoding}-{sdist.name}"
+        _rewrite_sdist(
+            sdist,
+            invalid,
+            replaced_content={
+                member: b"private path: " + os.fspath(ROOT).encode(encoding)
+            },
+        )
+
+        with unittest.TestCase().assertRaisesRegex(ValueError, "private build path"):
+            verify_sdist(invalid, "WORKTREE")
 
 
 def test_sdist_validator_rejects_absolute_and_traversal_names(
@@ -1196,7 +2032,7 @@ def test_sdist_validator_rejects_absolute_and_traversal_names(
             renamed={f"{ARTIFACT_STEM}/LICENSE": invalid_name},
         )
         with unittest.TestCase().assertRaisesRegex(ValueError, "archive member"):
-            verify_sdist(invalid, "HEAD")
+            verify_sdist(invalid, VALIDATOR_SOURCE_COMMIT)
 
 
 def test_sdist_validator_rejects_every_non_regular_member(tmp_path: Path) -> None:
@@ -1216,7 +2052,7 @@ def test_sdist_validator_rejects_every_non_regular_member(tmp_path: Path) -> Non
             additions=((_tar_member(f"{ARTIFACT_STEM}/{label}", kind=kind), None),),
         )
         with unittest.TestCase().assertRaisesRegex(ValueError, "non-regular"):
-            verify_sdist(invalid, "HEAD")
+            verify_sdist(invalid, VALIDATOR_SOURCE_COMMIT)
 
 
 def test_sdist_validator_allows_only_expected_directory_entries(
@@ -1227,18 +2063,22 @@ def test_sdist_validator_allows_only_expected_directory_entries(
     _rewrite_sdist(
         sdist,
         expected,
-        additions=((_tar_member(f"{ARTIFACT_STEM}/src/requests/", kind=tarfile.DIRTYPE), None),),
+        additions=(
+            (_tar_member(f"{ARTIFACT_STEM}/src/requests/", kind=tarfile.DIRTYPE), None),
+        ),
     )
-    verify_sdist(expected, "HEAD")
+    verify_sdist(expected, VALIDATOR_SOURCE_COMMIT)
 
     unexpected = tmp_path / "unexpected-directory.tar.gz"
     _rewrite_sdist(
         sdist,
         unexpected,
-        additions=((_tar_member(f"{ARTIFACT_STEM}/unexpected/", kind=tarfile.DIRTYPE), None),),
+        additions=(
+            (_tar_member(f"{ARTIFACT_STEM}/unexpected/", kind=tarfile.DIRTYPE), None),
+        ),
     )
     with unittest.TestCase().assertRaisesRegex(ValueError, "directory"):
-        verify_sdist(unexpected, "HEAD")
+        verify_sdist(unexpected, VALIDATOR_SOURCE_COMMIT)
 
 
 def _clean_environment() -> dict[str, str]:

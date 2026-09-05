@@ -1,26 +1,49 @@
 Requests
 Copyright 2019 Kenneth Reitz
 
-Requests Rust is an unofficial derivative that adds a native Rust transport while
-preserving the Requests Python API. The following upstream-derived Python files
-carry prominent per-file modification notices:
+Requests Native modification notice: this NOTICE differs from Requests 2.34.2.
 
-- src/requests/__init__.py
-- src/requests/adapters.py
-- src/requests/models.py
-- src/requests/sessions.py
+Requests Native is an independent, unofficial derivative of Requests, maintained
+by Puneet Chandna. It preserves upstream Requests attribution and adds a native
+Rust transport with Python compatibility fallbacks. The Python import remains
+requests; distribution versions are independent of the Requests compatibility
+version 2.34.2. See AUTHORS.rst for the preserved contributor record.
 
-THIRD-PARTY DEPENDENCY LICENSE CORPUS
+Requests Native is not an official Requests release and is not affiliated with,
+sponsored by, or endorsed by the upstream Requests maintainers or the Python
+Software Foundation. The independent name and this disclaimer are statements of
+provenance, not trademark clearance.
 
-This deterministic inventory covers the transitive normal-dependency graph of the
-native extension across supported Cargo target conditions. Build-only and
-development-only dependencies are excluded. It records each dependency's declared
-license expression and reproduces its packaged top-level license, notice,
-copyright, or copying files. This is compliance evidence, not legal advice;
-owner/legal approval is still required before redistribution.
+The project source is distributed under Apache-2.0 except where otherwise
+identified. Third-party components retain their respective license terms. These
+notices identify provenance and applicable third-party material; they do not
+replace or modify the accompanying licenses.
+
+THIRD-PARTY AND RUNTIME NOTICE CORPUS
+
+This deterministic corpus covers the transitive normal-dependency graph of the
+native extension across supported Cargo target conditions. It is a conservative
+cross-target inventory and does not assert that every listed package occurs in
+every wheel. Cargo build-only and development-only dependency edges are excluded;
+reviewed generated or vendored material is identified in its package section.
+Raw Cargo declarations are retained and reviewed obligations record every AND and
+the selected option for every OR. Python dependencies are not bundled in the
+wheel; they remain separate requirements. Platform system libraries are not bundled; platform linkage
+must still be verified for each final wheel.
+
+Rust 1.98.0 (commit 88d9e12ae178fab0fb5cc050a94da85685d449ea) is the pinned
+release toolchain. Its complete standard-library notice inventory is packaged as
+RUST_RUNTIME_NOTICES.html with SHA-256
+68129500b616d5838629e68f55ff3aed5e096dacf60ce9eb41bbe599a563afa6.
+
+Aggregate Python License and License-Expression metadata are intentionally omitted
+until the backend can represent source and binary artifacts separately. Canonical
+LICENSE, NOTICE, AUTHORS.rst, this runtime supplement, and the wheel SBOM remain
+packaged and validated.
 
 ----- BEGIN adler2 2.0.1 -----
 Declared license: 0BSD OR MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-0BSD ---
@@ -269,6 +292,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN alloc-no-stdlib 2.0.4 -----
 Declared license: BSD-3-Clause
+Reviewed obligations: BSD-3-Clause
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -289,9 +313,10 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 ----- BEGIN alloc-stdlib 0.2.4 -----
 Declared license: BSD-3-Clause
+Reviewed obligations: BSD-3-Clause
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
---- LICENSE (from alloc-no-stdlib 2.0.4; same repository and license) ---
+--- LICENSE (verified local byte source: alloc-no-stdlib 2.0.4; authority: rust-alloc-no-stdlib commit ae42d22078b98549e987d2f03d12df7b984fde47 root LICENSE; Git blob cd496ba72eb37e83a44958358d1f89a8a28cbc15; SHA-256 c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae) ---
 Copyright (c) 2016 Dropbox, Inc.
 All rights reserved.
 
@@ -309,6 +334,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 ----- BEGIN async-compression 0.4.42 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -541,6 +567,7 @@ SOFTWARE.
 
 ----- BEGIN atomic-waker 1.1.2 -----
 Declared license: Apache-2.0 OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -822,6 +849,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN base64 0.22.1 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -1054,6 +1082,7 @@ THE SOFTWARE.
 
 ----- BEGIN bitflags 2.13.1 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -1290,6 +1319,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN block-buffer 0.10.4 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -1526,6 +1556,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN brotli 8.0.4 -----
 Declared license: BSD-3-Clause AND MIT
+Reviewed obligations: BSD-3-Clause AND MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE.BSD-3-Clause ---
@@ -1563,10 +1594,18 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
+--- Google MIT encoder notice from src/enc/entropy_encode.rs (src/enc/entropy_encode.rs; SHA-256 1427f28f081792415f7ab352ece9d0820d7ab07e2318c0d4d190cd96131e32ab) ---
+/* Copyright 2010 Google Inc. All Rights Reserved.
+
+   Distributed under MIT license.
+   See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
+*/
+
 ----- END brotli 8.0.4 -----
 
 ----- BEGIN brotli-decompressor 5.0.3 -----
 Declared license: BSD-3-Clause/MIT
+Reviewed obligations: BSD-3-Clause AND MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -1583,10 +1622,39 @@ Redistribution and use in source and binary forms, with or without modification,
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+--- Google MIT context-table notice from src/context.rs (src/context.rs; SHA-256 8fe7865962916fa7ce820b9fb407e6a2dd9b9c373191ad4a41c507b6be373e40) ---
+// Copyright 2013 Google Inc. All Rights Reserved.
+//
+// Distributed under MIT license.
+// See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
+//
+
+--- MIT license text for the Google context-table material (verified byte source: brotli 8.0.4/LICENSE.MIT; SHA-256 3d180008e36922a4e8daec11c34c7af264fed5962d07924aea928c38e8663c94) ---
+Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
 ----- END brotli-decompressor 5.0.3 -----
 
 ----- BEGIN bytes 1.12.1 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -1620,6 +1688,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN cfg-if 1.0.4 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -1856,6 +1925,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN compression-codecs 0.4.38 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -2088,6 +2158,7 @@ SOFTWARE.
 
 ----- BEGIN compression-core 0.4.32 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -2320,6 +2391,7 @@ SOFTWARE.
 
 ----- BEGIN core-foundation 0.10.1 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -2556,6 +2628,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN core-foundation-sys 0.8.7 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -2792,6 +2865,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN cpufeatures 0.2.17 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -3028,6 +3102,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN crc32fast 1.5.0 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -3260,6 +3335,7 @@ SOFTWARE.
 
 ----- BEGIN crypto-common 0.1.7 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -3496,6 +3572,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN digest 0.10.7 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -3732,6 +3809,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN displaydoc 0.2.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -3966,6 +4044,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN equivalent 1.0.2 -----
 Declared license: Apache-2.0 OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -4202,6 +4281,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN flate2 1.1.9 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -4438,6 +4518,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN form_urlencoded 1.2.2 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -4674,6 +4755,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN futures-channel 0.3.33 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -4912,6 +4994,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN futures-core 0.3.33 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -5150,6 +5233,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN generic-array 0.14.7 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -5179,6 +5263,7 @@ SOFTWARE.
 
 ----- BEGIN getrandom 0.2.17 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -5416,6 +5501,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN hashbrown 0.15.2 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -5652,6 +5738,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN heck 0.5.0 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -5888,6 +5975,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN http 1.4.2 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -6124,6 +6212,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN http-body 1.1.0 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6157,6 +6246,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN http-body-util 0.1.4 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6190,6 +6280,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN httparse 1.10.1 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -6420,6 +6511,7 @@ THE SOFTWARE.
 
 ----- BEGIN hyper 1.11.0 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6447,6 +6539,7 @@ THE SOFTWARE.
 
 ----- BEGIN hyper-util 0.1.20 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6474,6 +6567,7 @@ THE SOFTWARE.
 
 ----- BEGIN icu_collections 2.2.0 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6528,6 +6622,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN icu_locale_core 2.2.0 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6582,6 +6677,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN icu_normalizer 2.2.0 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6636,6 +6732,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN icu_normalizer_data 2.2.0 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6690,6 +6787,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN icu_properties 2.2.0 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6744,6 +6842,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN icu_properties_data 2.2.0 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6798,6 +6897,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN icu_provider 2.2.0 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -6852,6 +6952,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN idna 1.1.0 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -7088,6 +7189,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN idna_adapter 1.2.2 -----
 Declared license: Apache-2.0 OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -7324,6 +7426,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN indexmap 2.9.0 -----
 Declared license: Apache-2.0 OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -7560,6 +7663,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN itoa 1.0.18 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -7769,6 +7873,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN libc 0.2.189 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -7980,6 +8085,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN litemap 0.8.2 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -8034,6 +8140,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN md-5 0.10.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -8272,6 +8379,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN memchr 2.8.3 -----
 Declared license: Unlicense OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- COPYING ---
@@ -8332,6 +8440,7 @@ For more information, please refer to <http://unlicense.org/>
 
 ----- BEGIN miniz_oxide 0.8.9 -----
 Declared license: MIT OR Zlib OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -8586,6 +8695,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 
 ----- BEGIN mio 1.2.2 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -8613,6 +8723,7 @@ THE SOFTWARE.
 
 ----- BEGIN once_cell 1.21.4 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -8847,6 +8958,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN openssl-probe 0.2.1 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -9083,6 +9195,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN percent-encoding 2.3.2 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -9319,6 +9432,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN pin-project-lite 0.2.17 -----
 Declared license: Apache-2.0 OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -9529,6 +9643,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN portable-atomic 1.14.0 -----
 Declared license: Apache-2.0 OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -9739,6 +9854,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN potential_utf 0.1.5 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -9793,6 +9909,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN proc-macro2 1.0.107 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -10002,6 +10119,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN pyo3 0.29.0 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -10215,6 +10333,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN pyo3-ffi 0.29.0 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -10428,6 +10547,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN pyo3-macros 0.29.0 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -10641,6 +10761,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN pyo3-macros-backend 0.29.0 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -10854,6 +10975,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN quote 1.0.47 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -11063,6 +11185,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN ring 0.17.14 -----
 Declared license: Apache-2.0 AND ISC
+Reviewed obligations: Apache-2.0 AND ISC
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -11365,10 +11488,623 @@ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
 OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+--- once_cell Apache-2.0 license (src/polyfill/once_cell/LICENSE-APACHE; SHA-256 a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2) ---
+                              Apache License
+                        Version 2.0, January 2004
+                     http://www.apache.org/licenses/
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1. Definitions.
+
+   "License" shall mean the terms and conditions for use, reproduction,
+   and distribution as defined by Sections 1 through 9 of this document.
+
+   "Licensor" shall mean the copyright owner or entity authorized by
+   the copyright owner that is granting the License.
+
+   "Legal Entity" shall mean the union of the acting entity and all
+   other entities that control, are controlled by, or are under common
+   control with that entity. For the purposes of this definition,
+   "control" means (i) the power, direct or indirect, to cause the
+   direction or management of such entity, whether by contract or
+   otherwise, or (ii) ownership of fifty percent (50%) or more of the
+   outstanding shares, or (iii) beneficial ownership of such entity.
+
+   "You" (or "Your") shall mean an individual or Legal Entity
+   exercising permissions granted by this License.
+
+   "Source" form shall mean the preferred form for making modifications,
+   including but not limited to software source code, documentation
+   source, and configuration files.
+
+   "Object" form shall mean any form resulting from mechanical
+   transformation or translation of a Source form, including but
+   not limited to compiled object code, generated documentation,
+   and conversions to other media types.
+
+   "Work" shall mean the work of authorship, whether in Source or
+   Object form, made available under the License, as indicated by a
+   copyright notice that is included in or attached to the work
+   (an example is provided in the Appendix below).
+
+   "Derivative Works" shall mean any work, whether in Source or Object
+   form, that is based on (or derived from) the Work and for which the
+   editorial revisions, annotations, elaborations, or other modifications
+   represent, as a whole, an original work of authorship. For the purposes
+   of this License, Derivative Works shall not include works that remain
+   separable from, or merely link (or bind by name) to the interfaces of,
+   the Work and Derivative Works thereof.
+
+   "Contribution" shall mean any work of authorship, including
+   the original version of the Work and any modifications or additions
+   to that Work or Derivative Works thereof, that is intentionally
+   submitted to Licensor for inclusion in the Work by the copyright owner
+   or by an individual or Legal Entity authorized to submit on behalf of
+   the copyright owner. For the purposes of this definition, "submitted"
+   means any form of electronic, verbal, or written communication sent
+   to the Licensor or its representatives, including but not limited to
+   communication on electronic mailing lists, source code control systems,
+   and issue tracking systems that are managed by, or on behalf of, the
+   Licensor for the purpose of discussing and improving the Work, but
+   excluding communication that is conspicuously marked or otherwise
+   designated in writing by the copyright owner as "Not a Contribution."
+
+   "Contributor" shall mean Licensor and any individual or Legal Entity
+   on behalf of whom a Contribution has been received by Licensor and
+   subsequently incorporated within the Work.
+
+2. Grant of Copyright License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   copyright license to reproduce, prepare Derivative Works of,
+   publicly display, publicly perform, sublicense, and distribute the
+   Work and such Derivative Works in Source or Object form.
+
+3. Grant of Patent License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   (except as stated in this section) patent license to make, have made,
+   use, offer to sell, sell, import, and otherwise transfer the Work,
+   where such license applies only to those patent claims licensable
+   by such Contributor that are necessarily infringed by their
+   Contribution(s) alone or by combination of their Contribution(s)
+   with the Work to which such Contribution(s) was submitted. If You
+   institute patent litigation against any entity (including a
+   cross-claim or counterclaim in a lawsuit) alleging that the Work
+   or a Contribution incorporated within the Work constitutes direct
+   or contributory patent infringement, then any patent licenses
+   granted to You under this License for that Work shall terminate
+   as of the date such litigation is filed.
+
+4. Redistribution. You may reproduce and distribute copies of the
+   Work or Derivative Works thereof in any medium, with or without
+   modifications, and in Source or Object form, provided that You
+   meet the following conditions:
+
+   (a) You must give any other recipients of the Work or
+       Derivative Works a copy of this License; and
+
+   (b) You must cause any modified files to carry prominent notices
+       stating that You changed the files; and
+
+   (c) You must retain, in the Source form of any Derivative Works
+       that You distribute, all copyright, patent, trademark, and
+       attribution notices from the Source form of the Work,
+       excluding those notices that do not pertain to any part of
+       the Derivative Works; and
+
+   (d) If the Work includes a "NOTICE" text file as part of its
+       distribution, then any Derivative Works that You distribute must
+       include a readable copy of the attribution notices contained
+       within such NOTICE file, excluding those notices that do not
+       pertain to any part of the Derivative Works, in at least one
+       of the following places: within a NOTICE text file distributed
+       as part of the Derivative Works; within the Source form or
+       documentation, if provided along with the Derivative Works; or,
+       within a display generated by the Derivative Works, if and
+       wherever such third-party notices normally appear. The contents
+       of the NOTICE file are for informational purposes only and
+       do not modify the License. You may add Your own attribution
+       notices within Derivative Works that You distribute, alongside
+       or as an addendum to the NOTICE text from the Work, provided
+       that such additional attribution notices cannot be construed
+       as modifying the License.
+
+   You may add Your own copyright statement to Your modifications and
+   may provide additional or different license terms and conditions
+   for use, reproduction, or distribution of Your modifications, or
+   for any such Derivative Works as a whole, provided Your use,
+   reproduction, and distribution of the Work otherwise complies with
+   the conditions stated in this License.
+
+5. Submission of Contributions. Unless You explicitly state otherwise,
+   any Contribution intentionally submitted for inclusion in the Work
+   by You to the Licensor shall be under the terms and conditions of
+   this License, without any additional terms or conditions.
+   Notwithstanding the above, nothing herein shall supersede or modify
+   the terms of any separate license agreement you may have executed
+   with Licensor regarding such Contributions.
+
+6. Trademarks. This License does not grant permission to use the trade
+   names, trademarks, service marks, or product names of the Licensor,
+   except as required for reasonable and customary use in describing the
+   origin of the Work and reproducing the content of the NOTICE file.
+
+7. Disclaimer of Warranty. Unless required by applicable law or
+   agreed to in writing, Licensor provides the Work (and each
+   Contributor provides its Contributions) on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+   implied, including, without limitation, any warranties or conditions
+   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+   PARTICULAR PURPOSE. You are solely responsible for determining the
+   appropriateness of using or redistributing the Work and assume any
+   risks associated with Your exercise of permissions under this License.
+
+8. Limitation of Liability. In no event and under no legal theory,
+   whether in tort (including negligence), contract, or otherwise,
+   unless required by applicable law (such as deliberate and grossly
+   negligent acts) or agreed to in writing, shall any Contributor be
+   liable to You for damages, including any direct, indirect, special,
+   incidental, or consequential damages of any character arising as a
+   result of this License or out of the use or inability to use the
+   Work (including but not limited to damages for loss of goodwill,
+   work stoppage, computer failure or malfunction, or any and all
+   other commercial damages or losses), even if such Contributor
+   has been advised of the possibility of such damages.
+
+9. Accepting Warranty or Additional Liability. While redistributing
+   the Work or Derivative Works thereof, You may choose to offer,
+   and charge a fee for, acceptance of support, warranty, indemnity,
+   or other liability obligations and/or rights consistent with this
+   License. However, in accepting such obligations, You may act only
+   on Your own behalf and on Your sole responsibility, not on behalf
+   of any other Contributor, and only if You agree to indemnify,
+   defend, and hold each Contributor harmless for any liability
+   incurred by, or claims asserted against, such Contributor by reason
+   of your accepting any such warranty or additional liability.
+
+END OF TERMS AND CONDITIONS
+
+APPENDIX: How to apply the Apache License to your work.
+
+   To apply the Apache License to your work, attach the following
+   boilerplate notice, with the fields enclosed by brackets "[]"
+   replaced with your own identifying information. (Don't include
+   the brackets!)  The text should be enclosed in the appropriate
+   comment syntax for the file format. We also recommend that a
+   file or class name and description of purpose be included on the
+   same "printed page" as the copyright notice for easier
+   identification within third-party archives.
+
+Copyright [yyyy] [name of copyright owner]
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--- once_cell MIT license (src/polyfill/once_cell/LICENSE-MIT; SHA-256 6ee2ed6c77710de911761acd5fc1ad1da00f476beb1a7ef27e78c2d1858deafc) ---
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHOR OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+--- fiat-crypto Apache-2.0 license (third_party/fiat/LICENSE; SHA-256 9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f) ---
+The Apache License, Version 2.0 (Apache-2.0)
+
+Copyright 2015-2020 the fiat-crypto authors (see the AUTHORS file)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--- Google ISC notice (crypto/fipsmodule/aes/aes_nohw.c; SHA-256 a78fb13eaf6704c6ab4109efc77dc14cabcefd7c8c78cd983e4daad97bbce42b) ---
+/* Copyright (c) 2019, Google Inc.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+ * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+ * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+
+--- Intel and OpenSSL Apache-2.0 notice (crypto/fipsmodule/ec/asm/p256-x86_64-asm.pl; SHA-256 454c278064dbae0f718bb2e415efee97e31a38958776623574632961b24e34ca) ---
+# Copyright 2014-2016 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright (c) 2014, Intel Corporation. All Rights Reserved.
+# Copyright (c) 2015 CloudFlare, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Originally written by Shay Gueron (1, 2), and Vlad Krasnov (1, 3)
+# (1) Intel Corporation, Israel Development Center, Haifa, Israel
+# (2) University of Haifa, Israel
+# (3) CloudFlare, Inc.
+#
+# Reference:
+# S.Gueron and V.Krasnov, "Fast Prime Field Elliptic Curve Cryptography with
+#                          256 Bit Primes"
+
+--- Intel ISC notice (crypto/fipsmodule/ec/ecp_nistz.c; SHA-256 d5d2359807cea970cdbd059935322890a5535c39b8abf633d4324656392d527d) ---
+/* Copyright (c) 2014, Intel Corporation.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+ * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+ * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+
+--- Google ISC notice (crypto/fipsmodule/ec/ecp_nistz.h; SHA-256 ba6982c928bbbc3c71e9ef2a7bd0e1f4ca3436bf3d178e0c5727fbcd49dfea61) ---
+/* Copyright (c) 2015, Google Inc.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+ * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+ * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+
+--- Intel ISC notice (crypto/fipsmodule/ec/ecp_nistz384.h; SHA-256 7aeb84e1d64b1018d8e0c89b97ae1e603f31f9cd4786104ce5932f4d425bb1d7) ---
+/* Copyright (c) 2014, Intel Corporation.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+ * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+ * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+
+--- Intel ISC notice and authors (crypto/fipsmodule/ec/ecp_nistz384.inl; SHA-256 0229835ebc9bdfe9268c53cf3e5d346831a9b2f66377a320d92407f2293b5412) ---
+/* Copyright (c) 2014, Intel Corporation.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+ * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+ * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+
+--- Intel and OpenSSL Apache-2.0 notice (crypto/fipsmodule/ec/p256-nistz-table.h; SHA-256 eae4169efa9021ca93cf265be4de56bf1cb77e19c2957573e363c99a166953aa) ---
+// Copyright 2014-2016 The OpenSSL Project Authors. All Rights Reserved.
+// Copyright (c) 2015, Intel Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+--- Intel and OpenSSL Apache-2.0 notice (crypto/fipsmodule/ec/p256-nistz.c; SHA-256 033e609fc9709c20f4b46c54760a1386a439b95585759bbd7ebaa3024a051133) ---
+// Copyright 2014-2016 The OpenSSL Project Authors. All Rights Reserved.
+// Copyright (c) 2014, Intel Corporation. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Originally written by Shay Gueron (1, 2), and Vlad Krasnov (1)
+// (1) Intel Corporation, Israel Development Center, Haifa, Israel
+// (2) University of Haifa, Israel
+//
+// Reference:
+// S.Gueron and V.Krasnov, "Fast Prime Field Elliptic Curve Cryptography with
+//                          256 Bit Primes"
+
+--- Intel and OpenSSL Apache-2.0 notice (crypto/fipsmodule/ec/p256-nistz.h; SHA-256 41d88cdd8f66e7ded5113290790e915c07c263c0e778078c7c76311d441b1513) ---
+// Copyright 2014-2016 The OpenSSL Project Authors. All Rights Reserved.
+// Copyright (c) 2014, Intel Corporation. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Originally written by Shay Gueron (1, 2), and Vlad Krasnov (1)
+// (1) Intel Corporation, Israel Development Center, Haifa, Israel
+// (2) University of Haifa, Israel
+//
+// Reference:
+// S.Gueron and V.Krasnov, "Fast Prime Field Elliptic Curve Cryptography with
+//                          256 Bit Primes"
+
+--- Intel and OpenSSL Apache-2.0 notice (crypto/fipsmodule/ec/p256_shared.h; SHA-256 1a69c500d344254a43afa37c2a6887f30d07d7d21ffe3a13988894171c98df48) ---
+// Copyright 2014-2016 The OpenSSL Project Authors. All Rights Reserved.
+// Copyright (c) 2014, Intel Corporation. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Originally written by Shay Gueron (1, 2), and Vlad Krasnov (1)
+// (1) Intel Corporation, Israel Development Center, Haifa, Israel
+// (2) University of Haifa, Israel
+//
+// Reference:
+// S.Gueron and V.Krasnov, "Fast Prime Field Elliptic Curve Cryptography with
+//                          256 Bit Primes"
+
+--- Google ISC notice (crypto/poly1305/poly1305.c; SHA-256 ef9031a370c97e16e7784eb70a982bf718734058ed960fd4c76f08385f03f2f7) ---
+/* Copyright (c) 2014, Google Inc.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+ * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+ * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+
+--- Google ISC notice (crypto/poly1305/poly1305_arm.c; SHA-256 2b2fc2e6c7b989d4d73626d4f15006b896b3eb16d08a131415b92b8a1c2c8b99) ---
+/* Copyright (c) 2014, Google Inc.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+ * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+ * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+
+--- Brian Smith and Google ISC notice (src/aead/chacha/fallback.rs; SHA-256 79c47ffa53a1450ef79cc311998998fb2d1785658ded656e85ef58a3621fc68a) ---
+// Copyright 2021 Brian Smith.
+// Portions Copyright (c) 2014, Google Inc.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+// Adapted from the public domain, estream code by D. Bernstein.
+// Adapted from the BoringSSL crypto/chacha/chacha.c.
+
+--- Brian Smith and Google ISC notice (src/aead/chacha.rs; SHA-256 bbb8f137622eda811404cd97fb6358c570c583ec21dc4b5406b2d56a23bd7aca) ---
+// Copyright 2016 Brian Smith.
+// Portions Copyright (c) 2016, Google Inc.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+--- Google and Brian Smith ISC notice (src/aead/gcm/fallback.rs; SHA-256 610754d15ee05925f4f606aba5c7bca88408e7fb2fce3ec9cfb27f7191be5870) ---
+// Copyright (c) 2019, Google Inc.
+// Portions Copyright 2020-2024 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+--- Brian Smith and Google ISC notice (src/aead/poly1305/ffi_arm_neon.rs; SHA-256 66b81d9ce04b938b1ca0fe53d6afb97e36afe99f0331db231f4566ed0824b7da) ---
+// Copyright 2015-2025 Brian Smith.
+// Portions Copyright (c) 2014, 2015, Google Inc.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+--- Brian Smith and Google ISC notice (src/aead/poly1305/ffi_fallback.rs; SHA-256 85d27d274e05e48fd9136f0435b9b72957514f1dd724b3640176b8f4464fd155) ---
+// Copyright 2015-2025 Brian Smith.
+// Portions Copyright (c) 2014, 2015, Google Inc.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+--- Trent Clarke ISC notice (src/debug.rs; SHA-256 9d0b5cdf0fbf2f18fa5a42c8916e30f93cf9881e5a1a0b8eb1b676e35dbafbe0) ---
+// Copyright 2018 Trent Clarke.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+--- Brian Smith and Simon Sapin ISC notice (src/digest/sha1.rs; SHA-256 9b5218444ee1268be006b853bc5994d8221c52243a3a2ffedbd37c60f6540290) ---
+// Copyright 2015-2025 Brian Smith.
+// Copyright 2016 Simon Sapin.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+--- David Judd and Brian Smith ISC notice (src/limb.rs; SHA-256 a7542a645f31c0887f46b99a31b71da5c82e448b5671cfb19fe8264a955b08b8) ---
+// Copyright 2016 David Judd.
+// Copyright 2016 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+--- fiat-crypto AUTHORS from ring release commit 2723abbca9e83347d82b056d5b239c6604f786df (SHA-256 ad74c036a6afaedc418fed65f171c877c2f74a4c70938a03930aa11c98a20508) ---
+# This is the official list of fiat-crypto authors for copyright purposes.
+# This file is distinct from the CONTRIBUTORS files.
+# See the latter for an explanation.
+
+# Names should be added to this file as one of
+#     Organization's name
+#     Individual's name <submission email address>
+#     Individual's name <submission email address> <email2> <emailN>
+# See CONTRIBUTORS for the meaning of multiple email addresses.
+
+# Please keep the list sorted.
+
+Andres Erbsen <andreser@mit.edu>
+Google Inc.
+Jade Philipoom <jadep@mit.edu> <jade.philipoom@gmail.com>
+Massachusetts Institute of Technology
+Zoe Paraskevopoulou <zoe.paraskevopoulou@gmail.com>
+
 ----- END ring 0.17.14 -----
 
 ----- BEGIN rustls 0.23.42 -----
 Declared license: Apache-2.0 OR ISC OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -11622,6 +12358,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN rustls-native-certs 0.8.4 -----
 Declared license: Apache-2.0 OR ISC OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -11886,6 +12623,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN rustls-pemfile 2.2.0 -----
 Declared license: Apache-2.0 OR ISC OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -12150,6 +12888,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN rustls-pki-types 1.15.1 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -12386,6 +13125,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN rustls-webpki 0.103.13 -----
 Declared license: ISC
+Reviewed obligations: ISC
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -12413,6 +13153,7 @@ third-party/chromium/LICENSE.
 
 ----- BEGIN schannel 0.1.29 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE.md ---
@@ -12428,6 +13169,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ----- BEGIN security-framework 3.7.0 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -12659,6 +13401,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN security-framework-sys 2.17.0 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -12890,6 +13633,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN serde 1.0.229 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -13099,6 +13843,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN serde_core 1.0.229 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -13308,6 +14053,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN serde_derive 1.0.229 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -13517,6 +14263,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN sha1 0.10.7 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -13755,6 +14502,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN sha2 0.10.9 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -13993,6 +14741,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN simd-adler32 0.3.10 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE.md ---
@@ -14022,6 +14771,7 @@ SOFTWARE.
 
 ----- BEGIN smallvec 1.15.2 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -14258,6 +15008,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN socket2 0.6.5 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -14494,6 +15245,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN stable_deref_trait 1.2.1 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -14730,6 +15482,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN subtle 2.6.1 -----
 Declared license: BSD-3-Clause
+Reviewed obligations: BSD-3-Clause
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -14767,6 +15520,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ----- BEGIN syn 2.0.119 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -14976,6 +15730,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN syn 3.0.3 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -15185,6 +15940,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN synstructure 0.13.2 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -15200,6 +15956,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ----- BEGIN tinystr 0.8.3 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -15254,6 +16011,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN tokio 1.53.1 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -15283,6 +16041,7 @@ SOFTWARE.
 
 ----- BEGIN tokio-macros 2.7.1 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -15313,6 +16072,7 @@ SOFTWARE.
 
 ----- BEGIN tokio-rustls 0.26.4 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -15549,6 +16309,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN try-lock 0.2.5 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -15577,6 +16338,7 @@ THE SOFTWARE.
 
 ----- BEGIN typenum 1.20.1 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -15812,6 +16574,7 @@ SOFTWARE.
 
 ----- BEGIN unicode-ident 1.0.24 -----
 Declared license: (MIT OR Apache-2.0) AND Unicode-3.0
+Reviewed obligations: MIT AND Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -16062,6 +16825,7 @@ authorization of the copyright holder.
 
 ----- BEGIN untrusted 0.9.0 -----
 Declared license: ISC
+Reviewed obligations: ISC
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE.txt ---
@@ -16083,6 +16847,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN url 2.5.8 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -16319,6 +17084,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN utf8_iter 1.0.4 -----
 Declared license: Apache-2.0 OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- COPYRIGHT ---
@@ -16600,6 +17366,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN want 0.3.1 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -16627,6 +17394,7 @@ THE SOFTWARE.
 
 ----- BEGIN wasi 0.11.1+wasi-snapshot-preview1 -----
 Declared license: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -17082,6 +17850,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN windows-link 0.2.1 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -17314,6 +18083,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows-sys 0.52.0 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -17546,6 +18316,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows-sys 0.61.2 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -17778,6 +18549,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows-targets 0.52.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -18010,6 +18782,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows_aarch64_gnullvm 0.52.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -18242,6 +19015,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows_aarch64_msvc 0.52.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -18474,6 +19248,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows_i686_gnu 0.52.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -18706,6 +19481,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows_i686_gnullvm 0.52.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -18938,6 +19714,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows_i686_msvc 0.52.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -19170,6 +19947,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows_x86_64_gnu 0.52.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -19402,6 +20180,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows_x86_64_gnullvm 0.52.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -19634,6 +20413,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN windows_x86_64_msvc 0.52.6 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- license-apache-2.0 ---
@@ -19866,6 +20646,7 @@ Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 ----- BEGIN writeable 0.6.3 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -19920,6 +20701,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN yoke 0.8.3 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -19974,6 +20756,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN yoke-derive 0.8.2 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -20028,6 +20811,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN zerofrom 0.1.8 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -20082,6 +20866,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN zerofrom-derive 0.1.7 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -20136,6 +20921,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN zeroize 1.9.0 -----
 Declared license: Apache-2.0 OR MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE ---
@@ -20373,6 +21159,7 @@ DEALINGS IN THE SOFTWARE.
 
 ----- BEGIN zerotrie 0.2.4 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -20427,6 +21214,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN zerovec 0.11.6 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -20481,6 +21269,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN zerovec-derive 0.11.3 -----
 Declared license: Unicode-3.0
+Reviewed obligations: Unicode-3.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -20535,6 +21324,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ----- BEGIN zlib-rs 0.6.6 -----
 Declared license: Zlib
+Reviewed obligations: Zlib
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -20562,6 +21352,7 @@ freely, subject to the following restrictions:
 
 ----- BEGIN zstd 0.13.3 -----
 Declared license: MIT
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -20578,6 +21369,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ----- BEGIN zstd-safe 7.2.4 -----
 Declared license: MIT OR Apache-2.0
+Reviewed obligations: MIT
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE ---
@@ -20776,7 +21568,11 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ----- BEGIN zstd-sys 2.0.16+zstd.1.5.7 -----
 Declared license: MIT/Apache-2.0
+Reviewed obligations: MIT AND BSD-3-Clause
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
+
+Bundled Zstandard C library selection: BSD-3-Clause
+The wrapper's Rust/generated-bindings terms remain separate; the GPLv2 alternative in zstd/COPYING is not selected or reproduced.
 
 --- LICENSE ---
 MIT or Apache-2.0
@@ -21003,5 +21799,37 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+--- Bundled Zstandard 1.5.7 C library BSD-3-Clause license (zstd/LICENSE; SHA-256 7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8) ---
+BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ----- END zstd-sys 2.0.16+zstd.1.5.7 -----

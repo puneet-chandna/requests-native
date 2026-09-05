@@ -1,3 +1,5 @@
+.. Requests Native modification notice: this retained file differs from Requests 2.34.2.
+
 Release process
 ===============
 
@@ -19,6 +21,23 @@ The ``v1.0.0-beta`` milestone may be created as a GitHub prerelease only after:
 The workflow stores validation artifacts for review. It contains no PyPI or
 TestPyPI deployment job. Publishing to any registry remains a separate,
 explicit maintainer decision.
+
+Python package metadata intentionally omits aggregate ``License`` and
+``License-Expression`` fields for now. Maturin currently supplies one project
+metadata value to both the source distribution and binary wheels, while their
+applicable license expressions differ. Canonical license files, notices,
+attribution, runtime supplement, and the wheel SBOM remain packaged and
+validated. Machine-readable aggregate SPDX metadata is deferred until the
+backend can represent each artifact accurately.
+
+Release wheels must be built with ``scripts/build_release_wheel.py`` and a
+fixed ``SOURCE_DATE_EPOCH``. The helper rejects competing Rust flags, computes
+portable path remappings for the complete Cargo build, adds the deterministic
+locked-graph SBOM through Maturin's supported interface, and validates the
+wheel before copying it to the requested output directory. Only release wheels
+built by this helper carry the path-sanitization guarantee. Direct Maturin,
+editable, and PEP 517 builds remain supported development and downstream build
+paths, but do not carry the release path-sanitization guarantee.
 
 Public repository gate
 ----------------------

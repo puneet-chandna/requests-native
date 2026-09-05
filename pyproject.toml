@@ -1,13 +1,13 @@
+# Requests Native modification notice: this retained file differs from Requests 2.34.2.
 [build-system]
-requires = ["maturin>=1.13,<2"]
+requires = ["maturin>=1.15,<2"]
 build-backend = "maturin"
 
 [project]
 name = "requests-native"
 description = "Unofficial native Rust implementation of Requests with strict Python API compatibility."
 readme = "README.md"
-license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE"]
+license-files = ["LICENSE", "NOTICE", "AUTHORS.rst", "RUST_RUNTIME_NOTICES.html"]
 authors = [{ name = "Puneet Chandna" }]
 maintainers = [{ name = "Puneet Chandna" }]
 requires-python = ">=3.10"
@@ -23,7 +23,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Web Environment",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python",
@@ -82,7 +81,13 @@ module-name = "requests._requests_rust"
 bindings = "pyo3"
 include = [
     { path = "HISTORY.md", format = "sdist" },
+    { path = "rust-toolchain.toml", format = "sdist" },
+    { path = "scripts/build_release_wheel.py", format = "sdist" },
+    { path = "scripts/generate_release_sbom.py", format = "sdist" },
 ]
+
+[tool.maturin.sbom]
+rust = false
 
 [tool.ruff]
 target-version = "py310"

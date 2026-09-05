@@ -1,4 +1,5 @@
 ---
+# Requests Native modification notice: this retained file differs from Requests 2.34.2.
 name: Feature request
 about: Propose a focused improvement to the Rust rewrite
 labels: enhancement

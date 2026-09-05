@@ -1,3 +1,4 @@
+<!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
 # AI-assisted contributions
 
 AI-assisted contributions are welcome when a human contributor reviews,

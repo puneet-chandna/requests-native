@@ -43,13 +43,29 @@ jobs:
           rustup default stable
 
       - name: Install maturin
-        run: python -m pip install --upgrade "maturin>=1.13,<2"
+        run: python -m pip install --upgrade "maturin==1.15.0"
+
+      - name: Set reproducible build epoch
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_ENV"
 
       - name: Compile every target and feature
         run: cargo check --workspace --all-targets --all-features
 
       - name: Build version-specific wheel
-        run: python -m maturin build --interpreter python --out dist
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            python scripts/build_release_wheel.py --interpreter python --manylinux 2_34 --out dist
+          else
+            python scripts/build_release_wheel.py --interpreter python --out dist
+          fi
+
+      - name: Verify exact wheel contents
+        shell: bash
+        run: |
+          wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          python tests_rust/test_distribution.py --verify-wheel "$wheel" --source-commit "$GITHUB_SHA"
 
       - name: Install wheel into a fresh environment and import it
         shell: bash

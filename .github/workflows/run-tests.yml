@@ -1,3 +1,4 @@
+# Requests Native modification notice: this retained file differs from Requests 2.34.2.
 name: Tests
 
 on:
@@ -10,6 +11,7 @@ on:
       - "crates/**"
       - .github/workflows/**
       - API_COMPATIBILITY.tsv
+      - AUTHORS.rst
       - HISTORY.md
       - LICENSE
       - LIFETIMES.tsv
@@ -17,8 +19,10 @@ on:
       - NOTICE
       - ORACLE.lock
       - README.md
+      - RUST_RUNTIME_NOTICES.html
       - pyproject.toml
       - requirements-dev.txt
+      - rust-toolchain.toml
       - "scripts/**"
       - "src/**"
       - "tests/**"
@@ -31,6 +35,7 @@ on:
       - "crates/**"
       - .github/workflows/**
       - API_COMPATIBILITY.tsv
+      - AUTHORS.rst
       - HISTORY.md
       - LICENSE
       - LIFETIMES.tsv
@@ -38,8 +43,10 @@ on:
       - NOTICE
       - ORACLE.lock
       - README.md
+      - RUST_RUNTIME_NOTICES.html
       - pyproject.toml
       - requirements-dev.txt
+      - rust-toolchain.toml
       - "scripts/**"
       - "src/**"
       - "tests/**"

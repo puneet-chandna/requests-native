@@ -103,9 +103,16 @@ def test_bootstrap_workflow_has_the_complete_supported_matrix() -> None:
     assert steps["Compile every target and feature"]["run"] == (
         "cargo check --workspace --all-targets --all-features"
     )
-    assert steps["Build version-specific wheel"]["run"] == (
-        "python -m maturin build --interpreter python --out dist"
+    build_script = steps["Build version-specific wheel"]["run"]
+    assert "scripts/build_release_wheel.py" in build_script
+    assert "--manylinux 2_34" in build_script
+    verification = steps["Verify exact wheel contents"]["run"]
+    assert "--verify-wheel" in verification
+    assert '--source-commit "$GITHUB_SHA"' in verification
+    assert steps["Install maturin"]["run"] == (
+        'python -m pip install --upgrade "maturin==1.15.0"'
     )
+    assert "SOURCE_DATE_EPOCH" in steps["Set reproducible build epoch"]["run"]
     install_script = steps["Install wheel into a fresh environment and import it"][
         "run"
     ]

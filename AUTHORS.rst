@@ -1,3 +1,5 @@
+.. Requests Native modification notice: this retained file differs from Requests 2.34.2.
+
 Requests Native
 `````````````
 

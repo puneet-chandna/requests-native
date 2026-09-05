@@ -54,7 +54,7 @@ def test_maturin_mixed_project_preserves_import_and_splits_versions() -> None:
     project = load_toml("pyproject.toml")
 
     assert project["build-system"] == {
-        "requires": ["maturin>=1.13,<2"],
+        "requires": ["maturin>=1.15,<2"],
         "build-backend": "maturin",
     }
     assert project["tool"]["maturin"] == {
@@ -64,7 +64,11 @@ def test_maturin_mixed_project_preserves_import_and_splits_versions() -> None:
         "bindings": "pyo3",
         "include": [
             {"path": "HISTORY.md", "format": "sdist"},
+            {"path": "rust-toolchain.toml", "format": "sdist"},
+            {"path": "scripts/build_release_wheel.py", "format": "sdist"},
+            {"path": "scripts/generate_release_sbom.py", "format": "sdist"},
         ],
+        "sbom": {"rust": False},
     }
 
     metadata = project["project"]
@@ -103,3 +107,10 @@ def test_native_benchmark_aliases_the_renamed_core() -> None:
         "package": "requests-native",
         "path": "../../crates/requests",
     }
+
+
+def test_public_rust_example_uses_the_package_and_library_names() -> None:
+    readme = (ROOT / "README.md").read_text()
+
+    assert 'requests-native = "=1.0.0-beta.1"' in readme
+    assert "use requests_native::Client;" in readme

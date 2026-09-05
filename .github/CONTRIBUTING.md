@@ -1,3 +1,4 @@
+<!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
 # Contributing to Requests Native
 
 Requests Native is an unofficial Rust rewrite of Requests. Use this repository

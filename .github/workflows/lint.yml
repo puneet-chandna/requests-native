@@ -1,12 +1,13 @@
+# Requests Native modification notice: this retained file differs from Requests 2.34.2.
 name: Lint code
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths-ignore: ["docs/**", "ext/**", ".superpowers/**"]
+    paths-ignore: ["docs/**", "ext/**"]
   pull_request:
-    paths-ignore: ["docs/**", "ext/**", ".superpowers/**"]
+    paths-ignore: ["docs/**", "ext/**"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}

@@ -1,7 +1,9 @@
+# Requests Native modification notice: automatic dependency pull requests are paused during release validation.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
+    open-pull-requests-limit: 0
     schedule:
       interval: "weekly"
     ignore:
@@ -17,6 +19,7 @@ updates:
           - "*"
   - package-ecosystem: "pre-commit"
     directory: "/"
+    open-pull-requests-limit: 0
     schedule:
       interval: "weekly"
     ignore:

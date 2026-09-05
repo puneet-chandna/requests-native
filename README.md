@@ -1,3 +1,4 @@
+<!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
 # Requests Native
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -10,9 +11,13 @@ drop-in compatibility with the Requests Python API while moving pristine
 built-in HTTP traffic through a native Rust transport.
 
 > **Beta:** this repository is under compatibility qualification. It is not an
-> official PSF Requests release, is not affiliated with the Python Software
-> Foundation, and is not published to PyPI or crates.io. Do not replace a
+> official PSF Requests release, and is not affiliated with, sponsored by, or
+> endorsed by the upstream Requests maintainers or the Python Software
+> Foundation. It is not published to PyPI or crates.io. Do not replace a
 > production Requests installation without testing your workload.
+
+The independent name and this disclaimer are statements of provenance, not
+trademark clearance.
 
 The Python distribution is `requests-native` at version `1.0.0b1`, while its
 drop-in import remains `requests` and `requests.__version__` remains `2.34.2`
@@ -30,7 +35,7 @@ git clone https://github.com/puneet-chandna/requests-native.git
 cd requests-native
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install "maturin>=1.13,<2"
+python -m pip install "maturin>=1.15,<2"
 python -m maturin develop
 ```
 
@@ -42,6 +47,19 @@ import requests
 response = requests.get("https://httpbin.org/get", timeout=10)
 response.raise_for_status()
 print(response.json())
+```
+
+The Rust crate is also source-only today. Its planned registry dependency form
+is shown here to make the package name distinct from the library import; it
+does not imply that a crates.io release exists:
+
+```toml
+[dependencies]
+requests-native = "=1.0.0-beta.1"
+```
+
+```rust
+use requests_native::Client;
 ```
 
 Exact pristine `Session` and `HTTPAdapter` traffic uses the Rust path by

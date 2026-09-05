@@ -1,6 +1,22 @@
 Release History
 ===============
 
+Requests Native 1.0.0b1 / Cargo 1.0.0-beta.1 (unreleased)
+---------------------------------------------------------
+
+- Established the independent ``requests-native`` distribution and Cargo
+  identities while preserving ``import requests`` and compatibility version
+  ``2.34.2``.
+- Added a native Rust transport for pristine built-in traffic while retaining
+  Python compatibility fallbacks for dynamic Requests behavior.
+
+
+Preserved upstream Requests history
+===================================
+
+The entries below are retained verbatim as upstream Requests provenance. They
+do not describe Requests Native releases.
+
 dev
 ---
 

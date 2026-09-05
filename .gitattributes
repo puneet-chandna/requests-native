@@ -1,2 +1,4 @@
 LICENSE text eol=lf
 NOTICE text eol=lf
+AUTHORS.rst text eol=lf
+RUST_RUNTIME_NOTICES.html text eol=lf -whitespace
