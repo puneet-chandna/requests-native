@@ -1,10 +1,9 @@
-# Requests Rust
+# Requests Native
 
-[![Tests](https://github.com/puneet-chandna/requests-rust/actions/workflows/run-tests.yml/badge.svg?branch=main)](https://github.com/puneet-chandna/requests-rust/actions/workflows/run-tests.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-beta-orange.svg)](https://github.com/puneet-chandna/requests-rust/releases)
+[![Status](https://img.shields.io/badge/status-beta-orange.svg)](https://github.com/puneet-chandna/requests-native/releases)
 
-Requests Rust is an unofficial, independent Rust rewrite of
+Requests Native is an unofficial, independent Rust rewrite of
 [PSF Requests](https://github.com/psf/requests), maintained by
 [Puneet Chandna](https://github.com/puneet-chandna). Its goal is strict
 drop-in compatibility with the Requests Python API while moving pristine
@@ -15,18 +14,20 @@ built-in HTTP traffic through a native Rust transport.
 > Foundation, and is not published to PyPI or crates.io. Do not replace a
 > production Requests installation without testing your workload.
 
-The Python import and distribution names intentionally remain `requests`, and
-the compatibility version remains `2.34.2`. The GitHub tag `v1.0.0-beta`
-identifies this rewrite milestone; it is not a Python package version.
+The Python distribution is `requests-native` at version `1.0.0b1`, while its
+drop-in import remains `requests` and `requests.__version__` remains `2.34.2`
+as the compatibility baseline. The Rust package is `requests-native` at
+`1.0.0-beta.1`. The GitHub milestone remains `v1.0.0-beta`. These names and
+versions describe different surfaces intentionally.
 
 ## Use from source
 
-There is no `pip install requests-rust` package. To test the beta, clone this
-repository and build it with Python 3.10+, Rust, and Maturin:
+Requests Native is not yet published to PyPI or crates.io. To test it, clone
+this repository and build it with Python 3.10+, Rust, and Maturin:
 
 ```console
-git clone https://github.com/puneet-chandna/requests-rust.git
-cd requests-rust
+git clone https://github.com/puneet-chandna/requests-native.git
+cd requests-native
 python -m venv .venv
 . .venv/bin/activate
 python -m pip install "maturin>=1.13,<2"

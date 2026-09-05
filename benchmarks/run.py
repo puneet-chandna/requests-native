@@ -494,7 +494,7 @@ import sysconfig
 import requests
 import requests._requests_rust as extension
 
-names = ("requests", "urllib3", "certifi", "idna", "charset-normalizer")
+names = ("urllib3", "certifi", "idna", "charset-normalizer")
 print(json.dumps({
     "python_executable": sys.executable,
     "python_prefix": sys.prefix,
@@ -506,6 +506,10 @@ print(json.dumps({
     "requests_module": requests.__file__,
     "extension_module": extension.__file__,
     "extension_backend": extension.backend_name(),
+    "distribution_name": "requests-native",
+    "distribution_version": metadata.version("requests-native"),
+    "compatibility_import": "requests",
+    "compatibility_version": requests.__version__,
     "versions": {name: metadata.version(name) for name in names},
 }, sort_keys=True))
 """
@@ -531,8 +535,12 @@ print(json.dumps({
         raise RuntimeError(
             "loaded Python extension digest differs from the release build"
         )
-    if provenance["extension_backend"] != "requests-rust":
+    if provenance["extension_backend"] != "requests-native":
         raise RuntimeError("loaded Python extension reports the wrong backend")
+    if provenance["distribution_version"] != "1.0.0b1":
+        raise RuntimeError("loaded Python distribution reports the wrong version")
+    if provenance["compatibility_version"] != "2.34.2":
+        raise RuntimeError("loaded Requests API reports the wrong compatibility version")
     provenance["build_command"] = build_record["command"]
     provenance["build_environment"] = build_record["environment"]
     provenance["extension_sha256"] = loaded_digest

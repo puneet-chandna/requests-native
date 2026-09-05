@@ -62,4 +62,4 @@ jobs:
             smoke_python="wheel-smoke/bin/python"
           fi
           "$smoke_python" -m pip install "$wheel"
-          "$smoke_python" -c "import requests; from requests import _requests_rust; assert _requests_rust.backend_name() == 'requests-rust'"
+          "$smoke_python" -c "import requests; from requests import _requests_rust; assert _requests_rust.backend_name() == 'requests-native'"

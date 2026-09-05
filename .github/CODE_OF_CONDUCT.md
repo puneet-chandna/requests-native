@@ -1,6 +1,6 @@
 # Code of conduct
 
-Requests Rust welcomes respectful, good-faith participation. Be considerate,
+Requests Native welcomes respectful, good-faith participation. Be considerate,
 focus criticism on the work, respect privacy and boundaries, and do not engage
 in harassment, discrimination, threats, sexualized conduct, or sustained
 disruption.

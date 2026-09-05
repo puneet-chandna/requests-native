@@ -7,11 +7,11 @@ use std::rc::Rc;
 
 use bytes::Bytes;
 use futures_core::Stream;
-use requests::blocking::{
+use requests_native::blocking::{
     BlockingDriverError, BlockingRuntimeDriver, BlockingSubmission, BlockingTaskError, Client,
     ClientBuilder, RequestBuilder, Response, ResponseBody,
 };
-use requests::{
+use requests_native::{
     BodySource, Client as CoreClient, ClientBuilder as CoreClientBuilder, ErrorKind, HeaderMap,
     HeaderName, HeaderValue, Method, Proxy, Request, RequestBuilder as CoreRequestBuilder,
     Response as CoreResponse, ResponseBody as CoreResponseBody, Result, StatusCode, Timeout,
@@ -142,12 +142,14 @@ fn assert_response_surface(response: &Response) {
 }
 
 fn assert_top_level_surface<'a, 'b>(url: &'a str, body: &'b [u8]) {
-    let get: fn(CustomUrl<'a>) -> Result<Response> = requests::blocking::get;
-    let head: fn(CustomUrl<'a>) -> Result<Response> = requests::blocking::head;
-    let post: fn(CustomUrl<'a>, CustomBody<'b>) -> Result<Response> = requests::blocking::post;
-    let put: fn(CustomUrl<'a>, CustomBody<'b>) -> Result<Response> = requests::blocking::put;
-    let patch: fn(CustomUrl<'a>, CustomBody<'b>) -> Result<Response> = requests::blocking::patch;
-    let delete: fn(CustomUrl<'a>) -> Result<Response> = requests::blocking::delete;
+    let get: fn(CustomUrl<'a>) -> Result<Response> = requests_native::blocking::get;
+    let head: fn(CustomUrl<'a>) -> Result<Response> = requests_native::blocking::head;
+    let post: fn(CustomUrl<'a>, CustomBody<'b>) -> Result<Response> =
+        requests_native::blocking::post;
+    let put: fn(CustomUrl<'a>, CustomBody<'b>) -> Result<Response> = requests_native::blocking::put;
+    let patch: fn(CustomUrl<'a>, CustomBody<'b>) -> Result<Response> =
+        requests_native::blocking::patch;
+    let delete: fn(CustomUrl<'a>) -> Result<Response> = requests_native::blocking::delete;
 
     let _: Result<Response> = get(custom_url(url));
     let _: Result<Response> = head(custom_url(url));

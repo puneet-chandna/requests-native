@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use requests::session_runtime::{
+use requests_native::session_runtime::{
     SessionCheckpoint, SessionPhase, SessionRuntimeHarness, SessionRuntimeHooks,
 };
-use requests::{BodySource, ResponseDispositionState, ResponseEvent};
+use requests_native::{BodySource, ResponseDispositionState, ResponseEvent};
 
 #[derive(Default)]
 struct RecordingHooks(Mutex<Vec<SessionCheckpoint>>);

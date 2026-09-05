@@ -6,23 +6,24 @@ Frequently asked questions
 Is this official Requests?
 --------------------------
 
-No. Requests Rust is an unofficial, independent rewrite and is not affiliated
+No. Requests Native is an unofficial, independent rewrite and is not affiliated
 with PSF Requests or the Python Software Foundation. Upstream Requests remains
 at `github.com/psf/requests <https://github.com/psf/requests>`_.
 
 Can I install it from PyPI?
 ---------------------------
 
-No. Requests Rust is not published to PyPI or crates.io. Build it from this
-repository by following :ref:`install`. There is no ``requests-rust`` package
+No. Requests Native is not published to PyPI or crates.io. Build it from this
+repository by following :ref:`install`. There is no ``requests-native`` package
 on PyPI maintained by this project.
 
 Why does it report version 2.34.2?
 ----------------------------------
 
-The Python distribution and import surfaces retain Requests version ``2.34.2``
-for strict compatibility testing. The GitHub milestone ``v1.0.0-beta`` tracks
-the rewrite itself and is not a Python package version.
+The import surface reports ``requests.__version__ == "2.34.2"`` for strict
+compatibility. The distinct ``requests-native`` distribution uses version
+``1.0.0b1``, the Cargo package uses ``1.0.0-beta.1``, and the GitHub milestone
+is ``v1.0.0-beta``.
 
 Does every request use Rust?
 ----------------------------

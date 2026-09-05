@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_core::Stream;
-use requests::{
+use requests_native::{
     Client, ContentCodecs, ErrorKind, HeaderName, HeaderValue, Response, ResponseBody, Timeout,
 };
 
@@ -90,7 +90,7 @@ fn send_response(runtime: &tokio::runtime::Runtime, client: &Client, url: &str) 
 fn response_bytes(
     runtime: &tokio::runtime::Runtime,
     response: Response,
-) -> requests::Result<Bytes> {
+) -> requests_native::Result<Bytes> {
     runtime
         .block_on(async { tokio::time::timeout(ASYNC_TIMEOUT, response.bytes()).await })
         .expect("response body timed out")
@@ -99,7 +99,7 @@ fn response_bytes(
 fn response_body_bytes(
     runtime: &tokio::runtime::Runtime,
     mut body: ResponseBody,
-) -> requests::Result<Bytes> {
+) -> requests_native::Result<Bytes> {
     runtime.block_on(async {
         let mut collected = Vec::new();
         while let Some(frame) = tokio::time::timeout(ASYNC_TIMEOUT, next_frame(&mut body))
@@ -112,7 +112,7 @@ fn response_body_bytes(
     })
 }
 
-async fn next_frame(body: &mut ResponseBody) -> Option<requests::Result<Bytes>> {
+async fn next_frame(body: &mut ResponseBody) -> Option<requests_native::Result<Bytes>> {
     poll_fn(|context| Pin::new(&mut *body).poll_next(context)).await
 }
 
@@ -1348,7 +1348,7 @@ fn write_recovery_response(stream: &mut TcpStream) -> Result<(), String> {
         .map_err(|error| format!("flush recovery response: {error}"))
 }
 
-fn assert_content_decoding(error: &requests::Error) {
+fn assert_content_decoding(error: &requests_native::Error) {
     assert_eq!(error.kind(), ErrorKind::ContentDecoding);
 }
 

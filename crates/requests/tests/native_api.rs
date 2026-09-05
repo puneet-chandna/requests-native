@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use requests::{
+use requests_native::{
     AsyncBody, BodySource, CertificateSource, Client, ClientBuilder, ErrorKind, HeaderMap,
     HeaderName, HeaderValue, Identity, Method, Proxy, RequestBuilder, StatusCode, Timeout,
     TlsConfig, Uri, Version,
@@ -21,7 +21,7 @@ impl AsyncBody for PublicStream {
     fn poll_next(
         mut self: Pin<&mut Self>,
         _context: &mut Context<'_>,
-    ) -> Poll<Option<requests::Result<Bytes>>> {
+    ) -> Poll<Option<requests_native::Result<Bytes>>> {
         Poll::Ready(self.chunks.pop_front().map(Ok))
     }
 
@@ -301,15 +301,17 @@ fn proxy_validation_rejects_relative_and_variant_mismatched_uris_at_build() {
     }
 }
 
-fn assert_response_future(future: impl Future<Output = requests::Result<requests::Response>>) {
+fn assert_response_future(
+    future: impl Future<Output = requests_native::Result<requests_native::Response>>,
+) {
     drop(future);
 }
 
-fn assert_string_future(future: impl Future<Output = requests::Result<String>>) {
+fn assert_string_future(future: impl Future<Output = requests_native::Result<String>>) {
     drop(future);
 }
 
-fn assert_response_surface(response: requests::Response) {
+fn assert_response_surface(response: requests_native::Response) {
     let _: Version = response.version();
     let _: Option<u64> = response.content_length();
     assert_string_future(response.text());
@@ -319,9 +321,9 @@ fn assert_top_level_url_generics<U>(url: U)
 where
     U: AsRef<str> + Clone,
 {
-    assert_response_future(requests::get(url.clone()));
-    assert_response_future(requests::head(url.clone()));
-    assert_response_future(requests::delete(url));
+    assert_response_future(requests_native::get(url.clone()));
+    assert_response_future(requests_native::head(url.clone()));
+    assert_response_future(requests_native::delete(url));
 }
 
 fn assert_top_level_post_generics<U, B>(url: U, body: B)
@@ -329,7 +331,7 @@ where
     U: AsRef<str>,
     B: Into<BodySource>,
 {
-    assert_response_future(requests::post(url, body));
+    assert_response_future(requests_native::post(url, body));
 }
 
 fn assert_top_level_put_generics<U, B>(url: U, body: B)
@@ -337,7 +339,7 @@ where
     U: AsRef<str>,
     B: Into<BodySource>,
 {
-    assert_response_future(requests::put(url, body));
+    assert_response_future(requests_native::put(url, body));
 }
 
 fn assert_top_level_patch_generics<U, B>(url: U, body: B)
@@ -345,7 +347,7 @@ where
     U: AsRef<str>,
     B: Into<BodySource>,
 {
-    assert_response_future(requests::patch(url, body));
+    assert_response_future(requests_native::patch(url, body));
 }
 
 #[test]
@@ -356,7 +358,7 @@ fn execute_and_top_level_async_helpers_have_the_approved_signatures() {
         .expect("build standalone request");
     assert_response_future(client.execute(request));
 
-    let _response_surface: fn(requests::Response) = assert_response_surface;
+    let _response_surface: fn(requests_native::Response) = assert_response_surface;
 
     assert_top_level_url_generics("http://example.test/generic".to_owned());
     assert_top_level_post_generics("http://example.test/post", Vec::from(&b"post"[..]));

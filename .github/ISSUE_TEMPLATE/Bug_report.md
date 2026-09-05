@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a reproducible Requests Rust beta defect
+about: Report a reproducible Requests Native beta defect
 labels: bug
 ---
 
@@ -20,7 +20,7 @@ import requests
 
 ## Environment
 
-- Requests Rust commit/tag:
+- Requests Native commit/tag:
 - Install method:
 - OS and architecture:
 - Python implementation/version:

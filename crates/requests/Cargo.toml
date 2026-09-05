@@ -1,14 +1,17 @@
 [package]
-name = "requests"
+name = "requests-native"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Native HTTP transport for the unofficial Requests Rust rewrite"
+description = "Native HTTP transport for the unofficial Requests Native rewrite"
 homepage.workspace = true
 repository.workspace = true
 publish = false
 include = ["Cargo.toml", "src/**/*.rs", "!src/**/*_tests.rs"]
+
+[lib]
+name = "requests_native"
 
 [lints]
 workspace = true

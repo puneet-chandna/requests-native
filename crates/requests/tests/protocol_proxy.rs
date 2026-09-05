@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use requests::{CertificateSource, Client, ErrorKind, Proxy, TlsConfig, Uri};
+use requests_native::{CertificateSource, Client, ErrorKind, Proxy, TlsConfig, Uri};
 use rustls::ServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
@@ -277,7 +277,7 @@ struct Socks5AuthObservation {
 fn exercise_socks5_auth(
     credentials: &str,
     selected_method: u8,
-) -> Result<Socks5AuthObservation, requests::Error> {
+) -> Result<Socks5AuthObservation, requests_native::Error> {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind SOCKS5 auth proxy");
     let address = listener.local_addr().expect("SOCKS5 auth proxy address");
     let task = thread::spawn(move || {

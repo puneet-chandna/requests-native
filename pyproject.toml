@@ -3,8 +3,8 @@ requires = ["maturin>=1.13,<2"]
 build-backend = "maturin"
 
 [project]
-name = "requests"
-description = "Unofficial Rust-backed rewrite of Requests with strict Python API compatibility."
+name = "requests-native"
+description = "Unofficial native Rust implementation of Requests with strict Python API compatibility."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
@@ -43,10 +43,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/puneet-chandna/requests-rust"
-Documentation = "https://github.com/puneet-chandna/requests-rust/tree/main/docs"
-Source = "https://github.com/puneet-chandna/requests-rust"
-Issues = "https://github.com/puneet-chandna/requests-rust/issues"
+Homepage = "https://github.com/puneet-chandna/requests-native"
+Documentation = "https://github.com/puneet-chandna/requests-native/tree/main/docs"
+Source = "https://github.com/puneet-chandna/requests-native"
+Issues = "https://github.com/puneet-chandna/requests-native/issues"
 Upstream = "https://github.com/psf/requests"
 
 [project.optional-dependencies]
@@ -56,7 +56,7 @@ use_chardet_on_py3 = ["chardet>=3.0.2,<8"]
 
 [dependency-groups]
 test = [
-    "requests[socks]",
+    "requests-native[socks]",
     "pytest-httpbin==2.1.0",
     "httpbin~=0.10.0",
     "pytest-cov",

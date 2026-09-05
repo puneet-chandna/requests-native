@@ -42,7 +42,7 @@ pub(crate) fn function_builtins_dict<'py>(
 
 #[pyfunction]
 fn backend_name() -> &'static str {
-    "requests-rust"
+    "requests-native"
 }
 
 #[pymodule]

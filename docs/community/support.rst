@@ -3,8 +3,8 @@
 Support
 =======
 
-Use the `Requests Rust issue tracker
-<https://github.com/puneet-chandna/requests-rust/issues>`_ for reproducible
+Use the `Requests Native issue tracker
+<https://github.com/puneet-chandna/requests-native/issues>`_ for reproducible
 bugs or improvements specific to the beta Rust rewrite. Include the commit or
 tag, installation method, OS and architecture, Python implementation/version,
 Rust version, minimal reproduction, and whether the request used the default

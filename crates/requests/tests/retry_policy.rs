@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use requests::retry::{
+use requests_native::retry::{
     BackoffPolicy, MethodSet, RetryCount, RetryFailure, RetryPolicy, RetryReason, RetryState,
     StatusSet,
 };

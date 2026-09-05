@@ -13,6 +13,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -37,6 +38,13 @@ PYTHONS = [
 ]
 SYSTEMS = ["ubuntu-22.04", "macos-latest", "windows-latest"]
 FROZEN_ORACLE_COMMIT = "69f84847045bef7a849cc994a26fe7ba8a169e95"
+PYTHON_DISTRIBUTION = "requests-native"
+PYTHON_DISTRIBUTION_VERSION = "1.0.0b1"
+ARTIFACT_STEM = "requests_native-1.0.0b1"
+COMPATIBILITY_VERSION = "2.34.2"
+BACKEND_NAME = "requests-native"
+CORE_CARGO_PACKAGE = "requests-native"
+BINDING_CARGO_PACKAGE = "requests-native-python"
 EXPECTED_WHEEL_KEYS = {
     (python, system)
     for python in PYTHONS
@@ -69,10 +77,10 @@ EXPECTED_CLASSIFIERS = [
     "Topic :: Software Development :: Libraries",
 ]
 EXPECTED_URLS = {
-    "Documentation": "https://github.com/puneet-chandna/requests-rust/tree/main/docs",
-    "Homepage": "https://github.com/puneet-chandna/requests-rust",
-    "Issues": "https://github.com/puneet-chandna/requests-rust/issues",
-    "Source": "https://github.com/puneet-chandna/requests-rust",
+    "Documentation": "https://github.com/puneet-chandna/requests-native/tree/main/docs",
+    "Homepage": "https://github.com/puneet-chandna/requests-native",
+    "Issues": "https://github.com/puneet-chandna/requests-native/issues",
+    "Source": "https://github.com/puneet-chandna/requests-native",
     "Upstream": "https://github.com/psf/requests",
 }
 EXPECTED_DEPENDENCIES = [
@@ -192,14 +200,15 @@ if os.environ["REQUESTS_EDITABLE"] == "1":
 else:
     assert not source.is_relative_to(checkout), source
 assert requests.__version__ == "2.34.2"
-assert requests._requests_rust.backend_name() == "requests-rust"
+assert requests._requests_rust.backend_name() == "requests-native"
 extension_source = Path(requests._requests_rust.__file__).resolve()
 if os.environ["REQUESTS_EDITABLE"] == "1":
     assert extension_source.is_relative_to(checkout / "src"), extension_source
 else:
     assert not extension_source.is_relative_to(checkout), extension_source
-distribution = metadata.distribution("requests")
-assert distribution.version == requests.__version__
+distribution = metadata.distribution("requests-native")
+assert distribution.version == "1.0.0b1"
+assert distribution.version != requests.__version__
 assert requests.__all__ == (
     "ConnectionError", "ConnectTimeout", "HTTPError", "JSONDecodeError",
     "PreparedRequest", "ReadTimeout", "Request", "RequestException", "Response",
@@ -300,8 +309,8 @@ def load_workflow(name: str) -> dict:
 
 
 def artifact_paths() -> tuple[Path, Path]:
-    wheels = sorted(DIST.glob("requests-*.whl"))
-    sdists = sorted(DIST.glob("requests-*.tar.gz"))
+    wheels = sorted(DIST.glob("requests_native-*.whl"))
+    sdists = sorted(DIST.glob("requests_native-*.tar.gz"))
     assert len(wheels) == 1, wheels
     assert len(sdists) == 1, sdists
     return wheels[0], sdists[0]
@@ -309,9 +318,9 @@ def artifact_paths() -> tuple[Path, Path]:
 
 def test_project_metadata_declares_license_files_dependencies_and_extras() -> None:
     project = load_toml(ROOT / "pyproject.toml")["project"]
-    assert project["name"] == "requests"
+    assert project["name"] == PYTHON_DISTRIBUTION
     assert project["description"] == (
-        "Unofficial Rust-backed rewrite of Requests with strict Python API "
+        "Unofficial native Rust implementation of Requests with strict Python API "
         "compatibility."
     )
     assert project["authors"] == [{"name": "Puneet Chandna"}]
@@ -325,10 +334,15 @@ def test_project_metadata_declares_license_files_dependencies_and_extras() -> No
 
     workspace = load_toml(ROOT / "Cargo.toml")["workspace"]["package"]
     assert workspace["authors"] == ["Puneet Chandna"]
-    assert workspace["homepage"] == "https://github.com/puneet-chandna/requests-rust"
+    assert workspace["version"] == "1.0.0-beta.1"
+    assert workspace["homepage"] == "https://github.com/puneet-chandna/requests-native"
     assert workspace["repository"] == workspace["homepage"]
-    for crate in ("requests", "requests-python"):
+    for crate, expected_name in (
+        ("requests", CORE_CARGO_PACKAGE),
+        ("requests-python", BINDING_CARGO_PACKAGE),
+    ):
         package = load_toml(ROOT / f"crates/{crate}/Cargo.toml")["package"]
+        assert package["name"] == expected_name
         assert package["publish"] is False
         assert package["authors"]["workspace"] is True
         assert package["homepage"]["workspace"] is True
@@ -361,7 +375,7 @@ def test_release_sources_are_allow_listed_and_legal_files_are_canonical() -> Non
     )
     completed = subprocess.run(
         [
-            os.fspath(ROOT / ".venv/bin/python"),
+            sys.executable,
             os.fspath(ROOT / "scripts/generate_third_party_notices.py"),
             "--check",
         ],
@@ -510,7 +524,7 @@ def test_source_workflows_cover_rust_default_and_explicit_trial() -> None:
         for step in load_workflow("lint.yml")["jobs"]["lint"]["steps"]
     )
     assert "cargo fmt --all -- --check" in lint_runs
-    assert "cargo clippy -p requests --all-targets -- -D warnings" in lint_runs
+    assert "cargo clippy -p requests-native --all-targets -- -D warnings" in lint_runs
 
 
 def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> None:
@@ -535,9 +549,17 @@ def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> No
         "requirements-dev.txt",
     } <= set(test_triggers["push"]["paths"])
 
-    for name in ("lint.yml", "typecheck.yml", "codeql-analysis.yml", "zizmor.yml"):
+    for name in (
+        "lint.yml",
+        "typecheck.yml",
+        "codeql-analysis.yml",
+        "zizmor.yml",
+        "run-tests.yml",
+    ):
         workflow = load_workflow(name)
         assert workflow["concurrency"]["cancel-in-progress"] is True
+        triggers = workflow.get("on", workflow.get(True))
+        assert "workflow_dispatch" in triggers
     for name in ("lint.yml", "typecheck.yml"):
         workflow = load_workflow(name)
         triggers = workflow.get("on", workflow.get(True))
@@ -818,8 +840,8 @@ def test_public_project_identity_is_derivative_and_registry_safe() -> None:
         ROOT / "docs/user/install.rst",
     ]
     combined = "\n".join(path.read_text() for path in public_files)
-    assert "Requests Rust" in combined
-    assert "https://github.com/puneet-chandna/requests-rust" in combined
+    assert "Requests Native" in combined
+    assert "https://github.com/puneet-chandna/requests-native" in combined
     assert "unofficial" in combined.lower()
     assert "not published to PyPI" in combined
     assert "github.com/psf/requests/security/advisories/new" not in combined
@@ -903,7 +925,7 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
                     raise ValueError(f"non-regular wheel member: {member.filename}")
                 file_members.append(name)
 
-        metadata_name = "requests-2.34.2.dist-info/METADATA"
+        metadata_name = f"{ARTIFACT_STEM}.dist-info/METADATA"
         expected_python = {
             path.removeprefix("src/")
             for path in EXPECTED_PYTHON_MEMBERS
@@ -917,8 +939,8 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
         ]
         if len(extension) != 1:
             raise ValueError("wheel must contain exactly one native extension")
-        dist_info = "requests-2.34.2.dist-info/"
-        sbom_name = f"{dist_info}sboms/requests-python.cyclonedx.json"
+        dist_info = f"{ARTIFACT_STEM}.dist-info/"
+        sbom_name = f"{dist_info}sboms/{BINDING_CARGO_PACKAGE}.cyclonedx.json"
         expected_members = expected_python | {
             "requests/_requests_rust.pyi",
             "requests/py.typed",
@@ -943,11 +965,12 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
         assert archive.read(f"{dist_info}licenses/NOTICE") == legal["NOTICE"]
         sbom = json.loads(archive.read(sbom_name))
         assert sbom["bomFormat"] == "CycloneDX"
-        assert sbom["metadata"]["component"]["name"] == "requests-python"
+        assert sbom["metadata"]["component"]["name"] == BINDING_CARGO_PACKAGE
         required_components = {
             (component["name"], component["version"])
             for component in sbom["components"]
-            if component.get("scope") == "required" and component["name"] != "requests"
+            if component.get("scope") == "required"
+            and component["name"] != CORE_CARGO_PACKAGE
         }
         notice_components = set(
             re.findall(
@@ -960,10 +983,10 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
             (name.encode(), version.encode()) for name, version in required_components
         }
 
-    assert metadata["Name"] == "requests"
-    assert metadata["Version"] == "2.34.2"
+    assert metadata["Name"] == PYTHON_DISTRIBUTION
+    assert metadata["Version"] == PYTHON_DISTRIBUTION_VERSION
     assert metadata["Summary"] == (
-        "Unofficial Rust-backed rewrite of Requests with strict Python API "
+        "Unofficial native Rust implementation of Requests with strict Python API "
         "compatibility."
     )
     assert metadata["Requires-Python"] == ">=3.10"
@@ -994,7 +1017,7 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
 
 def verify_sdist(sdist: Path, source_commit: str) -> None:
     legal = canonical_legal_bytes(source_commit)
-    root = "requests-2.34.2"
+    root = ARTIFACT_STEM
     expected_files = {f"{root}/{name}" for name in EXPECTED_SDIST_MEMBERS}
     allowed_directories = {root} | _expected_archive_directories(expected_files)
     with tarfile.open(sdist, "r:gz") as archive:
@@ -1051,7 +1074,7 @@ def _tar_member(name: str, *, kind: bytes = tarfile.REGTYPE) -> tarfile.TarInfo:
     member.type = kind
     member.mode = 0o644
     if kind in {tarfile.SYMTYPE, tarfile.LNKTYPE}:
-        member.linkname = "requests-2.34.2/LICENSE"
+        member.linkname = f"{ARTIFACT_STEM}/LICENSE"
     if kind in {tarfile.CHRTYPE, tarfile.BLKTYPE}:
         member.devmajor = 1
         member.devminor = 3
@@ -1108,10 +1131,10 @@ def test_wheel_validator_requires_exact_dist_info_root(tmp_path: Path) -> None:
     with zipfile.ZipFile(wheel) as archive:
         renamed = {
             name: name.replace(
-                "requests-2.34.2.dist-info/", "not-requests.dist-info/", 1
+                f"{ARTIFACT_STEM}.dist-info/", "not-requests.dist-info/", 1
             )
             for name in archive.namelist()
-            if name.startswith("requests-2.34.2.dist-info/")
+            if name.startswith(f"{ARTIFACT_STEM}.dist-info/")
         }
     invalid = tmp_path / wheel.name
     _rewrite_wheel(wheel, invalid, renamed=renamed)
@@ -1127,7 +1150,7 @@ def test_sdist_validator_rejects_duplicate_regular_member(tmp_path: Path) -> Non
     _rewrite_sdist(
         sdist,
         invalid,
-        additions=((_tar_member("requests-2.34.2/LICENSE"), license_bytes),),
+        additions=((_tar_member(f"{ARTIFACT_STEM}/LICENSE"), license_bytes),),
     )
 
     with unittest.TestCase().assertRaisesRegex(ValueError, "duplicate"):
@@ -1144,7 +1167,7 @@ def test_sdist_validator_requires_one_exact_root(tmp_path: Path) -> None:
         sdist,
         wrong_root,
         renamed={
-            name: name.replace("requests-2.34.2/", "wrong-2.34.2/", 1)
+            name: name.replace(f"{ARTIFACT_STEM}/", "wrong-1.0.0b1/", 1)
             for name in names
         },
     )
@@ -1155,7 +1178,7 @@ def test_sdist_validator_requires_one_exact_root(tmp_path: Path) -> None:
     _rewrite_sdist(
         sdist,
         multiple_roots,
-        renamed={"requests-2.34.2/LICENSE": "other-root/LICENSE"},
+        renamed={f"{ARTIFACT_STEM}/LICENSE": "other-root/LICENSE"},
     )
     with unittest.TestCase().assertRaisesRegex(ValueError, "sdist root"):
         verify_sdist(multiple_roots, "HEAD")
@@ -1170,7 +1193,7 @@ def test_sdist_validator_rejects_absolute_and_traversal_names(
         _rewrite_sdist(
             sdist,
             invalid,
-            renamed={"requests-2.34.2/LICENSE": invalid_name},
+            renamed={f"{ARTIFACT_STEM}/LICENSE": invalid_name},
         )
         with unittest.TestCase().assertRaisesRegex(ValueError, "archive member"):
             verify_sdist(invalid, "HEAD")
@@ -1190,7 +1213,7 @@ def test_sdist_validator_rejects_every_non_regular_member(tmp_path: Path) -> Non
         _rewrite_sdist(
             sdist,
             invalid,
-            additions=((_tar_member(f"requests-2.34.2/{label}", kind=kind), None),),
+            additions=((_tar_member(f"{ARTIFACT_STEM}/{label}", kind=kind), None),),
         )
         with unittest.TestCase().assertRaisesRegex(ValueError, "non-regular"):
             verify_sdist(invalid, "HEAD")
@@ -1204,7 +1227,7 @@ def test_sdist_validator_allows_only_expected_directory_entries(
     _rewrite_sdist(
         sdist,
         expected,
-        additions=((_tar_member("requests-2.34.2/src/requests/", kind=tarfile.DIRTYPE), None),),
+        additions=((_tar_member(f"{ARTIFACT_STEM}/src/requests/", kind=tarfile.DIRTYPE), None),),
     )
     verify_sdist(expected, "HEAD")
 
@@ -1212,7 +1235,7 @@ def test_sdist_validator_allows_only_expected_directory_entries(
     _rewrite_sdist(
         sdist,
         unexpected,
-        additions=((_tar_member("requests-2.34.2/unexpected/", kind=tarfile.DIRTYPE), None),),
+        additions=((_tar_member(f"{ARTIFACT_STEM}/unexpected/", kind=tarfile.DIRTYPE), None),),
     )
     with unittest.TestCase().assertRaisesRegex(ValueError, "directory"):
         verify_sdist(unexpected, "HEAD")
@@ -1378,7 +1401,7 @@ def test_fresh_editable_install_runs_default_and_trial_outside_checkout(
 
 def wheel_key(path: Path) -> tuple[str, str]:
     distribution, python_tag, abi_tag, platform_tag = path.stem.rsplit("-", 3)
-    if distribution != "requests-2.34.2":
+    if distribution != ARTIFACT_STEM:
         raise ValueError(f"unexpected wheel project/version: {path.name}")
     if python_tag == "pp311" and abi_tag == "pypy311_pp73":
         python = "pypy-3.11"
@@ -1468,13 +1491,13 @@ def compatibility_smoke(kind: str, backend: str) -> None:
 
 
 def verify_manifest(directory: Path) -> dict[str, str]:
-    wheels = sorted(directory.rglob("requests-*.whl"))
-    sdists = sorted(directory.rglob("requests-*.tar.gz"))
+    wheels = sorted(directory.rglob("requests_native-*.whl"))
+    sdists = sorted(directory.rglob("requests_native-*.tar.gz"))
     evidence = sorted(directory.rglob("free-threaded-evidence-*.json"))
     files = {path for path in directory.rglob("*") if path.is_file()}
     if len(sdists) != 1:
         raise ValueError(f"expected one sdist, found {len(sdists)}")
-    if sdists[0].name != "requests-2.34.2.tar.gz":
+    if sdists[0].name != f"{ARTIFACT_STEM}.tar.gz":
         raise ValueError(f"unexpected sdist project/version: {sdists[0].name}")
     if (
         len(evidence) != len(EXPECTED_FREE_THREADED_EVIDENCE)
@@ -1496,7 +1519,7 @@ def verify_manifest(directory: Path) -> dict[str, str]:
         ):
             raise ValueError(f"invalid free-threaded evidence: {path.name}")
         system = path.name.removeprefix("free-threaded-evidence-").removesuffix(".json")
-        sibling_wheels = list(path.parent.glob("requests-*.whl"))
+        sibling_wheels = list(path.parent.glob("requests_native-*.whl"))
         if len(sibling_wheels) != 1 or wheel_key(sibling_wheels[0]) != (
             "3.14t",
             system,
@@ -1532,7 +1555,7 @@ def build_publish_manifest(
     hashes = verify_manifest(directory)
     paths = {
         path.name: path
-        for path in directory.rglob("requests-*")
+        for path in directory.rglob("requests_native-*")
         if path.is_file() and path.name in hashes
     }
     source_names = {
@@ -1601,8 +1624,8 @@ def verify_release_set(
     directory: Path, manifest_path: Path, source_commit: str
 ) -> None:
     files = {path.resolve() for path in directory.rglob("*") if path.is_file()}
-    wheels = sorted(directory.rglob("requests-*.whl"))
-    sdists = sorted(directory.rglob("requests-*.tar.gz"))
+    wheels = sorted(directory.rglob("requests_native-*.whl"))
+    sdists = sorted(directory.rglob("requests_native-*.tar.gz"))
     if len(wheels) != 23 or len(sdists) != 1:
         raise ValueError(
             f"expected 23 wheels and one sdist, found {len(wheels)} and {len(sdists)}"
@@ -1659,7 +1682,7 @@ def verify_release_set(
 
 
 def write_complete_manifest_fixture(directory: Path) -> None:
-    (directory / "requests-2.34.2.tar.gz").touch()
+    (directory / f"{ARTIFACT_STEM}.tar.gz").touch()
     for python, system in sorted(EXPECTED_WHEEL_KEYS):
         python_tag = {
             "3.10": "cp310-cp310",
@@ -1678,7 +1701,7 @@ def write_complete_manifest_fixture(directory: Path) -> None:
         }[system]
         artifact = directory / f"wheel-{python}-{system}"
         artifact.mkdir()
-        (artifact / f"requests-2.34.2-{python_tag}-{platform}.whl").touch()
+        (artifact / f"{ARTIFACT_STEM}-{python_tag}-{platform}.whl").touch()
         if python == "3.14t":
             (artifact / f"free-threaded-evidence-{system}.json").write_text(
                 '{"Py_GIL_DISABLED": 1, "after_import": true, "before_import": false}\n'
@@ -1702,13 +1725,13 @@ def test_publish_manifest_accepts_only_the_complete_unique_matrix(
     manifest = verify_manifest(tmp_path)
     assert len(manifest) == 24
 
-    next(tmp_path.rglob("requests-*cp310-cp310*linux*.whl")).unlink()
+    next(tmp_path.rglob("requests_native-*cp310-cp310*linux*.whl")).unlink()
     with unittest.TestCase().assertRaisesRegex(ValueError, "wheel matrix mismatch"):
         verify_manifest(tmp_path)
 
     duplicate = tmp_path / "duplicate"
     duplicate.mkdir()
-    source = next(tmp_path.rglob("requests-*cp311-cp311*linux*.whl"))
+    source = next(tmp_path.rglob("requests_native-*cp311-cp311*linux*.whl"))
     (duplicate / source.name).touch()
     with unittest.TestCase().assertRaisesRegex(
         ValueError, "duplicate wheel matrix key"
@@ -1789,7 +1812,7 @@ def test_release_set_verifies_one_manifest_and_all_24_archives(
     )
     release = tmp_path / "release"
     release.mkdir()
-    for path in artifacts.rglob("requests-*"):
+    for path in artifacts.rglob("requests_native-*"):
         if path.is_file():
             shutil.copy2(path, release / path.name)
     manifest_path = release / "artifact-manifest.json"
@@ -1819,7 +1842,7 @@ def test_release_set_rejects_invalid_github_artifact_provenance(
     )
     release = tmp_path / "release"
     release.mkdir()
-    for path in artifacts.rglob("requests-*"):
+    for path in artifacts.rglob("requests_native-*"):
         if path.is_file():
             shutil.copy2(path, release / path.name)
     manifest_path = release / "artifact-manifest.json"
@@ -1845,15 +1868,15 @@ def test_release_set_rejects_invalid_github_artifact_provenance(
 def test_wheel_key_rejects_wrong_version_abi_and_platform() -> None:
     cases = [
         ("requests-9.9.9-cp310-cp310-manylinux_2_17_x86_64.whl", "project/version"),
-        ("requests-2.34.2-cp310-abi3-manylinux_2_17_x86_64.whl", "Python wheel tag"),
-        ("requests-2.34.2-py3-none-any.whl", "Python wheel tag"),
-        ("requests-2.34.2-cp310-cp310-any.whl", "platform wheel tag"),
+        (f"{ARTIFACT_STEM}-cp310-abi3-manylinux_2_17_x86_64.whl", "Python wheel tag"),
+        (f"{ARTIFACT_STEM}-py3-none-any.whl", "Python wheel tag"),
+        (f"{ARTIFACT_STEM}-cp310-cp310-any.whl", "platform wheel tag"),
         (
-            "requests-2.34.2-cp310-cp310-linux_x86_64.whl",
+            f"{ARTIFACT_STEM}-cp310-cp310-linux_x86_64.whl",
             "platform wheel tag",
         ),
         (
-            "requests-2.34.2-cp310-cp310-musllinux_1_2_x86_64.whl",
+            f"{ARTIFACT_STEM}-cp310-cp310-musllinux_1_2_x86_64.whl",
             "platform wheel tag",
         ),
     ]

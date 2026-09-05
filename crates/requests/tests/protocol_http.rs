@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_core::Stream;
 #[cfg(feature = "blocking")]
-use requests::blocking;
-use requests::{
+use requests_native::blocking;
+use requests_native::{
     AsyncBody, BodySource, Client, ErrorKind, HeaderName, HeaderValue, Method, Proxy,
     RequestBuilder, ResponseBody, StatusCode, Timeout, Uri, Version,
 };
@@ -170,7 +170,7 @@ impl AsyncBody for CallerTaskBody {
     fn poll_next(
         mut self: Pin<&mut Self>,
         _context: &mut Context<'_>,
-    ) -> Poll<Option<requests::Result<Bytes>>> {
+    ) -> Poll<Option<requests_native::Result<Bytes>>> {
         self.polls.fetch_add(1, Ordering::AcqRel);
         if thread::current().id() != self.caller_thread
             || tokio::runtime::Handle::try_current().is_err()
@@ -1512,7 +1512,7 @@ impl AsyncBody for PendingUploadBody {
     fn poll_next(
         self: Pin<&mut Self>,
         _context: &mut Context<'_>,
-    ) -> Poll<Option<requests::Result<Bytes>>> {
+    ) -> Poll<Option<requests_native::Result<Bytes>>> {
         self.probe.inner.polls.fetch_add(1, Ordering::AcqRel);
         Poll::Pending
     }
@@ -1581,7 +1581,7 @@ impl AsyncBody for TrackedBody {
     fn poll_next(
         self: Pin<&mut Self>,
         _context: &mut Context<'_>,
-    ) -> Poll<Option<requests::Result<Bytes>>> {
+    ) -> Poll<Option<requests_native::Result<Bytes>>> {
         let body = self.as_ref().get_ref();
         let next = body.chunks.lock().expect("body chunks lock").pop_front();
         body.probe
@@ -1664,7 +1664,7 @@ fn complete_exchange(
             let status = response.status();
             let url = response.url().to_owned();
             let body = response.bytes().await?;
-            Ok::<_, requests::Error>((status, url, body))
+            Ok::<_, requests_native::Error>((status, url, body))
         })
         .await
     });
@@ -1677,7 +1677,7 @@ fn complete_exchange(
 
 fn complete_top_level_exchange(
     runtime: &tokio::runtime::Runtime,
-    future: impl Future<Output = requests::Result<requests::Response>>,
+    future: impl Future<Output = requests_native::Result<requests_native::Response>>,
 ) -> Bytes {
     runtime
         .block_on(async {
@@ -1691,7 +1691,10 @@ fn complete_top_level_exchange(
         .expect("top-level exchange failed")
 }
 
-fn send_response(runtime: &tokio::runtime::Runtime, request: RequestBuilder) -> requests::Response {
+fn send_response(
+    runtime: &tokio::runtime::Runtime,
+    request: RequestBuilder,
+) -> requests_native::Response {
     match runtime.block_on(async { tokio::time::timeout(EXCHANGE_TIMEOUT, request.send()).await }) {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => panic!("response-head exchange failed: {error}"),
@@ -1702,13 +1705,13 @@ fn send_response(runtime: &tokio::runtime::Runtime, request: RequestBuilder) -> 
 fn send_deadline_request(
     runtime: &tokio::runtime::Runtime,
     request: RequestBuilder,
-) -> requests::Result<requests::Response> {
+) -> requests_native::Result<requests_native::Response> {
     runtime
         .block_on(async { tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, request.send()).await })
         .unwrap_or_else(|error| panic!("deadline-contract request exceeded outer bound: {error}"))
 }
 
-fn assert_timeout_error(error: &requests::Error, source: &str, phase: &str) {
+fn assert_timeout_error(error: &requests_native::Error, source: &str, phase: &str) {
     assert_eq!(error.kind(), ErrorKind::ReadTimeout);
     let message = error.to_string().to_ascii_lowercase();
     match source {
@@ -1733,9 +1736,9 @@ fn assert_timeout_error(error: &requests::Error, source: &str, phase: &str) {
 }
 
 fn expect_deadline_error(
-    result: requests::Result<requests::Response>,
+    result: requests_native::Result<requests_native::Response>,
     missing_timeout: &str,
-) -> requests::Error {
+) -> requests_native::Error {
     match result {
         Err(error) => error,
         Ok(response) => {
@@ -1747,8 +1750,8 @@ fn expect_deadline_error(
 
 fn collect_deadline_body(
     runtime: &tokio::runtime::Runtime,
-    response: requests::Response,
-) -> requests::Result<Bytes> {
+    response: requests_native::Response,
+) -> requests_native::Result<Bytes> {
     runtime
         .block_on(async { tokio::time::timeout(DEADLINE_OUTER_TIMEOUT, response.bytes()).await })
         .unwrap_or_else(|error| panic!("deadline-contract body exceeded outer bound: {error}"))
@@ -1759,7 +1762,7 @@ fn pending_upload_error(
     client: &Client,
     server: &PendingUploadServer,
     timeout: Timeout,
-) -> requests::Error {
+) -> requests_native::Error {
     let (body, probe) = PendingUploadBody::source();
     let mut send = runtime.spawn(
         client
@@ -1790,7 +1793,7 @@ fn pending_upload_error(
     }
 }
 
-fn assert_pending_upload_timeout(error: &requests::Error) {
+fn assert_pending_upload_timeout(error: &requests_native::Error) {
     assert_eq!(error.kind(), ErrorKind::ReadTimeout);
     let message = error.to_string().to_ascii_lowercase();
     assert!(
@@ -1855,7 +1858,7 @@ where
 async fn next_response_frame_after_pending(
     mut body: ResponseBody,
     pending: Sender<()>,
-) -> (ResponseBody, Option<requests::Result<Bytes>>) {
+) -> (ResponseBody, Option<requests_native::Result<Bytes>>) {
     let mut pending = Some(pending);
     let item = poll_fn(|context| {
         let result = Pin::new(&mut body).poll_next(context);
@@ -1994,7 +1997,7 @@ fn timeout_contract_into_body_outside_runtime_preserves_total_deadline() {
                 while let Some(frame) = next_response_frame(&mut body).await {
                     collected.extend_from_slice(&frame?);
                 }
-                Ok::<_, requests::Error>(Bytes::from(collected))
+                Ok::<_, requests_native::Error>(Bytes::from(collected))
             })
             .await
         })
@@ -3281,7 +3284,7 @@ fn get_over_new_plain_connection() {
             let response_url = response.url().to_owned();
             let body = response.bytes().await?;
 
-            Ok::<_, requests::Error>((status, fixture_header, response_url, body))
+            Ok::<_, requests_native::Error>((status, fixture_header, response_url, body))
         })
         .await
     });
@@ -3336,7 +3339,7 @@ fn complete_connection_close_response_is_successful() {
                 let connection = response.headers().get("connection").cloned();
                 let body = response.bytes().await?;
 
-                Ok::<_, requests::Error>((status, connection, body))
+                Ok::<_, requests_native::Error>((status, connection, body))
             })
             .await
         });
@@ -3753,24 +3756,27 @@ fn assert_top_level_helpers_use_fresh_clients(runtime: &tokio::runtime::Runtime)
     let server = PoolServer::spawn(PoolScript::KeepAlive, 6, 0);
 
     assert_eq!(
-        complete_top_level_exchange(runtime, requests::get(server.url("/top-level/get"))),
+        complete_top_level_exchange(runtime, requests_native::get(server.url("/top-level/get"))),
         Bytes::from_static(b"ok")
     );
     assert!(
-        complete_top_level_exchange(runtime, requests::head(server.url("/top-level/head")))
-            .is_empty()
+        complete_top_level_exchange(
+            runtime,
+            requests_native::head(server.url("/top-level/head"))
+        )
+        .is_empty()
     );
     assert_eq!(
         complete_top_level_exchange(
             runtime,
-            requests::post(server.url("/top-level/post"), Vec::from(&b"post"[..])),
+            requests_native::post(server.url("/top-level/post"), Vec::from(&b"post"[..])),
         ),
         Bytes::from_static(b"ok")
     );
     assert_eq!(
         complete_top_level_exchange(
             runtime,
-            requests::put(
+            requests_native::put(
                 server.url("/top-level/put"),
                 BodySource::Bytes(Bytes::from_static(b"put")),
             ),
@@ -3780,12 +3786,15 @@ fn assert_top_level_helpers_use_fresh_clients(runtime: &tokio::runtime::Runtime)
     assert_eq!(
         complete_top_level_exchange(
             runtime,
-            requests::patch(server.url("/top-level/patch"), Bytes::from_static(b"patch"),),
+            requests_native::patch(server.url("/top-level/patch"), Bytes::from_static(b"patch"),),
         ),
         Bytes::from_static(b"ok")
     );
     assert_eq!(
-        complete_top_level_exchange(runtime, requests::delete(server.url("/top-level/delete")),),
+        complete_top_level_exchange(
+            runtime,
+            requests_native::delete(server.url("/top-level/delete")),
+        ),
         Bytes::from_static(b"ok")
     );
 
@@ -3825,7 +3834,7 @@ fn top_level_streamed_post_is_polled_on_the_callers_tokio_runtime_and_moved_once
 
     let response = runtime
         .block_on(async {
-            tokio::time::timeout(EXCHANGE_TIMEOUT, requests::post(server.url(), body)).await
+            tokio::time::timeout(EXCHANGE_TIMEOUT, requests_native::post(server.url(), body)).await
         })
         .expect("top-level POST exceeded outer bound")
         .expect("top-level POST failed");
@@ -3971,7 +3980,15 @@ fn blocking_response_metadata_bytes_and_text_match_wire() {
             let content_length = response.content_length();
             let bytes = response.bytes()?;
             let text = blocking::get(text_url)?.text()?;
-            Ok::<_, requests::Error>((status, header, url, version, content_length, bytes, text))
+            Ok::<_, requests_native::Error>((
+                status,
+                header,
+                url,
+                version,
+                content_length,
+                bytes,
+                text,
+            ))
         },
         || {
             metadata_server.signal_shutdown();
@@ -4013,7 +4030,7 @@ fn blocking_full_body_read_reuses_one_connection() {
             body.read_to_end(&mut first)
                 .expect("read complete blocking response body");
             let second = client.get(second_url).send()?.bytes()?;
-            Ok::<_, requests::Error>((first, second))
+            Ok::<_, requests_native::Error>((first, second))
         },
         || server.signal_shutdown(),
     )
@@ -4047,7 +4064,7 @@ fn blocking_partial_body_drop_forces_a_second_connection() {
                 .expect("read partial blocking response body");
             drop(body);
             let second = client.get(second_url).send()?.bytes()?;
-            Ok::<_, requests::Error>((prefix, second))
+            Ok::<_, requests_native::Error>((prefix, second))
         },
         || server.signal_shutdown(),
     )
@@ -4082,7 +4099,7 @@ fn blocking_partial_body_close_forces_a_second_connection() {
                 .expect("read partial blocking response body");
             body.close()?;
             let second = client.get(second_url).send()?.bytes()?;
-            Ok::<_, requests::Error>((prefix, second))
+            Ok::<_, requests_native::Error>((prefix, second))
         },
         || server.signal_shutdown(),
     )
@@ -4110,7 +4127,7 @@ fn blocking_execute_client_and_top_level_helpers_preserve_wire_contracts() {
     let result = bounded_blocking(
         move || {
             let url = |path: &str| format!("http://{address}{path}");
-            let collect = |response: requests::Result<blocking::Response>| {
+            let collect = |response: requests_native::Result<blocking::Response>| {
                 response.and_then(blocking::Response::bytes)
             };
             let client = blocking::Client::new()?;
@@ -4167,7 +4184,7 @@ fn blocking_execute_client_and_top_level_helpers_preserve_wire_contracts() {
                     panic!("blocking top-level helper accepted a relative URL")
                 }
             };
-            Ok::<_, requests::Error>((bodies, client_error.kind(), top_level_error.kind()))
+            Ok::<_, requests_native::Error>((bodies, client_error.kind(), top_level_error.kind()))
         },
         || server.signal_shutdown(),
     )

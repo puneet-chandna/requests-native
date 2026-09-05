@@ -1,9 +1,9 @@
 .. _contributing:
 
-Contributing to Requests Rust
+Contributing to Requests Native
 =============================
 
-Requests Rust is an unofficial Rust rewrite of Requests. Contributions should
+Requests Native is an unofficial Rust rewrite of Requests. Contributions should
 target the rewrite, Rust transport, Python bridge, build and validation tools,
 documentation, or a demonstrated compatibility difference. General Requests
 usage questions and bugs reproducible in unmodified PSF Requests belong in the
@@ -11,11 +11,11 @@ usage questions and bugs reproducible in unmodified PSF Requests belong in the
 
 Before contributing, read the repository's
 `contribution guide
-<https://github.com/puneet-chandna/requests-rust/blob/main/.github/CONTRIBUTING.md>`_,
+<https://github.com/puneet-chandna/requests-native/blob/main/.github/CONTRIBUTING.md>`_,
 `code of conduct
-<https://github.com/puneet-chandna/requests-rust/blob/main/.github/CODE_OF_CONDUCT.md>`_,
+<https://github.com/puneet-chandna/requests-native/blob/main/.github/CODE_OF_CONDUCT.md>`_,
 and `AI policy
-<https://github.com/puneet-chandna/requests-rust/blob/main/.github/AI_POLICY.md>`_.
+<https://github.com/puneet-chandna/requests-native/blob/main/.github/AI_POLICY.md>`_.
 
 Code changes must include the smallest regression test, preserve strict
 Requests behavior, and report exact local verification commands. Include all
@@ -37,4 +37,4 @@ files.
 
 Suspected vulnerabilities must be reported privately under the
 `security policy
-<https://github.com/puneet-chandna/requests-rust/security/policy>`_.
+<https://github.com/puneet-chandna/requests-native/security/policy>`_.

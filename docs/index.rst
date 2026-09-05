@@ -1,9 +1,9 @@
-Requests Rust
+Requests Native
 =============
 
-Release compatibility version |version|. GitHub milestone ``v1.0.0-beta``.
+Requests compatibility version |version|. GitHub milestone ``v1.0.0-beta``.
 
-Requests Rust is an unofficial, independent Rust rewrite of
+Requests Native is an unofficial, independent Rust rewrite of
 `PSF Requests <https://github.com/psf/requests>`_. It preserves the familiar
 Python API and routes pristine built-in HTTP traffic through a native Rust
 transport, with compatibility fallback for unsupported extension behavior.
@@ -14,9 +14,11 @@ transport, with compatibility fallback for unsupported extension behavior.
    Software Foundation and is not published to PyPI or crates.io. Install it
    only from this repository and test it before production use.
 
-The Python import and distribution names remain ``requests`` and the runtime
-compatibility version remains ``2.34.2``. The GitHub beta tag identifies the
-rewrite milestone; it is not a Python package version.
+The Python distribution is ``requests-native`` version ``1.0.0b1``. Its
+drop-in import remains ``requests`` and reports compatibility version
+``2.34.2``. The Rust package version is ``1.0.0-beta.1``. The GitHub beta tag
+identifies the rewrite milestone; these versions intentionally describe
+different surfaces.
 
 The User Guide
 --------------

@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTICE = ROOT / "NOTICE"
-WORKSPACE_PACKAGE = "requests-python"
+WORKSPACE_PACKAGE = "requests-native-python"
 LICENSE_PREFIXES = ("COPYING", "COPYRIGHT", "LICENCE", "LICENSE", "NOTICE", "UNLICENSE")
 SHARED_LICENSES = {
     # These two crates are released from the same repository under BSD-3-Clause,

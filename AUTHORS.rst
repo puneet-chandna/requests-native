@@ -1,4 +1,4 @@
-Requests Rust
+Requests Native
 `````````````
 
 - Puneet Chandna `@puneet-chandna <https://github.com/puneet-chandna>`_,

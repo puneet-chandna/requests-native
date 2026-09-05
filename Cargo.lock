@@ -892,8 +892,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "requests"
-version = "2.34.2"
+name = "requests-native"
+version = "1.0.0-beta.1"
 dependencies = [
  "async-compression",
  "base64",
@@ -920,13 +920,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "requests-python"
-version = "2.34.2"
+name = "requests-native-python"
+version = "1.0.0-beta.1"
 dependencies = [
  "bytes",
  "pyo3",
  "pyo3-build-config",
- "requests",
+ "requests-native",
  "tokio",
 ]
 

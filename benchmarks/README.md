@@ -5,6 +5,9 @@ Rust-backed Python API, and the native Rust async and blocking APIs against one
 HTTP/1.1 loopback fixture. Measurements have no pass/fail target and do not
 authorize compatibility changes.
 
+The checked-in 20260902 result predates the Requests Native rename; its
+``requests-rust`` backend label is preserved as historical evidence.
+
 ## Run
 
 Use the rewrite virtual environment so the compiled Python extension and the

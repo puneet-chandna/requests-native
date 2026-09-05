@@ -1,6 +1,6 @@
-# Contributing to Requests Rust
+# Contributing to Requests Native
 
-Requests Rust is an unofficial Rust rewrite of Requests. Use this repository
+Requests Native is an unofficial Rust rewrite of Requests. Use this repository
 for bugs or improvements in the rewrite, its Rust transport, Python bridge,
 builds, documentation, and compatibility boundary. General Requests usage
 questions and issues reproducible in unmodified PSF Requests belong in the

@@ -27,7 +27,7 @@ def main() -> int:
                 "test",
                 target,
                 "--package",
-                "requests",
+                "requests-native",
                 "--toolchain",
                 "nightly",
                 "--runs",

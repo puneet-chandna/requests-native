@@ -35,15 +35,22 @@ def test_core_is_python_independent_and_binding_depends_on_core() -> None:
     binding = load_toml("crates/requests-python/Cargo.toml")
 
     assert "pyo3" not in core.get("dependencies", {})
-    assert core["package"]["name"] == "requests"
+    assert core["package"]["name"] == "requests-native"
+    assert core["lib"]["name"] == "requests_native"
+    assert core["package"]["publish"] is False
+    assert binding["package"]["name"] == "requests-native-python"
+    assert binding["package"]["publish"] is False
     assert "requests" in binding["dependencies"]
-    assert binding["dependencies"]["requests"]["path"] == "../requests"
+    assert binding["dependencies"]["requests"] == {
+        "package": "requests-native",
+        "path": "../requests",
+    }
     assert "pyo3" in binding["dependencies"]
     assert binding["lib"]["name"] == "_requests_rust"
     assert binding["lib"]["crate-type"] == ["cdylib"]
 
 
-def test_maturin_mixed_project_preserves_requests_metadata() -> None:
+def test_maturin_mixed_project_preserves_import_and_splits_versions() -> None:
     project = load_toml("pyproject.toml")
 
     assert project["build-system"] == {
@@ -61,9 +68,10 @@ def test_maturin_mixed_project_preserves_requests_metadata() -> None:
     }
 
     metadata = project["project"]
-    assert metadata["name"] == "requests"
+    assert metadata["name"] == "requests-native"
     assert metadata["requires-python"] == ">=3.10"
     assert metadata["dynamic"] == ["version"]
+    assert workspace_version() == "1.0.0-beta.1"
     assert metadata["dependencies"] == [
         "charset_normalizer>=2,<4",
         "idna>=2.5,<4",
@@ -77,5 +85,21 @@ def test_maturin_mixed_project_preserves_requests_metadata() -> None:
     }
 
     test_dependencies = project["dependency-groups"]["test"]
+    assert "requests-native[socks]" in test_dependencies
+    assert "requests[socks]" not in test_dependencies
     assert "PyYAML>=6" in test_dependencies
     assert "tomli>=2; python_version < '3.11'" in test_dependencies
+
+
+def workspace_version() -> str:
+    return load_toml("Cargo.toml")["workspace"]["package"]["version"]
+
+
+def test_native_benchmark_aliases_the_renamed_core() -> None:
+    benchmark = load_toml("benchmarks/rust-native/Cargo.toml")
+
+    assert benchmark["package"]["name"] == "requests-benchmark-native"
+    assert benchmark["dependencies"]["requests"] == {
+        "package": "requests-native",
+        "path": "../../crates/requests",
+    }

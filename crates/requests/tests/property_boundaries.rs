@@ -1,6 +1,8 @@
-use requests::cookies::{CookieScalar, CookieSnapshot, JarSnapshot};
-use requests::retry::{BackoffPolicy, RetryCount, RetryPolicy, RetryReason, RetryState, StatusSet};
-use requests::{
+use requests_native::cookies::{CookieScalar, CookieSnapshot, JarSnapshot};
+use requests_native::retry::{
+    BackoffPolicy, RetryCount, RetryPolicy, RetryReason, RetryState, StatusSet,
+};
+use requests_native::{
     HeaderInput, HeaderPart, ResponseDecision, ResponseDisposition, ResponseDispositionState,
     ResponseEvent, prepare_headers, prepare_url,
 };

@@ -1,6 +1,6 @@
 # Security policy
 
-Requests Rust is beta software and is not published to PyPI or crates.io.
+Requests Native is beta software and is not published to PyPI or crates.io.
 
 While this repository is private, invited collaborators must use an
 already-agreed private channel with the owner. Never disclose a suspected

@@ -31,13 +31,13 @@ def _assert_named_rust_contract(package: str, name: str) -> None:
 
 def test_core_response_disposition_contract_is_compiled() -> None:
     _assert_named_rust_contract(
-        "requests",
+        "requests-native",
         "response_disposition_is_monotonic_and_exactly_once",
     )
 
 
 def test_binding_response_payload_and_owner_contract_is_compiled() -> None:
     _assert_named_rust_contract(
-        "requests-python",
+        "requests-native-python",
         "response_payloads_and_origin_owner_are_explicit",
     )

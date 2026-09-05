@@ -4,7 +4,7 @@ about: Ask whether behavior is specific to the Rust rewrite
 labels: question
 ---
 
-Requests Rust issues are for this beta rewrite. For general Requests usage,
+Requests Native issues are for this beta rewrite. For general Requests usage,
 consult the [upstream documentation](https://requests.readthedocs.io/) or the
 [python-requests Stack Overflow tag](https://stackoverflow.com/questions/tagged/python-requests).
 

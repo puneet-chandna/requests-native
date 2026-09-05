@@ -1,6 +1,6 @@
 # Porting Requests from Python to Rust
 
-This is the authoritative working guide for the Requests Rust port. Read it
+This is the authoritative working guide for the Requests Native port. Read it
 before translating or reviewing any file.
 
 The method is adapted from Bun's Zig-to-Rust migration: preserve behavior,
@@ -1002,12 +1002,13 @@ only the rewrite comparison for I04 because importing the extension
 intentionally enables the process-global GIL and changes that case's warning
 and logging observation; the ABI evidence step records this before the suite.
 
-Preserve the compatibility distribution surface, except for this reviewed
-derivative-identity correction:
+Preserve the compatibility import surface while keeping release identity
+separate:
 
-- the distribution/import name and version remain `requests` 2.34.2 solely for
-  drop-in validation, while description, author/maintainer, project URLs, and
-  development status identify Requests Rust and its owner;
+- the Python distribution is `requests-native` version `1.0.0b1`, the Cargo
+  package is `requests-native` version `1.0.0-beta.1`, the Python import stays
+  `requests`, and `requests.__version__` stays `2.34.2` solely as the strict
+  Requests compatibility baseline;
 - Python requirement, language/platform classifiers, dependencies, and the
   `security`, `socks`, and `use_chardet_on_py3` extras remain unchanged;
 - `requests/py.typed`, `LICENSE`, `NOTICE`, and expected artifact contents;

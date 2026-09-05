@@ -8,5 +8,5 @@ publish = false
 
 [dependencies]
 futures-core = "0.3"
-requests = { path = "../../crates/requests" }
+requests = { package = "requests-native", path = "../../crates/requests" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,18 @@ from benchmarks.run import (
 
 
 class BenchmarkHarnessTests(unittest.TestCase):
+    def test_python_artifact_provenance_separates_release_and_compat_versions(
+        self,
+    ) -> None:
+        source = inspect.getsource(benchmark.python_artifact_provenance)
+
+        self.assertIn('metadata.version("requests-native")', source)
+        self.assertIn('"distribution_name": "requests-native"', source)
+        self.assertIn('"compatibility_import": "requests"', source)
+        self.assertIn('"compatibility_version": requests.__version__', source)
+        self.assertIn('provenance["distribution_version"] != "1.0.0b1"', source)
+        self.assertIn('provenance["compatibility_version"] != "2.34.2"', source)
+
     def test_public_report_replaces_checkout_paths_and_rejects_home_paths(self) -> None:
         sanitizer = getattr(benchmark, "sanitize_public_report", None)
         self.assertIsNotNone(sanitizer)

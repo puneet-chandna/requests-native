@@ -1,10 +1,12 @@
 Release process
 ===============
 
-Requests Rust releases are GitHub milestones for the independent rewrite.
+Requests Native releases are GitHub milestones for the independent rewrite.
 They are not PSF Requests releases and are not published to PyPI or crates.io.
-The Python distribution remains named ``requests`` at compatibility version
-``2.34.2`` during beta qualification.
+The Python distribution is ``requests-native`` version ``1.0.0b1`` and the
+Cargo package is ``requests-native`` version ``1.0.0-beta.1``. The installed
+Python import remains ``requests`` and ``requests.__version__`` remains
+``2.34.2`` as the compatibility baseline.
 
 The ``v1.0.0-beta`` milestone may be created as a GitHub prerelease only after:
 
@@ -15,8 +17,8 @@ The ``v1.0.0-beta`` milestone may be created as a GitHub prerelease only after:
 4. no source or workflow changes occur after that evidence is collected.
 
 The workflow stores validation artifacts for review. It contains no PyPI or
-TestPyPI deployment job. A future registry release requires a separate design,
-version decision, ownership review, and explicit maintainer approval.
+TestPyPI deployment job. Publishing to any registry remains a separate,
+explicit maintainer decision.
 
 Public repository gate
 ----------------------

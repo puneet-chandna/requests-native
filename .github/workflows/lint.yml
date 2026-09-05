@@ -1,6 +1,7 @@
 name: Lint code
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths-ignore: ["docs/**", "ext/**", ".superpowers/**"]
@@ -34,4 +35,4 @@ jobs:
     - name: Check Rust formatting
       run: cargo fmt --all -- --check
     - name: Lint the Python-independent Rust core
-      run: cargo clippy -p requests --all-targets -- -D warnings
+      run: cargo clippy -p requests-native --all-targets -- -D warnings
