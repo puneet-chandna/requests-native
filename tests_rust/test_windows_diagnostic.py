@@ -102,6 +102,7 @@ def test_windows_diagnostic_workflow_cannot_start_a_matrix_or_publish():
     assert job["runs-on"] == "windows-latest"
     assert job["timeout-minutes"] == "20"
     assert "strategy" not in job
+    assert all("timeout-minutes" not in step for step in job["steps"])
     actions = [step for step in job["steps"] if "uses" in step]
     assert all(
         re.fullmatch(

@@ -33,14 +33,12 @@ jobs:
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_ENV"
           git rev-parse HEAD > "$RUNNER_TEMP/testserver-diagnostic/source-commit.log"
       - name: Build one sanitized diagnostic wheel
-        timeout-minutes: 6
         shell: bash
         run: |
           python scripts/build_release_wheel.py --interpreter python --out wheelhouse > "$RUNNER_TEMP/testserver-diagnostic/build.log" 2>&1
           wheel="$(find wheelhouse -maxdepth 1 -type f -name '*.whl' -print -quit)"
           python tests_rust/test_distribution.py --verify-wheel "$wheel" --source-commit "$GITHUB_SHA" >> "$RUNNER_TEMP/testserver-diagnostic/build.log" 2>&1
       - name: Install independent environments with identical dependencies
-        timeout-minutes: 2
         shell: bash
         run: |
           python -m venv "$RUNNER_TEMP/diagnostic-candidate"
@@ -59,7 +57,6 @@ jobs:
           path: frozen-oracle
           persist-credentials: false
       - name: Observe each upstream suite once outside the checkouts
-        timeout-minutes: 11
         shell: bash
         run: |
           python scripts/diagnose_windows_testserver.py \
