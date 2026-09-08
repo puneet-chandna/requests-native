@@ -1,0 +1,181 @@
+diff --git a/crates/requests/src/transport/mod.rs b/crates/requests/src/transport/mod.rs
+index be7583b..1a1ce93 100644
+--- a/crates/requests/src/transport/mod.rs
++++ b/crates/requests/src/transport/mod.rs
+@@ -44,6 +44,131 @@ use crate::{BodySource, ContentCodecs, Error, Proxy, Request, Result, Timeout, T
+
+ pub(crate) const DEFAULT_MAX_IDLE_PER_HOST: usize = 10;
+
++// DIAGNOSTIC ONLY: this code is applied to a disposable source archive.
++type DiagnosticConnection = Option<(std::net::SocketAddr, std::net::SocketAddr)>;
++
++fn diagnostic_event(event: &str, connection: DiagnosticConnection, bytes: usize, result: &str) {
++    use std::io::Write as _;
++    let time_ns = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_nanos();
++    let (local, peer) = connection
++        .map(|(local, peer)| (local.to_string(), peer.to_string()))
++        .unwrap_or_else(|| ("unavailable".to_owned(), "unavailable".to_owned()));
++    let record = format!(
++        "NATIVE_TLS_TRACE {{\"time_ns\":{time_ns},\"event\":\"{event}\",\"local\":\"{local}\",\"peer\":\"{peer}\",\"bytes\":{bytes},\"result\":\"{result}\",\"thread\":\"{:?}\"}}\n",
++        std::thread::current().id()
++    );
++    let _ = std::io::stderr().lock().write_all(record.as_bytes());
++}
++
++struct DiagnosticIo<IO> {
++    inner: IO,
++    connection: DiagnosticConnection,
++    events: usize,
++}
++
++impl<IO> DiagnosticIo<IO> {
++    fn observe(&mut self, event: &str, bytes: usize, result: &str) {
++        // Bound diagnostic overhead even if a transport repeatedly returns Pending.
++        if self.events < 128 {
++            diagnostic_event(event, self.connection, bytes, result);
++        } else if self.events == 128 {
++            diagnostic_event("trace_truncated", self.connection, 0, "incomplete");
++        }
++        self.events = self.events.saturating_add(1);
++    }
++}
++
++impl<IO: AsyncRead + Unpin> AsyncRead for DiagnosticIo<IO> {
++    fn poll_read(
++        self: Pin<&mut Self>,
++        context: &mut Context<'_>,
++        buffer: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.get_mut().inner).poll_read(context, buffer)
++    }
++}
++
++impl<IO: AsyncWrite + Unpin> AsyncWrite for DiagnosticIo<IO> {
++    fn poll_write(
++        self: Pin<&mut Self>,
++        context: &mut Context<'_>,
++        buffer: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        let this = self.get_mut();
++        this.observe("client_plaintext_write_attempt", buffer.len(), "enter");
++        let result = Pin::new(&mut this.inner).poll_write(context, buffer);
++        match &result {
++            Poll::Pending => this.observe("client_plaintext_write_result", 0, "pending"),
++            Poll::Ready(Ok(written)) => {
++                this.observe("client_plaintext_write_result", *written, "accepted")
++            }
++            Poll::Ready(Err(error)) => this.observe(
++                "client_plaintext_write_result",
++                0,
++                &format!("{:?}", error.kind()),
++            ),
++        }
++        result
++    }
++
++    fn is_write_vectored(&self) -> bool {
++        self.inner.is_write_vectored()
++    }
++
++    fn poll_write_vectored(
++        self: Pin<&mut Self>,
++        context: &mut Context<'_>,
++        buffers: &[io::IoSlice<'_>],
++    ) -> Poll<io::Result<usize>> {
++        let this = self.get_mut();
++        this.observe(
++            "client_plaintext_write_vectored_attempt",
++            buffers
++                .iter()
++                .fold(0usize, |total, buffer| total.saturating_add(buffer.len())),
++            "enter",
++        );
++        let result = Pin::new(&mut this.inner).poll_write_vectored(context, buffers);
++        match &result {
++            Poll::Pending => this.observe("client_plaintext_write_vectored_result", 0, "pending"),
++            Poll::Ready(Ok(written)) => this.observe(
++                "client_plaintext_write_vectored_result",
++                *written,
++                "accepted",
++            ),
++            Poll::Ready(Err(error)) => this.observe(
++                "client_plaintext_write_vectored_result",
++                0,
++                &format!("{:?}", error.kind()),
++            ),
++        }
++        result
++    }
++
++    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
++        let this = self.get_mut();
++        this.observe("client_plaintext_flush_attempt", 0, "enter");
++        let result = Pin::new(&mut this.inner).poll_flush(context);
++        match &result {
++            Poll::Pending => this.observe("client_plaintext_flush_result", 0, "pending"),
++            Poll::Ready(Ok(())) => this.observe("client_plaintext_flush_result", 0, "complete"),
++            Poll::Ready(Err(error)) => this.observe(
++                "client_plaintext_flush_result",
++                0,
++                &format!("{:?}", error.kind()),
++            ),
++        }
++        result
++    }
++
++    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
++    }
++}
++
+ pub(crate) struct Transport {
+     pool: Arc<Mutex<Pool>>,
+     #[cfg(test)]
+@@ -1684,6 +1809,8 @@ impl Transport {
+                         .map(|reservation| reservation.checkpoint(SessionPhase::ConnectBlocked)),
+                 )
+                 .await?;
++            let diagnostic_connection = stream.local_addr().ok().zip(stream.peer_addr().ok());
++            diagnostic_event("client_tcp_connected", diagnostic_connection, 0, "complete");
+             let stream = stream
+                 .into_std()
+                 .map_err(|error| Error::connect(target, error))?;
+@@ -1710,7 +1837,15 @@ impl Transport {
+                 Some(loaded_tls) => {
+                     #[cfg(test)]
+                     self.establishment_checkpoint(EstablishmentStage::Tls).await;
+-                    let stream = tls::handshake(loaded_tls, host, stream).await?;
++                    diagnostic_event("client_tls_start", diagnostic_connection, 0, "enter");
++                    let result = tls::handshake(loaded_tls, host, stream).await;
++                    diagnostic_event(
++                        "client_tls_end",
++                        diagnostic_connection,
++                        0,
++                        if result.is_ok() { "complete" } else { "error" },
++                    );
++                    let stream = result?;
+                     #[cfg(test)]
+                     self.establishment_checkpoint(EstablishmentStage::Http1)
+                         .await;
+@@ -1780,6 +1915,18 @@ where
+     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+ {
+     let observation = ResponseHeadObservation::default();
++    let diagnostic_connection = driver
++        .shutdown
++        .as_ref()
++        .and_then(|socket| socket.local_addr().ok().zip(socket.peer_addr().ok()));
++    diagnostic_event("client_http1_start", diagnostic_connection, 0, "enter");
++    // Below ResponseHeadIo: these are actual TLS/plaintext write/flush calls,
++    // not its header-buffer acceptance and not kernel packet timestamps.
++    let stream = DiagnosticIo {
++        inner: stream,
++        connection: diagnostic_connection,
++        events: 0,
++    };
+     let stream = ResponseHeadIo::new(stream, observation.clone());
+     let (sender, connection) = http1::Builder::new()
+         .handshake(TokioIo::new(stream))

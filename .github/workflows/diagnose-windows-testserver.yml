@@ -1,4 +1,4 @@
-name: Diagnose Windows free-threaded test server
+name: Diagnose Windows TLS request timing
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   diagnose:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 12
     env:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONNOUSERSITE: "1"
@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.14t"
+          python-version: "3.10"
       - name: Prepare bounded diagnostic
         shell: bash
         run: |
@@ -32,12 +32,10 @@ jobs:
           python -m pip install "maturin==1.15.0"
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_ENV"
           git rev-parse HEAD > "$RUNNER_TEMP/testserver-diagnostic/source-commit.log"
-      - name: Build one sanitized diagnostic wheel
+      - name: Build one instrumented non-release wheel from a disposable source copy
         shell: bash
         run: |
-          python scripts/build_release_wheel.py --interpreter python --out wheelhouse > "$RUNNER_TEMP/testserver-diagnostic/build.log" 2>&1
-          wheel="$(find wheelhouse -maxdepth 1 -type f -name '*.whl' -print -quit)"
-          python tests_rust/test_distribution.py --verify-wheel "$wheel" --source-commit "$GITHUB_SHA" >> "$RUNNER_TEMP/testserver-diagnostic/build.log" 2>&1
+          python scripts/diagnose_windows_testserver.py --build-diagnostic python --output "$RUNNER_TEMP/testserver-diagnostic" > "$RUNNER_TEMP/testserver-diagnostic/build.log" 2>&1
       - name: Install independent environments with identical dependencies
         shell: bash
         run: |
@@ -45,7 +43,7 @@ jobs:
           python -m venv "$RUNNER_TEMP/diagnostic-oracle"
           candidate_python="$RUNNER_TEMP/diagnostic-candidate/Scripts/python.exe"
           oracle_python="$RUNNER_TEMP/diagnostic-oracle/Scripts/python.exe"
-          wheel="$(find wheelhouse -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          wheel="$(find "$RUNNER_TEMP/testserver-diagnostic/wheelhouse" -maxdepth 1 -type f -name '*.whl' -print -quit)"
           "$candidate_python" -m pip install "$wheel" "pytest>=6.2,<10" "pytest-httpbin==2.1.0" "httpbin~=0.10.0" trustme "PySocks>=1.5.6,!=1.5.7" > "$RUNNER_TEMP/testserver-diagnostic/install.log" 2>&1
           "$candidate_python" -m pip freeze --exclude requests-native > "$RUNNER_TEMP/testserver-diagnostic/dependencies.log"
           "$oracle_python" -m pip install -r "$RUNNER_TEMP/testserver-diagnostic/dependencies.log" >> "$RUNNER_TEMP/testserver-diagnostic/install.log" 2>&1
@@ -56,7 +54,7 @@ jobs:
           ref: 69f84847045bef7a849cc994a26fe7ba8a169e95
           path: frozen-oracle
           persist-credentials: false
-      - name: Observe each upstream suite once outside the checkouts
+      - name: Observe two TLS cases separately and together for each implementation
         shell: bash
         run: |
           python scripts/diagnose_windows_testserver.py \
@@ -68,7 +66,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: windows-314t-testserver-diagnostic
+          name: windows-310-tls-diagnostic
           path: |
             ${{ runner.temp }}/testserver-diagnostic/**/*.log
             ${{ runner.temp }}/testserver-diagnostic/**/*.json
