@@ -34,9 +34,13 @@ permissions:
 
 jobs:
   windows-first:
+    strategy:
+      fail-fast: true
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t", "3.15-dev"]
     uses: ./.github/workflows/build-wheel.yml
     with:
-      python: "3.10"
+      python: ${{ matrix.python }}
       os: windows-latest
 
   wheels:
@@ -45,10 +49,7 @@ jobs:
       fail-fast: true
       matrix:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t", "3.15-dev", "pypy-3.11"]
-        os: [ubuntu-22.04, macos-latest, windows-latest]
-        exclude:
-          - {python: "pypy-3.11", os: windows-latest}
-          - {python: "3.10", os: windows-latest}
+        os: [ubuntu-22.04, macos-latest]
     uses: ./.github/workflows/build-wheel.yml
     with:
       python: ${{ matrix.python }}

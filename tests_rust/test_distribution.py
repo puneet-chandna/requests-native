@@ -1026,8 +1026,12 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert set(workflow["jobs"]) == {"windows-first", "wheels"}
     first = workflow["jobs"]["windows-first"]
     assert first == {
+        "strategy": {
+            "fail-fast": True,
+            "matrix": {"python": PYTHONS[:-1]},
+        },
         "uses": "./.github/workflows/build-wheel.yml",
-        "with": {"python": "3.10", "os": "windows-latest"},
+        "with": {"python": "${{ matrix.python }}", "os": "windows-latest"},
     }
     job = workflow["jobs"]["wheels"]
     assert job["needs"] == "windows-first"
@@ -1040,23 +1044,20 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert job["strategy"]["fail-fast"] is True
     assert job["strategy"]["matrix"] == {
         "python": PYTHONS,
-        "os": SYSTEMS,
-        "exclude": [
-            {"python": "pypy-3.11", "os": "windows-latest"},
-            {"python": "3.10", "os": "windows-latest"},
-        ],
+        "os": SYSTEMS[:-1],
     }
     matrix = job["strategy"]["matrix"]
     remaining = {
-        (python, system)
-        for python in matrix["python"]
-        for system in matrix["os"]
-        if {"python": python, "os": system} not in matrix["exclude"]
+        (python, system) for python in matrix["python"] for system in matrix["os"]
     }
-    first_key = (first["with"]["python"], first["with"]["os"])
-    assert len(remaining) == 22
-    assert first_key not in remaining
-    assert remaining | {first_key} == EXPECTED_WHEEL_KEYS
+    windows = {
+        (python, first["with"]["os"])
+        for python in first["strategy"]["matrix"]["python"]
+    }
+    assert len(windows) == 7
+    assert len(remaining) == 16
+    assert not windows & remaining
+    assert remaining | windows == EXPECTED_WHEEL_KEYS
 
     helper = load_workflow("build-wheel.yml")
     helper_triggers = helper.get("on", helper.get(True))

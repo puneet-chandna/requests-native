@@ -9,7 +9,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_API_ROWS = 366
-EXPECTED_LIFETIME_ROWS = 105
+EXPECTED_LIFETIME_ROWS = 106
 
 
 def run_script(name: str, *arguments: str) -> subprocess.CompletedProcess[str]:
