@@ -28,6 +28,83 @@ from requests.models import PreparedRequest
 _PROVENANCE_PROBE = None
 
 
+@pytest.mark.parametrize("state", ["consumed", "live", "partial_stream"])
+def test_response_cycle_collected_on_foreign_thread_matches_oracle(state):
+    source = r"""
+import gc
+import os
+import sys
+import threading
+import weakref
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import requests
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *args):
+        pass
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+worker = threading.Thread(target=server.serve_forever, daemon=True)
+worker.start()
+errors = []
+previous = sys.unraisablehook
+sys.unraisablehook = lambda event: errors.append(str(event.exc_value))
+gc.disable()
+session = requests.Session()
+session.trust_env = False
+session.mount("http://", requests.adapters.HTTPAdapter(pool_maxsize=1, pool_block=True))
+try:
+    url = f"http://127.0.0.1:{server.server_port}/"
+    response = session.get(url, stream=STATE != "consumed")
+    if os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "rewrite":
+        assert type(response.raw).__name__ == "NativeAdapterRaw"
+    if STATE == "consumed":
+        assert response.content == b"ok"
+    if STATE == "partial_stream":
+        response.iterator = response.raw.stream(1)
+        assert next(response.iterator) == b"o"
+    response.cycle = response
+    reference = weakref.ref(response)
+    del response
+    collector = threading.Thread(target=gc.collect)
+    collector.start()
+    collector.join(5)
+    assert not collector.is_alive()
+    assert reference() is None
+    assert errors == []
+    # Native pool permits are internal, separate from oracle GC observations.
+    if os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "rewrite":
+        with session.get(url) as recovered:
+            assert recovered.content == b"ok"
+    result = "collected"
+finally:
+    session.close()
+    gc.enable()
+    server.shutdown()
+    worker.join(5)
+    server.server_close()
+    sys.unraisablehook = previous
+""".replace("STATE", repr(state))
+    oracle = run_oracle_case({"source": source})
+    rewrite = run_rewrite_case({"source": source})
+    assert oracle.observations["exception"] is None
+    assert rewrite.observations["exception"] is None
+    assert rewrite.observations["result"] == oracle.observations["result"]
+    # Live urllib3 sockets can emit ResourceWarning on GC; native sockets do not
+    # own Python socket objects. Neither implementation may emit unraisable errors.
+    assert all(
+        warning["category"]["name"] == "ResourceWarning"
+        for warning in oracle.observations["warnings"]
+    )
+    assert rewrite.observations["warnings"] == []
+    assert oracle.stderr == rewrite.stderr == ""
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -90,6 +167,148 @@ def loopback(*responses):
         server.shutdown()
         server.server_close()
         worker.join(timeout=5)
+
+
+def test_native_raw_foreign_access_keeps_decoder_on_origin(monkeypatch):
+    with loopback((200, {"Content-Encoding": "gzip"}, gzip.compress(b"body"))) as (
+        _,
+        url,
+    ):
+        response = requests.get(url, stream=True)
+        raw = response.raw
+        assert type(raw).__name__ == "NativeAdapterRaw"
+        stream = raw.stream(1, decode_content=True)
+        calls = []
+        decompress = urllib3.response.GzipDecoder.decompress
+
+        def observed_decompress(self, *args, **kwargs):
+            calls.append(threading.get_ident())
+            return decompress(self, *args, **kwargs)
+
+        class Index:
+            def __index__(self):
+                calls.append(threading.get_ident())
+                return 1
+
+        # PyO3's numpy-bool compatibility path invokes __bool__.
+        class bool_:
+            __module__ = "numpy"
+
+            def __bool__(self):
+                calls.append(threading.get_ident())
+                return True
+
+        monkeypatch.setattr(
+            urllib3.response.GzipDecoder, "decompress", observed_decompress
+        )
+        operations = [
+            lambda: raw.read(1, decode_content=True),
+            lambda: raw.stream(1),
+            lambda: raw.stream(Index()),
+            lambda: raw.stream(1, bool_()),
+            lambda: raw.read(1, bool_()),
+            lambda: raw.read(1, False, bool_()),
+            raw.close,
+            raw.release_conn,
+            lambda: raw.status,
+            lambda: raw.reason,
+            lambda: raw.headers,
+            lambda: raw._original_response,
+            lambda: raw.closed,
+            raw._retained_decoded_bytes_trial,
+            lambda: iter(stream),
+            lambda: next(stream),
+            stream.close,
+        ]
+        rejected = []
+
+        def foreign_access():
+            for operation in operations:
+                try:
+                    operation()
+                except RuntimeError:
+                    rejected.append(True)
+
+        worker = threading.Thread(target=foreign_access)
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert len(rejected) == len(operations)
+        assert calls == []
+        assert b"".join(stream) == b"body"
+        assert calls and set(calls) == {threading.get_ident()}
+        response.close()
+
+
+@pytest.mark.parametrize("access", ["reentrant", "foreign"])
+def test_native_stream_guard_does_not_borrow_busy_raw(monkeypatch, access):
+    with loopback((200, {"Content-Encoding": "gzip"}, gzip.compress(b"body"))) as (
+        _,
+        url,
+    ):
+        response = requests.get(url, stream=True)
+        raw = response.raw
+        assert type(raw).__name__ == "NativeAdapterRaw"
+        stream = raw.stream(1)
+        empty = raw.stream(0)
+        done = raw.stream(0)
+        assert next(done, None) is None
+        decompress = urllib3.response.GzipDecoder.decompress
+        observations = []
+
+        def observed_decompress(self, *args, **kwargs):
+            if access == "reentrant":
+                assert iter(stream) is stream
+                assert next(empty, None) is None
+                assert next(done, None) is None
+            else:
+                rejected = []
+
+                def foreign_access():
+                    for operation in (
+                        lambda: iter(stream),
+                        lambda: next(stream),
+                        stream.close,
+                    ):
+                        try:
+                            operation()
+                        except BaseException as error:
+                            rejected.append(type(error))
+
+                worker = threading.Thread(target=foreign_access)
+                worker.start()
+                worker.join(5)
+                assert not worker.is_alive()
+                assert rejected == [RuntimeError] * 3
+            observations.append(threading.get_ident())
+            return decompress(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            urllib3.response.GzipDecoder, "decompress", observed_decompress
+        )
+        assert raw.read(decode_content=True) == b"body"
+        assert observations and set(observations) == {threading.get_ident()}
+        response.close()
+
+
+def test_native_stream_argument_conversion_keeps_defaults_and_errors():
+    with loopback((200, {}, b"x" * 70_000)) as (_, url):
+        response = requests.get(url, stream=True)
+        raw = response.raw
+        assert type(raw).__name__ == "NativeAdapterRaw"
+        for amount, exception in [(object(), TypeError), (1 << 200, OverflowError)]:
+            with pytest.raises(exception) as caught:
+                raw.stream(amount)
+            if hasattr(BaseException, "add_note"):
+                assert caught.value.__notes__ == ["while processing 'amt'"]
+        with pytest.raises(TypeError) as caught:
+            raw.stream(1, object())
+        if hasattr(BaseException, "add_note"):
+            assert caught.value.__notes__ == ["while processing 'decode_content'"]
+        iterator = raw.stream()
+        assert len(next(iterator)) == 65_536
+        assert b"".join(iterator) == b"x" * (70_000 - 65_536)
+        response.close()
 
 
 @contextmanager

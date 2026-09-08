@@ -244,9 +244,14 @@ fn _adapter_fork_reset_trial() -> PyResult<()> {
     ensure_adapter_process()
 }
 
-#[pyclass(module = "requests._requests_rust", unsendable)]
+// Python GC may drop these owned, Send + Sync fields on any attached thread.
+// API access stays on the creator thread so decoder callbacks cannot migrate.
+#[pyclass(module = "requests._requests_rust")]
 struct NativeAdapterRaw {
-    body: Option<AdapterResponseBody>,
+    origin_thread: std::thread::ThreadId,
+    // The body is Send, not Sync; this wrapper is never locked. Exclusive
+    // get_mut/into_inner access provides Sync without a guard across callbacks/awaits.
+    body: Option<Mutex<AdapterResponseBody>>,
     pool: Py<PyAny>,
     content_encoding: Option<String>,
     decoder: Option<Py<PyAny>>,
@@ -263,8 +268,10 @@ struct NativeAdapterRaw {
     closed: bool,
 }
 
-#[pyclass(module = "requests._requests_rust", unsendable)]
+#[pyclass(module = "requests._requests_rust")]
 struct NativeAdapterStream {
+    // Decoder callbacks can access this stream while raw is already borrowed.
+    origin_thread: std::thread::ThreadId,
     raw: Py<NativeAdapterRaw>,
     amount: Option<usize>,
     decode_content: bool,
@@ -3786,7 +3793,8 @@ fn build_python_response(
     let raw = Py::new(
         py,
         NativeAdapterRaw {
-            body: Some(response.into_raw_body()),
+            origin_thread: std::thread::current().id(),
+            body: Some(Mutex::new(response.into_raw_body())),
             pool: pool.clone().unbind(),
             content_encoding,
             decoder: None,
@@ -4281,6 +4289,15 @@ fn _adapter_pool_side_table_trial(py: Python<'_>) -> PyResult<usize> {
 }
 
 impl NativeAdapterRaw {
+    fn ensure_origin_thread(&self) -> PyResult<()> {
+        if std::thread::current().id() != self.origin_thread {
+            return Err(PyRuntimeError::new_err(
+                "native response accessed outside its creating OS thread",
+            ));
+        }
+        Ok(())
+    }
+
     fn finish_body_failure(&mut self) {
         self.body = None;
         self.closed = true;
@@ -4300,6 +4317,9 @@ impl NativeAdapterRaw {
         let Some(body) = self.body.take() else {
             return Ok(Vec::new());
         };
+        let body = body
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = run_with_actions_and_signal_checker(
             py,
             move |_actions| async move {
@@ -4318,7 +4338,7 @@ impl NativeAdapterRaw {
         );
         match result {
             Ok(Ok((body, bytes))) => {
-                self.body = Some(body);
+                self.body = Some(Mutex::new(body));
                 Ok(bytes)
             }
             Ok(Err(error))
@@ -4458,7 +4478,9 @@ impl NativeAdapterRaw {
         if Self::decoder_reached_clean_end(decoder)?
             && let Some(body) = self.body.as_mut()
         {
-            body.finish_encoded_declared_length();
+            body.get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .finish_encoded_declared_length();
         }
         Ok(())
     }
@@ -4563,6 +4585,7 @@ impl NativeAdapterRaw {
         amount: Option<usize>,
         decode_content: bool,
     ) -> PyResult<Py<PyAny>> {
+        self.ensure_origin_thread()?;
         if amount == Some(0) {
             return Ok(PyBytes::new(py, b"").into_any().unbind());
         }
@@ -4614,39 +4637,57 @@ impl NativeAdapterRaw {
 #[pymethods]
 impl NativeAdapterRaw {
     #[getter]
-    fn status(&self) -> u16 {
-        self.status
+    fn status(&self) -> PyResult<u16> {
+        self.ensure_origin_thread()?;
+        Ok(self.status)
     }
 
     #[getter]
-    fn reason(&self) -> &str {
-        &self.reason
+    fn reason(&self) -> PyResult<&str> {
+        self.ensure_origin_thread()?;
+        Ok(&self.reason)
     }
 
     #[getter]
-    fn headers(&self, py: Python<'_>) -> Py<PyAny> {
-        self.headers.clone_ref(py)
+    fn headers(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.ensure_origin_thread()?;
+        Ok(self.headers.clone_ref(py))
     }
 
     #[getter]
-    fn _original_response(&self, py: Python<'_>) -> Py<PyAny> {
-        self.original_response.clone_ref(py)
+    fn _original_response(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.ensure_origin_thread()?;
+        Ok(self.original_response.clone_ref(py))
     }
 
     #[getter]
-    fn closed(&self) -> bool {
-        self.closed
+    fn closed(&self) -> PyResult<bool> {
+        self.ensure_origin_thread()?;
+        Ok(self.closed)
     }
 
-    #[pyo3(signature = (amt=None, decode_content=false, cache_content=false))]
+    #[pyo3(
+        signature = (amt=None, decode_content=Python::attach(|py| PyBool::new(py, false).to_owned().into_any().unbind()), cache_content=Python::attach(|py| PyBool::new(py, false).to_owned().into_any().unbind())),
+        text_signature = "($self, amt=None, decode_content=False, cache_content=False)"
+    )]
     fn read(
         &mut self,
         py: Python<'_>,
         amt: Option<&Bound<'_, PyAny>>,
-        decode_content: bool,
-        cache_content: bool,
+        decode_content: Py<PyAny>,
+        cache_content: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let _ = cache_content;
+        self.ensure_origin_thread()?;
+        let decode_content = pyo3::impl_::extract_argument::extract_argument::<bool, true>(
+            decode_content.bind(py).as_borrowed(),
+            &mut (),
+            "decode_content",
+        )?;
+        let _ = pyo3::impl_::extract_argument::extract_argument::<bool, true>(
+            cache_content.bind(py).as_borrowed(),
+            &mut (),
+            "cache_content",
+        )?;
         let amount = match amt {
             None => None,
             Some(value) if value.is_none() => None,
@@ -4658,13 +4699,31 @@ impl NativeAdapterRaw {
         self.read_amount(py, amount, decode_content)
     }
 
-    #[pyo3(signature = (amt=65_536, decode_content=None))]
+    #[pyo3(
+        signature = (amt=Python::attach(|py| PyInt::new(py, 65_536).into_any().unbind()), decode_content=None),
+        text_signature = "($self, amt=65536, decode_content=None)"
+    )]
     fn stream(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
-        amt: Option<isize>,
-        decode_content: Option<bool>,
+        amt: Py<PyAny>,
+        decode_content: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<NativeAdapterStream>> {
+        slf.ensure_origin_thread()?;
+        let amt = pyo3::impl_::extract_argument::extract_argument::<Option<isize>, true>(
+            amt.bind(py).as_borrowed(),
+            &mut (),
+            "amt",
+        )?;
+        let decode_content = decode_content
+            .map(|value| {
+                pyo3::impl_::extract_argument::extract_argument::<bool, true>(
+                    value.as_borrowed(),
+                    &mut (),
+                    "decode_content",
+                )
+            })
+            .transpose()?;
         let amount = match amt {
             None => None,
             Some(value) if value < 0 => None,
@@ -4673,6 +4732,7 @@ impl NativeAdapterRaw {
         Py::new(
             py,
             NativeAdapterStream {
+                origin_thread: slf.origin_thread,
                 raw: slf.into_pyobject(py)?.unbind(),
                 amount,
                 decode_content: decode_content.unwrap_or(false),
@@ -4682,7 +4742,11 @@ impl NativeAdapterRaw {
     }
 
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.ensure_origin_thread()?;
         if let Some(body) = self.body.take() {
+            let body = body
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.closed = true;
             self.decoder_eof = true;
             let result = run_with_actions_and_signal_checker(
@@ -4703,20 +4767,36 @@ impl NativeAdapterRaw {
         Ok(())
     }
 
-    fn release_conn(&mut self) {}
+    fn release_conn(&mut self) -> PyResult<()> {
+        self.ensure_origin_thread()
+    }
 
-    fn _retained_decoded_bytes_trial(&self) -> usize {
-        self.decoded.len().saturating_sub(self.decoded_offset)
+    fn _retained_decoded_bytes_trial(&self) -> PyResult<usize> {
+        self.ensure_origin_thread()?;
+        Ok(self.decoded.len().saturating_sub(self.decoded_offset))
+    }
+}
+
+impl NativeAdapterStream {
+    fn ensure_origin_thread(&self) -> PyResult<()> {
+        if std::thread::current().id() != self.origin_thread {
+            return Err(PyRuntimeError::new_err(
+                "native response accessed outside its creating OS thread",
+            ));
+        }
+        Ok(())
     }
 }
 
 #[pymethods]
 impl NativeAdapterStream {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
+    fn __iter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        slf.ensure_origin_thread()?;
+        Ok(slf)
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.ensure_origin_thread()?;
         if self.done {
             return Ok(None);
         }
@@ -4738,6 +4818,7 @@ impl NativeAdapterStream {
     }
 
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.ensure_origin_thread()?;
         self.raw.bind(py).borrow_mut().close(py)?;
         self.done = true;
         Ok(())
