@@ -18,6 +18,10 @@ frozen oracle's dependencies are available:
 .venv/bin/python benchmarks/run.py --profile default
 ```
 
+The frozen oracle defaults to the sibling `requests` checkout. Set
+`REQUESTS_ORACLE_ROOT` to its absolute path if your checkouts are elsewhere.
+The same setting is inherited by benchmark worker processes.
+
 `smoke` uses two requests per case, 64 B and 32 KiB bodies, and concurrency
 levels 1 and 2. `default` uses twelve requests per case, 128 B and 256 KiB
 bodies, and concurrency levels 1 and 4. Both profiles cover every combination

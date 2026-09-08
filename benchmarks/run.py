@@ -33,7 +33,9 @@ except ImportError:  # pragma: no cover - Windows records RSS as unavailable.
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-ORACLE_ROOT = ROOT.parent / "requests"
+ORACLE_ROOT = pathlib.Path(
+    os.environ.get("REQUESTS_ORACLE_ROOT", ROOT.parent / "requests")
+).resolve()
 NATIVE_BINARY = ROOT / "target" / "release" / "requests-benchmark-native"
 NATIVE_MANIFEST = ROOT / "benchmarks" / "rust-native" / "Cargo.toml"
 SCHEMA_VERSION = 2

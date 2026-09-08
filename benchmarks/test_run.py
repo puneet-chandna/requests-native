@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import inspect
+import os
+import runpy
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import benchmarks.run as benchmark
 from benchmarks.run import (
@@ -20,6 +23,17 @@ from benchmarks.run import (
 
 
 class BenchmarkHarnessTests(unittest.TestCase):
+    def test_oracle_location_accepts_an_override_and_preserves_sibling_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            override = Path(directory) / "frozen-oracle"
+            with mock.patch.dict(os.environ, {"REQUESTS_ORACLE_ROOT": str(override)}):
+                configured = runpy.run_path(benchmark.__file__)
+            self.assertEqual(configured["ORACLE_ROOT"], override)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("REQUESTS_ORACLE_ROOT", None)
+            default = runpy.run_path(benchmark.__file__)
+        self.assertEqual(default["ORACLE_ROOT"], benchmark.ROOT.parent / "requests")
+
     def test_python_artifact_provenance_separates_release_and_compat_versions(
         self,
     ) -> None:

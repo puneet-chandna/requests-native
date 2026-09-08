@@ -9,7 +9,7 @@ visible, and let the existing tests define correctness.
 
 ## Status
 
-The rewrite is qualified locally and through a complete 23-cell compiled wheel
+An earlier candidate passed local checks and a complete 23-cell compiled wheel
 matrix, one sdist, and one validation manifest from an exact commit. That remote
 workflow reported success, but later cross-platform inspection found that all
 seven Windows wheels contained CRLF-normalized `LICENSE` and `NOTICE` bytes and
@@ -18,6 +18,12 @@ source forces LF for both legal files and verifies every archive against its
 source-commit Git blobs on one LF runner, but that corrected contract has not
 yet been rerun across the full matrix. The prior artifact set is therefore
 qualified evidence, not release-ready evidence.
+
+The latest source checks passed, but the subsequent artifact run was incomplete.
+Windows 3.10 failed a TLS handshake test; the other unfinished platform checks
+remain open. Inspection also found locale-dependent author text in two Windows
+wheel SBOMs. The metadata decoder now uses UTF-8 explicitly, but corrected
+artifacts still need complete platform qualification.
 
 Exact pristine built-in `Session` and `HTTPAdapter` traffic uses the Rust
 backend by default. Unsupported, subclassed, custom, and dynamically mutated

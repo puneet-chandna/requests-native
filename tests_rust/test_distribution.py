@@ -1023,14 +1023,57 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     porting = " ".join((ROOT / "PORTING.md").read_text().split())
     assert "reusable and manually dispatched release-validation gate" in porting
     assert "complete 23-cell compiled wheel matrix" in porting
+    assert set(workflow["jobs"]) == {"windows-first", "wheels"}
+    first = workflow["jobs"]["windows-first"]
+    assert first == {
+        "uses": "./.github/workflows/build-wheel.yml",
+        "with": {"python": "3.10", "os": "windows-latest"},
+    }
     job = workflow["jobs"]["wheels"]
-    assert job["strategy"]["fail-fast"] is False
+    assert job["needs"] == "windows-first"
+    assert "if" not in job
+    assert job["uses"] == first["uses"]
+    assert job["with"] == {
+        "python": "${{ matrix.python }}",
+        "os": "${{ matrix.os }}",
+    }
+    assert job["strategy"]["fail-fast"] is True
     assert job["strategy"]["matrix"] == {
         "python": PYTHONS,
         "os": SYSTEMS,
-        "exclude": [{"python": "pypy-3.11", "os": "windows-latest"}],
+        "exclude": [
+            {"python": "pypy-3.11", "os": "windows-latest"},
+            {"python": "3.10", "os": "windows-latest"},
+        ],
     }
-    assert len(PYTHONS) * len(SYSTEMS) - 1 == 23
+    matrix = job["strategy"]["matrix"]
+    remaining = {
+        (python, system)
+        for python in matrix["python"]
+        for system in matrix["os"]
+        if {"python": python, "os": system} not in matrix["exclude"]
+    }
+    first_key = (first["with"]["python"], first["with"]["os"])
+    assert len(remaining) == 22
+    assert first_key not in remaining
+    assert remaining | {first_key} == EXPECTED_WHEEL_KEYS
+
+    helper = load_workflow("build-wheel.yml")
+    helper_triggers = helper.get("on", helper.get(True))
+    assert helper_triggers == {
+        "workflow_call": {
+            "inputs": {
+                "python": {"required": True, "type": "string"},
+                "os": {"required": True, "type": "string"},
+            }
+        }
+    }
+    assert helper["permissions"] == {"contents": "read"}
+    assert "concurrency" not in helper
+    assert set(helper["jobs"]) == {"wheel"}
+    job = helper["jobs"]["wheel"]
+    assert job["runs-on"] == "${{ inputs.os }}"
+    assert "strategy" not in job
     ordered_names = [step.get("name") for step in job["steps"]]
     steps = {step.get("name"): step for step in job["steps"]}
     assert "scripts/build_release_wheel.py" in steps["Build wheel"]["run"]
@@ -1059,11 +1102,17 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert "Py_GIL_DISABLED" in evidence
     assert "is False" not in evidence
     assert "gil_used" not in evidence
-    assert "free-threaded-evidence-${{ matrix.os }}.json" in evidence
+    assert steps["Record free-threaded ABI evidence"]["env"] == {
+        "EVIDENCE_FILENAME": "free-threaded-evidence-${{ inputs.os }}.json"
+    }
+    assert 'os.environ["EVIDENCE_FILENAME"]' in evidence
     assert ordered_names.index(
         "Record free-threaded ABI evidence"
     ) < ordered_names.index("Run installed artifact suite once")
     assert steps["Upload wheel"]["with"]["if-no-files-found"] == "error"
+    assert steps["Upload wheel"]["with"]["name"] == (
+        "wheel-${{ inputs.python }}-${{ inputs.os }}"
+    )
 
 
 def test_bootstrap_matrix_uses_the_release_helper_and_validates_each_wheel() -> None:
@@ -1500,7 +1549,10 @@ def test_public_project_identity_is_derivative_and_registry_safe() -> None:
     release_flat = " ".join(release.split())
     assert "private through the" not in conduct
     assert "profile as a private fallback" not in security
-    assert "must enable GitHub private vulnerability reporting" in security_flat
+    assert "when available" in security_flat
+    assert "If private reporting is unavailable" in security_flat
+    assert "already-agreed private channel" in security_flat
+    assert "without disclosing vulnerability details" in security_flat
     assert "Report a vulnerability" in security_flat
     assert "prefix the report title with `Conduct:`" in conduct_flat
     assert "private vulnerability reporting" in release_flat
