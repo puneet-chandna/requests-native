@@ -1301,6 +1301,12 @@ def test_installed_suite_isolates_mutating_test_groups(
                 "tests_rust/test_backend_boundary.py",
                 "tests_differential/test_property_boundaries.py",
             ],
+            [
+                "tests_differential/test_adapters.py::test_response_cycle_collected_on_foreign_thread_matches_oracle",
+                "tests_differential/test_adapters.py::test_native_raw_foreign_access_keeps_decoder_on_origin",
+                "tests_differential/test_adapters.py::test_native_stream_guard_does_not_borrow_busy_raw",
+                "tests_differential/test_adapters.py::test_native_stream_argument_conversion_keeps_defaults_and_errors",
+            ],
         ]
 
 
@@ -2271,6 +2277,12 @@ def run_installed_suite(python: Path, oracle: Path, checkout: Path) -> None:
             (
                 "tests_rust/test_backend_boundary.py",
                 "tests_differential/test_property_boundaries.py",
+            ),
+            (
+                "tests_differential/test_adapters.py::test_response_cycle_collected_on_foreign_thread_matches_oracle",
+                "tests_differential/test_adapters.py::test_native_raw_foreign_access_keeps_decoder_on_origin",
+                "tests_differential/test_adapters.py::test_native_stream_guard_does_not_borrow_busy_raw",
+                "tests_differential/test_adapters.py::test_native_stream_argument_conversion_keeps_defaults_and_errors",
             ),
         )
         for group in groups:
