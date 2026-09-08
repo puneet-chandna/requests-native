@@ -34,6 +34,7 @@ def test_response_cycle_collected_on_foreign_thread_matches_oracle(state):
 import gc
 import os
 import sys
+import sysconfig
 import threading
 import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,7 +54,18 @@ worker = threading.Thread(target=server.serve_forever, daemon=True)
 worker.start()
 errors = []
 previous = sys.unraisablehook
-sys.unraisablehook = lambda event: errors.append(str(event.exc_value))
+def record_unraisable(event):
+    locations = []
+    traceback = event.exc_traceback
+    while traceback is not None:
+        frame = traceback.tb_frame
+        locations.append((frame.f_globals.get("__name__"), frame.f_code.co_name))
+        traceback = traceback.tb_next
+    errors.append((
+        event.exc_type.__module__, event.exc_type.__name__,
+        str(event.exc_value), locations,
+    ))
+sys.unraisablehook = record_unraisable
 gc.disable()
 session = requests.Session()
 session.trust_env = False
@@ -71,12 +83,25 @@ try:
     response.cycle = response
     reference = weakref.ref(response)
     del response
-    collector = threading.Thread(target=gc.collect)
+    # PyPy clears the Response weakref before collecting its native wrapper.
+    # Two collections on the same foreign thread cover both finalization stages.
+    collector = threading.Thread(target=lambda: (gc.collect(), gc.collect()))
     collector.start()
     collector.join(5)
     assert not collector.is_alive()
     assert reference() is None
-    assert errors == []
+    if errors:
+        # This observed stdlib/urllib3 finalizer error is not intentional runtime
+        # parity: native cleanup must remain clean, not reproduce the oracle bug.
+        assert os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "oracle"
+        assert sys.implementation.name == "cpython"
+        assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1
+        assert not sys._is_gil_enabled()
+        assert STATE in ("live", "partial_stream")
+        assert errors == [(
+            "builtins", "ValueError", "I/O operation on closed file.",
+            [("http.client", "close"), ("http.client", "flush")],
+        )]
     # Native pool permits are internal, separate from oracle GC observations.
     if os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "rewrite":
         with session.get(url) as recovered:
@@ -96,7 +121,8 @@ finally:
     assert rewrite.observations["exception"] is None
     assert rewrite.observations["result"] == oracle.observations["result"]
     # Live urllib3 sockets can emit ResourceWarning on GC; native sockets do not
-    # own Python socket objects. Neither implementation may emit unraisable errors.
+    # own Python socket objects. The one narrowly characterized oracle finalizer
+    # error above is separate from the strict native no-unraisables requirement.
     assert all(
         warning["category"]["name"] == "ResourceWarning"
         for warning in oracle.observations["warnings"]
