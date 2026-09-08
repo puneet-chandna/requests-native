@@ -10,9 +10,12 @@ repos:
   - id: check-toml
   - id: check-yaml
   - id: end-of-file-fixer
+    # Preserve byte-canonical generated third-party license notices.
+    exclude: ^RUST_RUNTIME_NOTICES\.html$
   - id: mixed-line-ending
     args: [--fix=auto]
   - id: trailing-whitespace
+    exclude: ^RUST_RUNTIME_NOTICES\.html$
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.15.21
   hooks:

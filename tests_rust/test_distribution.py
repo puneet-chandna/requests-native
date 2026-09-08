@@ -1377,9 +1377,24 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
         in manifest_by_name["Fetch GitHub artifact metadata"]["run"]
     )
     assert manifest["runs-on"] == "ubuntu-24.04"
-    assert manifest["steps"][-1]["name"] == "Verify complete release set"
-    assert all(
-        "upload-artifact" not in str(step.get("uses", "")) for step in manifest["steps"]
+    assert manifest["steps"][-2]["name"] == "Verify complete release set"
+    release_upload = manifest["steps"][-1]
+    assert release_upload["name"] == "Upload complete release set"
+    assert release_upload["uses"] == (
+        "actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f"
+    )
+    assert "if" not in release_upload
+    assert release_upload["with"] == {
+        "name": "beta-release-set",
+        "path": "dist/",
+        "if-no-files-found": "error",
+        "retention-days": 5,
+    }
+    assert (
+        sum(
+            "upload-artifact" in str(step.get("uses", "")) for step in manifest["steps"]
+        )
+        == 1
     )
     triggers = workflow.get("on", workflow.get(True))
     assert set(triggers) == {"workflow_dispatch"}

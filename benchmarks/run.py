@@ -540,7 +540,9 @@ print(json.dumps({
     if provenance["distribution_version"] != "1.0.0b1":
         raise RuntimeError("loaded Python distribution reports the wrong version")
     if provenance["compatibility_version"] != "2.34.2":
-        raise RuntimeError("loaded Requests API reports the wrong compatibility version")
+        raise RuntimeError(
+            "loaded Requests API reports the wrong compatibility version"
+        )
     provenance["build_command"] = build_record["command"]
     provenance["build_environment"] = build_record["environment"]
     provenance["extension_sha256"] = loaded_digest

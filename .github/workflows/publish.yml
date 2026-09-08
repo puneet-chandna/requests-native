@@ -105,3 +105,10 @@ jobs:
           cp artifact-manifest.json dist/
       - name: Verify complete release set
         run: python tests_rust/test_distribution.py --verify-release-set dist --manifest dist/artifact-manifest.json --source-commit "$GITHUB_SHA"
+      - name: Upload complete release set
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: beta-release-set
+          path: dist/
+          if-no-files-found: error
+          retention-days: 5
