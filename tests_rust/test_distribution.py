@@ -1183,6 +1183,9 @@ def test_source_workflows_cover_rust_default_and_explicit_trial() -> None:
     )
     assert "cargo fmt --all -- --check" in lint_runs
     assert "cargo clippy -p requests-native --all-targets -- -D warnings" in lint_runs
+    setup = lint_runs.index("rustup component add rustfmt clippy")
+    assert setup < lint_runs.index("cargo fmt --all -- --check")
+    assert setup < lint_runs.index("cargo clippy -p requests-native")
 
 
 def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> None:
