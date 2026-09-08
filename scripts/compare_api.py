@@ -4,6 +4,7 @@ import csv
 import importlib
 import inspect
 import json
+import os
 import re
 import subprocess
 import sys
@@ -15,7 +16,9 @@ sys.path.insert(0, str(ROOT))
 
 from tests_differential.runner import _child_environment  # noqa: E402
 
-ORACLE_ROOT = ROOT.parent / "requests"
+ORACLE_ROOT = Path(
+    os.environ.get("REQUESTS_ORACLE_ROOT", ROOT.parent / "requests")
+).resolve()
 CHILD = "--child"
 RESOLVABLE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
 PROBE_TIMEOUT_SECONDS = 30
@@ -79,6 +82,11 @@ def record(row: dict[str, str]) -> dict[str, Any]:
 
 
 def child() -> int:
+    import requests
+
+    expected = Path(sys.argv[-1]) / "requests" / "__init__.py"
+    if Path(requests.__file__).resolve() != expected:
+        raise RuntimeError("API probe imported requests from an unexpected source")
     rows = json.load(sys.stdin)
     json.dump([record(row) for row in rows], sys.stdout, sort_keys=True)
     sys.stdout.write("\n")
@@ -86,9 +94,14 @@ def child() -> int:
 
 
 def probe(package_root: Path, rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    package_root = package_root.resolve()
+    if not (package_root / "requests" / "__init__.py").is_file():
+        raise FileNotFoundError(
+            f"requests source package not found under {package_root}"
+        )
     try:
         completed = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), CHILD],
+            [sys.executable, str(Path(__file__).resolve()), CHILD, str(package_root)],
             input=json.dumps(rows),
             text=True,
             capture_output=True,

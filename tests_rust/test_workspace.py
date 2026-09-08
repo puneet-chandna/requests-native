@@ -112,5 +112,8 @@ def test_native_benchmark_aliases_the_renamed_core() -> None:
 def test_public_rust_example_uses_the_package_and_library_names() -> None:
     readme = (ROOT / "README.md").read_text()
 
-    assert 'requests-native = "=1.0.0-beta.1"' in readme
+    assert 'requests-native = { path = "../requests-native/crates/requests" }' in readme
     assert "use requests_native::Client;" in readme
+    assert "use requests_native::blocking::Client;" in readme
+    assert "There is no registry package to install yet." in readme
+    assert "| `requests-native` / `requests_native` | `1.0.0-beta.1` |" in readme

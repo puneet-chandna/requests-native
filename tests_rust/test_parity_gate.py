@@ -88,6 +88,13 @@ def test_current_oracle_ledgers_api_and_boundary_are_valid() -> None:
         assert completed.returncode == 0, (name, completed.stdout, completed.stderr)
 
 
+def test_api_probe_rejects_missing_configured_oracle(monkeypatch, tmp_path):
+    monkeypatch.setenv("REQUESTS_ORACLE_ROOT", str(tmp_path / "missing-oracle"))
+    completed = run_script("compare_api.py")
+    assert completed.returncode == 1
+    assert "requests source package not found" in completed.stderr
+
+
 def test_ledger_checker_rejects_duplicate_keys_and_unreviewed_closure(
     tmp_path: Path,
 ) -> None:

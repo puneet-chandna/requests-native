@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -10,7 +11,9 @@ import pytest
 from tests_differential.runner import run_oracle_case
 
 ROOT = Path(__file__).resolve().parents[1]
-ORACLE_ROOT = ROOT.parent / "requests"
+ORACLE_ROOT = Path(
+    os.environ.get("REQUESTS_ORACLE_ROOT", ROOT.parent / "requests")
+).resolve()
 ORACLE_REQUESTS_FILE = ORACLE_ROOT / "src" / "requests" / "__init__.py"
 WARNING_CLASS = "urllib3.exceptions.InsecureRequestWarning"
 
@@ -67,8 +70,9 @@ FIXTURE_MANIFEST = {
     ),
 }
 
-_TLS_SOURCE = dedent(
-    r"""
+_TLS_SOURCE = (
+    dedent(
+        r"""
     import hashlib
     import os
     import platform
@@ -85,7 +89,7 @@ _TLS_SOURCE = dedent(
     from urllib3.connection import HTTPSConnection
 
     ROOT = Path.cwd().resolve()
-    ORACLE_ROOT = ROOT.parent / "requests"
+    ORACLE_ROOT = Path(__ORACLE_ROOT__)
     ORACLE_REQUESTS_FILE = ORACLE_ROOT / "src" / "requests" / "__init__.py"
     FIXTURE_MANIFEST = __FIXTURE_MANIFEST__
     IO_TIMEOUT = 2.0
@@ -539,7 +543,10 @@ _TLS_SOURCE = dedent(
         request["error"] = None if error is None else exception_graph(error)[0]
         return wrap({"request": request, "server": server.observation()})
     """
-).replace("__FIXTURE_MANIFEST__", repr(FIXTURE_MANIFEST))
+    )
+    .replace("__FIXTURE_MANIFEST__", repr(FIXTURE_MANIFEST))
+    .replace("__ORACLE_ROOT__", repr(str(ORACLE_ROOT)))
+)
 
 
 def _snapshot(expression: str) -> dict[str, object]:

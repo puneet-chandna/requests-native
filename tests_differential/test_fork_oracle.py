@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-ORACLE_SOURCE = ROOT.parent / "requests" / "src"
 REWRITE_SOURCE = ROOT / "src"
 
 pytestmark = pytest.mark.skipif(
@@ -22,8 +21,13 @@ import json
 import os
 import select
 import threading
+from pathlib import Path
 
 import requests
+
+assert Path(requests.__file__).resolve() == (
+    Path(os.environ["REQUESTS_FORK_SOURCE"]) / "requests/__init__.py"
+)
 
 scenario = os.environ["REQUESTS_FORK_SCENARIO"]
 session = requests.Session() if scenario == "idle-session" else None
@@ -86,6 +90,11 @@ print(child_payload.decode())
 
 
 def _run_probe(package_source: Path, scenario: str) -> dict[str, object]:
+    package_source = package_source.resolve()
+    if not (package_source / "requests" / "__init__.py").is_file():
+        raise FileNotFoundError(
+            f"requests source package not found under {package_source}"
+        )
     environment = {
         name: os.environ[name]
         for name in (
@@ -112,6 +121,7 @@ def _run_probe(package_source: Path, scenario: str) -> dict[str, object]:
             "PYTHONNOUSERSITE": "1",
             "PYTHONPATH": str(package_source),
             "REQUESTS_FORK_SCENARIO": scenario,
+            "REQUESTS_FORK_SOURCE": str(package_source),
         }
     )
     completed = subprocess.run(
@@ -130,11 +140,17 @@ def _run_probe(package_source: Path, scenario: str) -> dict[str, object]:
 @pytest.mark.parametrize("scenario", ["import-only", "idle-session"])
 def test_rewrite_matches_single_threaded_frozen_oracle_fork_behavior(
     scenario: str,
+    oracle_root: Path,
 ) -> None:
     expected = {
         "method": "GET",
         "path": "/fork",
         "pid_changed": True,
     }
-    assert _run_probe(ORACLE_SOURCE, scenario) == expected
+    assert _run_probe(oracle_root / "src", scenario) == expected
     assert _run_probe(REWRITE_SOURCE, scenario) == expected
+
+
+def test_fork_probe_rejects_missing_source_before_import(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="requests source package not found"):
+        _run_probe(tmp_path / "missing", "import-only")
