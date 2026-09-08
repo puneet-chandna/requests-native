@@ -2,28 +2,24 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
+import urllib.request
 import zipfile
 from pathlib import Path
 from textwrap import dedent
 
 import pytest
 from tests_differential.runner import (
-    DEFAULT_ORACLE_ROOT,
     REPOSITORY_ROOT,
     run_oracle_case,
     run_rewrite_case,
 )
 
 _SIMPLEJSON_VERSION = "4.1.1"
-_SIMPLEJSON_WHEEL = Path(
-    "/tmp/requests-task14-cache/"
-    "simplejson-4.1.1-cp314-cp314-manylinux1_x86_64."
-    "manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl"
-)
 _SIMPLEJSON_URL = (
     "https://files.pythonhosted.org/packages/78/91/"
     "3635cdb13318cb0a328abaa69e2b91251caad39d6779aa308098f341f6cb/"
@@ -31,6 +27,19 @@ _SIMPLEJSON_URL = (
     "manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl"
 )
 _SIMPLEJSON_SHA256 = "3851658d642c1184d2023f0e6c9ce44a21eb1629e74e7c84ef956b128841fe12"
+
+
+def _simplejson_wheel_bytes() -> bytes:
+    supplied = os.environ.get("REQUESTS_SIMPLEJSON_WHEEL")
+    if supplied is not None:
+        content = Path(supplied).read_bytes()
+    else:
+        with urllib.request.urlopen(_SIMPLEJSON_URL, timeout=30) as response:
+            content = response.read()
+    if hashlib.sha256(content).hexdigest() != _SIMPLEJSON_SHA256:
+        raise ValueError("simplejson wheel SHA-256 mismatch")
+    return content
+
 
 _TRIAL_HELPERS = """
 try:
@@ -942,19 +951,34 @@ result = requests.__version__
     )
 
 
-def test_certs_module_cli_prints_certifi_path() -> None:
+def test_certs_module_cli_prints_certifi_path(oracle_root: Path) -> None:
     environment = {
         name: os.environ[name]
         for name in ("PATH", "LD_LIBRARY_PATH", "LANG", "LC_ALL", "LC_CTYPE")
         if name in os.environ
     }
     records = []
-    for package_root in (DEFAULT_ORACLE_ROOT.resolve(), REPOSITORY_ROOT.resolve()):
+    for package_root in (oracle_root, REPOSITORY_ROOT.resolve()):
         child_environment = environment | {
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONNOUSERSITE": "1",
             "PYTHONPATH": str(package_root / "src"),
         }
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import requests, sys; from pathlib import Path; "
+                "assert Path(requests.__file__).resolve() == "
+                "Path(sys.argv[1]) / 'src/requests/__init__.py'",
+                str(package_root),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=child_environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         completed = subprocess.run(
             [sys.executable, "-m", "requests.certs"],
             cwd=REPOSITORY_ROOT,
@@ -970,21 +994,56 @@ def test_certs_module_cli_prints_certifi_path() -> None:
     assert records[0][1].strip()
 
 
-def test_real_simplejson_constructor_and_pickle_lane(tmp_path: Path) -> None:
-    assert _SIMPLEJSON_WHEEL.is_file()
-    assert hashlib.sha256(_SIMPLEJSON_WHEEL.read_bytes()).hexdigest() == (
-        _SIMPLEJSON_SHA256
+def test_simplejson_fixture_accepts_only_verified_offline_bytes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    content = b"isolated fixture bytes"
+    wheel = tmp_path / "simplejson.whl"
+    wheel.write_bytes(content)
+    monkeypatch.setenv("REQUESTS_SIMPLEJSON_WHEEL", str(wheel))
+    monkeypatch.setitem(
+        globals(), "_SIMPLEJSON_SHA256", hashlib.sha256(content).hexdigest()
     )
-    with zipfile.ZipFile(_SIMPLEJSON_WHEEL) as archive:
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("offline fixture must not use the network"),
+    )
+    assert _simplejson_wheel_bytes() == content
+    wheel.write_bytes(b"changed fixture bytes")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        _simplejson_wheel_bytes()
+
+
+def test_configured_oracle_must_exist_before_comparison(monkeypatch, tmp_path):
+    from tests_differential.conftest import oracle_root
+
+    monkeypatch.setenv("REQUESTS_ORACLE_ROOT", str(tmp_path / "missing-oracle"))
+    with pytest.raises(pytest.fail.Exception, match="configured oracle package"):
+        oracle_root.__wrapped__()
+
+
+def test_real_simplejson_constructor_and_pickle_lane(
+    tmp_path: Path, oracle_root: Path
+) -> None:
+    with zipfile.ZipFile(io.BytesIO(_simplejson_wheel_bytes())) as archive:
         archive.extractall(tmp_path)
 
     source = dedent(
         f"""
         import json
+        import os
         import pickle
+        from pathlib import Path
+        import requests
         import requests.compat as compat
         import requests.exceptions as exceptions
         import simplejson
+
+        assert Path(requests.__file__).resolve() == (
+            Path(os.environ["EXPECTED_REQUESTS_ROOT"]) / "src/requests/__init__.py"
+        )
+        assert Path(simplejson.__file__).resolve().is_relative_to(Path({str(tmp_path)!r}))
 
         error = exceptions.JSONDecodeError(
             "broken", "{{", 1, request="request-marker"
@@ -1030,10 +1089,11 @@ def test_real_simplejson_constructor_and_pickle_lane(tmp_path: Path) -> None:
         """
     )
     records = []
-    for package_root in (DEFAULT_ORACLE_ROOT.resolve(), REPOSITORY_ROOT.resolve()):
+    for package_root in (oracle_root, REPOSITORY_ROOT.resolve()):
         environment = os.environ.copy()
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PYTHONNOUSERSITE"] = "1"
+        environment["EXPECTED_REQUESTS_ROOT"] = str(package_root)
         environment["PYTHONPATH"] = os.pathsep.join(
             (str(tmp_path), str(package_root / "src"))
         )
