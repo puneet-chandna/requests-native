@@ -829,6 +829,32 @@ def test_release_sbom_metadata_offline_mode_is_explicit(
     assert "--offline" in commands[1]
 
 
+def test_release_sbom_metadata_preserves_utf8_under_non_utf8_locale(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from scripts import generate_release_sbom as release_sbom
+
+    expected = {"packages": [{"authors": ["Bartłomiej Kamiński"]}]}
+    payload = json.dumps(expected, ensure_ascii=False).encode("utf-8")
+    real_run = subprocess.run
+
+    def emit_cargo_json(command, **kwargs):
+        assert command[:2] == ["cargo", "metadata"]
+        return real_run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                f"import sys; sys.stdout.buffer.write({payload!r})",
+            ],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(subprocess, "_text_encoding", lambda: "cp1252")
+    monkeypatch.setattr(release_sbom.subprocess, "run", emit_cargo_json)
+    assert release_sbom.cargo_metadata(root=tmp_path) == expected
+
+
 def test_release_wheel_helper_forwards_metadata_offline_mode(
     monkeypatch, tmp_path: Path
 ) -> None:
