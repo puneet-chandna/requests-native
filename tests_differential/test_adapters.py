@@ -93,15 +93,22 @@ try:
     if errors:
         # This observed stdlib/urllib3 finalizer error is not intentional runtime
         # parity: native cleanup must remain clean, not reproduce the oracle bug.
-        assert os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "oracle"
-        assert sys.implementation.name == "cpython"
-        assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1
-        assert not sys._is_gil_enabled()
-        assert STATE in ("live", "partial_stream")
-        assert errors == [(
-            "builtins", "ValueError", "I/O operation on closed file.",
-            [("http.client", "close"), ("http.client", "flush")],
-        )]
+        assert os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "oracle", ("target", errors)
+        assert sys.implementation.name == "cpython", ("interpreter", errors)
+        assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1, ("build", errors)
+        assert not sys._is_gil_enabled(), ("gil", errors)
+        assert STATE in ("live", "partial_stream"), ("state", errors)
+        assert errors in (
+            [(
+                "builtins", "ValueError", "I/O operation on closed file.",
+                [("http.client", "close"), ("http.client", "flush")],
+            )],
+            [(
+                "builtins", "ValueError", "I/O operation on closed file.",
+                [("urllib3.response", "close"), ("http.client", "close"),
+                 ("http.client", "flush")],
+            )],
+        ), errors
     # Native pool permits are internal, separate from oracle GC observations.
     if os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "rewrite":
         with session.get(url) as recovered:
@@ -117,8 +124,8 @@ finally:
 """.replace("STATE", repr(state))
     oracle = run_oracle_case({"source": source})
     rewrite = run_rewrite_case({"source": source})
-    assert oracle.observations["exception"] is None
-    assert rewrite.observations["exception"] is None
+    assert oracle.observations["exception"] is None, oracle.observations
+    assert rewrite.observations["exception"] is None, rewrite.observations
     assert rewrite.observations["result"] == oracle.observations["result"]
     # Live urllib3 sockets can emit ResourceWarning on GC; native sockets do not
     # own Python socket objects. The one narrowly characterized oracle finalizer
