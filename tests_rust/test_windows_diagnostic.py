@@ -3,6 +3,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 import requests
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,8 +59,9 @@ def test_diagnostic_observes_server_without_replacing_client(tmp_path):
     assert str(ROOT) not in output.read_text()
 
 
+@pytest.mark.parametrize("full_order", [False, True])
 def test_diagnostic_runs_both_implementations_after_first_failure(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, full_order
 ):
     helper = diagnostic()
     calls = []
@@ -89,33 +92,33 @@ def test_diagnostic_runs_both_implementations_after_first_failure(
         ("candidate", Path(sys.executable), ROOT),
         ("oracle", Path(sys.executable), oracle_source),
     ]
-    assert helper.run_suites(targets, tmp_path) == 1
-    assert len(calls) == 6
+    options = {"full_order": True} if full_order else {}
+    assert helper.run_suites(targets, tmp_path, **options) == 1
+    group_count = 1 if full_order else 3
+    assert len(calls) == 2 * group_count
     for index, (command, options) in enumerate(calls):
-        label = "candidate" if index < 3 else "oracle"
+        label = "candidate" if index < group_count else "oracle"
         assert command[4] == label
         assert options["cwd"].parent == tmp_path / label
-        assert options["timeout"] == 60
+        assert options["timeout"] == (300 if full_order else 60)
         assert options["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
         assert "PYTHONPATH" not in options["env"]
         assert (options["cwd"] / "tests/test_testserver.py").is_file()
-    groups = [command[5:] for command, _ in calls[:3]]
-    assert groups[0] == [
-        "tests/test_requests.py::TestRequests::test_pyopenssl_redirect"
-    ]
-    assert groups[1] == [
-        "tests/test_requests.py::TestRequests::test_auth_is_stripped_on_http_downgrade"
-    ]
-    assert groups[2] == groups[0] + groups[1]
-    assert [command[5:] for command, _ in calls[3:]] == groups
-    assert list(json.loads((tmp_path / "results.json").read_text()).values()) == [
-        1,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ]
+    groups = [command[5:] for command, _ in calls[:group_count]]
+    if full_order:
+        assert groups == [["tests"]]
+    else:
+        assert groups[0] == [
+            "tests/test_requests.py::TestRequests::test_pyopenssl_redirect"
+        ]
+        assert groups[1] == [
+            "tests/test_requests.py::TestRequests::test_auth_is_stripped_on_http_downgrade"
+        ]
+        assert groups[2] == groups[0] + groups[1]
+    assert [command[5:] for command, _ in calls[group_count:]] == groups
+    assert list(json.loads((tmp_path / "results.json").read_text()).values()) == (
+        [1, 0] if full_order else [1, 0, 0, 0, 0, 0]
+    )
 
 
 def test_diagnostic_requires_actual_native_io_for_passing_candidate():
@@ -255,7 +258,8 @@ def test_windows_diagnostic_workflow_cannot_start_a_matrix_or_publish():
     assert list(workflow["jobs"]) == ["diagnose"]
     job = workflow["jobs"]["diagnose"]
     assert job["runs-on"] == "windows-latest"
-    assert job["timeout-minutes"] == "12"
+    assert job["timeout-minutes"] == "18"
+    assert any("--full-order" in step.get("run", "") for step in job["steps"])
     assert "strategy" not in job
     assert all("timeout-minutes" not in step for step in job["steps"])
     actions = [step for step in job["steps"] if "uses" in step]

@@ -13,7 +13,7 @@ concurrency:
 jobs:
   diagnose:
     runs-on: windows-latest
-    timeout-minutes: 12
+    timeout-minutes: 18
     env:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONNOUSERSITE: "1"
@@ -54,10 +54,11 @@ jobs:
           ref: 69f84847045bef7a849cc994a26fe7ba8a169e95
           path: frozen-oracle
           persist-credentials: false
-      - name: Observe two TLS cases separately and together for each implementation
+      - name: Observe each full upstream suite once in original order
         shell: bash
         run: |
           python scripts/diagnose_windows_testserver.py \
+            --full-order \
             --candidate-python "$RUNNER_TEMP/diagnostic-candidate/Scripts/python.exe" \
             --oracle-python "$RUNNER_TEMP/diagnostic-oracle/Scripts/python.exe" \
             --oracle-root "$GITHUB_WORKSPACE/frozen-oracle" \

@@ -314,14 +314,18 @@ def native_evidence(log, returncode):
     }
 
 
-def run_suites(targets, output):
+def run_suites(targets, output, *, full_order=False):
     # Reuse the release harness's allowlisted environment, including no bytecode.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from tests_rust.test_distribution import _clean_environment
 
+    groups = (
+        (("tests",),) if full_order else ((TLS_NODES[0],), (TLS_NODES[1],), TLS_NODES)
+    )
+    timeout = 300 if full_order else 60
     results = {}
     for implementation, python, source in targets:
-        for index, nodes in enumerate(((TLS_NODES[0],), (TLS_NODES[1],), TLS_NODES)):
+        for index, nodes in enumerate(groups):
             suite = output / implementation / str(index)
             suite.mkdir(parents=True)
             shutil.copytree(source / "tests", suite / "tests")
@@ -351,12 +355,12 @@ def run_suites(targets, output):
                         env=environment,
                         stdout=log,
                         stderr=subprocess.STDOUT,
-                        timeout=60,
+                        timeout=timeout,
                         check=False,
                     )
                     results[key] = int(completed.returncode)
                 except subprocess.TimeoutExpired:
-                    results[key] = "timeout-60s"
+                    results[key] = f"timeout-{timeout}s"
             if implementation == "candidate":
                 evidence = native_evidence(
                     (suite / "pytest.log").read_text(encoding="utf-8"), results[key]
@@ -458,6 +462,11 @@ def main():
     parser.add_argument("--oracle-root", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--build-diagnostic", type=Path, metavar="INTERPRETER")
+    parser.add_argument(
+        "--full-order",
+        action="store_true",
+        help="Run the upstream suite once per implementation, bounded to 300 seconds each",
+    )
     parser.add_argument("nodes", nargs="*")
     args = parser.parse_args()
     if args.child:
@@ -480,6 +489,7 @@ def main():
             ("oracle", args.oracle_python, args.oracle_root.resolve()),
         ],
         args.output.resolve(),
+        full_order=args.full_order,
     )
 
 
