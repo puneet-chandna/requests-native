@@ -165,6 +165,27 @@ def test_commands(python, source, proof_path, expected_hash):
     ]
 
 
+def stage_suite(source, suite):
+    suite.mkdir(parents=True)
+    for part in ("tests", "tests_differential"):
+        shutil.copytree(
+            source / part,
+            suite / part,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+    (suite / "tests_rust").mkdir()
+    shutil.copyfile(
+        source / "tests_rust/test_backend_boundary.py",
+        suite / "tests_rust/test_backend_boundary.py",
+    )
+    shutil.copyfile(source / "requirements-dev.txt", suite / "requirements-dev.txt")
+    for relative in (
+        "tests/certs/valid/ca/ca.crt",
+        "tests/certs/mtls/client/ca/ca.crt",
+    ):
+        assert (suite / relative).read_bytes() == (source / relative).read_bytes()
+
+
 def compare(output):
     assert sys.platform == "win32" and sys.version_info[:3] == (3, 12, 10)
     assert output.resolve().is_relative_to(Path(os.environ["RUNNER_TEMP"]).resolve())
@@ -209,8 +230,8 @@ def compare(output):
         ),
     )
     results = {}
-    # Leave several minutes of the 45-minute job for setup and artifact upload.
-    deadline = time.monotonic() + 39 * 60
+    # Leave several minutes of the 40-minute job for setup and artifact upload.
+    deadline = time.monotonic() + 34 * 60
 
     def run(label, command, cwd=checkout, env=build_env, timeout=900, required=True):
         remaining = deadline - time.monotonic()
@@ -278,6 +299,45 @@ def compare(output):
             == "be22c0760ceffdae3f4f620336e20e30245da9f0"
         )
         write_json(evidence / "sources.json", manifests)
+        # Use the ordinary checkout's Windows symlinks, as the installed suite does.
+        # The archive-derived certificate directory link was unreadable on Windows.
+        suite_inputs = [
+            "tests",
+            "tests_differential",
+            "tests_rust/test_backend_boundary.py",
+            "requirements-dev.txt",
+        ]
+        untracked = subprocess.check_output(
+            ["git", "ls-files", "--others", "--", *suite_inputs],
+            cwd=checkout,
+            timeout=30,
+            text=True,
+        )
+        assert not untracked.strip(), f"untracked suite inputs: {untracked}"
+        run(
+            "suite-source-check",
+            [
+                "git",
+                "diff",
+                "--exit-code",
+                REVISIONS["current"],
+                "--",
+                *suite_inputs,
+            ],
+            timeout=30,
+        )
+        for source, profile in CELLS:
+            stage_suite(checkout, output / f"{source}-{profile}" / "outside")
+        write_json(
+            evidence / "suite-staging.json",
+            {
+                "source_revision": REVISIONS["current"],
+                "source": str(checkout),
+                "cells": [f"{source}-{profile}" for source, profile in CELLS],
+                "completed_before_builds": True,
+            },
+        )
+
         wheelhouse = output / "dependencies"
         run(
             "download-dependencies",
@@ -309,7 +369,7 @@ def compare(output):
         for source, profile in CELLS:
             name = f"{source}-{profile}"
             cell = output / name
-            cell.mkdir()
+            # The suite preflight already created this cell.
             run(
                 f"{name}-build",
                 build_command(sys.executable, cell, profile),
@@ -361,22 +421,6 @@ def compare(output):
                 timeout=120,
             )
             run(f"{name}-pip-check", [python, "-m", "pip", "check"], timeout=30)
-            suite = cell / "outside"
-            suite.mkdir()
-            for part in ("tests", "tests_differential"):
-                shutil.copytree(
-                    output / "current" / part,
-                    suite / part,
-                    ignore=shutil.ignore_patterns("__pycache__"),
-                )
-            (suite / "tests_rust").mkdir()
-            shutil.copyfile(
-                output / "current/tests_rust/test_backend_boundary.py",
-                suite / "tests_rust/test_backend_boundary.py",
-            )
-            shutil.copyfile(
-                output / "current/requirements-dev.txt", suite / "requirements-dev.txt"
-            )
 
         valid_cells = []
         dependency_inventories = {}
@@ -446,6 +490,15 @@ def self_check():
     assert [item[2] for item in commands[2:4]] == [60, 60]
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
+        suite = root / "outside"
+        checkout = Path(__file__).resolve().parents[1]
+        stage_suite(checkout, suite)
+        for relative in (
+            "tests/certs/valid/ca/ca.crt",
+            "tests/certs/mtls/client/ca/ca.crt",
+        ):
+            assert (suite / relative).read_bytes() == (checkout / relative).read_bytes()
+            assert not (suite / relative).parent.is_symlink()
         wheel = root / "test.whl"
         with zipfile.ZipFile(wheel, "w") as archive:
             archive.writestr(

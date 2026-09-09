@@ -13,7 +13,7 @@ concurrency:
 jobs:
   compare:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 40
     env:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONNOUSERSITE: "1"
