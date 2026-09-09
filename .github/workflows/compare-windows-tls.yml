@@ -1,0 +1,54 @@
+name: Compare Windows TLS source and build profiles
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-tls-profile-comparison
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONNOUSERSITE: "1"
+      CARGO_TERM_COLOR: never
+      RUSTUP_TOOLCHAIN: "1.98.0"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+      - name: Prepare fixed toolchain
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-tls-comparison/evidence'
+          New-Item -ItemType Directory -Force $evidence | Out-Null
+          rustup toolchain install 1.98.0 --profile minimal *> "$evidence/toolchain-setup.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install --disable-pip-version-check --retries 0 --timeout 30 "maturin==1.15.0" *> "$evidence/maturin-setup.log"
+          exit $LASTEXITCODE
+      - name: Build four controls then compare installed artifacts
+        shell: pwsh
+        run: |
+          python scripts/compare_windows_tls.py --output "$env:RUNNER_TEMP/windows-tls-comparison"
+          exit $LASTEXITCODE
+      - name: Retain private comparison logs even on failure
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: windows-312-tls-profile-comparison-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/windows-tls-comparison/evidence/**/*.log
+            ${{ runner.temp }}/windows-tls-comparison/evidence/**/*.json
+          if-no-files-found: warn
+          retention-days: 1
