@@ -23,6 +23,7 @@ import threading
 import unittest
 import venv
 import warnings
+import xml.etree.ElementTree as ET
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -60,6 +61,17 @@ EXPECTED_WHEEL_KEYS = {
 EXPECTED_FREE_THREADED_EVIDENCE = {
     f"free-threaded-evidence-{system}.json" for system in SYSTEMS
 }
+WINDOWS_ISSUE1_URL = "https://github.com/puneet-chandna/requests-native/issues/1"
+WINDOWS_ISSUE1_NODES = {
+    "tests/test_requests.py::TestRequests::test_pyopenssl_redirect",
+    "tests/test_requests.py::TestRequests::test_auth_is_stripped_on_http_downgrade",
+}
+WINDOWS_ISSUE1_SIGNATURES = {
+    "ssl-10053-server-handshake-timeout",
+    "remote-disconnected-server-requestline-timeout",
+}
+WINDOWS_JUNIT = "windows-upstream.xml"
+WINDOWS_REPORT = "windows-validation.json"
 EXPECTED_CLASSIFIERS = [
     "Development Status :: 4 - Beta",
     "Environment :: Web Environment",
@@ -1097,6 +1109,10 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     )
     suite = steps["Run installed artifact suite once"]["run"]
     assert suite.count("--installed-suite") == 1
+    assert 'if [[ "$RUNNER_OS" == "Windows" ]]' in suite
+    assert '--accept-windows-tls-issue-1 "$wheel"' in suite
+    assert '--source-commit "$GITHUB_SHA"' in suite
+    assert steps["Upload wheel"]["if"] == "${{ !cancelled() }}"
     evidence = steps["Record free-threaded ABI evidence"]["run"]
     assert '"before_import"' in evidence
     assert '"after_import"' in evidence
@@ -1252,6 +1268,379 @@ def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> No
 def test_installed_smoke_checks_the_package_file_in_its_distribution() -> None:
     assert "metadata.packages_distributions" not in INSTALLED_SMOKE
     assert 'distribution.locate_file("requests") / "__init__.py"' in INSTALLED_SMOKE
+
+
+def write_windows_junit_fixture(path: Path, signature: str | None = None) -> None:
+    root = ET.Element("testsuites")
+    suite = ET.SubElement(
+        root,
+        "testsuite",
+        tests="3",
+        errors="0",
+        failures=str(int(signature is not None)),
+        skipped="0",
+    )
+    for name in (
+        "test_pyopenssl_redirect",
+        "test_auth_is_stripped_on_http_downgrade",
+        "test_get",
+    ):
+        case = ET.SubElement(
+            suite, "testcase", classname="tests.test_requests.TestRequests", name=name
+        )
+        if name != "test_pyopenssl_redirect" or signature is None:
+            continue
+        if signature == "handshake":
+            message = "requests.exceptions.SSLError: TLS configuration or handshake failed: (os error 10053)"
+            server = "pytest-httpbin server hit an exception serving request: _ssl.c:993: The handshake operation timed out"
+        else:
+            message = "requests.exceptions.ConnectionError: RemoteDisconnected('Remote end closed connection without response')"
+            server = 'File "pytest_httpbin/serve.py", line 32, in handle\nself.raw_requestline = self.rfile.readline()\nFile "ssl.py", line 1103, in read\nreturn self._sslobj.read(len, buffer)\nTimeoutError: The read operation timed out'
+        ET.SubElement(case, "failure", message=message).text = f"E {message}"
+        ET.SubElement(case, "system-out").text = server
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def test_windows_issue1_classifies_only_approved_call_signatures(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "upstream.xml"
+    for signature, expected in (
+        (None, []),
+        (
+            "handshake",
+            [
+                {
+                    "nodeid": "tests/test_requests.py::TestRequests::test_pyopenssl_redirect",
+                    "signature": "ssl-10053-server-handshake-timeout",
+                }
+            ],
+        ),
+        (
+            "read",
+            [
+                {
+                    "nodeid": "tests/test_requests.py::TestRequests::test_pyopenssl_redirect",
+                    "signature": "remote-disconnected-server-requestline-timeout",
+                }
+            ],
+        ),
+    ):
+        write_windows_junit_fixture(path, signature)
+        result = classify_windows_issue1(path, int(signature is not None))
+        assert result == {"tests": 3, "skipped": 0, "accepted_failures": expected}
+        if signature:
+            tree = ET.parse(path)
+            cases = tree.findall(".//testcase")
+            cases[0].set("name", "test_auth_is_stripped_on_http_downgrade")
+            cases[1].set("name", "test_pyopenssl_redirect")
+            tree.write(path)
+            assert (
+                classify_windows_issue1(path, 1)["accepted_failures"][0]["nodeid"]
+                == "tests/test_requests.py::TestRequests::test_auth_is_stripped_on_http_downgrade"
+            )
+
+
+def test_windows_issue1_classifies_real_pytest_junit(tmp_path: Path) -> None:
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "__init__.py").touch()
+    junit = tmp_path / "upstream.xml"
+    environment = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+    for exception, message, output, signature in (
+        (
+            "SSLError",
+            "TLS configuration or handshake failed: (os error 10053)",
+            "pytest-httpbin server hit an exception serving request: _ssl.c:993: The handshake operation timed out",
+            "ssl-10053-server-handshake-timeout",
+        ),
+        (
+            "ConnectionError",
+            "RemoteDisconnected('Remote end closed connection without response')",
+            "self.raw_requestline = self.rfile.readline()\nself._sslobj.read(len, buffer)\nTimeoutError: The read operation timed out",
+            "remote-disconnected-server-requestline-timeout",
+        ),
+    ):
+        (tests / "test_requests.py").write_text(
+            f"Failure = type({exception!r}, (Exception,), {{'__module__': 'requests.exceptions'}})\n"
+            "class TestRequests:\n"
+            "    def test_pyopenssl_redirect(self):\n"
+            f"        print({output!r})\n"
+            f"        raise Failure({message!r})\n"
+            "    def test_auth_is_stripped_on_http_downgrade(self):\n"
+            "        pass\n",
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests",
+                f"--junitxml={junit}",
+                "-o",
+                "junit_logging=all",
+                "-o",
+                "junit_log_passing_tests=false",
+            ],
+            cwd=tmp_path,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert completed.returncode == 1, completed.stdout + completed.stderr
+        assert classify_windows_issue1(junit, completed.returncode) == {
+            "tests": 2,
+            "skipped": 0,
+            "accepted_failures": [
+                {
+                    "nodeid": "tests/test_requests.py::TestRequests::test_pyopenssl_redirect",
+                    "signature": signature,
+                }
+            ],
+        }
+
+
+def test_windows_issue1_rejects_unrelated_or_incomplete_junit(tmp_path: Path) -> None:
+    path = tmp_path / "upstream.xml"
+    for mutation in (
+        "unknown",
+        "assertion",
+        "setup",
+        "teardown",
+        "missing-server",
+        "mixed",
+        "skipped",
+        "duplicate",
+        "missing-node",
+        "counts",
+        "empty",
+    ):
+        write_windows_junit_fixture(path, "read")
+        tree = ET.parse(path)
+        suite = tree.getroot()[0]
+        cases = list(suite)
+        failure = cases[0].find("failure")
+        assert failure is not None
+        if mutation == "unknown":
+            cases[0].set("name", "test_unrelated")
+        elif mutation == "assertion":
+            failure.set("message", "AssertionError: " + failure.get("message", ""))
+        elif mutation in {"setup", "teardown"}:
+            failure.tag = "error"
+            failure.set("message", f"failed on {mutation}")
+        elif mutation == "missing-server":
+            cases[0].remove(cases[0].find("system-out"))
+        elif mutation == "mixed":
+            ET.SubElement(cases[2], "failure", message="AssertionError")
+            suite.set("failures", "2")
+        elif mutation == "skipped":
+            ET.SubElement(cases[1], "skipped")
+            suite.set("skipped", "1")
+        elif mutation == "duplicate":
+            suite.append(copy.deepcopy(cases[0]))
+            suite.set("tests", "4")
+            suite.set("failures", "2")
+        elif mutation == "missing-node":
+            suite.remove(cases[1])
+            suite.set("tests", "2")
+        elif mutation == "counts":
+            suite.set("tests", "999")
+        else:
+            suite.clear()
+        tree.write(path)
+        with unittest.TestCase().assertRaises(ValueError, msg=mutation):
+            classify_windows_issue1(path, 1)
+    for content in ("", "<invalid", "<testsuites />"):
+        path.write_text(content)
+        with unittest.TestCase().assertRaises(ValueError):
+            classify_windows_issue1(path, 1)
+    path.unlink()
+    with unittest.TestCase().assertRaises(ValueError):
+        classify_windows_issue1(path, 1)
+    write_windows_junit_fixture(path, "read")
+    for code in (0, 2, 3, 4, 5, -9):
+        with unittest.TestCase().assertRaises(ValueError):
+            classify_windows_issue1(path, code)
+    write_windows_junit_fixture(path)
+    with unittest.TestCase().assertRaises(ValueError):
+        classify_windows_issue1(path, 1)
+
+
+def test_windows_issue1_suite_runs_remaining_groups_and_reports_only_success(
+    monkeypatch, tmp_path: Path
+) -> None:
+    wheel = tmp_path / f"{ARTIFACT_STEM}-cp312-cp312-win_amd64.whl"
+    wheel.write_bytes(b"wheel-under-test")
+    report_path = tmp_path / "windows-validation.json"
+    monkeypatch.setitem(globals(), "run_installed_smoke", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        globals(), "_target_site_packages", lambda python: str(tmp_path)
+    )
+    monkeypatch.setitem(globals(), "_target_is_free_threaded", lambda python: False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    for outcome in (
+        "accepted",
+        "allpass",
+        "later-failure",
+        "timeout",
+        "exit2",
+        "strict",
+    ):
+        commands = []
+        if report_path.exists():
+            report_path.unlink()
+        xml_path = tmp_path / "windows-upstream.xml"
+        if xml_path.exists():
+            xml_path.unlink()
+
+        def run(command, **kwargs):
+            commands.append(command)
+            assert not report_path.exists()
+            if len(commands) == 1:
+                assert command[:5] == ["python", "-m", "pytest", "-q", "tests"]
+                assert not any(
+                    flag in command for flag in ("-x", "--lf", "--ff", "--last-failed")
+                )
+                if outcome == "strict":
+                    assert kwargs["check"] is True
+                    assert not any(item.startswith("--junitxml=") for item in command)
+                    raise subprocess.CalledProcessError(1, command)
+                assert kwargs["check"] is False
+                junit = Path(
+                    next(
+                        item.split("=", 1)[1]
+                        for item in command
+                        if item.startswith("--junitxml=")
+                    )
+                )
+                write_windows_junit_fixture(
+                    junit, None if outcome == "allpass" else "read"
+                )
+                if outcome == "timeout":
+                    raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                return subprocess.CompletedProcess(
+                    command, 2 if outcome == "exit2" else int(outcome != "allpass")
+                )
+            assert kwargs["check"] is True
+            if outcome == "later-failure":
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0)
+
+        monkeypatch.setattr(subprocess, "run", run)
+        options = (
+            {}
+            if outcome == "strict"
+            else {"accept_windows_issue1_wheel": wheel, "source_commit": "a" * 40}
+        )
+        if outcome in {"accepted", "allpass"}:
+            run_installed_suite(Path("python"), tmp_path / "oracle", ROOT, **options)
+            assert len(commands) == 5
+            report = json.loads(report_path.read_text())
+            assert report["status"] == (
+                "passed" if outcome == "allpass" else "accepted-failures"
+            )
+            assert report["remaining_groups_passed"] == 4
+            assert report["source_commit"] == "a" * 40
+            assert (
+                report["wheel_sha256"]
+                == hashlib.sha256(b"wheel-under-test").hexdigest()
+            )
+            assert (
+                report["issue"]
+                == "https://github.com/puneet-chandna/requests-native/issues/1"
+            )
+            assert len(report["accepted_failures"]) == int(outcome != "allpass")
+        else:
+            with unittest.TestCase().assertRaises(
+                (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError)
+            ):
+                run_installed_suite(
+                    Path("python"), tmp_path / "oracle", ROOT, **options
+                )
+            assert not report_path.exists()
+            assert len(commands) == (2 if outcome == "later-failure" else 1)
+            if outcome != "strict":
+                assert xml_path.exists()
+
+
+def test_windows_issue1_optin_rejects_nonwindows_and_missing_provenance(
+    monkeypatch, tmp_path: Path
+) -> None:
+    wheel = tmp_path / f"{ARTIFACT_STEM}-cp312-cp312-win_amd64.whl"
+    wheel.touch()
+    monkeypatch.setattr(sys, "platform", "linux")
+    with unittest.TestCase().assertRaisesRegex(ValueError, "Windows"):
+        run_installed_suite(
+            Path("python"),
+            tmp_path,
+            ROOT,
+            accept_windows_issue1_wheel=wheel,
+            source_commit="a" * 40,
+        )
+    monkeypatch.setattr(sys, "platform", "win32")
+    with unittest.TestCase().assertRaisesRegex(ValueError, "source commit"):
+        run_installed_suite(
+            Path("python"), tmp_path, ROOT, accept_windows_issue1_wheel=wheel
+        )
+    linux = tmp_path / f"{ARTIFACT_STEM}-cp312-cp312-manylinux_2_34_x86_64.whl"
+    linux.touch()
+    with unittest.TestCase().assertRaisesRegex(ValueError, "Windows"):
+        run_installed_suite(
+            Path("python"),
+            tmp_path,
+            ROOT,
+            accept_windows_issue1_wheel=linux,
+            source_commit="a" * 40,
+        )
+
+
+def test_windows_issue1_cli_is_an_explicit_installed_suite_only_optin(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls = []
+    monkeypatch.setitem(
+        globals(),
+        "run_installed_suite",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    wheel = tmp_path / "candidate.whl"
+    command = [
+        "test_distribution.py",
+        "--installed-suite",
+        "python",
+        "--oracle",
+        str(tmp_path),
+        "--accept-windows-tls-issue-1",
+        str(wheel),
+        "--source-commit",
+        "a" * 40,
+    ]
+    monkeypatch.setattr(sys, "argv", command)
+    assert main() == 0
+    assert calls[0][1] == {
+        "accept_windows_issue1_wheel": wheel,
+        "source_commit": "a" * 40,
+    }
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "test_distribution.py",
+            "--verify-wheel",
+            str(wheel),
+            "--accept-windows-tls-issue-1",
+            str(wheel),
+            "--source-commit",
+            "a" * 40,
+        ],
+    )
+    with unittest.TestCase().assertRaises(SystemExit) as error:
+        main()
+    assert error.exception.code == 2
+    assert len(calls) == 1
 
 
 def test_installed_suite_isolates_mutating_test_groups(
@@ -2241,7 +2630,134 @@ def _target_is_free_threaded(python: Path) -> bool:
     return completed.stdout.strip() == "1"
 
 
-def run_installed_suite(python: Path, oracle: Path, checkout: Path) -> None:
+def classify_windows_issue1(path: Path, returncode: int) -> dict:
+    """Accept only the recorded issue-1 call failures, never pytest errors."""
+    if type(returncode) is not int or returncode not in (0, 1):
+        raise ValueError("Windows upstream pytest did not finish normally")
+    try:
+        xml = path.read_text(encoding="utf-8")
+        if len(xml) > 16 * 1024 * 1024 or "<!DOCTYPE" in xml or "<!ENTITY" in xml:
+            raise ValueError("unsupported Windows upstream JUnit")
+        root = ET.fromstring(xml)
+    except (OSError, UnicodeError, ET.ParseError) as error:
+        raise ValueError("missing or malformed Windows upstream JUnit") from error
+    if root.tag != "testsuites" or len(root) != 1 or root[0].tag != "testsuite":
+        raise ValueError("expected one Windows upstream JUnit suite")
+    suite = root[0]
+    cases = list(suite)
+    if not cases or any(case.tag != "testcase" for case in cases):
+        raise ValueError("missing or unexpected Windows upstream JUnit cases")
+    accepted = []
+    seen = set()
+    skipped = 0
+    for case in cases:
+        classname, name = case.get("classname", ""), case.get("name", "")
+        key = (classname, name)
+        if not all(key) or key in seen:
+            raise ValueError("missing or duplicate Windows upstream test identity")
+        seen.add(key)
+        nodeid = (
+            f"tests/test_requests.py::TestRequests::{name}"
+            if classname == "tests.test_requests.TestRequests"
+            else ""
+        )
+        if any(
+            child.tag not in {"failure", "skipped", "system-out", "system-err"}
+            for child in case
+        ):
+            raise ValueError("Windows upstream setup, teardown, or collection error")
+        failures, skips = case.findall("failure"), case.findall("skipped")
+        if len(failures) + len(skips) > 1:
+            raise ValueError("multiple Windows upstream test outcomes")
+        if skips:
+            if nodeid in WINDOWS_ISSUE1_NODES:
+                raise ValueError("issue-1 test was skipped, not exercised")
+            skipped += 1
+        if not failures:
+            continue
+        if nodeid not in WINDOWS_ISSUE1_NODES:
+            raise ValueError("unrelated Windows upstream failure")
+        failure = failures[0]
+        message = failure.get("message", "")
+        traceback = failure.text or ""
+        output = "\n".join(
+            child.text or ""
+            for child in case
+            if child.tag in {"system-out", "system-err"}
+        )
+        if (
+            message.startswith("requests.exceptions.SSLError:")
+            and "TLS configuration or handshake failed:" in message
+            and "(os error 10053)" in message
+            and re.search(r"(?m)^E\s+requests\.exceptions\.SSLError:", traceback)
+            and re.search(
+                r"pytest-httpbin server hit an exception serving request: _ssl\.c:\d+: The handshake operation timed out",
+                output,
+            )
+        ):
+            signature = "ssl-10053-server-handshake-timeout"
+        elif (
+            message.startswith("requests.exceptions.ConnectionError:")
+            and "RemoteDisconnected('Remote end closed connection without response')"
+            in message
+            and re.search(r"(?m)^E\s+requests\.exceptions\.ConnectionError:", traceback)
+            and "self.raw_requestline = self.rfile.readline()" in output
+            and "self._sslobj.read(" in output
+            and "TimeoutError: The read operation timed out" in output
+        ):
+            signature = "remote-disconnected-server-requestline-timeout"
+        else:
+            raise ValueError("unrecognized issue-1 failure signature")
+        accepted.append({"nodeid": nodeid, "signature": signature})
+    required = {
+        ("tests.test_requests.TestRequests", node.rsplit("::", 1)[1])
+        for node in WINDOWS_ISSUE1_NODES
+    }
+    if not required <= seen:
+        raise ValueError("issue-1 tests missing from Windows upstream suite")
+    counts = {
+        "tests": len(cases),
+        "errors": 0,
+        "failures": len(accepted),
+        "skipped": skipped,
+    }
+    if any(suite.get(key) != str(value) for key, value in counts.items()):
+        raise ValueError("Windows upstream JUnit count mismatch")
+    if returncode != int(bool(accepted)):
+        raise ValueError("Windows upstream exit status disagrees with JUnit")
+    return {
+        "tests": len(cases),
+        "skipped": skipped,
+        "accepted_failures": sorted(accepted, key=lambda failure: failure["nodeid"]),
+    }
+
+
+def run_installed_suite(
+    python: Path,
+    oracle: Path,
+    checkout: Path,
+    *,
+    accept_windows_issue1_wheel: Path | None = None,
+    source_commit: str | None = None,
+) -> None:
+    wheel = accept_windows_issue1_wheel
+    if wheel is not None:
+        if sys.platform != "win32" or wheel_key(wheel)[1] != "windows-latest":
+            raise ValueError("issue-1 opt-in requires a Windows runner and wheel")
+        if not isinstance(source_commit, str) or not re.fullmatch(
+            r"[0-9a-f]{40}", source_commit
+        ):
+            raise ValueError("issue-1 opt-in requires an exact source commit")
+        wheel = wheel.resolve(strict=True)
+        junit_path, report_path = (
+            wheel.parent / WINDOWS_JUNIT,
+            wheel.parent / WINDOWS_REPORT,
+        )
+        if junit_path.exists() or report_path.exists():
+            raise ValueError(
+                "Windows validation evidence already exists; use a fresh build directory"
+            )
+        wheel_digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     run_installed_smoke(python, editable=False, checkout=checkout)
     environment = _clean_environment()
     environment.update(
@@ -2285,13 +2801,47 @@ def run_installed_suite(python: Path, oracle: Path, checkout: Path) -> None:
                 "tests_differential/test_adapters.py::test_native_stream_argument_conversion_keeps_defaults_and_errors",
             ),
         )
-        for group in groups:
-            subprocess.run(
-                [str(python), "-m", "pytest", "-q", *group],
+        for index, group in enumerate(groups):
+            command = [str(python), "-m", "pytest", "-q", *group]
+            accepted_upstream = wheel is not None and index == 0
+            if accepted_upstream:
+                command += [
+                    f"--junitxml={junit_path}",
+                    "-o",
+                    "junit_logging=all",
+                    "-o",
+                    "junit_log_passing_tests=false",
+                ]
+            completed = subprocess.run(
+                command,
                 cwd=suite,
                 env=environment,
-                check=True,
+                check=not accepted_upstream,
                 timeout=900,
+            )
+            if accepted_upstream:
+                upstream = classify_windows_issue1(junit_path, completed.returncode)
+                upstream_returncode = completed.returncode
+        if wheel is not None:
+            if hashlib.sha256(wheel.read_bytes()).hexdigest() != wheel_digest:
+                raise ValueError("Windows wheel changed during validation")
+            report = {
+                "schema": 1,
+                "issue": WINDOWS_ISSUE1_URL,
+                "source_commit": source_commit,
+                "wheel_filename": wheel.name,
+                "wheel_sha256": wheel_digest,
+                "junit_filename": WINDOWS_JUNIT,
+                "junit_sha256": hashlib.sha256(junit_path.read_bytes()).hexdigest(),
+                "upstream_returncode": upstream_returncode,
+                "remaining_groups_passed": len(groups) - 1,
+                "status": "accepted-failures"
+                if upstream["accepted_failures"]
+                else "passed",
+                **upstream,
+            }
+            report_path.write_text(
+                json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
             )
 
 
@@ -2439,7 +2989,98 @@ def compatibility_smoke(kind: str, backend: str) -> None:
         worker.join(5)
 
 
-def verify_manifest(directory: Path) -> dict[str, str]:
+def validate_windows_summary(
+    report: object, wheel: Path, source_commit: str | None
+) -> None:
+    fields = {
+        "schema",
+        "issue",
+        "source_commit",
+        "wheel_filename",
+        "wheel_sha256",
+        "junit_filename",
+        "junit_sha256",
+        "upstream_returncode",
+        "remaining_groups_passed",
+        "status",
+        "tests",
+        "skipped",
+        "accepted_failures",
+    }
+    if not isinstance(report, dict) or set(report) != fields:
+        raise ValueError("unexpected Windows validation report fields")
+    if (
+        type(report["schema"]) is not int
+        or report["schema"] != 1
+        or report["issue"] != WINDOWS_ISSUE1_URL
+        or report["junit_filename"] != WINDOWS_JUNIT
+        or type(report["remaining_groups_passed"]) is not int
+        or report["remaining_groups_passed"] != 4
+    ):
+        raise ValueError("invalid Windows validation policy or incomplete groups")
+    for field, length in (
+        ("source_commit", 40),
+        ("wheel_sha256", 64),
+        ("junit_sha256", 64),
+    ):
+        if not isinstance(report[field], str) or not re.fullmatch(
+            rf"[0-9a-f]{{{length}}}", report[field]
+        ):
+            raise ValueError(f"invalid Windows validation {field}")
+    if source_commit is not None and report["source_commit"] != source_commit.lower():
+        raise ValueError("Windows validation source commit mismatch")
+    if (
+        report["wheel_filename"] != wheel.name
+        or report["wheel_sha256"] != hashlib.sha256(wheel.read_bytes()).hexdigest()
+    ):
+        raise ValueError("Windows validation wheel binding mismatch")
+    failures = report["accepted_failures"]
+    if not isinstance(failures, list):
+        raise ValueError("invalid Windows accepted failure list")
+    nodes = []
+    for failure in failures:
+        if (
+            not isinstance(failure, dict)
+            or set(failure) != {"nodeid", "signature"}
+            or not isinstance(failure["nodeid"], str)
+            or failure["nodeid"] not in WINDOWS_ISSUE1_NODES
+            or not isinstance(failure["signature"], str)
+            or failure["signature"] not in WINDOWS_ISSUE1_SIGNATURES
+        ):
+            raise ValueError("unrecognized Windows accepted failure")
+        nodes.append(failure["nodeid"])
+    if nodes != sorted(set(nodes)):
+        raise ValueError("duplicate or unordered Windows accepted failures")
+    if (
+        type(report["tests"]) is not int
+        or report["tests"] < 2
+        or type(report["skipped"]) is not int
+        or not 0 <= report["skipped"] <= report["tests"] - 2
+        or type(report["upstream_returncode"]) is not int
+        or report["upstream_returncode"] != int(bool(failures))
+        or report["status"] != ("accepted-failures" if failures else "passed")
+    ):
+        raise ValueError("invalid Windows validation counts or status")
+
+
+def verify_windows_report(wheel: Path, source_commit: str | None = None) -> dict:
+    try:
+        report = json.loads((wheel.parent / WINDOWS_REPORT).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError("missing or malformed Windows validation report") from error
+    validate_windows_summary(report, wheel, source_commit)
+    junit = wheel.parent / WINDOWS_JUNIT
+    upstream = classify_windows_issue1(junit, report["upstream_returncode"])
+    if report["junit_sha256"] != hashlib.sha256(junit.read_bytes()).hexdigest():
+        raise ValueError("Windows validation JUnit hash mismatch")
+    if any(report[field] != value for field, value in upstream.items()):
+        raise ValueError("Windows validation summary disagrees with JUnit")
+    return report
+
+
+def verify_manifest(
+    directory: Path, source_commit: str | None = None
+) -> dict[str, str]:
     wheels = sorted(directory.rglob("requests_native-*.whl"))
     sdists = sorted(directory.rglob("requests_native-*.tar.gz"))
     evidence = sorted(directory.rglob("free-threaded-evidence-*.json"))
@@ -2456,8 +3097,6 @@ def verify_manifest(directory: Path) -> dict[str, str]:
             "free-threaded evidence matrix mismatch: "
             f"found={sorted(path.name for path in evidence)!r}"
         )
-    if files != {*wheels, *sdists, *evidence}:
-        raise ValueError("unexpected release artifact")
     for path in evidence:
         free_threaded = json.loads(path.read_text())
         if (
@@ -2483,6 +3122,20 @@ def verify_manifest(directory: Path) -> dict[str, str]:
         raise ValueError(
             f"wheel matrix mismatch: missing={sorted(missing)!r} unexpected={sorted(unexpected)!r}"
         )
+    windows = [wheel for wheel in wheels if wheel_key(wheel)[1] == "windows-latest"]
+    reports = {wheel.parent / WINDOWS_REPORT for wheel in windows}
+    junit = {wheel.parent / WINDOWS_JUNIT for wheel in windows}
+    if (
+        set(directory.rglob(WINDOWS_REPORT)) != reports
+        or set(directory.rglob(WINDOWS_JUNIT)) != junit
+    ):
+        raise ValueError("Windows validation evidence matrix mismatch")
+    if len(reports) != len(windows) or len(junit) != len(windows):
+        raise ValueError("Windows validation evidence must belong to one wheel")
+    if files != {*wheels, *sdists, *evidence, *reports, *junit}:
+        raise ValueError("unexpected release artifact")
+    for wheel in windows:
+        verify_windows_report(wheel, source_commit)
     artifacts = [sdists[0], *wheels]
     return {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in artifacts
@@ -2501,7 +3154,7 @@ def build_publish_manifest(
     if matrix_result not in {"success", "failure", "cancelled", "skipped", "local"}:
         raise ValueError(f"unexpected matrix result: {matrix_result}")
 
-    hashes = verify_manifest(directory)
+    hashes = verify_manifest(directory, source_commit)
     paths = {
         path.name: path
         for path in directory.rglob("requests_native-*")
@@ -2545,6 +3198,10 @@ def build_publish_manifest(
                 "source_artifact": source_artifact,
             }
         )
+        if filename.endswith(".whl") and wheel_key(path)[1] == "windows-latest":
+            manifest_artifacts[-1]["windows_validation"] = verify_windows_report(
+                path, source_commit
+            )
     return {
         "artifacts": manifest_artifacts,
         "matrix_result": matrix_result,
@@ -2609,13 +3266,22 @@ def verify_release_set(
         raise ValueError("release manifest archive inventory mismatch")
     for path in archives:
         record = records_by_name[path.name]
-        if set(record) != {
+        expected_fields = {
             "filename",
             "github_archive_digest",
             "github_artifact_id",
             "sha256",
             "source_artifact",
-        }:
+        }
+        if path.suffix == ".whl" and wheel_key(path)[1] == "windows-latest":
+            expected_fields.add("windows_validation")
+            validate_windows_summary(
+                record.get("windows_validation"), path, source_commit
+            )
+            python, system = wheel_key(path)
+            if record["source_artifact"] != f"wheel-{python}-{system}":
+                raise ValueError("Windows validation source artifact mismatch")
+        if set(record) != expected_fields:
             raise ValueError(f"unexpected manifest record fields: {path.name}")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if record["sha256"] != digest:
@@ -2650,11 +3316,95 @@ def write_complete_manifest_fixture(directory: Path) -> None:
         }[system]
         artifact = directory / f"wheel-{python}-{system}"
         artifact.mkdir()
-        (artifact / f"{ARTIFACT_STEM}-{python_tag}-{platform}.whl").touch()
+        wheel = artifact / f"{ARTIFACT_STEM}-{python_tag}-{platform}.whl"
+        wheel.touch()
+        if system == "windows-latest":
+            write_windows_validation_fixture(wheel)
         if python == "3.14t":
             (artifact / f"free-threaded-evidence-{system}.json").write_text(
                 '{"Py_GIL_DISABLED": 1, "after_import": true, "before_import": false}\n'
             )
+
+
+def write_windows_validation_fixture(wheel: Path, signature: str | None = None) -> dict:
+    junit = wheel.parent / "windows-upstream.xml"
+    write_windows_junit_fixture(junit, signature)
+    report = {
+        "schema": 1,
+        "issue": "https://github.com/puneet-chandna/requests-native/issues/1",
+        "source_commit": "a" * 40,
+        "wheel_filename": wheel.name,
+        "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        "junit_filename": "windows-upstream.xml",
+        "junit_sha256": hashlib.sha256(junit.read_bytes()).hexdigest(),
+        "upstream_returncode": int(signature is not None),
+        "remaining_groups_passed": 4,
+        "status": "accepted-failures" if signature else "passed",
+        "tests": 3,
+        "skipped": 0,
+        "accepted_failures": [
+            {
+                "nodeid": "tests/test_requests.py::TestRequests::test_pyopenssl_redirect",
+                "signature": "remote-disconnected-server-requestline-timeout",
+            }
+        ]
+        if signature
+        else [],
+    }
+    (wheel.parent / "windows-validation.json").write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+    return report
+
+
+def test_windows_issue1_manifest_requires_bound_and_recomputed_evidence(
+    tmp_path: Path,
+) -> None:
+    write_complete_manifest_fixture(tmp_path)
+    wheel = next(tmp_path.rglob("*cp312-cp312-win_amd64.whl"))
+    expected = write_windows_validation_fixture(wheel, "read")
+    manifest = build_publish_manifest(
+        tmp_path, source_commit="a" * 40, matrix_result="success"
+    )
+    record = next(
+        item for item in manifest["artifacts"] if item["filename"] == wheel.name
+    )
+    assert record["windows_validation"] == expected
+    assert sum("windows_validation" in item for item in manifest["artifacts"]) == 7
+    report_path = wheel.parent / "windows-validation.json"
+    for field, value in (
+        ("source_commit", "b" * 40),
+        ("wheel_filename", "other.whl"),
+        ("wheel_sha256", "b" * 64),
+        ("junit_sha256", "b" * 64),
+        ("status", "passed"),
+        ("accepted_failures", []),
+        ("remaining_groups_passed", 3),
+        ("tests", 999),
+        ("unknown", "runner private path"),
+    ):
+        report = {**expected, field: value}
+        report_path.write_text(json.dumps(report))
+        with unittest.TestCase().assertRaises(ValueError, msg=field):
+            build_publish_manifest(
+                tmp_path, source_commit="a" * 40, matrix_result="success"
+            )
+    report_path.unlink()
+    with unittest.TestCase().assertRaisesRegex(ValueError, "Windows validation"):
+        verify_manifest(tmp_path)
+    report_path.write_text("not-json")
+    with unittest.TestCase().assertRaises(ValueError):
+        verify_manifest(tmp_path)
+    report_path.write_text(json.dumps(expected))
+    junit = wheel.parent / "windows-upstream.xml"
+    junit.unlink()
+    with unittest.TestCase().assertRaises(ValueError):
+        verify_manifest(tmp_path)
+    write_windows_junit_fixture(junit)
+    expected["junit_sha256"] = hashlib.sha256(junit.read_bytes()).hexdigest()
+    report_path.write_text(json.dumps(expected))
+    with unittest.TestCase().assertRaises(ValueError):
+        verify_manifest(tmp_path)
 
 
 def github_metadata_for(directory: Path) -> dict:
@@ -2770,6 +3520,45 @@ def test_release_set_verifies_one_manifest_and_all_24_archives(
     monkeypatch.setitem(globals(), "verify_sdist", lambda *args: None)
 
     verify_release_set(release, manifest_path, source_commit)
+
+    windows = next(
+        item for item in manifest["artifacts"] if "windows_validation" in item
+    )
+    for mutation in (
+        "missing",
+        "source",
+        "hash",
+        "status",
+        "signature",
+        "extra",
+        "artifact",
+    ):
+        invalid = copy.deepcopy(manifest)
+        record = next(
+            item
+            for item in invalid["artifacts"]
+            if item["filename"] == windows["filename"]
+        )
+        if mutation == "missing":
+            del record["windows_validation"]
+        elif mutation == "source":
+            record["windows_validation"]["source_commit"] = "b" * 40
+        elif mutation == "hash":
+            record["windows_validation"]["wheel_sha256"] = "b" * 64
+        elif mutation == "status":
+            record["windows_validation"]["status"] = "accepted-failures"
+        elif mutation == "signature":
+            record["windows_validation"]["accepted_failures"] = [
+                {"nodeid": "unrelated", "signature": "unknown"}
+            ]
+        elif mutation == "artifact":
+            record["source_artifact"] = "wheel-other"
+        else:
+            record["windows_validation"]["private_path"] = "/private/runner/path"
+        manifest_path.write_text(json.dumps(invalid))
+        with unittest.TestCase().assertRaises(ValueError, msg=mutation):
+            verify_release_set(release, manifest_path, source_commit)
+    manifest_path.write_text(json.dumps(manifest))
 
     (release / "unexpected.txt").touch()
     with unittest.TestCase().assertRaisesRegex(ValueError, "exactly 23 wheels"):
@@ -2898,11 +3687,28 @@ def main() -> int:
     parser.add_argument("--verify-sdist", type=Path)
     parser.add_argument("--installed-smoke", type=Path)
     parser.add_argument("--installed-suite", type=Path)
+    parser.add_argument("--accept-windows-tls-issue-1", type=Path, metavar="WHEEL")
     parser.add_argument("--oracle", type=Path)
     parser.add_argument("--compatibility-smoke", choices=["no-detector", "urllib3-1"])
     parser.add_argument("--backend", choices=["default", "trial"])
     parser.add_argument("checkout", nargs="?", type=Path, default=ROOT)
     arguments = parser.parse_args()
+    if arguments.accept_windows_tls_issue_1 is not None and (
+        arguments.installed_suite is None
+        or any(
+            (
+                arguments.verify_manifest,
+                arguments.verify_release_set,
+                arguments.verify_wheel,
+                arguments.verify_sdist,
+                arguments.installed_smoke,
+                arguments.compatibility_smoke,
+            )
+        )
+    ):
+        parser.error(
+            "--accept-windows-tls-issue-1 requires only --installed-suite mode"
+        )
     if arguments.verify_manifest:
         if arguments.source_commit is None or arguments.matrix_result is None:
             parser.error(
@@ -2958,6 +3764,8 @@ def main() -> int:
             arguments.installed_suite,
             arguments.oracle,
             arguments.checkout.resolve(),
+            accept_windows_issue1_wheel=arguments.accept_windows_tls_issue_1,
+            source_commit=arguments.source_commit,
         )
         return 0
     if arguments.compatibility_smoke and arguments.backend:

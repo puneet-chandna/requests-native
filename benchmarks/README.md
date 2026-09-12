@@ -8,6 +8,23 @@ authorize compatibility changes.
 The checked-in 20260902 result predates the Requests Native rename; its
 ``requests-rust`` backend label is preserved as historical evidence.
 
+The [September 13, 2026 local-date result](results/20260913-local-default.json)
+contains 64 rows, 16 per surface, from the bounded default profile. Median
+throughput was 504.905 requests/s for the frozen Python oracle, 23.859 for the
+Rust-backed Python API, 3,172.514 for native Rust async, and 2,531.828 for native
+Rust blocking. Python/Rust was slower in this run; this is not an overall
+speedup claim.
+
+The recorded source is `2a15969` with documentation/test changes in progress,
+not a clean immutable release candidate. Runtime/build inputs were unchanged;
+the extension and native driver were rebuilt in release mode offline. The
+oracle's documentation commit differs from its frozen behavioral commit, but
+its Python source, tests, and package manifests match the frozen baseline.
+Twelve requests per case without warm-up do not predict production performance
+or resolve the Windows TLS issue.
+The public result normalizes its output destination to `{benchmark-output}`;
+measurement data and build provenance are unchanged.
+
 ## Run
 
 Use the rewrite virtual environment so the compiled Python extension and the

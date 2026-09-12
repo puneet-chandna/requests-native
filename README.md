@@ -9,9 +9,12 @@ Requests Native is an unofficial, independent Rust rewrite of
 `import requests` Python API and separate async and blocking Rust clients.
 The compatibility target is Requests 2.34.2.
 
-**Beta:** platform qualification is incomplete, including an unresolved
-Windows TLS test failure. Test your workload before replacing a production
-Requests installation. The project is not published to PyPI or crates.io.
+**Beta:** [known issue #1: intermittent Windows TLS failures](https://github.com/puneet-chandna/requests-native/issues/1)
+is accepted for this beta, not fixed. HTTPS tests have failed with timeouts or
+connection errors, including during redirects; the cause, failure rate, and
+production impact are unknown. Platform qualification is incomplete. Test your
+workload before replacing production Requests. The project is not published
+to PyPI or crates.io.
 
 ## Python
 
@@ -120,32 +123,38 @@ dynamic behavior can require Python authority. Those requests fall back before
 native I/O begins.
 
 This is not a pure Rust replacement of every Python code path. Strict
-compatibility remains the goal; the final platform and distribution checks are
-still open. See [the architecture and porting guide](PORTING.md) and
+compatibility remains the goal. The Windows TLS issue is a disclosed beta
+qualification exception, not proof of parity or a change to that goal; all
+unrelated failures remain blockers. Published beta artifacts must carry an
+exact-commit validation manifest recording any accepted Windows failures.
+See [the architecture and porting guide](PORTING.md) and
 [compatibility inventory](API_COMPATIBILITY.tsv) for the boundaries.
 
 ## Current performance evidence
 
-The historical September 2, 2026 Linux loopback run measured the following
+The September 13, 2026 (local date) Linux loopback run measured the following
 median throughput across 16 rows per surface:
 
 | Surface | Median requests/s |
 | --- | ---: |
-| Frozen Python Requests oracle | 672.374 |
-| Rust-backed Python API | 23.931 |
-| Native Rust async API | 3,052.193 |
-| Native Rust blocking API | 2,616.302 |
+| Frozen Python Requests oracle | 504.905 |
+| Rust-backed Python API | 23.859 |
+| Native Rust async API | 3,172.514 |
+| Native Rust blocking API | 2,531.828 |
 
 The Rust-backed Python API was slower than the frozen Python oracle in this
-run. The native Rust APIs were faster. These measurements predate the current
-release candidate and do not establish performance for your workload.
+run. The native Rust APIs were faster. The run used commit `2a15969` with
+non-runtime documentation/test changes in progress, not an immutable release
+candidate. It does not establish performance for your workload.
 
 The harness compares one-shot and pooled clients, buffered and streaming
 reads, two body sizes, and serial and concurrent requests against the same
 HTTP/1.1 loopback server. The default run uses only twelve requests per case,
 without warm-up. Performance has no required target and does not override
 compatibility. See the [method and limitations](benchmarks/README.md) and
-[raw result](benchmarks/results/20260902-local-default.json).
+[raw result](benchmarks/results/20260913-local-default.json). The
+[September 2 result](benchmarks/results/20260902-local-default.json) remains
+available as historical evidence.
 
 ## Names and versions
 

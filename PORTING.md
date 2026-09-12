@@ -15,28 +15,44 @@ workflow reported success, but later cross-platform inspection found that all
 seven Windows wheels contained CRLF-normalized `LICENSE` and `NOTICE` bytes and
 the per-runner verifier compared against the normalized checkout. The current
 source forces LF for both legal files and verifies every archive against its
-source-commit Git blobs on one LF runner, but that corrected contract has not
-yet been rerun across the full matrix. The prior artifact set is therefore
-qualified evidence, not release-ready evidence.
+source-commit Git blobs on one LF runner. The prior artifact set is qualified
+historical evidence, not evidence for a current release set.
 
-The latest source checks passed, but the subsequent artifact run was incomplete.
-Windows 3.10 failed a TLS handshake test; the other unfinished platform checks
-remain open. Inspection also found locale-dependent author text in two Windows
+A later artifact run was incomplete despite passing source checks.
+Windows 3.10 failed a TLS handshake test. Inspection also found
+locale-dependent author text in two Windows
 wheel SBOMs. The metadata decoder now uses UTF-8 explicitly, but corrected
-artifacts still need complete platform qualification.
+artifacts require their own exact-commit qualification.
+
+[Known issue #1](https://github.com/puneet-chandna/requests-native/issues/1)
+tracks intermittent Windows TLS failures accepted for `v1.0.0-beta`, including
+Windows wheels. This is a narrow beta qualification exception, not a runtime
+fix or a change to the strict Requests compatibility goal. All unrelated
+failures remain blockers. Published beta artifacts must include an exact-commit
+validation manifest recording accepted Windows failures; this is not a claim
+of complete parity.
+
+In the latest controlled Windows CPython 3.12 comparison, the old debug, old
+release, and current debug full suites passed; current release failed
+`test_pyopenssl_redirect` with `ConnectionError` / `RemoteDisconnected` and a
+server request-line read timeout after the server's TLS handshake. Earlier
+qualification also observed an initial-handshake timeout / Windows error
+10053. A shared cause, failure rate, and production impact remain unknown.
+One full-suite exposure per source/profile does not establish causation.
 
 Exact pristine built-in `Session` and `HTTPAdapter` traffic uses the Rust
 backend by default. Unsupported, subclassed, custom, and dynamically mutated
 surfaces retain Python authority. The API ledger still has exactly three
 `IN_PROGRESS` cross-cutting rows: `platform matrix`, `distribution surface`, and
-`default backend`. They remain open until the final immutable release candidate
-passes the reusable and manually dispatched release-validation gate with
-canonical legal bytes and receives its recorded review. This is not a claim
-that the entire port is complete or releasable.
+`default backend`. They remain open for strict completion; the disclosed beta
+exception does not close them. Beta artifacts require the reusable and manually
+dispatched release-validation gate with canonical legal bytes, recorded
+exceptions, and review. This is not a claim that the entire port is complete.
 
 The dependency-free loopback benchmark covers the frozen Python oracle,
 Rust-backed Python, and native Rust async/blocking surfaces. Its bounded default
-result is in `benchmarks/results/20260902-local-default.json`; measurements have
+result is in `benchmarks/results/20260913-local-default.json`, with the earlier
+September 2 result retained; measurements have
 no numeric acceptance gate and do not change compatibility behavior. Paths in
 the public record use portable repository/oracle placeholders while preserving
 the measured values, toolchain versions, build hashes, and workload details.
@@ -1003,10 +1019,13 @@ it cannot import `src/requests` accidentally.
 Do not claim free-threaded support based on a normal CPython wheel. Do not
 claim PyPy support based on CPython ABI builds.
 
-Free-threaded wheel qualification runs 13 of the 14 import tests. It deselects
-only the rewrite comparison for I04 because importing the extension
-intentionally enables the process-global GIL and changes that case's warning
-and logging observation; the ABI evidence step records this before the suite.
+Free-threaded wheel qualification runs 13 of the 14 import tests. It retains
+the I04 rewrite-comparison exclusion for warning/logging observations; that
+case is not qualified by this gate. The current PyO3 0.29 `#[pymodule]`
+defaults to `gil_used = false`, with no override in the binding, so the
+extension does not declare a GIL requirement. The ABI evidence step records
+actual GIL state before and after import; this is not a guarantee that every
+dependency or workload runs without the GIL.
 
 Preserve the compatibility import surface while keeping release identity
 separate:
