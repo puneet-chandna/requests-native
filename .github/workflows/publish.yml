@@ -3,6 +3,12 @@ name: Validate beta artifacts
 
 on:
   workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: "Existing qualified artifact run; leave empty to build all artifacts"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -13,6 +19,7 @@ concurrency:
 
 jobs:
   sdist:
+    if: ${{ inputs.artifact_run_id == '' }}
     name: Build sdist
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -64,38 +71,66 @@ jobs:
           retention-days: 5
 
   wheels:
+    if: ${{ inputs.artifact_run_id == '' }}
     uses: ./.github/workflows/wheels.yml
 
   manifest:
     name: Validate release artifact manifest
     needs: [sdist, wheels]
+    if: ${{ !cancelled() && (inputs.artifact_run_id != '' || (needs.sdist.result == 'success' && needs.wheels.result == 'success')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       actions: read
       contents: read
     steps:
+      - name: Resolve qualified artifact source
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.artifact_run_id || github.run_id }}
+        shell: bash
+        run: |
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" > "$RUNNER_TEMP/source-run.json"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/jobs?per_page=100" > "$RUNNER_TEMP/source-jobs.json"
+          source_sha=$(jq -er --arg repo "$GITHUB_REPOSITORY" '
+            select(.head_repository.full_name == $repo and .path == ".github/workflows/publish.yml")
+            | .head_sha | select(test("^[0-9a-f]{40}$"))
+          ' "$RUNNER_TEMP/source-run.json")
+          jq -e '[.jobs[] | select(.name == "Build sdist" or (.name | endswith(" / wheel")))]
+            | length == 24 and all(.[]; .conclusion == "success")' "$RUNNER_TEMP/source-jobs.json"
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "run=$SOURCE_RUN" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ steps.source.outputs.sha }}
           persist-credentials: false
+      - name: Prepare locked Rust dependencies
+        run: cargo fetch --locked
       - name: Download sdist
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
           name: sdist
           path: artifacts/sdist
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.source.outputs.run }}
       - name: Download wheel fan-out separately
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
           pattern: wheel-*
           path: artifacts/wheels
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.source.outputs.run }}
       - name: Fetch GitHub artifact metadata
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > artifact-metadata.json
+          SOURCE_RUN: ${{ steps.source.outputs.run }}
+        run: gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/artifacts?per_page=100" > artifact-metadata.json
       - name: Validate exact artifact fan-out
         env:
-          WHEELS_RESULT: ${{ needs.wheels.result }}
-        run: python tests_rust/test_distribution.py --verify-manifest artifacts --source-commit "$GITHUB_SHA" --matrix-result "$WHEELS_RESULT" --artifact-metadata artifact-metadata.json > artifact-manifest.json
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: python tests_rust/test_distribution.py --verify-manifest artifacts --source-commit "$SOURCE_SHA" --matrix-result success --artifact-metadata artifact-metadata.json > artifact-manifest.json
       - name: Assemble complete release set
         shell: bash
         run: |
@@ -104,7 +139,9 @@ jobs:
           find artifacts -type f -name '*.tar.gz' -exec cp '{}' dist/ \;
           cp artifact-manifest.json dist/
       - name: Verify complete release set
-        run: python tests_rust/test_distribution.py --verify-release-set dist --manifest dist/artifact-manifest.json --source-commit "$GITHUB_SHA"
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: python tests_rust/test_distribution.py --verify-release-set dist --manifest dist/artifact-manifest.json --source-commit "$SOURCE_SHA"
       - name: Upload complete release set
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:

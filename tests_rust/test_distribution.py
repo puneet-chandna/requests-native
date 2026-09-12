@@ -1806,6 +1806,48 @@ def test_security_workflows_use_private_repository_safe_reporting() -> None:
     }
 
 
+def test_manifest_prepares_dependencies_and_can_reuse_qualified_artifacts() -> None:
+    workflow = load_workflow("publish.yml")
+    jobs = workflow["jobs"]
+    steps = jobs["manifest"]["steps"]
+    names = [step.get("name") for step in steps]
+    fetch = next(step for step in steps if step.get("run") == "cargo fetch --locked")
+    assert steps.index(fetch) < names.index("Verify complete release set")
+    for job in ("sdist", "wheels"):
+        assert jobs[job]["if"] == "${{ inputs.artifact_run_id == '' }}"
+    assert "!cancelled()" in jobs["manifest"]["if"]
+    source = next(step for step in steps if step.get("id") == "source")
+    assert '[[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]' in source["run"]
+    assert 'length == 24 and all(.[]; .conclusion == "success")' in source["run"]
+    job_filter = re.search(r"jq -e '([^']+)'", source["run"], re.DOTALL).group(1)
+    qualified = [{"name": "Build sdist", "conclusion": "success"}] + [
+        {"name": f"target {index} / wheel", "conclusion": "success"}
+        for index in range(23)
+    ]
+    for records, accepted in (
+        (qualified, True),
+        (qualified[:-1], False),
+        ([{**qualified[0], "conclusion": "failure"}, *qualified[1:]], False),
+        ([{**qualified[0], "conclusion": "cancelled"}, *qualified[1:]], False),
+    ):
+        result = subprocess.run(
+            ["jq", "-e", job_filter],
+            input=json.dumps({"jobs": records}),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert (result.returncode == 0) is accepted
+    checkout = next(
+        step for step in steps if "actions/checkout@" in step.get("uses", "")
+    )
+    assert checkout["with"]["ref"] == "${{ steps.source.outputs.sha }}"
+    for step in steps:
+        if "actions/download-artifact@" in step.get("uses", ""):
+            assert step["with"]["run-id"] == "${{ steps.source.outputs.run }}"
+    assert '--source-commit "$SOURCE_SHA"' in steps[-2]["run"]
+
+
 def test_publish_workflow_validates_one_shared_release_artifact_without_publishing() -> (
     None
 ):
@@ -1847,7 +1889,7 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     assert "--artifact-metadata" in runs
     assert "--verify-release-set" in runs
     assert (
-        "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100"
+        "actions/runs/$SOURCE_RUN/artifacts?per_page=100"
         in manifest_by_name["Fetch GitHub artifact metadata"]["run"]
     )
     assert manifest["runs-on"] == "ubuntu-24.04"
@@ -1872,7 +1914,7 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     )
     triggers = workflow.get("on", workflow.get(True))
     assert set(triggers) == {"workflow_dispatch"}
-    assert triggers["workflow_dispatch"] is None
+    assert set(triggers["workflow_dispatch"]["inputs"]) == {"artifact_run_id"}
     assert workflow["concurrency"] == {
         "group": "beta-artifact-validation-${{ github.ref }}",
         "cancel-in-progress": True,
