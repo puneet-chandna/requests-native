@@ -1,7 +1,7 @@
 .. Requests Native modification notice: this retained file differs from Requests 2.34.2.
 
 Requests Native
-`````````````
+```````````````
 
 - Puneet Chandna `@puneet-chandna <https://github.com/puneet-chandna>`_,
   maintainer of the independent Rust rewrite.
@@ -13,13 +13,13 @@ Requests was created by Kenneth Reitz. The original Requests authors and
 contributors are preserved below for attribution.
 
 Upstream Requests Maintainers
-```````````````````````````
+`````````````````````````````
 
 - Ian Stapleton Cordasco <graffatcolmingov@gmail.com> `@sigmavirus24 <https://github.com/sigmavirus24>`_.
 - Nate Prewitt `@nateprewitt <https://github.com/nateprewitt>`_.
 
 Previous Upstream Maintainers
-```````````````````````````
+`````````````````````````````
 
 - Kenneth Reitz <me@kennethreitz.org> `@kennethreitz <https://github.com/kennethreitz>`_, reluctant Keeper of the Master Crystal.
 - Cory Benfield <cory@lukasa.co.uk> `@lukasa <https://github.com/lukasa>`_

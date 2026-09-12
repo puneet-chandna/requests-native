@@ -10,17 +10,49 @@ Cargo package is ``requests-native`` version ``1.0.0-beta.1``. The installed
 Python import remains ``requests`` and ``requests.__version__`` remains
 ``2.34.2`` as the compatibility baseline.
 
-The ``v1.0.0-beta`` milestone may be created as a GitHub prerelease only after:
+Current beta
+------------
+
+The `v1.0.0-beta prerelease
+<https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta>`_
+contains 23 wheels, one sdist, and an exact-commit validation manifest. Its
+source commit is ``2146b22ed25951a5483cbb13d69dc551f99ff352``.
+`Platform validation
+<https://github.com/puneet-chandna/requests-native/actions/runs/34716443823>`_
+completed with a narrowly accepted Windows failure under
+`issue #1 <https://github.com/puneet-chandna/requests-native/issues/1>`_.
+That exception is recorded in the manifest and is not a fix or a claim of
+complete Requests parity.
+
+`Final artifact validation
+<https://github.com/puneet-chandna/requests-native/actions/runs/34719533263>`_
+passed with workflow correction ``9d4c96f``. It reused the qualified archives
+without rebuilding them or changing their source identity. Exact-source
+artifact checks and strict Twine validation passed before release upload.
+
+Qualification procedure
+-----------------------
+
+A release requires:
 
 1. local compatibility, Rust, metadata, and benchmark checks pass;
-2. source CI is green for the exact commit;
+2. source and installed-artifact checks qualify the exact source commit, with
+   any explicitly approved beta exception disclosed and recorded;
 3. the manually dispatched validation workflow produces one sdist, the full
    23-wheel matrix, and a validated artifact manifest; and
-4. no source or workflow changes occur after that evidence is collected.
+4. uploaded archives and checksums match that qualified release set.
+
+``Validate beta artifacts`` builds the complete set when ``artifact_run_id``
+is empty. To recover final assembly without repeating successful builds,
+provide the existing qualified run ID. The workflow verifies its source and
+24 successful build jobs, then validates the original archives. Later
+documentation or validation-workflow corrections must not relabel those
+archives as a newer source commit. Runtime or packaged-source changes require
+fresh artifact qualification.
 
 The workflow stores validation artifacts for review. It contains no PyPI or
-TestPyPI deployment job. Publishing to any registry remains a separate,
-explicit maintainer decision.
+TestPyPI deployment job, and version tags do not start registry publishing.
+Publishing to any registry remains a separate, explicit maintainer decision.
 
 Python package metadata intentionally omits aggregate ``License`` and
 ``License-Expression`` fields for now. Maturin currently supplies one project
@@ -39,13 +71,13 @@ built by this helper carry the path-sanitization guarantee. Direct Maturin,
 editable, and PEP 517 builds remain supported development and downstream build
 paths, but do not carry the release path-sanitization guarantee.
 
-Public repository gate
-----------------------
+Private reporting
+-----------------
 
-Repository visibility is an owner-controlled step and is separate from the
-GitHub beta prerelease. Before making the repository public, the owner must
-enable GitHub private vulnerability reporting and confirm that the
-``Report a vulnerability`` path is available. Security reports use that path;
-confidential conduct reports use the same path with ``Conduct:`` at the start
-of the title. Until then, invited collaborators use an already-agreed private
-channel with the owner and never public Issues.
+The maintainer should enable GitHub private vulnerability reporting on the
+public repository and confirm that ``Report a vulnerability`` is available.
+Security reports use that path when available; confidential conduct reports
+use the same path with ``Conduct:`` at the start of the title. If unavailable,
+use an already-agreed private channel with the maintainer, or ask for a private
+contact method without sharing sensitive details. Never disclose these reports
+in public issues. See the repository's security policy and code of conduct.

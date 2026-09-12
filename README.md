@@ -12,9 +12,11 @@ The compatibility target is Requests 2.34.2.
 **Beta:** [known issue #1: intermittent Windows TLS failures](https://github.com/puneet-chandna/requests-native/issues/1)
 is accepted for this beta, not fixed. HTTPS tests have failed with timeouts or
 connection errors, including during redirects; the cause, failure rate, and
-production impact are unknown. Platform qualification is incomplete. Test your
-workload before replacing production Requests. The project is not published
-to PyPI or crates.io.
+production impact are unknown. The [v1.0.0-beta release](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta)
+includes 23 validated platform wheels, a source distribution, and a manifest
+recording the accepted Windows failure. Strict compatibility work continues.
+Test your workload before replacing production Requests. The project is not
+published to PyPI or crates.io.
 
 ## Python
 
@@ -35,7 +37,20 @@ with requests.Session() as session:
     print(response.json())
 ```
 
-### Install from source
+### Install the beta
+
+Download the wheel matching your Python version, operating system, and CPU
+architecture from the [release assets](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta).
+Create and activate a fresh virtual environment, then install the downloaded
+file with `python -m pip install /path/to/downloaded.whl`. Wheels are available
+for Linux x86-64, Windows x86-64, and macOS Apple silicon. Other targets require
+a source build and are not covered by this wheel matrix.
+See [installation details](docs/user/install.rst).
+
+Do not install upstream `requests` in the same environment. Both distributions
+own the `requests` import and can overwrite each other's files.
+
+### Build from source
 
 You need Python 3.10 or later, Rust through rustup, and a C build toolchain
 (MSVC Build Tools on Windows). The repository pins Rust 1.98.0 in
@@ -165,8 +180,9 @@ available as historical evidence.
 | Rust package / library | `requests-native` / `requests_native` | `1.0.0-beta.1` |
 | GitHub beta milestone | Requests Native | `v1.0.0-beta` |
 
-The milestone name does not mean a release has been published. The Python
-compatibility version stays separate from this project's release version.
+The GitHub prerelease is available from the release link above. The Python
+compatibility version stays separate from this project's release version;
+neither package is published to a registry.
 
 ## Contributing and security
 

@@ -10,12 +10,9 @@ Maintainers may edit or remove contributions and temporarily or permanently
 restrict participation when behavior harms the community. Enforcement will be
 proportionate and will avoid public disclosure of sensitive reports.
 
-While this repository is private, invited collaborators must report sensitive
-conduct concerns through an already-agreed private channel with the owner.
-Never place a sensitive conduct report in a GitHub issue or discussion.
-
-Before making this repository public, the owner must enable GitHub private
-vulnerability reporting. After it is enabled, use the repository's
-**Report a vulnerability** path and prefix the report title with `Conduct:`.
-This provides the project-owned confidential channel for conduct reports; it
-does not claim that private vulnerability reporting is enabled now.
+Report sensitive conduct concerns privately. Use the repository's
+**Report a vulnerability** path when available and prefix the report title with `Conduct:`.
+If that path is unavailable, use an already-agreed private channel with the
+maintainer, or ask for a private contact method without sharing report details.
+Never place a sensitive conduct report in a GitHub issue, discussion, or pull
+request.

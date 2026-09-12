@@ -1,9 +1,10 @@
 .. Requests Native modification notice: this retained file differs from Requests 2.34.2.
 
 Requests Native
-=============
+===============
 
-Requests compatibility version |version|. GitHub milestone ``v1.0.0-beta``.
+Requests compatibility version |version|. GitHub prerelease
+`v1.0.0-beta <https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta>`_.
 
 Requests Native is an unofficial, independent Rust rewrite of
 `PSF Requests <https://github.com/psf/requests>`_. It preserves the familiar
@@ -14,7 +15,10 @@ transport, with compatibility fallback for unsupported extension behavior.
 
    This project is beta software. It is not affiliated with the Python
    Software Foundation and is not published to PyPI or crates.io. Install it
-   only from this repository and test it before production use.
+   from this repository's release assets or source. An unresolved
+   `Windows TLS issue <https://github.com/puneet-chandna/requests-native/issues/1>`_
+   is accepted for the beta. Follow :ref:`install` and test your own workload
+   before production use.
 
 The Python distribution is ``requests-native`` version ``1.0.0b1``. Its
 drop-in import remains ``requests`` and reports compatibility version

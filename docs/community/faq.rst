@@ -15,9 +15,9 @@ at `github.com/psf/requests <https://github.com/psf/requests>`_.
 Can I install it from PyPI?
 ---------------------------
 
-No. Requests Native is not published to PyPI or crates.io. Build it from this
-repository by following :ref:`install`. There is no ``requests-native`` package
-on PyPI maintained by this project.
+No. Requests Native is not published to PyPI or crates.io. Install a wheel from
+the GitHub beta release or build from source by following :ref:`install`.
+There is no ``requests-native`` package on PyPI maintained by this project.
 
 Why does it report version 2.34.2?
 ----------------------------------
@@ -34,6 +34,15 @@ Pristine built-in ``Session`` and ``HTTPAdapter`` traffic uses the native Rust
 transport. Unsupported custom adapters, subclasses, monkeypatches, and dynamic
 extension behavior fall back before native I/O begins. See ``PORTING.md`` in
 the repository for the current evidence and boundary.
+
+Are all Requests integrations supported?
+----------------------------------------
+
+No. In addition to the unresolved Windows TLS issue, Sphinx 7.2.6's online
+intersphinx downloader currently fails when mutating a native response's
+``raw`` object. Test integrations against your actual workload; the retained
+API reference is a compatibility target, not a claim that every extension
+has been qualified.
 
 Is it faster than Requests?
 ---------------------------

@@ -3,7 +3,7 @@
 .. _contributing:
 
 Contributing to Requests Native
-=============================
+===============================
 
 Requests Native is an unofficial Rust rewrite of Requests. Contributions should
 target the rewrite, Rust transport, Python bridge, build and validation tools,
@@ -36,6 +36,17 @@ gates include::
 Documentation is reStructuredText under ``docs/`` and Markdown at the project
 root and under ``.github/``. Keep changes focused and avoid unrelated generated
 files.
+
+The pinned Sphinx dependency requires the distribution named ``requests`` and
+can install upstream Requests alongside this project's editable package. Check
+``requests.__file__`` before generating API docs; it must point to this
+checkout's ``src/requests``. Keep documentation tooling in a disposable
+environment to avoid changing an application environment.
+
+Sphinx 7.2.6's online intersphinx downloader currently fails when it assigns
+``response.raw.url`` on a native response. Local rendering with pre-downloaded
+Python and urllib3 inventories is possible, but does not qualify that HTTP
+integration. This known compatibility gap is recorded in ``PORTING.md``.
 
 Suspected vulnerabilities must be reported privately under the
 `security policy

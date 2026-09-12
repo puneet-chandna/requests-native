@@ -1,7 +1,7 @@
 Release History
 ===============
 
-Requests Native 1.0.0b1 / Cargo 1.0.0-beta.1 (unreleased)
+Requests Native 1.0.0b1 / Cargo 1.0.0-beta.1 (2026-09-13)
 ---------------------------------------------------------
 
 - Established the independent ``requests-native`` distribution and Cargo
@@ -9,6 +9,11 @@ Requests Native 1.0.0b1 / Cargo 1.0.0-beta.1 (unreleased)
   ``2.34.2``.
 - Added a native Rust transport for pristine built-in traffic while retaining
   Python compatibility fallbacks for dynamic Requests behavior.
+- Released the GitHub-only `v1.0.0-beta` with 23 wheels, one sdist, and an
+  exact-commit validation manifest. Neither package is published to a registry.
+- Disclosed unresolved Windows TLS failures under
+  [issue #1](https://github.com/puneet-chandna/requests-native/issues/1), with a
+  narrowly accepted validation exception. Strict compatibility work continues.
 
 
 Preserved upstream Requests history

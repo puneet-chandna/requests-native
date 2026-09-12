@@ -9,20 +9,20 @@ visible, and let the existing tests define correctness.
 
 ## Status
 
-An earlier candidate passed local checks and a complete 23-cell compiled wheel
-matrix, one sdist, and one validation manifest from an exact commit. That remote
-workflow reported success, but later cross-platform inspection found that all
-seven Windows wheels contained CRLF-normalized `LICENSE` and `NOTICE` bytes and
-the per-runner verifier compared against the normalized checkout. The current
-source forces LF for both legal files and verifies every archive against its
-source-commit Git blobs on one LF runner. The prior artifact set is qualified
-historical evidence, not evidence for a current release set.
+[The v1.0.0-beta release](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta)
+contains 23 platform wheels, one sdist, and an exact-commit artifact manifest.
+Its source is `2146b22ed25951a5483cbb13d69dc551f99ff352`.
+[Platform validation](https://github.com/puneet-chandna/requests-native/actions/runs/34716443823)
+completed with the accepted Windows exception below. An
+[artifact-only validation run](https://github.com/puneet-chandna/requests-native/actions/runs/34719533263)
+then passed using workflow fix `9d4c96f`, which prepared the Cargo dependency
+cache before offline SBOM verification. It reused the tested archives without
+rebuilding or changing their source identity.
 
-A later artifact run was incomplete despite passing source checks.
-Windows 3.10 failed a TLS handshake test. Inspection also found
-locale-dependent author text in two Windows
-wheel SBOMs. The metadata decoder now uses UTF-8 explicitly, but corrected
-artifacts require their own exact-commit qualification.
+Every released archive passed exact-source checks and strict Twine validation.
+Legal files are compared with canonical source-commit Git blobs, and SBOM
+metadata is decoded as UTF-8. Earlier Windows newline and metadata-decoding
+findings are historical; the released artifacts passed the corrected checks.
 
 [Known issue #1](https://github.com/puneet-chandna/requests-native/issues/1)
 tracks intermittent Windows TLS failures accepted for `v1.0.0-beta`, including
@@ -40,14 +40,21 @@ qualification also observed an initial-handshake timeout / Windows error
 10053. A shared cause, failure rate, and production impact remain unknown.
 One full-suite exposure per source/profile does not establish causation.
 
+The September 13 documentation build also exposed a Sphinx 7.2.6 integration
+gap: its intersphinx downloader assigns `response.raw.url` and replaces
+`response.raw.read`. A native `NativeAdapterRaw` rejects the first assignment
+with `AttributeError`. Online inventory fetching is therefore not qualified;
+rendering with pre-downloaded inventories does not prove this behavior fixed.
+
 Exact pristine built-in `Session` and `HTTPAdapter` traffic uses the Rust
 backend by default. Unsupported, subclassed, custom, and dynamically mutated
 surfaces retain Python authority. The API ledger still has exactly three
 `IN_PROGRESS` cross-cutting rows: `platform matrix`, `distribution surface`, and
 `default backend`. They remain open for strict completion; the disclosed beta
 exception does not close them. Beta artifacts require the reusable and manually
-dispatched release-validation gate with canonical legal bytes, recorded
-exceptions, and review. This is not a claim that the entire port is complete.
+dispatched release-validation gate covering the complete 23-cell compiled wheel
+matrix with canonical legal bytes, recorded exceptions, and review. This is not
+a claim that the entire port is complete.
 
 The dependency-free loopback benchmark covers the frozen Python oracle,
 Rust-backed Python, and native Rust async/blocking surfaces. Its bounded default
