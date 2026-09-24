@@ -617,4 +617,3 @@ Changes specific to this Rust rewrite are maintained by **[Puneet Chandna](https
 ### Familiar API. Native core. Compatibility first.
 
 [Releases](https://github.com/puneet-chandna/requests-native/releases) · [Issues](https://github.com/puneet-chandna/requests-native/issues) · [Porting Guide](PORTING.md)
-
