@@ -1,3 +1,4 @@
+<!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
 <div align="center">
   <img src="docs/assets/logo.png" alt="Requests Native" width="250">
   <h1>Requests Native</h1>

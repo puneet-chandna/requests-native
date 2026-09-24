@@ -38,11 +38,10 @@ the repository for the current evidence and boundary.
 Are all Requests integrations supported?
 ----------------------------------------
 
-No. In addition to the unresolved Windows TLS issue, Sphinx 7.2.6's online
-intersphinx downloader currently fails when mutating a native response's
-``raw`` object. Test integrations against your actual workload; the retained
-API reference is a compatibility target, not a claim that every extension
-has been qualified.
+No. The Windows TLS issue remains unresolved, and Sphinx 7.2.6's online
+intersphinx downloader failed when mutating a native response's ``raw``
+object. The pinned Sphinx 9.1.0 builds these docs online, but other
+integrations still need testing against their actual workload.
 
 Is it faster than Requests?
 ---------------------------

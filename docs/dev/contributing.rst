@@ -43,10 +43,10 @@ can install upstream Requests alongside this project's editable package. Check
 checkout's ``src/requests``. Keep documentation tooling in a disposable
 environment to avoid changing an application environment.
 
-Sphinx 7.2.6's online intersphinx downloader currently fails when it assigns
-``response.raw.url`` on a native response. Local rendering with pre-downloaded
-Python and urllib3 inventories is possible, but does not qualify that HTTP
-integration. This known compatibility gap is recorded in ``PORTING.md``.
+Sphinx 7.2.6's online intersphinx downloader failed when it assigned
+``response.raw.url`` on a native response. The pinned Sphinx 9.1.0 completed
+an online ``dirhtml`` build with this checkout's native extension on
+September 25, 2026. See ``PORTING.md`` for the historical limitation.
 
 Suspected vulnerabilities must be reported privately under the
 `security policy

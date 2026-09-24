@@ -43,8 +43,10 @@ One full-suite exposure per source/profile does not establish causation.
 The September 13 documentation build also exposed a Sphinx 7.2.6 integration
 gap: its intersphinx downloader assigns `response.raw.url` and replaces
 `response.raw.read`. A native `NativeAdapterRaw` rejects the first assignment
-with `AttributeError`. Online inventory fetching is therefore not qualified;
-rendering with pre-downloaded inventories does not prove this behavior fixed.
+with `AttributeError`. On September 25, the pinned Sphinx 9.1.0 completed a
+normal online `dirhtml` build with this checkout's native extension and both
+inventories. That build does not prove the old raw-object mutation is accepted
+by other callers.
 
 Exact pristine built-in `Session` and `HTTPAdapter` traffic uses the Rust
 backend by default. Unsupported, subclassed, custom, and dynamically mutated

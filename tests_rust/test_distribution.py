@@ -535,7 +535,7 @@ def test_notice_closes_curated_and_runtime_attribution_requirements() -> None:
 
     rendered = notices.render_notice().decode("utf-8")
     notices.validate_notice(rendered)
-    assert notices.RUNTIME_TOOLCHAIN == "1.98.0"
+    assert notices.RUNTIME_TOOLCHAIN == "1.98.1"
     runtime = (ROOT / "RUST_RUNTIME_NOTICES.html").read_bytes()
     assert hashlib.sha256(runtime).hexdigest() == notices.RUNTIME_NOTICE_SHA256
     assert b"Copyright notices for The Rust Standard Library" in runtime
@@ -569,9 +569,9 @@ def test_notice_closes_curated_and_runtime_attribution_requirements() -> None:
     ].split("----- END brotli-decompressor 5.0.3 -----", 1)[0]
     assert "src/context.rs" in brotli_section
     assert "Permission is hereby granted, free of charge" in brotli_section
-    zstd_section = rendered.split("----- BEGIN zstd-sys 2.0.16+zstd.1.5.7 -----", 1)[
+    zstd_section = rendered.split("----- BEGIN zstd-sys 2.1.0+zstd.1.5.7 -----", 1)[
         1
-    ].split("----- END zstd-sys 2.0.16+zstd.1.5.7 -----", 1)[0]
+    ].split("----- END zstd-sys 2.1.0+zstd.1.5.7 -----", 1)[0]
     assert "LICENSE.BSD-3-Clause" in zstd_section
     assert "zstd/LICENSE" in zstd_section
     assert "--- zstd/COPYING" not in zstd_section
@@ -654,8 +654,8 @@ def test_release_sbom_is_deterministic_and_matches_locked_runtime_graph() -> Non
         (component["name"], component["version"]): component for component in components
     }
     assert len(by_key) == len(components) == len(visited) == 136
-    assert sum(component["scope"] == "required" for component in components) == 126
-    assert sum(component["scope"] == "excluded" for component in components) == 10
+    assert sum(component["scope"] == "required" for component in components) == 127
+    assert sum(component["scope"] == "excluded" for component in components) == 9
     assert set(by_key) == {
         (packages[package_id]["name"], packages[package_id]["version"])
         for package_id in visited

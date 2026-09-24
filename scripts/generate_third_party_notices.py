@@ -16,8 +16,8 @@ NOTICE = ROOT / "NOTICE"
 RUNTIME_NOTICE = ROOT / "RUST_RUNTIME_NOTICES.html"
 WORKSPACE_PACKAGE = "requests-native-python"
 LICENSE_PREFIXES = ("COPYING", "COPYRIGHT", "LICENCE", "LICENSE", "NOTICE", "UNLICENSE")
-RUNTIME_TOOLCHAIN = "1.98.0"
-RUNTIME_COMMIT = "88d9e12ae178fab0fb5cc050a94da85685d449ea"
+RUNTIME_TOOLCHAIN = "1.98.1"
+RUNTIME_COMMIT = "48a229ceaefd4985c50990b14116b6d856af0985"
 RUNTIME_NOTICE_SHA256 = (
     "68129500b616d5838629e68f55ff3aed5e096dacf60ce9eb41bbe599a563afa6"
 )
@@ -48,7 +48,7 @@ REVIEWED_OBLIGATIONS = {
     "Zlib": "Zlib",
 }
 CURATED_FILES = {
-    ("zstd-sys", "2.0.16+zstd.1.5.7"): (
+    ("zstd-sys", "2.1.0+zstd.1.5.7"): (
         (
             "Bundled Zstandard 1.5.7 C library BSD-3-Clause license",
             "zstd/LICENSE",
@@ -264,7 +264,7 @@ the selected option for every OR. Python dependencies are not bundled in the
 wheel; they remain separate requirements. Platform system libraries are not bundled; platform linkage
 must still be verified for each final wheel.
 
-Rust 1.98.0 (commit 88d9e12ae178fab0fb5cc050a94da85685d449ea) is the pinned
+Rust 1.98.1 (commit 48a229ceaefd4985c50990b14116b6d856af0985) is the pinned
 release toolchain. Its complete standard-library notice inventory is packaged as
 RUST_RUNTIME_NOTICES.html with SHA-256
 68129500b616d5838629e68f55ff3aed5e096dacf60ce9eb41bbe599a563afa6.
@@ -455,7 +455,7 @@ def curated_notices(
 
 def reviewed_obligations(package: dict, expression: str) -> str:
     key = (package["name"], package["version"])
-    if key == ("zstd-sys", "2.0.16+zstd.1.5.7"):
+    if key == ("zstd-sys", "2.1.0+zstd.1.5.7"):
         return "MIT AND BSD-3-Clause"
     try:
         return REVIEWED_OBLIGATIONS[expression]
@@ -528,7 +528,7 @@ def render_notice() -> bytes:
         )
         if (package["name"], package["version"]) == (
             "zstd-sys",
-            "2.0.16+zstd.1.5.7",
+            "2.1.0+zstd.1.5.7",
         ):
             sections.append(
                 "Bundled Zstandard C library selection: BSD-3-Clause\n"
