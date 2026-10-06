@@ -291,12 +291,12 @@ fn assert_https_pool_key(
 }
 
 fn frozen_root_bundle() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/certs/expired/ca/ca.crt")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/expired-ca.crt")
 }
 
 fn frozen_mtls_client(filename: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/tls/mtls-client")
+        .join("tests/fixtures/mtls-client")
         .join(filename)
 }
 

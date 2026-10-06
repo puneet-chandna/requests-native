@@ -325,12 +325,12 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn frozen_ca_bundle() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/certs/expired/ca/ca.crt")
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/expired-ca.crt")
 }
 
 fn injected_native_roots() -> rustls_native_certs::CertificateResult {
     let mut result = rustls_native_certs::CertificateResult::default();
-    let mut pem = Cursor::new(include_bytes!("../../../../tests/certs/expired/ca/ca.crt"));
+    let mut pem = Cursor::new(include_bytes!("../../tests/fixtures/expired-ca.crt"));
     result.certs = rustls_pemfile::certs(&mut pem)
         .collect::<Result<Vec<_>, _>>()
         .expect("parse deterministic injected native root");
@@ -351,7 +351,7 @@ fn injected_native_roots_with_error() -> rustls_native_certs::CertificateResult 
 
 fn frozen_mtls_client(filename: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/tls/mtls-client")
+        .join("tests/fixtures/mtls-client")
         .join(filename)
 }
 
@@ -1024,7 +1024,7 @@ fn every_invalid_client_chain_uses_one_failed_load_before_downstream_work() {
     let empty = directory.write("empty-client-chain.pem", b"");
     let malformed = directory.write("malformed-client-chain.pem", b"not a PEM certificate");
     let mut malformed_intermediate_contents =
-        include_bytes!("../../../../tests/fixtures/tls/mtls-client/client.pem").to_vec();
+        include_bytes!("../../tests/fixtures/mtls-client/client.pem").to_vec();
     malformed_intermediate_contents
         .extend_from_slice(b"\n-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n");
     let malformed_intermediate = directory.write(
@@ -1095,8 +1095,7 @@ fn every_invalid_client_key_uses_one_failed_load_before_downstream_work() {
     let read_failure = directory.directory("unreadable-client.key");
     let empty = directory.write("empty-client.key", b"");
     let malformed = directory.write("malformed-client.key", b"not a PEM private key");
-    let mismatched =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/certs/valid/server/server.key");
+    let mismatched = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/server.key");
     let certificate_chain = frozen_mtls_client("client-chain.pem");
     let cases = [
         ("client-key-missing", missing),
@@ -1300,8 +1299,8 @@ fn red_f_tls_failure_closes_raw_socket_once_without_http_or_pool_entry() {
                 .expect("TLS-failure accept timed out")
                 .expect("accept TLS-failure connection");
             let acceptor = tls_acceptor(
-                include_bytes!("../../../../tests/fixtures/tls/wrong-host/wrong-host.pem"),
-                include_bytes!("../../../../tests/fixtures/tls/wrong-host/wrong-host.key"),
+                include_bytes!("../../tests/fixtures/wrong-host.pem"),
+                include_bytes!("../../tests/fixtures/wrong-host.key"),
             );
             if let Ok(stream) = tokio::time::timeout(OUTER_BOUND, acceptor.accept(stream))
                 .await
@@ -1427,8 +1426,8 @@ fn red_f_http1_gate_timeout_closes_raw_socket_once_after_completed_tls() {
                 .expect("HTTP/1-stage accept timed out")
                 .expect("accept HTTP/1-stage connection");
             let acceptor = tls_acceptor(
-                include_bytes!("../../../../tests/certs/valid/server/server.pem"),
-                include_bytes!("../../../../tests/certs/valid/server/server.key"),
+                include_bytes!("../../tests/fixtures/server.pem"),
+                include_bytes!("../../tests/fixtures/server.key"),
             );
             let stream = tokio::time::timeout(OUTER_BOUND, acceptor.accept(stream))
                 .await

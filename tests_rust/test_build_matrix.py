@@ -13,9 +13,68 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_performance_ci_uses_the_local_command_on_namespace() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/evaluate.yml").read_text())
+    job = workflow["jobs"]["evaluate"]
+    assert job["runs-on"] == "namespace-profile-puneet-chandna"
+    steps = {step.get("name"): step for step in job["steps"]}
+    run = steps["Evaluate paired revisions"]["run"]
+    assert "benchmarks/evaluate.py" in run and "mode=--gate" in run
+    assert '--base "$BASE" --candidate "$CANDIDATE"' in run
+    source_runs = "\n".join(
+        str(step.get("run", ""))
+        for step in yaml.safe_load(
+            (ROOT / ".github/workflows/run-tests.yml").read_text()
+        )["jobs"]["build"]["steps"]
+    )
+    assert "cargo test -p requests-native --locked" in source_runs
+    assert "python -m pytest -q tests_rust tests_differential" in source_runs
+    assert "benchmarks.test_evaluate" in source_runs
+
+
+def test_linux_jobs_use_namespace_and_other_platforms_keep_github_runners() -> None:
+    for path in (ROOT / ".github/workflows").glob("*.yml"):
+        jobs = yaml.safe_load(path.read_text())["jobs"]
+        for job in jobs.values():
+            if "uses" in job:
+                continue
+            runner = job["runs-on"]
+            if path.name in {"build-wheel.yml", "bootstrap-matrix.yml"}:
+                source = "inputs.os" if path.name == "build-wheel.yml" else "matrix.os"
+                assert runner == (
+                    "${{ startsWith(" + source + ", 'ubuntu-') && "
+                    "'namespace-profile-puneet-chandna' || " + source + " }}"
+                )
+            elif path.name in {
+                "compare-windows-tls.yml",
+                "diagnose-windows-testserver.yml",
+            }:
+                assert runner == "windows-latest"
+            else:
+                assert runner == "namespace-profile-puneet-chandna", path.name
+
+
 def _core_manifest() -> dict:
     with (ROOT / "crates/requests/Cargo.toml").open("rb") as manifest:
         return tomllib.load(manifest)
+
+
+def test_windows_qualification_uses_current_commit_and_frozen_oracle() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/compare-windows-tls.yml").read_text()
+    )
+    triggers = workflow.get("on", workflow.get(True))
+    option = triggers["workflow_dispatch"]["inputs"]["qualify_current_release"]
+    assert option["type"] == "boolean" and option["default"] is False
+    job = workflow["jobs"]["compare"]
+    steps = {step.get("name"): step for step in job["steps"]}
+    oracle = steps["Check out frozen Python oracle"]
+    assert oracle["if"] == "inputs.qualify_current_release"
+    assert oracle["with"]["ref"] == "69f84847045bef7a849cc994a26fe7ba8a169e95"
+    command = steps["Build and test installed artifacts"]["run"]
+    assert "'--current-revision', $env:GITHUB_SHA" in command
+    assert "'--qualify-current-release', '--oracle-root', 'frozen-oracle'" in command
+    assert "rust-toolchain.toml" in steps["Prepare fixed toolchain"]["run"]
 
 
 def test_direct_http_dependencies_are_required_and_explicit() -> None:

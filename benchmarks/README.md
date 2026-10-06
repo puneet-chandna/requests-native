@@ -2,8 +2,105 @@
 
 This directory compares the frozen Python Requests oracle, the rewrite's
 Rust-backed Python API, and the native Rust async and blocking APIs against one
-HTTP/1.1 loopback fixture. Measurements have no pass/fail target and do not
-authorize compatibility changes.
+HTTP/1.1 loopback fixture. The paired release evaluator adds a regression gate;
+measurements do not authorize compatibility changes.
+
+## Local and CI regression evaluation
+
+From an existing development environment, run a quick local check:
+
+```console
+.venv/bin/python benchmarks/evaluate.py --base v1.0.0-beta --candidate WORKTREE --smoke
+```
+
+This captures local uncommitted source without switching branches or committing.
+It runs one short pair and checks the pipeline; the performance decision is
+**inconclusive**, not release qualification. Untracked runtime files under
+`src/` and `crates/` are included; other untracked files are excluded.
+Use `--candidate HEAD` for the current committed revision.
+
+For the release performance gate:
+
+```console
+.venv/bin/python benchmarks/evaluate.py --base v1.0.0-beta --candidate HEAD --gate
+```
+
+The `.github/workflows/evaluate.yml` workflow runs this identical command on
+`namespace-profile-puneet-chandna`; its smoke input selects the quick check.
+Windows/macOS packaging and qualification retain their GitHub runners. Neither
+mode publishes packages or creates a GitHub release.
+
+Prerequisites: an isolated Python environment with maturin and runtime
+dependencies, Git, rustup, a clean frozen oracle checkout (the sibling `requests`
+directory or `REQUESTS_ORACLE_ROOT`), and disk space for two release builds.
+Linux is the validated local platform; native CPU/RSS accounting needs Linux.
+The oracle's behavioral files must match `ORACLE.lock`; its later documentation
+commit is permitted. A fresh environment can use the same dependencies as CI:
+
+```console
+python3 -m venv .venv
+.venv/bin/python -m pip install maturin==1.15.0 charset_normalizer==3.5.1 idna==3.19 urllib3==2.7.0 certifi==2026.7.22
+```
+
+Rust dependencies are prepared online by default; `--offline` needs a populated
+Cargo cache. Git references must already exist locally. Both revisions use the
+candidate's Rust toolchain and identical Python dependencies. The current
+evaluator and native driver run against both snapshots; the driver's dependency
+lock is seeded from each revision's release lock. Source, driver-lock,
+release-lock and evaluator hashes identify what ran. This compares source on a
+common toolchain, rather than previously published binary artifacts.
+The evaluator checks that preinstalled dependencies satisfy both revisions and
+disables dependency installation while switching native editable artifacts.
+An incompatible environment fails preflight without upgrading your packages.
+
+The snapshots share the caller's Python dependency environment. `maturin develop`
+switches its editable Requests Native install during evaluation and restores the
+caller's checkout afterward. Keep other native Python tests and development
+processes out of this environment during evaluation; use a dedicated evaluation
+venv if your development server must remain running.
+
+Default qualification runs five alternating pairs, 100 measured requests per
+case and four untimed requests per logical worker. Warm-up retains pooled
+clients, checks bytes/checksum/native routing, then releases workers through a
+shared timing barrier. All 64 cases cover four surfaces, one-shot/pooled clients,
+buffered/streaming reads, small/large bodies and serial/concurrent workloads.
+Allocation replay is separate from timed measurements.
+On Linux the worker resets its own resident-memory high-water mark at this
+barrier using `/proc/self/clear_refs`, so a released warm-up peak cannot conceal
+a measured-phase RSS increase. If reset is unavailable, the scope is recorded
+as process lifetime and release evidence is inconclusive.
+
+Evidence goes to `target/evaluations/<timestamp>/`: raw reports, local build/
+error logs and `comparison.json`. CI retains JSON evidence on failure. A nonempty
+output directory is never overwritten; use `--output DIRECTORY` to choose one.
+
+The initial policy allows a configurable 20% increase in cost per case: inverse
+throughput, p95 latency, peak RSS and allocation replay. CPU is summed per surface
+to reduce Linux tick granularity; totals below 50 ms are insufficient evidence.
+A deterministic paired bootstrap reports a marginal 95% interval for each
+median cost ratio. An interval entirely above budget is a regression; one
+crossing budget is inconclusive. Qualification passes only when every measured
+case is within budget with sufficient evidence. The unchanged Python oracle
+controls machine drift in either direction; noisy controls make the overall
+decision inconclusive. Calibrate this initial budget on the workload; it is not
+a universal statistical guarantee.
+
+`--gate` returns nonzero on regression, inconclusive evidence or execution/
+correctness errors, and rejects smoke mode and uncommitted source. Larger samples
+can resolve uncertainty without discarding a failing case:
+
+```console
+.venv/bin/python benchmarks/evaluate.py --base v1.0.0-beta --gate --pairs 7 --requests 300 --warmup 8 --output target/evaluations/release-check
+.venv/bin/python -m unittest benchmarks.test_run benchmarks.test_evaluate
+```
+
+Keep the machine idle during measurements. Loopback results do not predict
+internet/proxy/TLS/DNS performance or close the Windows TLS issue. Source CI
+separately runs native unit tests, frozen-oracle differential checks,
+distribution/fresh-install checks and benchmark helper checks on relevant
+changes. Full platform artifact qualification remains a release requirement.
+
+## Historical observations
 
 The checked-in 20260902 result predates the Requests Native rename; its
 ``requests-rust`` backend label is preserved as historical evidence.
@@ -105,8 +202,10 @@ configuration, raw latency samples, latency distribution, throughput, client
 CPU, process peak RSS, allocation replay, transferred bytes, application chunk
 count, checksum, and fixture-observed connection reuse.
 
-Each case runs in a fresh process without a warm-up phase. One-shot timings
-include client construction; pooled cases keep one client per logical worker.
+Each case runs in a fresh process; `run.py` defaults to no warm-up, while the
+paired evaluator supplies an explicit warm-up. One-shot elapsed timings include
+client construction; per-request latencies cover the request/read. Pooled cases
+keep one client per logical worker.
 The loopback server runs in the orchestrator, so its CPU is not included in
 client CPU. Python allocation numbers come from an otherwise identical serial
 replay, so `tracemalloc` does not distort the timed sample; they cover
@@ -119,8 +218,11 @@ concurrency. They are neither live nor peak bytes and are not directly
 comparable to Python's traced peak. The native counter performs no allocation
 of its own and is disabled for timed samples.
 
-Peak RSS is a whole-process high-water mark and therefore includes imports and
-runtime setup. `ru_maxrss` is normalized from bytes on macOS and KiB elsewhere.
+Peak RSS in historical reports is a process-lifetime high-water mark. Current
+Linux workers reset it before the measured phase and record `rss_scope`;
+already-resident imports and warmed client state remain part of memory in use.
+Other platforms retain lifetime RSS; `ru_maxrss` is normalized from bytes on
+macOS and KiB elsewhere.
 Native CPU and RSS are read from `/proc` on Linux; unsupported platforms record
 `null`. Tiny runs can report zero native CPU because Linux accounting is
 tick-granular. Streaming counts are application-level chunks: both native
@@ -128,5 +230,6 @@ clients aggregate or split transport frames to honor the configured chunk size,
 with only the last chunk allowed to be shorter.
 
 Loopback results reduce network noise but do not predict internet, proxy, TLS,
-DNS, or application performance. Compare rows only within the same result file,
-and retain the raw file when reporting any observation.
+DNS, or application performance. Compare historical rows only within the same
+result file; use the paired evaluator for regression comparisons and retain its
+raw reports.

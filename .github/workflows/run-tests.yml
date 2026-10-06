@@ -9,6 +9,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - "crates/**"
+      - "benchmarks/**"
       - .github/workflows/**
       - API_COMPATIBILITY.tsv
       - AUTHORS.rst
@@ -33,6 +34,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - "crates/**"
+      - "benchmarks/**"
       - .github/workflows/**
       - API_COMPATIBILITY.tsv
       - AUTHORS.rst
@@ -62,9 +64,9 @@ permissions:
 
 jobs:
   build:
-    name: Editable anchor (3.14, ubuntu-22.04)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    name: Editable anchor (3.14, Namespace Linux)
+    runs-on: namespace-profile-puneet-chandna
+    timeout-minutes: 40
 
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -95,10 +97,30 @@ jobs:
       run: |
         echo "Explicit Rust trial backend"
         python -m pytest -q tests_rust/test_backend_boundary.py tests_differential/test_property_boundaries.py
+    - name: Run native and rewrite regression checks
+      env:
+        REQUESTS_ORACLE_ROOT: ${{ github.workspace }}/frozen-oracle
+      run: |
+        cargo test -p requests-native --locked
+        cargo test --manifest-path benchmarks/rust-native/Cargo.toml --locked --target-dir target
+        python scripts/check_ledgers.py
+        python scripts/compare_windows_tls.py --self-check
+        python -m unittest benchmarks.test_run benchmarks.test_evaluate
+    - name: Build canonical artifacts for distribution regression checks
+      shell: bash
+      run: |
+        export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+        python scripts/build_release_wheel.py --interpreter "$(command -v python)" --out dist --manylinux 2_34
+        python -m maturin sdist --out dist
+    - name: Run full rewrite and differential regression suite
+      env:
+        REQUESTS_ORACLE_ROOT: ${{ github.workspace }}/frozen-oracle
+      run: |
+        python -m pytest -q tests_rust tests_differential
 
   no_chardet:
     name: "No Character Detection"
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-puneet-chandna
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -137,7 +159,7 @@ jobs:
 
   urllib3:
     name: 'urllib3 1.x'
-    runs-on: 'ubuntu-latest'
+    runs-on: namespace-profile-puneet-chandna
     timeout-minutes: 15
     strategy:
       fail-fast: true

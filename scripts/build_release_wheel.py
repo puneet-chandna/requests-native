@@ -19,6 +19,11 @@ import zipfile
 from pathlib import Path
 
 try:
+    import tomllib
+except ImportError:  # Python 3.10: supplied by the required maturin dependency.
+    import tomli as tomllib
+
+try:
     from . import generate_release_sbom
 except ImportError:  # Executed directly from the scripts directory.
     import generate_release_sbom
@@ -32,11 +37,6 @@ RUSTFLAG_NAMES = {
     "CARGO_BUILD_RUSTFLAGS",
 }
 TARGET_RUSTFLAGS = re.compile(r"^CARGO_TARGET_.+_RUSTFLAGS$")
-CARGO_CONFIG_RUSTFLAGS = re.compile(
-    r"(?im)^\s*(?:(?:[A-Za-z0-9_'\".-]+)\.)*"
-    r"(?:rustflags|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|"
-    r"CARGO_TARGET_[A-Z0-9_]+_RUSTFLAGS)\s*="
-)
 
 
 def reject_preexisting_rustflags(environment: dict[str, str]) -> None:
@@ -52,13 +52,20 @@ def reject_preexisting_rustflags(environment: dict[str, str]) -> None:
 
 
 def reject_repository_rustflags(repository: Path) -> None:
+    def check(table: dict) -> None:
+        for key, value in table.items():
+            if key.upper() in RUSTFLAG_NAMES or TARGET_RUSTFLAGS.fullmatch(key.upper()):
+                raise ValueError(
+                    "repository Cargo rustflags configuration is forbidden"
+                )
+            if isinstance(value, dict):
+                check(value)
+
     cargo = repository / ".cargo"
     for name in ("config", "config.toml"):
         path = cargo / name
-        if path.is_file() and CARGO_CONFIG_RUSTFLAGS.search(
-            path.read_text(encoding="utf-8")
-        ):
-            raise ValueError("repository Cargo rustflags configuration is forbidden")
+        if path.is_file():
+            check(tomllib.loads(path.read_text(encoding="utf-8")))
 
 
 def path_spellings(value: str | os.PathLike[str]) -> tuple[str, ...]:

@@ -12,6 +12,7 @@ on:
     branches: [main]
     paths:
       - "docs/**/*.py"
+      - "benchmarks/**/*.py"
       - pyproject.toml
       - "scripts/**/*.py"
       - "src/**/*.py"
@@ -25,6 +26,7 @@ on:
     branches: [main]
     paths:
       - "docs/**/*.py"
+      - "benchmarks/**/*.py"
       - pyproject.toml
       - "scripts/**/*.py"
       - "src/**/*.py"
@@ -50,7 +52,7 @@ jobs:
       contents: read  # for actions/checkout to fetch code
       security-events: write  # for github/codeql-action/autobuild to send a status report
     name: Analyze
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-puneet-chandna
 
     strategy:
       fail-fast: false

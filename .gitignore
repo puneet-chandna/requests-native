@@ -18,6 +18,7 @@ env/
 .venv/
 .worktrees/
 /target/
+/benchmarks/rust-native/target/
 src/requests/_requests_rust.*
 !src/requests/_requests_rust.pyi
 .eggs/

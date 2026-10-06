@@ -115,5 +115,5 @@ def test_public_rust_example_uses_the_package_and_library_names() -> None:
     assert 'requests-native = { path = "../requests-native/crates/requests" }' in readme
     assert "use requests_native::Client;" in readme
     assert "use requests_native::blocking::Client;" in readme
-    assert "There is no registry package to install yet." in readme
-    assert "| `requests-native` / `requests_native` | `1.0.0-beta.1` |" in readme
+    assert "not published to crates.io" in readme
+    assert workspace_version() in readme

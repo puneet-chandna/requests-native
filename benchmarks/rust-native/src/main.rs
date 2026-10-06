@@ -105,6 +105,7 @@ struct Config {
     read: String,
     chunk_size: usize,
     measure_allocations: bool,
+    warmup: usize,
 }
 
 fn parse_args() -> Result<Config, DynError> {
@@ -117,6 +118,7 @@ fn parse_args() -> Result<Config, DynError> {
     let mut read = None;
     let mut chunk_size = None;
     let mut measure_allocations = false;
+    let mut warmup = 0;
     while let Some(flag) = arguments.next() {
         if flag == "--measure-allocations" {
             measure_allocations = true;
@@ -129,6 +131,7 @@ fn parse_args() -> Result<Config, DynError> {
             "--surface" => surface = Some(value),
             "--url" => url = Some(value),
             "--requests" => requests = Some(value.parse()?),
+            "--warmup" => warmup = value.parse()?,
             "--concurrency" => concurrency = Some(value.parse()?),
             "--mode" => mode = Some(value),
             "--read" => read = Some(value),
@@ -145,6 +148,7 @@ fn parse_args() -> Result<Config, DynError> {
         read: read.ok_or("missing --read")?,
         chunk_size: chunk_size.ok_or("missing --chunk-size")?,
         measure_allocations,
+        warmup,
     };
     if !matches!(config.surface.as_str(), "rust-async" | "rust-blocking")
         || !matches!(config.mode.as_str(), "one-shot" | "pooled")
@@ -219,12 +223,21 @@ async fn async_request(
     ))
 }
 
-async fn async_client(config: Config, count: usize) -> Result<Vec<Observation>, DynError> {
+async fn async_client(
+    config: Config,
+    count: usize,
+    barrier: Arc<tokio::sync::Barrier>,
+) -> Result<(Vec<Observation>, Vec<Observation>), DynError> {
     let pooled = (config.mode == "pooled")
         .then(requests::Client::new)
         .transpose()?;
     let mut observations = Vec::with_capacity(count);
-    for _ in 0..count {
+    let mut warmups = Vec::with_capacity(config.warmup);
+    for index in 0..config.warmup + count {
+        if index == config.warmup {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         let one_shot;
         let client = if let Some(client) = &pooled {
             client
@@ -232,21 +245,40 @@ async fn async_client(config: Config, count: usize) -> Result<Vec<Observation>, 
             one_shot = requests::Client::new()?;
             &one_shot
         };
-        observations.push(async_request(client, &config).await?);
+        let observation = async_request(client, &config).await?;
+        if index < config.warmup {
+            warmups.push(observation);
+        } else {
+            observations.push(observation);
+        }
     }
-    Ok(observations)
+    Ok((observations, warmups))
 }
 
-async fn run_async(config: &Config) -> Result<Vec<Observation>, DynError> {
+async fn run_async(config: &Config) -> Result<Measurement, DynError> {
     let mut tasks = tokio::task::JoinSet::new();
+    let barrier = Arc::new(tokio::sync::Barrier::new(
+        config.requests.min(config.concurrency) + 1,
+    ));
     for count in split_work(config.requests, config.concurrency) {
-        tasks.spawn(async_client(config.clone(), count));
+        let config = config.clone();
+        let barrier = Arc::clone(&barrier);
+        tasks.spawn(async move {
+            // The orchestrator's case deadline bounds a failed warm-up worker.
+            async_client(config, count, barrier).await
+        });
     }
+    barrier.wait().await;
+    let clock = Clock::start(config.measure_allocations);
+    barrier.wait().await;
     let mut observations = Vec::with_capacity(config.requests);
+    let mut warmups = Vec::new();
     while let Some(result) = tasks.join_next().await {
-        observations.extend(result??);
+        let (measured, warmed) = result??;
+        observations.extend(measured);
+        warmups.extend(warmed);
     }
-    Ok(observations)
+    Ok(clock.finish(observations, warmups))
 }
 
 fn blocking_request(
@@ -293,12 +325,21 @@ fn blocking_request(
     ))
 }
 
-fn blocking_client(config: &Config, count: usize) -> Result<Vec<Observation>, DynError> {
+fn blocking_client(
+    config: &Config,
+    count: usize,
+    barrier: Arc<std::sync::Barrier>,
+) -> Result<(Vec<Observation>, Vec<Observation>), DynError> {
     let pooled = (config.mode == "pooled")
         .then(requests::blocking::Client::new)
         .transpose()?;
     let mut observations = Vec::with_capacity(count);
-    for _ in 0..count {
+    let mut warmups = Vec::with_capacity(config.warmup);
+    for index in 0..config.warmup + count {
+        if index == config.warmup {
+            barrier.wait();
+            barrier.wait();
+        }
         let one_shot;
         let client = if let Some(client) = &pooled {
             client
@@ -306,25 +347,40 @@ fn blocking_client(config: &Config, count: usize) -> Result<Vec<Observation>, Dy
             one_shot = requests::blocking::Client::new()?;
             &one_shot
         };
-        observations.push(blocking_request(client, config)?);
+        let observation = blocking_request(client, config)?;
+        if index < config.warmup {
+            warmups.push(observation);
+        } else {
+            observations.push(observation);
+        }
     }
-    Ok(observations)
+    Ok((observations, warmups))
 }
 
-fn run_blocking(config: &Config) -> Result<Vec<Observation>, DynError> {
+fn run_blocking(config: &Config) -> Result<Measurement, DynError> {
     let config = Arc::new(config.clone());
+    let barrier = Arc::new(std::sync::Barrier::new(
+        config.requests.min(config.concurrency) + 1,
+    ));
     let handles = split_work(config.requests, config.concurrency)
         .into_iter()
         .map(|count| {
             let config = Arc::clone(&config);
-            std::thread::spawn(move || blocking_client(&config, count))
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || blocking_client(&config, count, barrier))
         })
         .collect::<Vec<_>>();
+    barrier.wait();
+    let clock = Clock::start(config.measure_allocations);
+    barrier.wait();
     let mut observations = Vec::with_capacity(config.requests);
+    let mut warmups = Vec::new();
     for handle in handles {
-        observations.extend(handle.join().map_err(|_| "blocking worker panicked")??);
+        let (measured, warmed) = handle.join().map_err(|_| "blocking worker panicked")??;
+        observations.extend(measured);
+        warmups.extend(warmed);
     }
-    Ok(observations)
+    Ok(clock.finish(observations, warmups))
 }
 
 #[cfg(target_os = "linux")]
@@ -366,6 +422,53 @@ fn rss_peak_bytes() -> Option<u64> {
     None
 }
 
+struct Measurement {
+    observations: Vec<Observation>,
+    warmups: Vec<Observation>,
+    elapsed: u128,
+    cpu: Option<f64>,
+    allocations: Option<u64>,
+    rss: Option<u64>,
+    rss_reset: bool,
+}
+
+struct Clock {
+    started: Instant,
+    cpu: Option<f64>,
+    allocations: bool,
+    rss_reset: bool,
+}
+
+impl Clock {
+    fn start(allocations: bool) -> Self {
+        #[cfg(target_os = "linux")]
+        let rss_reset = std::fs::write("/proc/self/clear_refs", b"5\n").is_ok();
+        #[cfg(not(target_os = "linux"))]
+        let rss_reset = false;
+        if allocations {
+            begin_allocation_measurement();
+        }
+        Self {
+            started: Instant::now(),
+            cpu: cpu_seconds(),
+            allocations,
+            rss_reset,
+        }
+    }
+
+    fn finish(self, observations: Vec<Observation>, warmups: Vec<Observation>) -> Measurement {
+        Measurement {
+            elapsed: self.started.elapsed().as_nanos(),
+            cpu: cpu_seconds().zip(self.cpu).map(|(end, start)| end - start),
+            allocations: self.allocations.then(end_allocation_measurement),
+            rss: rss_peak_bytes(),
+            rss_reset: self.rss_reset,
+            observations,
+            warmups,
+        }
+    }
+}
+
 fn json_number(value: Option<f64>) -> String {
     value.map_or_else(|| "null".to_owned(), |value| value.to_string())
 }
@@ -377,21 +480,39 @@ fn json_integer(value: Option<u64>) -> String {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), DynError> {
     let config = parse_args()?;
-    if config.measure_allocations {
-        begin_allocation_measurement();
-    }
-    let cpu_started = cpu_seconds();
-    let started = Instant::now();
-    let observations = if config.surface == "rust-async" {
+    let measurement = if config.surface == "rust-async" {
         run_async(&config).await?
     } else {
         run_blocking(&config)?
     };
-    let native_total_allocated_bytes = config.measure_allocations.then(end_allocation_measurement);
-    let elapsed = started.elapsed().as_nanos();
-    let cpu = cpu_seconds()
-        .zip(cpu_started)
-        .map(|(end, start)| end - start);
+    let elapsed = measurement.elapsed;
+    let cpu = measurement.cpu;
+    let native_total_allocated_bytes = measurement.allocations;
+    let rss = measurement.rss;
+    let rss_scope = if measurement.rss_reset {
+        "measured-phase"
+    } else {
+        "process-lifetime"
+    };
+    let observations = measurement.observations;
+    let warmups = measurement.warmups;
+    let warmup_body_bytes = warmups.iter().map(|item| item.1).sum::<usize>();
+    let warmup_checksum = warmups.iter().map(|item| item.2).sum::<u64>();
+    let warmup_application_chunks = warmups.iter().map(|item| item.4).sum::<usize>();
+    let warmup_native_responses = warmups.len();
+    let warmup_latencies = warmups
+        .iter()
+        .map(|item| item.0.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let warmup_connections = warmups
+        .iter()
+        .map(|item| item.3)
+        .collect::<BTreeSet<_>>()
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let body_bytes = observations.iter().map(|item| item.1).sum::<usize>();
     let digest = observations.iter().map(|item| item.2).sum::<u64>();
     let connections = observations
@@ -410,9 +531,9 @@ async fn main() -> Result<(), DynError> {
         .collect::<Vec<_>>()
         .join(",");
     println!(
-        "{{\"latencies_ns\":[{latencies}],\"body_bytes\":{body_bytes},\"checksum\":{digest},\"connection_ids\":[{connection_ids}],\"elapsed_ns\":{elapsed},\"cpu_seconds\":{},\"rss_peak_bytes\":{},\"python_peak_alloc_bytes\":null,\"native_total_allocated_bytes\":{},\"native_responses\":{},\"application_chunks\":{application_chunks},\"implementation\":\"requests-native\"}}",
+        "{{\"warmup_latencies_ns\":[{warmup_latencies}],\"warmup_connection_ids\":[{warmup_connections}],\"warmup_body_bytes\":{warmup_body_bytes},\"warmup_checksum\":{warmup_checksum},\"warmup_application_chunks\":{warmup_application_chunks},\"warmup_native_responses\":{warmup_native_responses},\"latencies_ns\":[{latencies}],\"body_bytes\":{body_bytes},\"checksum\":{digest},\"connection_ids\":[{connection_ids}],\"elapsed_ns\":{elapsed},\"cpu_seconds\":{},\"rss_peak_bytes\":{},\"rss_scope\":\"{rss_scope}\",\"python_peak_alloc_bytes\":null,\"native_total_allocated_bytes\":{},\"native_responses\":{},\"application_chunks\":{application_chunks},\"implementation\":\"requests-native\"}}",
         json_number(cpu),
-        json_integer(rss_peak_bytes()),
+        json_integer(rss),
         json_integer(native_total_allocated_bytes),
         config.requests,
     );

@@ -1,4 +1,17 @@
-"""One uninstrumented, bounded Windows source/profile comparison; no publication."""
+"""Bounded Windows TLS comparison or strict current-release qualification.
+
+Historical controls are the default. To test a committed main revision without
+isolated HTTPS warmups or accepting issue-1 failures, use CPython 3.12.10 on
+Windows with maturin 1.15.0. Strict qualification reads the selected revision's
+rust-toolchain.toml channel; the historical comparison retains Rust 1.98.0:
+
+python scripts/compare_windows_tls.py --current-revision HEAD \
+    --qualify-current-release --oracle-root frozen-oracle \
+    --output <fresh-directory-under-RUNNER_TEMP>
+
+The frozen oracle is psf/requests commit 69f84847045bef7a849cc994a26fe7ba8a169e95.
+One passing run is a non-reproduction, not proof that issue #1 is repaired.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +26,8 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
+
+import tomllib
 
 REVISIONS = {
     "old": "275ad59820691ada9824472f5ebe75bfeb90ad41",
@@ -136,18 +151,37 @@ def build_command(python, output, profile):
     return command
 
 
-def test_commands(python, source, proof_path, expected_hash):
+def test_commands(python, source, proof_path, expected_hash, *, qualification=None):
     identity = (
         ("requests", "requests-rust", "2.34.2")
         if source == "old"
         else ("requests-native", "requests-native", "1.0.0b1")
     )
+    provenance = (
+        "provenance",
+        [python, "-I", "-c", PROVENANCE, *identity, str(proof_path), expected_hash],
+        30,
+    )
+    if qualification is not None:
+        checkout, oracle = qualification
+        return [
+            provenance,
+            (
+                "qualification",
+                [
+                    sys.executable,
+                    str(checkout / "tests_rust/test_distribution.py"),
+                    "--installed-suite",
+                    python,
+                    "--oracle",
+                    str(oracle),
+                    str(checkout),
+                ],
+                1200,
+            ),
+        ]
     return [
-        (
-            "provenance",
-            [python, "-I", "-c", PROVENANCE, *identity, str(proof_path), expected_hash],
-            30,
-        ),
+        provenance,
         (
             "admission",
             [
@@ -186,13 +220,41 @@ def stage_suite(source, suite):
         assert (suite / relative).read_bytes() == (source / relative).read_bytes()
 
 
-def compare(output):
+def release_toolchain(checkout, revision):
+    contents = subprocess.check_output(
+        ["git", "show", f"{revision}:rust-toolchain.toml"],
+        cwd=checkout,
+        text=True,
+        timeout=30,
+    )
+    return tomllib.loads(contents)["toolchain"]["channel"]
+
+
+def compare(output, *, current_revision=None, oracle_root=None):
     assert sys.platform == "win32" and sys.version_info[:3] == (3, 12, 10)
     assert output.resolve().is_relative_to(Path(os.environ["RUNNER_TEMP"]).resolve())
     output.mkdir(parents=True, exist_ok=True)
     evidence = output / "evidence"
     evidence.mkdir(exist_ok=True)
     checkout = Path(__file__).resolve().parents[1]
+    revisions = dict(REVISIONS)
+    if current_revision is not None:
+        revisions["current"] = subprocess.check_output(
+            [
+                "git",
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                f"{current_revision}^{{commit}}",
+            ],
+            cwd=checkout,
+            text=True,
+            timeout=30,
+        ).strip()
+    qualification = (checkout, oracle_root) if oracle_root is not None else None
+    cells = [("current", "release")] if qualification else CELLS
+    if qualification:
+        revisions = {"current": revisions["current"]}
     pins = Path(__file__).with_name("windows-tls-dependencies.txt")
     build_env = dict(os.environ)
     for key in (
@@ -205,7 +267,9 @@ def compare(output):
         build_env.pop(key, None)
     build_env.update(
         CARGO_TARGET_DIR=str(output / "target"),
-        RUSTUP_TOOLCHAIN="1.98.0",
+        RUSTUP_TOOLCHAIN=release_toolchain(checkout, revisions["current"])
+        if qualification
+        else "1.98.0",
         PYTHONDONTWRITEBYTECODE="1",
         CARGO_TERM_COLOR="never",
     )
@@ -226,7 +290,10 @@ def compare(output):
             test=test_env,
             dependencies=pins.read_text().splitlines(),
             dependency_pins_sha256=sha256(pins),
-            order=CELLS,
+            order=cells,
+            mode="strict-qualification"
+            if qualification
+            else "source-profile-comparison",
         ),
     )
     results = {}
@@ -257,8 +324,36 @@ def compare(output):
         for tool in ("rustc", "cargo"):
             run(tool, [tool, "--version", "--verbose"], timeout=30)
         run("maturin", [sys.executable, "-m", "maturin", "--version"], timeout=30)
+        if qualification:
+            oracle_commit = subprocess.check_output(
+                ["git", "-C", str(oracle_root), "rev-parse", "HEAD"],
+                text=True,
+                timeout=30,
+            ).strip()
+            if oracle_commit != "69f84847045bef7a849cc994a26fe7ba8a169e95":
+                raise ValueError(
+                    "oracle must be checked out at the frozen source commit"
+                )
+            oracle_changes = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(oracle_root),
+                    "status",
+                    "--porcelain",
+                    "--",
+                    "src/requests",
+                ],
+                text=True,
+                timeout=30,
+            )
+            if oracle_changes.strip():
+                raise ValueError(
+                    "frozen oracle source has tracked or untracked changes"
+                )
+            write_json(evidence / "oracle.json", {"revision": oracle_commit})
         manifests = {}
-        for source, revision in REVISIONS.items():
+        for source, revision in revisions.items():
             source_dir = output / source
             source_dir.mkdir()
             archive = output / f"{source}.tar"
@@ -286,15 +381,15 @@ def compare(output):
                 manifests[source][part] = subprocess.check_output(
                     ["git", "rev-parse", f"{revision}:{part}"], cwd=checkout, text=True
                 ).strip()
-        assert (
+        assert "old" not in manifests or (
             manifests["old"]["crates/requests/src"]
             == "6348fb64dfb329f7c591b3cff0e9302a737b2718"
         )
-        assert (
+        assert "old" not in manifests or (
             manifests["old"]["crates/requests-python/src"]
             == "264118b5c306bb059810866f87cd358e418be050"
         )
-        assert (
+        assert "old" not in manifests or (
             manifests["old"]["src/requests"]
             == "be22c0760ceffdae3f4f620336e20e30245da9f0"
         )
@@ -307,6 +402,8 @@ def compare(output):
             "tests_rust/test_backend_boundary.py",
             "requirements-dev.txt",
         ]
+        if qualification:
+            suite_inputs.append("tests_rust/test_distribution.py")
         untracked = subprocess.check_output(
             ["git", "ls-files", "--others", "--", *suite_inputs],
             cwd=checkout,
@@ -320,20 +417,20 @@ def compare(output):
                 "git",
                 "diff",
                 "--exit-code",
-                REVISIONS["current"],
+                revisions["current"],
                 "--",
                 *suite_inputs,
             ],
             timeout=30,
         )
-        for source, profile in CELLS:
+        for source, profile in cells:
             stage_suite(checkout, output / f"{source}-{profile}" / "outside")
         write_json(
             evidence / "suite-staging.json",
             {
-                "source_revision": REVISIONS["current"],
+                "source_revision": revisions["current"],
                 "source": str(checkout),
-                "cells": [f"{source}-{profile}" for source, profile in CELLS],
+                "cells": [f"{source}-{profile}" for source, profile in cells],
                 "completed_before_builds": True,
             },
         )
@@ -366,13 +463,29 @@ def compare(output):
         )
         wheels = {}
         extension_hashes = {}
-        for source, profile in CELLS:
+        for source, profile in cells:
             name = f"{source}-{profile}"
             cell = output / name
             # The suite preflight already created this cell.
+            command = build_command(sys.executable, cell, profile)
+            if qualification:
+                command = [
+                    sys.executable,
+                    "scripts/build_release_wheel.py",
+                    "--interpreter",
+                    sys.executable,
+                    "--out",
+                    str(cell),
+                ]
+                build_env["SOURCE_DATE_EPOCH"] = subprocess.check_output(
+                    ["git", "show", "-s", "--format=%ct", revisions[source]],
+                    cwd=checkout,
+                    text=True,
+                    timeout=30,
+                ).strip()
             run(
                 f"{name}-build",
-                build_command(sys.executable, cell, profile),
+                command,
                 cwd=output / source,
             )
             built = list(cell.glob("*.whl"))
@@ -392,7 +505,7 @@ def compare(output):
             )
 
         # Finish every build and environment install before any test child starts.
-        for source, profile in CELLS:
+        for source, profile in cells:
             name = f"{source}-{profile}"
             cell = output / name
             environment = cell / "venv"
@@ -424,14 +537,18 @@ def compare(output):
 
         valid_cells = []
         dependency_inventories = {}
-        for source, profile in CELLS:
+        for source, profile in cells:
             name = f"{source}-{profile}"
             cell = output / name
             python = str(cell / "venv/Scripts/python.exe")
             proof_path = evidence / f"{name}-installed.json"
             valid = True
             for label, command, timeout in test_commands(
-                python, source, proof_path, extension_hashes[name]
+                python,
+                source,
+                proof_path,
+                extension_hashes[name],
+                qualification=qualification,
             ):
                 record = run(
                     f"{name}-{label}",
@@ -439,9 +556,12 @@ def compare(output):
                     cwd=cell / "outside",
                     env=test_env,
                     timeout=timeout,
-                    required=False,
+                    required=bool(qualification) and label == "provenance",
                 )
-                if label in ("provenance", "admission") and record["exit_code"]:
+                if (
+                    label in ("provenance", "admission", "qualification")
+                    and record["exit_code"]
+                ):
                     valid = False
                 if label == "provenance" and record["exit_code"] == 0:
                     dependency_inventories[name] = external_dependencies(
@@ -462,8 +582,8 @@ def compare(output):
                 failures=failed,
                 passed=not failed,
                 instrumentation=False,
-                explicit_maturin_strip=False,
-                limitation="Cargo release defaults include debuginfo stripping. This compares source/build profiles; it does not prove a low-level cause or a repair.",
+                explicit_maturin_strip=bool(qualification),
+                limitation="Cargo release defaults include debuginfo stripping. A passing comparison or qualification does not prove a low-level cause or a repair.",
             ),
         )
         return int(bool(failed))
@@ -488,6 +608,51 @@ def self_check():
     commands = test_commands("python", "old", Path("proof.json"), "a" * 64)
     assert commands[-1][1][-1] == "tests" and commands[-1][2] == 300
     assert [item[2] for item in commands[2:4]] == [60, 60]
+    checkout = Path(__file__).resolve().parents[1]
+    assert (
+        release_toolchain(checkout, "HEAD")
+        == tomllib.loads(
+            (checkout / "rust-toolchain.toml").read_text(encoding="utf-8")
+        )["toolchain"]["channel"]
+    )
+    qualification = test_commands(
+        "python",
+        "current",
+        Path("proof.json"),
+        "a" * 64,
+        qualification=(checkout, Path("oracle")),
+    )
+    assert [item[0] for item in qualification] == ["provenance", "qualification"]
+    assert qualification[-1][1] == [
+        sys.executable,
+        str(checkout / "tests_rust/test_distribution.py"),
+        "--installed-suite",
+        "python",
+        "--oracle",
+        "oracle",
+        str(checkout),
+    ]
+    assert "--accept-windows-tls-issue-1" not in qualification[-1][1]
+    assert qualification[-1][2] == 1200
+    for options in (
+        ["--qualify-current-release"],
+        ["--oracle-root", "missing-oracle"],
+        ["--qualify-current-release", "--oracle-root", "missing-oracle"],
+        [
+            "--qualify-current-release",
+            "--oracle-root",
+            "missing-oracle",
+            "--current-revision",
+            "HEAD",
+        ],
+    ):
+        rejected = subprocess.run(
+            [sys.executable, __file__, "--self-check", *options],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert rejected.returncode == 2 and "error:" in rejected.stderr
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         suite = root / "outside"
@@ -538,13 +703,50 @@ def self_check():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--self-check", action="store_true")
+    parser.add_argument(
+        "--current-revision",
+        help="Current source Git ref; defaults to the historical issue-1 control",
+    )
+    parser.add_argument(
+        "--qualify-current-release",
+        action="store_true",
+        help="Build one release wheel with the normal helper and run the strict installed suite once",
+    )
+    parser.add_argument(
+        "--oracle-root",
+        type=Path,
+        help="Frozen psf/requests oracle checkout required for strict qualification",
+    )
     arguments = parser.parse_args()
+    if arguments.qualify_current_release != (arguments.oracle_root is not None):
+        parser.error(
+            "--qualify-current-release and --oracle-root must be supplied together"
+        )
+    if arguments.qualify_current_release and not arguments.current_revision:
+        parser.error("strict qualification requires an explicit --current-revision")
+    if (
+        arguments.oracle_root
+        and not (arguments.oracle_root / "src/requests/__init__.py").is_file()
+    ):
+        parser.error(
+            "--oracle-root must contain the frozen oracle src/requests package"
+        )
     if arguments.self_check:
         self_check()
     elif arguments.output:
-        sys.exit(compare(arguments.output.resolve()))
+        sys.exit(
+            compare(
+                arguments.output.resolve(),
+                current_revision=arguments.current_revision,
+                oracle_root=arguments.oracle_root.resolve()
+                if arguments.oracle_root
+                else None,
+            )
+        )
     else:
         parser.error("--output or --self-check is required")

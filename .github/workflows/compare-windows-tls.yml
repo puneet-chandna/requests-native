@@ -2,6 +2,11 @@ name: Compare Windows TLS source and build profiles
 
 on:
   workflow_dispatch:
+    inputs:
+      qualify_current_release:
+        description: "Run strict release qualification of this commit instead of historical controls"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,6 +24,7 @@ jobs:
       PYTHONNOUSERSITE: "1"
       CARGO_TERM_COLOR: never
       RUSTUP_TOOLCHAIN: "1.98.0"
+      QUALIFY_CURRENT_RELEASE: ${{ inputs.qualify_current_release }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -28,19 +34,36 @@ jobs:
         with:
           python-version: "3.12.10"
           architecture: x64
+      - name: Check out frozen Python oracle
+        if: inputs.qualify_current_release
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: psf/requests
+          ref: 69f84847045bef7a849cc994a26fe7ba8a169e95
+          path: frozen-oracle
+          persist-credentials: false
       - name: Prepare fixed toolchain
         shell: pwsh
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'windows-tls-comparison/evidence'
           New-Item -ItemType Directory -Force $evidence | Out-Null
-          rustup toolchain install 1.98.0 --profile minimal *> "$evidence/toolchain-setup.log"
+          $toolchain = '1.98.0'
+          if ($env:QUALIFY_CURRENT_RELEASE -eq 'true') {
+            $toolchain = python -c "import tomllib; print(tomllib.load(open('rust-toolchain.toml', 'rb'))['toolchain']['channel'])"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          rustup toolchain install $toolchain --profile minimal *> "$evidence/toolchain-setup.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install --disable-pip-version-check --retries 0 --timeout 30 "maturin==1.15.0" *> "$evidence/maturin-setup.log"
           exit $LASTEXITCODE
-      - name: Build four controls then compare installed artifacts
+      - name: Build and test installed artifacts
         shell: pwsh
         run: |
-          python scripts/compare_windows_tls.py --output "$env:RUNNER_TEMP/windows-tls-comparison"
+          $qualification = @()
+          if ($env:QUALIFY_CURRENT_RELEASE -eq 'true') {
+            $qualification = @('--current-revision', $env:GITHUB_SHA, '--qualify-current-release', '--oracle-root', 'frozen-oracle')
+          }
+          python scripts/compare_windows_tls.py @qualification --output "$env:RUNNER_TEMP/windows-tls-comparison"
           exit $LASTEXITCODE
       - name: Retain private comparison logs even on failure
         if: always()

@@ -27,18 +27,27 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+
+try:
     import resource
 except ImportError:  # pragma: no cover - Windows records RSS as unavailable.
     resource = None  # type: ignore[assignment]
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(
+    os.environ.get(
+        "REQUESTS_BENCHMARK_ROOT", pathlib.Path(__file__).resolve().parents[1]
+    )
+).resolve()
 ORACLE_ROOT = pathlib.Path(
     os.environ.get("REQUESTS_ORACLE_ROOT", ROOT.parent / "requests")
 ).resolve()
 NATIVE_BINARY = ROOT / "target" / "release" / "requests-benchmark-native"
 NATIVE_MANIFEST = ROOT / "benchmarks" / "rust-native" / "Cargo.toml"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SURFACES = ("python-oracle", "python-rust", "rust-async", "rust-blocking")
 _PERSONAL_HOME = re.compile(
     r"(?:/(?:home|Users)/[^/\s]+|[A-Za-z]:[\\/]Users[\\/][^\\/\s]+)"
@@ -54,6 +63,7 @@ def sanitize_public_report(
     replacements = (
         (str(repository.resolve()), "{repository}"),
         (str(oracle.resolve()), "{oracle}"),
+        (str(pathlib.Path(__file__).resolve().parents[1]), "{evaluator}"),
     )
 
     def sanitize(item: Any) -> Any:
@@ -106,6 +116,7 @@ def resolve_workload(arguments: argparse.Namespace) -> tuple[int, int, int, int]
         min(requests, small_size, large_size, maximum_concurrency, arguments.chunk_size)
         < 1
         or arguments.case_timeout_seconds <= 0
+        or arguments.warmup < 0
     ):
         raise ValueError("all workload sizes and deadlines must be positive")
     return requests, small_size, large_size, maximum_concurrency
@@ -164,6 +175,37 @@ def normalize_peak_rss(value: int, system: str = sys.platform) -> int:
     return value if system == "darwin" else value * 1024
 
 
+def reset_peak_rss() -> bool:
+    if sys.platform != "linux":
+        return False
+    try:
+        pathlib.Path("/proc/self/clear_refs").write_text("5\n")
+    except OSError:
+        return False
+    return True
+
+
+def peak_rss_bytes() -> int | None:
+    if sys.platform == "linux":
+        for line in pathlib.Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) * 1024
+        return None
+    return (
+        normalize_peak_rss(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if resource is not None
+        else None
+    )
+
+
+def valid_latencies(values: Any, count: int) -> bool:
+    return (
+        isinstance(values, list)
+        and len(values) == count
+        and all(type(value) is int and value > 0 for value in values)
+    )
+
+
 def validate_allocations(worker: dict[str, Any], surface: str) -> None:
     python_peak = worker["python_peak_alloc_bytes"]
     native_total = worker["native_total_allocated_bytes"]
@@ -199,7 +241,7 @@ def validate_result_row(row: dict[str, Any]) -> None:
     missing = required - row.keys()
     if missing:
         raise ValueError(f"result row missing keys: {sorted(missing)}")
-    if len(row["latency_ns_samples"]) != row["requests"]:
+    if not valid_latencies(row["latency_ns_samples"], row["requests"]):
         raise ValueError("result row has the wrong latency sample count")
     validate_allocations(row, row["surface"])
 
@@ -231,7 +273,7 @@ def validate_worker_result(
     if missing:
         raise ValueError(f"worker result missing keys: {sorted(missing)}")
     latencies = worker["latencies_ns"]
-    if len(latencies) != requests or any(value <= 0 for value in latencies):
+    if not valid_latencies(latencies, requests):
         raise ValueError("worker returned an invalid latency sample count")
     if worker["body_bytes"] != requests * expected_bytes:
         raise ValueError("worker body bytes differ from the fixture contract")
@@ -241,12 +283,38 @@ def validate_worker_result(
         raise ValueError("worker application chunks differ from the read contract")
     if require_native and worker["native_responses"] != requests:
         raise ValueError("Rust-backed Python did not route every response natively")
-    if worker["elapsed_ns"] <= 0 or (
-        worker["cpu_seconds"] is not None and worker["cpu_seconds"] < 0
+    if (
+        type(worker["elapsed_ns"]) is not int
+        or worker["elapsed_ns"] <= 0
+        or (
+            worker["cpu_seconds"] is not None
+            and (not math.isfinite(worker["cpu_seconds"]) or worker["cpu_seconds"] < 0)
+        )
     ):
         raise ValueError("worker returned invalid timing data")
     if not worker["connection_ids"]:
         raise ValueError("worker did not observe a fixture connection")
+
+
+def validate_warmup(
+    worker: dict[str, Any],
+    count: int,
+    body: bytes,
+    chunk_size: int,
+    read: str,
+    surface: str,
+) -> None:
+    if (
+        not valid_latencies(worker["warmup_latencies_ns"], count)
+        or worker["warmup_body_bytes"] != count * len(body)
+        or worker["warmup_checksum"] != count * body_checksum(body)
+        or worker["warmup_application_chunks"]
+        != (0 if read == "buffered" else count * math.ceil(len(body) / chunk_size))
+        or worker["warmup_native_responses"]
+        != (count if surface != "python-oracle" else 0)
+        or (count > 0 and not worker["warmup_connection_ids"])
+    ):
+        raise ValueError("warm-up violates the fixture/native routing contract")
 
 
 class FixtureServer(ThreadingHTTPServer):
@@ -316,8 +384,9 @@ def fixture_server(small_body: bytes, large_body: bytes):
 
 
 def python_worker(arguments: argparse.Namespace) -> int:
-    if arguments.surface == "python-oracle":
-        sys.path.insert(0, str(ORACLE_ROOT / "src"))
+    sys.path.insert(
+        0, str((ORACLE_ROOT if arguments.surface == "python-oracle" else ROOT) / "src")
+    )
     import requests  # noqa: PLC0415
 
     implementation = pathlib.Path(requests.__file__).resolve()
@@ -327,11 +396,11 @@ def python_worker(arguments: argparse.Namespace) -> int:
             f"{arguments.surface} imported {implementation}, outside {expected_root}"
         )
 
-    native_responses = 0
-    lock = threading.Lock()
+    workers = min(arguments.concurrency, arguments.requests)
+    ready = threading.Barrier(workers + 1)
+    start = threading.Barrier(workers + 1)
 
-    def consume(session, url: str) -> tuple[int, int, int, int, int]:
-        nonlocal native_responses
+    def consume(session, url: str) -> tuple[int, int, int, int, int, int]:
         start = time.perf_counter_ns()
         with session.get(url, stream=arguments.read == "streaming") as response:
             response.raise_for_status()
@@ -351,55 +420,66 @@ def python_worker(arguments: argparse.Namespace) -> int:
                     checksum += body_checksum(chunk)
                     application_chunks += 1
         latency = time.perf_counter_ns() - start
-        if is_native:
-            with lock:
-                native_responses += 1
-        return latency, size, checksum, connection_id, application_chunks
+        return (
+            latency,
+            size,
+            checksum,
+            connection_id,
+            application_chunks,
+            int(is_native),
+        )
 
-    def run_client(count: int) -> list[tuple[int, int, int, int, int]]:
+    def run_client(count: int) -> list[tuple[int, int, int, int, int, int]]:
         pooled = None
         if arguments.mode == "pooled":
             pooled = requests.Session()
             pooled.trust_env = False
         output = []
+        warmed = []
         try:
-            for _ in range(count):
+            for index in range(arguments.warmup + count):
+                if index == arguments.warmup:
+                    ready.wait()
+                    start.wait()
                 if pooled is None:
                     with requests.Session() as one_shot:
                         one_shot.trust_env = False
-                        output.append(consume(one_shot, arguments.url))
+                        observation = consume(one_shot, arguments.url)
                 else:
-                    output.append(consume(pooled, arguments.url))
+                    observation = consume(pooled, arguments.url)
+                (warmed if index < arguments.warmup else output).append(observation)
+        except BaseException:
+            ready.abort()
+            start.abort()
+            raise
         finally:
             if pooled is not None:
                 pooled.close()
-        return output
+        return output, warmed
 
-    if arguments.measure_allocations:
-        tracemalloc.start()
-    cpu_start = time.process_time()
-    wall_start = time.perf_counter_ns()
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(arguments.concurrency, arguments.requests)
-    ) as executor:
-        nested = list(
-            executor.map(
-                run_client, split_work(arguments.requests, arguments.concurrency)
-            )
-        )
-    elapsed_ns = time.perf_counter_ns() - wall_start
-    cpu_seconds = time.process_time() - cpu_start
-    allocation_peak = None
-    if arguments.measure_allocations:
-        _, allocation_peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(run_client, count)
+            for count in split_work(arguments.requests, arguments.concurrency)
+        ]
+        ready.wait()
+        rss_reset = reset_peak_rss()
+        if arguments.measure_allocations:
+            tracemalloc.start()
+        cpu_start = time.process_time()
+        wall_start = time.perf_counter_ns()
+        start.wait()
+        nested = [future.result() for future in futures]
+        elapsed_ns = time.perf_counter_ns() - wall_start
+        cpu_seconds = time.process_time() - cpu_start
+        rss_peak_bytes = peak_rss_bytes()
+        allocation_peak = None
+        if arguments.measure_allocations:
+            _, allocation_peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
 
-    observations = [item for group in nested for item in group]
-    rss_peak_bytes = (
-        normalize_peak_rss(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-        if resource is not None
-        else None
-    )
+    observations = [item for measured, _ in nested for item in measured]
+    warmups = [item for _, warmed in nested for item in warmed]
     result = {
         "latencies_ns": [item[0] for item in observations],
         "body_bytes": sum(item[1] for item in observations),
@@ -408,12 +488,23 @@ def python_worker(arguments: argparse.Namespace) -> int:
         "elapsed_ns": elapsed_ns,
         "cpu_seconds": cpu_seconds,
         "rss_peak_bytes": rss_peak_bytes,
+        "rss_scope": "measured-phase" if rss_reset else "process-lifetime",
         "python_peak_alloc_bytes": allocation_peak,
-        "native_responses": native_responses,
+        "native_responses": sum(item[5] for item in observations),
         "application_chunks": sum(item[4] for item in observations),
         "native_total_allocated_bytes": None,
         "implementation": str(implementation),
     }
+    result.update(
+        {
+            "warmup_latencies_ns": [item[0] for item in warmups],
+            "warmup_body_bytes": sum(item[1] for item in warmups),
+            "warmup_checksum": sum(item[2] for item in warmups),
+            "warmup_connection_ids": sorted({item[3] for item in warmups}),
+            "warmup_application_chunks": sum(item[4] for item in warmups),
+            "warmup_native_responses": sum(item[5] for item in warmups),
+        }
+    )
     print(json.dumps(result, sort_keys=True))
     return 0
 
@@ -427,6 +518,7 @@ def build_native(command_log: list[str]) -> None:
         "--target-dir",
         str(ROOT / "target"),
         "--release",
+        "--locked",
         "--offline",
     ]
     command_log.append(shlex.join(command))
@@ -444,6 +536,7 @@ def build_python_extension(
     temporary = ROOT / "target" / "benchmark-tmp"
     temporary.mkdir(parents=True, exist_ok=True)
     environment_overrides = {
+        "PIP_NO_DEPS": "1",
         "TEMP": str(temporary),
         "TMP": str(temporary),
         "TMPDIR": str(temporary),
@@ -453,6 +546,7 @@ def build_python_extension(
         str(resolve_maturin(environment)),
         "develop",
         "--release",
+        "--locked",
         "--offline",
     ]
     command_log.append(
@@ -465,6 +559,7 @@ def build_python_extension(
     )
     process_environment = os.environ.copy()
     process_environment.update(environment_overrides)
+    process_environment["VIRTUAL_ENV"] = str(environment)
     subprocess.run(command, cwd=ROOT, check=True, env=process_environment)
     release_build = find_release_library(ROOT / "target" / "release")
     return release_build, {
@@ -493,6 +588,8 @@ import json
 import pathlib
 import sys
 import sysconfig
+import os
+sys.path.insert(0, str(pathlib.Path(os.environ.get("REQUESTS_BENCHMARK_ROOT", ".")) / "src"))
 import requests
 import requests._requests_rust as extension
 
@@ -539,7 +636,14 @@ print(json.dumps({
         )
     if provenance["extension_backend"] != "requests-native":
         raise RuntimeError("loaded Python extension reports the wrong backend")
-    if provenance["distribution_version"] != "1.0.0b1":
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]
+    expected_version = (
+        workspace["version"]
+        .replace("-beta.", "b")
+        .replace("-alpha.", "a")
+        .replace("-rc.", "rc")
+    )
+    if provenance["distribution_version"] != expected_version:
         raise RuntimeError("loaded Python distribution reports the wrong version")
     if provenance["compatibility_version"] != "2.34.2":
         raise RuntimeError(
@@ -598,8 +702,14 @@ def tool_version(command: list[str]) -> str | None:
 
 
 def git_metadata() -> dict[str, Any]:
-    commit = tool_version(["git", "rev-parse", "HEAD"])
-    status = tool_version(["git", "status", "--short"])
+    commit = os.environ.get("REQUESTS_BENCHMARK_COMMIT") or tool_version(
+        ["git", "rev-parse", "HEAD"]
+    )
+    status = (
+        ""
+        if os.environ.get("REQUESTS_BENCHMARK_COMMIT")
+        else tool_version(["git", "status", "--short"])
+    )
     oracle_commit = subprocess.run(
         ["git", "-C", str(ORACLE_ROOT), "rev-parse", "HEAD"],
         check=True,
@@ -616,11 +726,30 @@ def git_metadata() -> dict[str, Any]:
         raise RuntimeError(
             "frozen Python oracle is dirty; benchmark provenance is invalid"
         )
+    frozen = tomllib.loads((ROOT / "ORACLE.lock").read_text())["frozen_source_commit"]
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ORACLE_ROOT),
+            "diff",
+            "--exit-code",
+            frozen,
+            "--",
+            "src/requests",
+            "tests",
+            "pyproject.toml",
+            "setup.py",
+        ],
+        check=True,
+        capture_output=True,
+    )
     return {
         "rewrite_commit": commit,
         "rewrite_dirty": bool(status),
         "rewrite_status": status.splitlines() if status else [],
         "oracle_commit": oracle_commit,
+        "oracle_frozen_source_commit": frozen,
         "oracle_dirty": False,
     }
 
@@ -652,6 +781,7 @@ def worker_command(
     mode: str,
     read: str,
     chunk_size: int,
+    warmup: int = 0,
 ) -> list[str]:
     common = [
         "--surface",
@@ -668,6 +798,8 @@ def worker_command(
         read,
         "--chunk-size",
         str(chunk_size),
+        "--warmup",
+        str(warmup),
     ]
     if surface.startswith("python-"):
         return [
@@ -714,6 +846,7 @@ def summarize(
         },
         "cpu_seconds": worker["cpu_seconds"],
         "rss_peak_bytes": worker["rss_peak_bytes"],
+        "rss_scope": worker["rss_scope"],
         "python_peak_alloc_bytes": worker["python_peak_alloc_bytes"],
         "native_total_allocated_bytes": worker["native_total_allocated_bytes"],
         "body_bytes_total": worker["body_bytes"],
@@ -776,6 +909,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
             "stream_chunk_bytes": arguments.chunk_size,
             "concurrency_levels": concurrencies,
             "surfaces": surfaces,
+            "warmup_per_worker": arguments.warmup,
         },
     }
     rows = []
@@ -796,6 +930,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                                 mode=mode,
                                 read=read,
                                 chunk_size=arguments.chunk_size,
+                                warmup=arguments.warmup,
                             )
                             before_requests, before_connections = server.snapshot()
                             commands.append(shlex.join(command))
@@ -816,14 +951,28 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                             after_requests, after_connections = server.snapshot()
                             request_delta = after_requests - before_requests
                             accepted_delta = after_connections - before_connections
-                            if request_delta != requests:
+                            warmup_requests = arguments.warmup * min(
+                                concurrency, requests
+                            )
+                            if request_delta != requests + warmup_requests:
                                 raise RuntimeError(
                                     f"fixture observed {request_delta} requests, expected {requests}"
                                 )
-                            if accepted_delta != len(worker["connection_ids"]):
+                            if accepted_delta != len(
+                                set(worker["connection_ids"])
+                                | set(worker["warmup_connection_ids"])
+                            ):
                                 raise RuntimeError(
                                     "fixture and worker disagree on accepted connections"
                                 )
+                            validate_warmup(
+                                worker,
+                                warmup_requests,
+                                expected_body,
+                                arguments.chunk_size,
+                                read,
+                                surface,
+                            )
                             validate_worker_result(
                                 worker,
                                 requests=requests,
@@ -858,6 +1007,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                                     mode=mode,
                                     read=read,
                                     chunk_size=arguments.chunk_size,
+                                    warmup=arguments.warmup,
                                 ),
                                 "--measure-allocations",
                             ]
@@ -874,11 +1024,25 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                                     f"allocation replay failed: {case_name}: {error}"
                                 ) from error
                             allocation_after, _ = server.snapshot()
-                            if allocation_after - allocation_before != requests:
+                            if (
+                                allocation_after - allocation_before
+                                != requests
+                                + arguments.warmup
+                                * min(allocation_concurrency, requests)
+                            ):
                                 raise RuntimeError(
                                     f"allocation replay sent the wrong request count: {case_name}"
                                 )
                             try:
+                                validate_warmup(
+                                    allocation_worker,
+                                    arguments.warmup
+                                    * min(allocation_concurrency, requests),
+                                    expected_body,
+                                    arguments.chunk_size,
+                                    read,
+                                    surface,
+                                )
                                 validate_worker_result(
                                     allocation_worker,
                                     requests=requests,
@@ -918,7 +1082,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                                     read=read,
                                     concurrency=concurrency,
                                     requests=requests,
-                                    accepted_connections=accepted_delta,
+                                    accepted_connections=len(worker["connection_ids"]),
                                     allocation_replay_concurrency=allocation_concurrency,
                                 )
                             )
@@ -946,6 +1110,12 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--profile", choices=("smoke", "default"), default="default")
     command.add_argument("--surfaces", nargs="+", choices=SURFACES)
     command.add_argument("--requests", type=int)
+    command.add_argument(
+        "--warmup",
+        type=int,
+        default=0,
+        help="Untimed requests per logical worker on the same clients",
+    )
     command.add_argument("--concurrency", type=int)
     command.add_argument("--small-bytes", type=int)
     command.add_argument("--large-bytes", type=int)

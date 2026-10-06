@@ -1,0 +1,63 @@
+name: Release performance qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Baseline tag or commit in this repository"
+        type: string
+        required: true
+      smoke:
+        description: "Short harness check only; does not qualify a release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-performance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evaluate:
+    runs-on: namespace-profile-puneet-chandna
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+      - name: Prepare isolated evaluation environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install "maturin==1.15.0" "charset_normalizer==3.5.1" "idna==3.19" "urllib3==2.7.0" "certifi==2026.7.22"
+      - name: Check out frozen Python oracle
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: psf/requests
+          ref: 69f84847045bef7a849cc994a26fe7ba8a169e95
+          path: frozen-oracle
+          persist-credentials: false
+      - name: Evaluate paired revisions
+        env:
+          REQUESTS_ORACLE_ROOT: ${{ github.workspace }}/frozen-oracle
+          BASE: ${{ inputs.base }}
+          CANDIDATE: ${{ github.sha }}
+          SMOKE: ${{ inputs.smoke }}
+        shell: bash
+        run: |
+          mode=--gate
+          if [[ "$SMOKE" == true ]]; then mode=--smoke; fi
+          .venv/bin/python benchmarks/evaluate.py --base "$BASE" --candidate "$CANDIDATE" "$mode" --output target/performance-evidence
+      - name: Preserve raw measurements and decision
+        if: ${{ always() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: performance-evidence
+          path: target/performance-evidence/*.json
+          if-no-files-found: warn
+          retention-days: 14

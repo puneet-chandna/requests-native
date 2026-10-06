@@ -23,6 +23,52 @@ from benchmarks.run import (
 
 
 class BenchmarkHarnessTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "Linux RSS measurement")
+    def test_measured_rss_discards_released_warmup_peak(self):
+        result = benchmark.run_json_command(
+            [
+                sys.executable,
+                "-c",
+                "import mmap, json; from benchmarks import run; "
+                "m = mmap.mmap(-1, 64 * 1024 * 1024); "
+                "[m.write(b'x' * 65536) for _ in range(1024)]; "
+                "before = run.peak_rss_bytes(); m.close(); "
+                "reset = run.reset_peak_rss(); after = run.peak_rss_bytes(); "
+                "print(json.dumps({'before': before, 'after': after, 'reset': reset}))",
+            ],
+            cwd=benchmark.ROOT,
+            timeout_seconds=10,
+        )
+        self.assertTrue(result["reset"])
+        self.assertGreater(result["before"] - result["after"], 32 * 1024 * 1024)
+
+    def test_warmup_preserves_pooled_clients_and_excludes_measured_samples(self):
+        with benchmark.fixture_server(b"abc", b"abcdef") as server:
+            host, port = server.server_address
+            command = benchmark.worker_command(
+                "python-oracle",
+                url=f"http://{host}:{port}/small",
+                requests=4,
+                concurrency=2,
+                mode="pooled",
+                read="streaming",
+                chunk_size=2,
+                warmup=2,
+            )
+            result = benchmark.run_json_command(
+                command, cwd=benchmark.ROOT, timeout_seconds=10
+            )
+            self.assertEqual(server.snapshot(), (8, 2))
+            self.assertEqual(len(result["latencies_ns"]), 4)
+            self.assertEqual(len(result["warmup_latencies_ns"]), 4)
+            self.assertEqual(result["body_bytes"], 12)
+            self.assertEqual(result["warmup_body_bytes"], 12)
+            self.assertEqual(result["warmup_checksum"], 4 * sum(b"abc"))
+            self.assertEqual(result["warmup_application_chunks"], 8)
+            self.assertEqual(
+                set(result["connection_ids"]), set(result["warmup_connection_ids"])
+            )
+
     def test_oracle_location_accepts_an_override_and_preserves_sibling_default(self):
         with tempfile.TemporaryDirectory() as directory:
             override = Path(directory) / "frozen-oracle"
@@ -43,7 +89,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertIn('"distribution_name": "requests-native"', source)
         self.assertIn('"compatibility_import": "requests"', source)
         self.assertIn('"compatibility_version": requests.__version__', source)
-        self.assertIn('provenance["distribution_version"] != "1.0.0b1"', source)
+        self.assertIn('provenance["distribution_version"] != expected_version', source)
         self.assertIn('provenance["compatibility_version"] != "2.34.2"', source)
 
     def test_public_report_replaces_checkout_paths_and_rejects_home_paths(self) -> None:

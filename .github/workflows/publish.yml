@@ -21,7 +21,7 @@ jobs:
   sdist:
     if: ${{ inputs.artifact_run_id == '' }}
     name: Build sdist
-    runs-on: ubuntu-24.04
+    runs-on: namespace-profile-puneet-chandna
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -78,7 +78,7 @@ jobs:
     name: Validate release artifact manifest
     needs: [sdist, wheels]
     if: ${{ !cancelled() && (inputs.artifact_run_id != '' || (needs.sdist.result == 'success' && needs.wheels.result == 'success')) }}
-    runs-on: ubuntu-24.04
+    runs-on: namespace-profile-puneet-chandna
     timeout-minutes: 10
     permissions:
       actions: read

@@ -201,6 +201,9 @@ EXPECTED_REQUESTS_RUST_SOURCES = {
     "crates/requests/src/session_runtime.rs",
     "crates/requests/src/structures.rs",
     "crates/requests/src/transport/connect.rs",
+    "crates/requests/src/transport/establishment_tests.rs",
+    "crates/requests/src/transport/pool_tests.rs",
+    "crates/requests/src/transport/timeout_tests.rs",
     "crates/requests/src/transport/decode.rs",
     "crates/requests/src/transport/mod.rs",
     "crates/requests/src/transport/pool.rs",
@@ -239,6 +242,20 @@ EXPECTED_SDIST_MEMBERS = (
         "scripts/build_release_wheel.py",
         "scripts/generate_release_sbom.py",
         "crates/requests/Cargo.toml",
+        "crates/requests/AUTHORS.rst",
+        "crates/requests/LICENSE",
+        "crates/requests/NOTICE",
+        "crates/requests/README.md",
+        "crates/requests/RUST_RUNTIME_NOTICES.html",
+        "crates/requests/tests/fixtures/expired-ca.crt",
+        "crates/requests/tests/fixtures/mtls-client/client-chain.pem",
+        "crates/requests/tests/fixtures/mtls-client/client-combined.pem",
+        "crates/requests/tests/fixtures/mtls-client/client.key",
+        "crates/requests/tests/fixtures/mtls-client/client.pem",
+        "crates/requests/tests/fixtures/server.key",
+        "crates/requests/tests/fixtures/server.pem",
+        "crates/requests/tests/fixtures/wrong-host.key",
+        "crates/requests/tests/fixtures/wrong-host.pem",
         "crates/requests-python/Cargo.toml",
         "crates/requests-python/build.rs",
     }
@@ -451,8 +468,38 @@ def test_release_sources_are_allow_listed_and_legal_files_are_canonical() -> Non
     assert requests_package["include"] == [
         "Cargo.toml",
         "src/**/*.rs",
-        "!src/**/*_tests.rs",
+        "tests/fixtures/**/*",
+        "README.md",
+        "LICENSE",
+        "NOTICE",
+        "AUTHORS.rst",
+        "RUST_RUNTIME_NOTICES.html",
     ]
+    assert requests_package["readme"] == "README.md"
+    for filename in ("README.md", *LEGAL_FILES):
+        assert (ROOT / "crates/requests" / filename).read_bytes() == (
+            ROOT / filename
+        ).read_bytes()
+    fixtures = {
+        "expired-ca.crt": "tests/certs/expired/ca/ca.crt",
+        "server.key": "tests/certs/valid/server/server.key",
+        "server.pem": "tests/certs/valid/server/server.pem",
+        "wrong-host.key": "tests/fixtures/tls/wrong-host/wrong-host.key",
+        "wrong-host.pem": "tests/fixtures/tls/wrong-host/wrong-host.pem",
+        **{
+            f"mtls-client/{name}": f"tests/fixtures/tls/mtls-client/{name}"
+            for name in (
+                "client.pem",
+                "client-chain.pem",
+                "client-combined.pem",
+                "client.key",
+            )
+        },
+    }
+    for name, original in fixtures.items():
+        assert (ROOT / "crates/requests/tests/fixtures" / name).read_bytes() == (
+            ROOT / original
+        ).read_bytes()
     requests_python_package = load_toml(ROOT / "crates/requests-python/Cargo.toml")[
         "package"
     ]
@@ -509,17 +556,18 @@ def test_internal_agent_paths_are_not_exposed_in_tracked_ignore_policy() -> None
     assert gitignore.startswith(marker)
     retained_body = gitignore.removeprefix(marker)
     assert hashlib.sha256(retained_body.encode()).hexdigest() == (
-        "f96e598d7ed339da8cba1e31a5bb1d74989c1da607257423761c6deb0fdb349f"
+        "5c070fdcf93ff0c9925a6dba678a1b30c6d5ee37b50da3e313b3295e33b8836f"
     )
     rust_patterns = (
         ".worktrees/\n",
+        "/benchmarks/rust-native/target/\n",
         "/target/\n",
         "src/requests/_requests_rust.*\n",
         "!src/requests/_requests_rust.pyi\n",
     )
     oracle_body = retained_body
     for pattern in rust_patterns:
-        assert retained_body.count(pattern) == 1
+        assert retained_body.splitlines().count(pattern.rstrip("\n")) == 1
         oracle_body = oracle_body.replace(pattern, "")
     assert hashlib.sha256(oracle_body.encode()).hexdigest() == (
         "0d87c78c285d5f3a9f83c7b9a09c42aa566c771a7e35d0da1ed0dabcd5831b6c"
@@ -920,9 +968,37 @@ def test_release_wheel_helper_rejects_flag_injection_and_cargo_config(
     repository = tmp_path / "repository"
     config = repository / ".cargo/config.toml"
     config.parent.mkdir(parents=True)
-    config.write_text('[build]\nrustflags = ["-C", "debuginfo=0"]\n')
-    with unittest.TestCase().assertRaisesRegex(ValueError, "Cargo rustflags"):
-        release_wheel.reject_repository_rustflags(repository)
+    for content in (
+        '[build]\nrustflags = ["-C", "debuginfo=0"]\n',
+        "'build'.'rustflags' = []\n",
+        '[env]\n"CARGO_ENCODED_RUSTFLAGS" = "injected"\n',
+        '[env]\n"cargo_build_rustflags" = "injected"\n',
+        '[build]\n"rust\\u0066lags" = []\n',
+    ):
+        config.write_text(content)
+        with unittest.TestCase().assertRaisesRegex(ValueError, "Cargo rustflags"):
+            release_wheel.reject_repository_rustflags(repository)
+
+
+def test_release_wheel_cargo_config_scan_is_bounded(tmp_path: Path) -> None:
+    config = tmp_path / ".cargo/config.toml"
+    config.parent.mkdir()
+    config.write_text('".' * 64 + "=\n")
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; "
+            "from scripts.build_release_wheel import reject_repository_rustflags; "
+            "\ntry: reject_repository_rustflags(Path(sys.argv[1]))"
+            "\nexcept ValueError: pass"
+            "\nelse: raise AssertionError('invalid TOML was accepted')",
+            str(tmp_path),
+        ],
+        cwd=ROOT,
+        check=True,
+        timeout=2,
+    )
 
 
 def test_release_wheel_helper_builds_portable_broad_to_specific_remaps(
@@ -1085,7 +1161,9 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert "concurrency" not in helper
     assert set(helper["jobs"]) == {"wheel"}
     job = helper["jobs"]["wheel"]
-    assert job["runs-on"] == "${{ inputs.os }}"
+    assert job["runs-on"] == (
+        "${{ startsWith(inputs.os, 'ubuntu-') && 'namespace-profile-puneet-chandna' || inputs.os }}"
+    )
     assert "strategy" not in job
     ordered_names = [step.get("name") for step in job["steps"]]
     steps = {step.get("name"): step for step in job["steps"]}
@@ -1209,7 +1287,7 @@ def test_non_release_workflows_cancel_stale_runs_and_limit_safe_triggers() -> No
     tests = load_workflow("run-tests.yml")
     test_triggers = tests.get("on", tests.get(True))
     build = tests["jobs"]["build"]
-    assert build["runs-on"] == "ubuntu-22.04"
+    assert build["runs-on"] == "namespace-profile-puneet-chandna"
     assert "strategy" not in build
     assert tests["concurrency"]["cancel-in-progress"] is True
     assert set(tests["jobs"]) == {"build", "no_chardet", "urllib3"}
@@ -1892,7 +1970,7 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
         "actions/runs/$SOURCE_RUN/artifacts?per_page=100"
         in manifest_by_name["Fetch GitHub artifact metadata"]["run"]
     )
-    assert manifest["runs-on"] == "ubuntu-24.04"
+    assert manifest["runs-on"] == "namespace-profile-puneet-chandna"
     assert manifest["steps"][-2]["name"] == "Verify complete release set"
     release_upload = manifest["steps"][-1]
     assert release_upload["name"] == "Upload complete release set"
@@ -2262,7 +2340,7 @@ def verify_sdist(sdist: Path, source_commit: str) -> None:
             if name_is_directory or not member.isfile():
                 raise ValueError(f"non-regular sdist member: {member.name}")
             members[name] = member
-        assert len(EXPECTED_SDIST_MEMBERS) == 72
+        assert len(EXPECTED_SDIST_MEMBERS) == 89
         if set(members) != expected_files:
             raise ValueError("sdist inventory does not match the canonical source tree")
         contents = {}
@@ -2273,6 +2351,7 @@ def verify_sdist(sdist: Path, source_commit: str) -> None:
             _reject_private_path_bytes(name, contents[name])
         for filename in LEGAL_FILES:
             assert contents[f"{root}/{filename}"] == legal[filename]
+            assert contents[f"{root}/crates/requests/{filename}"] == legal[filename]
         metadata = email.parser.BytesParser().parsebytes(contents[f"{root}/PKG-INFO"])
         assert metadata["License"] is None
         assert metadata["License-Expression"] is None
@@ -2283,6 +2362,44 @@ def test_built_wheel_and_sdist_have_complete_clean_inventory_and_metadata() -> N
     wheel, sdist = artifact_paths()
     verify_wheel(wheel, VALIDATOR_SOURCE_COMMIT)
     verify_sdist(sdist, VALIDATOR_SOURCE_COMMIT)
+
+
+def test_core_crate_archive_runs_its_unit_tests(tmp_path: Path) -> None:
+    target = tmp_path / "package-target"
+    subprocess.run(
+        [
+            "cargo",
+            "package",
+            "-p",
+            CORE_CARGO_PACKAGE,
+            "--locked",
+            "--allow-dirty",
+            "--no-verify",
+            "--target-dir",
+            os.fspath(target),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+    version = load_toml(ROOT / "Cargo.toml")["workspace"]["package"]["version"]
+    crate = target / "package" / f"{CORE_CARGO_PACKAGE}-{version}.crate"
+    with tarfile.open(crate) as archive:
+        archive.extractall(tmp_path / "extracted", filter="data")
+    manifest = next((tmp_path / "extracted").glob("*/Cargo.toml"))
+    subprocess.run(
+        [
+            "cargo",
+            "test",
+            "--manifest-path",
+            os.fspath(manifest),
+            "--lib",
+            "--locked",
+            "--target-dir",
+            os.fspath(ROOT / "target"),
+        ],
+        cwd=manifest.parent,
+        check=True,
+    )
 
 
 def test_distribution_validator_cli_runs_outside_the_checkout(tmp_path: Path) -> None:

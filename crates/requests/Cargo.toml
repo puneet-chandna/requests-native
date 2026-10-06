@@ -8,7 +8,8 @@ description = "Native HTTP transport for the unofficial Requests Native rewrite"
 homepage.workspace = true
 repository.workspace = true
 publish = false
-include = ["Cargo.toml", "src/**/*.rs", "!src/**/*_tests.rs"]
+readme = "README.md"
+include = ["Cargo.toml", "src/**/*.rs", "tests/fixtures/**/*", "README.md", "LICENSE", "NOTICE", "AUTHORS.rst", "RUST_RUNTIME_NOTICES.html"]
 
 [lib]
 name = "requests_native"

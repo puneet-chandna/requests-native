@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   wheel-smoke:
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ startsWith(matrix.os, 'ubuntu-') && 'namespace-profile-puneet-chandna' || matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false

@@ -19,7 +19,7 @@ permissions: {}
 
 jobs:
   zizmor:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-puneet-chandna
     permissions:
       contents: read
     steps:

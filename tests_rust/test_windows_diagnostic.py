@@ -208,6 +208,7 @@ def test_diagnostic_correlates_tls_plaintext_without_changing_deadline(tmp_path)
             assert response.status_code == 200
             assert type(response.raw).__name__ == "NativeAdapterRaw"
             context = ssl.create_default_context(cafile=certs.where())
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
             with socket.create_connection((server.host, server.port)) as raw:
                 with context.wrap_socket(raw, server_hostname="localhost") as client:
                     client.sendall(b"GET /get HTTP/1.0\r\nHost: localhost\r\n\r\n")
