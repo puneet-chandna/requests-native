@@ -2398,7 +2398,7 @@ def test_core_crate_archive_runs_its_unit_tests(tmp_path: Path) -> None:
             "--lib",
             "--locked",
             "--target-dir",
-            os.fspath(ROOT / "target"),
+            os.fspath(target),
         ],
         cwd=manifest.parent,
         check=True,
