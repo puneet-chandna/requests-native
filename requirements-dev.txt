@@ -1,3 +1,4 @@
+# Requests Native modification notice: this retained file differs from Requests 2.34.2.
 -e .[socks]
 pytest>=2.8.0,<10
 pytest-cov
@@ -5,3 +6,5 @@ pytest-httpbin==2.1.0
 httpbin~=0.10.0
 trustme
 wheel
+PyYAML>=6
+tomli>=2; python_version < "3.11"

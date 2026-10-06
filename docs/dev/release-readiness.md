@@ -19,7 +19,7 @@ GitHub returned seven open CodeQL findings against main
 | Alert | Finding | Verified response |
 | --- | --- | --- |
 | [7](https://github.com/puneet-chandna/requests-native/security/code-scanning/7) | Exponential regex in release build configuration guard | Reproduced a bounded subprocess timeout; replaced regex scanning with TOML parsing. Quoted/escaped keys and Windows case-insensitive Rust flag environment names are rejected. Invalid TOML fails quickly. |
-| [2](https://github.com/puneet-chandna/requests-native/security/code-scanning/2), [1](https://github.com/puneet-chandna/requests-native/security/code-scanning/1) | Implicit TLS defaults in test client/server contexts | Local contexts reported `MINIMUM_SUPPORTED`; both flagged locations now explicitly require TLS 1.2 or newer. Existing TLS/loopback checks pass. |
+| [2](https://github.com/puneet-chandna/requests-native/security/code-scanning/2), [1](https://github.com/puneet-chandna/requests-native/security/code-scanning/1) | Implicit TLS defaults in test client/server contexts | The server context lacked an explicit minimum. Both locations now explicitly require TLS 1.2 or newer; client certificate and hostname validation remain enabled. Existing TLS/loopback checks pass. |
 | [6](https://github.com/puneet-chandna/requests-native/security/code-scanning/6), [5](https://github.com/puneet-chandna/requests-native/security/code-scanning/5) | SHA-512/SHA-256 used with passwords | These functions implement HTTP Digest challenge-response, not stored password hashing. The algorithm and wire values are required by the protocol and Requests compatibility. Replacing them with a password-storage KDF breaks authentication. |
 | [4](https://github.com/puneet-chandna/requests-native/security/code-scanning/4), [3](https://github.com/puneet-chandna/requests-native/security/code-scanning/3) | SHA-1/MD5 used with passwords | Same protocol flow, with real weaknesses in legacy algorithms. Compatibility retains server-selected legacy Digest algorithms; no stronger-security claim or automatic dismissal. Prefer HTTPS and modern server authentication policies. |
 
@@ -47,8 +47,9 @@ range. These changes address the advisory patch boundaries for
 [Deflate streaming](https://github.com/advisories/GHSA-gh4c-6fx4-qh6g), and
 [Werkzeug Windows device names](https://github.com/advisories/GHSA-g6x2-hccm-hh4m).
 Historical diagnostic runs retain their original immutable dependency evidence;
-new historical comparisons use the updated shared dependency lock. GitHub must
-refresh its graph after push before the alerts can be claimed closed.
+new historical comparisons use the updated shared dependency lock. GitHub
+marked all four alerts fixed after graph refresh on 2026-10-06 at 22:19 UTC
+(2026-10-07 at 03:49 IST).
 
 Secret scanning and secret push protection
 were disabled at the initial audit; both have now been enabled under the owner's
@@ -59,6 +60,18 @@ the historical scan must complete before treating its inventory as assessed.
 Private vulnerability reporting is enabled. Automatic dependency update PRs
 stay paused because they can trigger extra Namespace CI work and runner cost;
 alerts remain available for manual triage.
+
+RustSec `cargo-audit 0.22.2` checked 169 locked dependencies against advisory
+database `ef6173cbc5c50ec8166f9a5b28f07834144373ee`: zero known vulnerabilities.
+Two maintenance warnings remain.
+[Unmaintained rustls-pemfile](https://rustsec.org/advisories/RUSTSEC-2025-0134.html)
+is a thin wrapper over the already-used rustls-pki-types parser; replacing it
+requires preserving malformed-PEM error text and missing-key behavior.
+[Yanked yoke-derive 0.8.3](https://github.com/unicode-org/icu4x/issues/8506)
+accidentally required Rust 1.87 without declaring it; the pinned Rust 1.98.1
+is unaffected. Version 0.8.4 remedies that metadata issue. Neither finding
+identifies a vulnerability or explains the intermittent Windows failure. Treat
+these as separate maintenance changes with fresh compatibility qualification.
 
 ## Gates added locally
 
@@ -104,7 +117,14 @@ alerts remain available for manual triage.
    [37538288557](https://github.com/puneet-chandna/requests-native/actions/runs/37538288557)
    passed at `3ed9c7da974dad5f976711fd491e807c4b726a80`; a pass establishes
    compatibility on that runner, not the cause of the intermittent failure.
-   Repeat final qualification with the patched dependency environment.
+   Patched-dependency strict run
+   [37539806412](https://github.com/puneet-chandna/requests-native/actions/runs/37539806412)
+   and all seven Windows wheels in
+   [37539810736](https://github.com/puneet-chandna/requests-native/actions/runs/37539810736)
+   also passed at `9fc5b46d037c96d7a63a03b1c7d71e28a73acac3`, with zero
+   accepted TLS failures. Issue 1 now records the runner/environment hypothesis
+   and these results. The newer runner image, compiler and dependencies changed
+   together, so attribution remains unproved.
 2. Qualify the final exact source commit: full 23-wheel matrix, source archive,
    installed suites and artifact manifest, with no beta exception. Close the
    three `IN_PROGRESS` cross-cutting compatibility rows using this evidence.
