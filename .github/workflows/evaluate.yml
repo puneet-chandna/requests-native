@@ -22,7 +22,7 @@ concurrency:
 jobs:
   evaluate:
     runs-on: namespace-profile-puneet-chandna
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -58,6 +58,8 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: performance-evidence
-          path: target/performance-evidence/*.json
+          path: |
+            target/performance-evidence/*.json
+            target/performance-evidence/*.log
           if-no-files-found: warn
           retention-days: 14

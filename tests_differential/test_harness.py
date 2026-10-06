@@ -582,7 +582,9 @@ def test_protocol_error_reports_target_and_bounded_streams() -> None:
 def test_configured_source_roots_cannot_cross_contaminate(
     monkeypatch, oracle_root
 ) -> None:
-    rewrite_root = ROOT.resolve()
+    rewrite_root = Path(
+        os.environ.get("REQUESTS_DIFFERENTIAL_REWRITE_ROOT", ROOT / "src")
+    ).resolve()
     monkeypatch.setenv("PYTHONHOME", str(ROOT / "missing-python-home"))
     monkeypatch.setenv("PYTHONPATH", str(ROOT / "missing-python-path"))
     case = {
@@ -601,7 +603,7 @@ def test_configured_source_roots_cannot_cross_contaminate(
     oracle_module = Path(oracle.observations["side_effects"][0]).resolve()
     rewrite_module = Path(rewrite.observations["side_effects"][0]).resolve()
 
-    assert oracle_module.is_relative_to(oracle_root)
+    assert oracle_module.is_relative_to(oracle_root / "src")
     assert not oracle_module.is_relative_to(rewrite_root)
     assert rewrite_module.is_relative_to(rewrite_root)
     assert not rewrite_module.is_relative_to(oracle_root)

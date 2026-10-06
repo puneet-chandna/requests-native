@@ -100,6 +100,12 @@ these as separate maintenance changes with fresh compatibility qualification.
 - Frozen-oracle differential group: 2,638 passed, six skipped, clean exit zero
   in 21 minutes 14 seconds. The prior combined run reported passing assertions
   but exited with signal 143; these split runs verify clean process exit.
+- Patched urllib3 2.8 preparation: 81 tests passed, plus 10 backend checks and
+  three skips; the Rust URL admission guard passed. New helper and regex proofs
+  retain replacement rejection. Invalid schemeless and trailing-dot numeric
+  hosts preserve the oracle behavior. Independent review found no remaining
+  actionable issue. Oracle/layout checks passed 60 checks and two additional
+  checks with an exact frozen checkout nested inside the rewrite directory.
 - Benchmark helper suite: 25 checks passed; final local HEAD/WORKTREE smoke:
   64 cases per revision, measured-phase RSS, preserved Python dependencies,
   restored environment and exit zero. It is intentionally inconclusive and
@@ -137,7 +143,12 @@ these as separate maintenance changes with fresh compatibility qualification.
    can remain private.
 4. Complete performance qualification on the final candidate, calibrating the
    initial 20% budget and increasing samples if controls or CPU evidence are
-   inconclusive. Smoke checks verify execution, not release performance.
+   inconclusive. Smoke checks verify execution, not release performance. Initial
+   Namespace run [37538303779](https://github.com/puneet-chandna/requests-native/actions/runs/37538303779)
+   completed four pairs before its 60-minute deadline. The preserved partial
+   comparison had no definite regression, but noisy oracle controls and the
+   missing fifth pair made qualification inconclusive. The job limit is now
+   90 minutes; measurement deadlines, samples and budgets are unchanged.
 5. Prepare stable version metadata and corresponding validators/docs only once
    the candidate qualifies: Rust `1.0.0`, Python distribution `1.0.0`, stable
    classifiers/history, while retaining `requests.__version__ == 2.34.2`.
@@ -146,6 +157,10 @@ these as separate maintenance changes with fresh compatibility qualification.
    HTTP 404 for `requests-native` on both PyPI and crates.io on 2026-10-07;
    no package currently exists under that name, but this does not reserve it.
    Current `publish.yml` validates artifacts and performs no PyPI/crates.io upload.
+   The owner has not created registry accounts yet. PyPI needs a verified email
+   and two-factor authentication; crates.io can use the owner's GitHub login
+   and requires a verified email before publishing. Account creation remains
+   an owner action; credentials must not be pasted into this chat.
 
 Core crate README/legal and TLS fixture copies are regular files for portable
 Windows checkouts. When changing their canonical originals, update the matching

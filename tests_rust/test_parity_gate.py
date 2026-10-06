@@ -88,6 +88,41 @@ def test_current_oracle_ledgers_api_and_boundary_are_valid() -> None:
         assert completed.returncode == 0, (name, completed.stdout, completed.stderr)
 
 
+def test_oracle_check_accepts_frozen_checkout_and_rejects_source_changes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from scripts import check_oracle
+
+    with (ROOT / "ORACLE.lock").open("rb") as stream:
+        lock = check_oracle.tomllib.load(stream)
+    oracle = tmp_path / "oracle"
+    for arguments in (
+        [
+            "git",
+            "clone",
+            "--shared",
+            "--no-checkout",
+            str(check_oracle.resolve_oracle_root(lock)),
+            str(oracle),
+        ],
+        [
+            "git",
+            "-C",
+            str(oracle),
+            "checkout",
+            "--detach",
+            lock["frozen_source_commit"],
+        ],
+    ):
+        subprocess.run(arguments, check=True, capture_output=True)
+    monkeypatch.setenv("REQUESTS_ORACLE_ROOT", str(oracle))
+    assert run_script("check_oracle.py").returncode == 0
+    with (oracle / "src/requests/__init__.py").open("a") as stream:
+        stream.write("\n# altered oracle source\n")
+    assert run_script("check_oracle.py").returncode == 1
+
+
 def test_api_probe_rejects_missing_configured_oracle(monkeypatch, tmp_path):
     monkeypatch.setenv("REQUESTS_ORACLE_ROOT", str(tmp_path / "missing-oracle"))
     completed = run_script("compare_api.py")

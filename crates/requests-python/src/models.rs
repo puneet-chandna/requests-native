@@ -85,6 +85,7 @@ enum IntrinsicBuiltin {
 #[derive(Clone, Copy)]
 enum KnownRegexPattern {
     Text(&'static str),
+    TextPair(&'static str, &'static str),
     Bytes(&'static [u8]),
     Generated(GeneratedRegex),
 }
@@ -112,6 +113,7 @@ enum KnownValue {
     TextListContaining(&'static [&'static str]),
     Bytes(&'static [u8]),
     EmptyDict,
+    PartialType,
     UrlType,
     ByteQuoterFactory,
     QuoterType {
@@ -447,19 +449,19 @@ fn intrinsic_builtin_is(
 
 fn intrinsic_builtin_for_name(name: &str) -> Option<IntrinsicBuiltin> {
     match name {
-        "getattr" | "setattr" | "isinstance" | "hasattr" | "len" | "ord" | "hex" | "chr" => {
-            Some(IntrinsicBuiltin::Function(match name {
-                "getattr" => "getattr",
-                "setattr" => "setattr",
-                "isinstance" => "isinstance",
-                "hasattr" => "hasattr",
-                "len" => "len",
-                "ord" => "ord",
-                "hex" => "hex",
-                "chr" => "chr",
-                _ => unreachable!(),
-            }))
-        }
+        "getattr" | "setattr" | "isinstance" | "hasattr" | "len" | "ord" | "hex" | "chr"
+        | "all" => Some(IntrinsicBuiltin::Function(match name {
+            "getattr" => "getattr",
+            "setattr" => "setattr",
+            "isinstance" => "isinstance",
+            "hasattr" => "hasattr",
+            "len" => "len",
+            "ord" => "ord",
+            "hex" => "hex",
+            "chr" => "chr",
+            "all" => "all",
+            _ => unreachable!(),
+        })),
         "str" => Some(IntrinsicBuiltin::Str),
         "bytes" => Some(IntrinsicBuiltin::Bytes),
         "bool" => Some(IntrinsicBuiltin::Bool),
@@ -575,7 +577,10 @@ fn known_module_value(module: &str, name: &str) -> Option<KnownValue> {
         flags: 0,
     };
     const IPV4: KnownRegex = KnownRegex {
-        pattern: KnownRegexPattern::Text(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$"),
+        pattern: KnownRegexPattern::TextPair(
+            r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$",
+            r"^(?:0[xX][0-9a-fA-F]+|[0-9]+)(?:\.(?:0[xX][0-9a-fA-F]+|[0-9]+)){0,3}$",
+        ),
         flags: 32,
     };
     const SCHEME: KnownRegex = KnownRegex {
@@ -630,6 +635,15 @@ fn known_module_value(module: &str, name: &str) -> Option<KnownValue> {
         }
         ("requests.utils", "UNRESERVED_SET") => Some(KnownValue::TextFrozenSet(UNRESERVED)),
         ("urllib3.util.url", "_PERCENT_RE") => Some(KnownValue::Regex(PERCENT)),
+        ("urllib3.util.url", "_HOST_INVALID_CHAR_RE") => Some(KnownValue::Regex(KnownRegex {
+            pattern: KnownRegexPattern::Text(r"[\x00-\x20\x7f]"),
+            flags: 32,
+        })),
+        ("urllib3.util.url", "_HOST_PERCENT_RE") => Some(KnownValue::Regex(KnownRegex {
+            pattern: KnownRegexPattern::Text(r"%[a-fA-F0-9]{2}|%"),
+            flags: 32,
+        })),
+        ("urllib3.util.url", "partial") => Some(KnownValue::PartialType),
         ("urllib3.util.url", "_IPV4_RE") => Some(KnownValue::Regex(IPV4)),
         ("urllib3.util.url", "_SCHEME_RE") => Some(KnownValue::Regex(SCHEME)),
         ("urllib3.util.url", "_URI_RE") => Some(KnownValue::Regex(URI)),
@@ -684,6 +698,15 @@ fn known_python_function(module: &str, name: &str) -> Option<(&'static str, &'st
         }
         ("urllib3.util.url", "_idna_encode") => Some(("urllib3.util.url", "_idna_encode")),
         ("urllib3.util.url", "_normalize_host") => Some(("urllib3.util.url", "_normalize_host")),
+        ("urllib3.util.url", "_normalize_host_percent_encoding") => {
+            Some(("urllib3.util.url", "_normalize_host_percent_encoding"))
+        }
+        ("urllib3.util.url", "_normalize_zone_id_percent_encoding") => {
+            Some(("urllib3.util.url", "_normalize_zone_id_percent_encoding"))
+        }
+        ("urllib3.util.url", "_decode_percent_encoding") => {
+            Some(("urllib3.util.url", "_decode_percent_encoding"))
+        }
         ("urllib3.util.url", "_remove_path_dot_segments") => {
             Some(("urllib3.util.url", "_remove_path_dot_segments"))
         }
@@ -1206,6 +1229,14 @@ fn known_regex_is(
                     .cast::<PyString>()
                     .is_ok_and(|value| value.to_str().is_ok_and(|value| value == expected))
         }
+        KnownRegexPattern::TextPair(first, second) => {
+            pattern.is_exact_instance_of::<PyString>()
+                && pattern.cast::<PyString>().is_ok_and(|value| {
+                    value
+                        .to_str()
+                        .is_ok_and(|value| value == first || value == second)
+                })
+        }
         KnownRegexPattern::Bytes(expected) => {
             pattern.is_exact_instance_of::<PyBytes>()
                 && pattern
@@ -1324,6 +1355,15 @@ fn known_value_is(
             && current.cast::<PyBytes>()?.as_bytes() == expected),
         KnownValue::EmptyDict => {
             Ok(current.is_exact_instance_of::<PyDict>() && current.cast::<PyDict>()?.is_empty())
+        }
+        KnownValue::PartialType => {
+            if !current.is_exact_instance_of::<PyType>() {
+                return Ok(false);
+            }
+            let Ok(current) = current.cast::<PyType>() else {
+                return Ok(false);
+            };
+            static_type_is(current, "functools", "partial")
         }
         KnownValue::UrlType => {
             let Some(KnownCode::Url {
@@ -1724,7 +1764,13 @@ fn direct_function_trust(
         ("requests.utils", "_validate_header_part") => &["InvalidHeader"],
         ("requests.utils", "unquote_unreserved") => &["InvalidURL"],
         ("urllib.parse", "quote_from_bytes") => &["math"],
-        ("urllib3.util.url", "_idna_encode") => &["LocationParseError"],
+        (
+            "urllib3.util.url",
+            "_idna_encode"
+            | "_normalize_host"
+            | "_normalize_host_percent_encoding"
+            | "_decode_percent_encoding",
+        ) => &["LocationParseError"],
         _ => &[],
     };
     Ok(Some(Box::new(build_canonical_function_inner(

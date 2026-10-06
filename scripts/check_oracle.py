@@ -71,7 +71,7 @@ def main() -> int:
     except (OSError, subprocess.CalledProcessError) as error:
         print(f"oracle git verification failed: {error}", file=sys.stderr)
         return 1
-    if head != lock["documentation_commit"]:
+    if head not in {lock["frozen_source_commit"], lock["documentation_commit"]}:
         print(
             f"oracle HEAD differs from ORACLE.lock: {head}",
             file=sys.stderr,

@@ -65,13 +65,16 @@ clients, checks bytes/checksum/native routing, then releases workers through a
 shared timing barrier. All 64 cases cover four surfaces, one-shot/pooled clients,
 buffered/streaming reads, small/large bodies and serial/concurrent workloads.
 Allocation replay is separate from timed measurements.
+The first Namespace run took about seven minutes per side; allow roughly
+75 minutes for the full gate, including builds. Use smoke mode for a quick
+local pipeline check; the full gate is a deliberate release qualification run.
 On Linux the worker resets its own resident-memory high-water mark at this
 barrier using `/proc/self/clear_refs`, so a released warm-up peak cannot conceal
 a measured-phase RSS increase. If reset is unavailable, the scope is recorded
 as process lifetime and release evidence is inconclusive.
 
 Evidence goes to `target/evaluations/<timestamp>/`: raw reports, local build/
-error logs and `comparison.json`. CI retains JSON evidence on failure. A nonempty
+error logs and `comparison.json`. CI retains JSON evidence and diagnostic logs on failure. A nonempty
 output directory is never overwritten; use `--output DIRECTORY` to choose one.
 
 The initial policy allows a configurable 20% increase in cost per case: inverse

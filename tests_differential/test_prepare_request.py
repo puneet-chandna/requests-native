@@ -516,7 +516,7 @@ try:
 finally:
     sys.setprofile(None)
 
-assert seen == []
+assert seen == [], seen
 assert method_subject.method == "GET"
 assert url_subject.url == "http://example.com/a%20path?x=a+b"
 assert list(headers_subject.headers.items()) == [("Name", "value")]
@@ -1349,6 +1349,68 @@ finally:
     globals_dict["_normalize_host"] = original
 """
     )
+
+
+def test_prepare_url_urllib3_host_and_fast_path_dependencies_reject_replacements() -> (
+    None
+):
+    for module, name in (
+        ("builtins", "all"),
+        ("urllib3.util.url", "_HOST_INVALID_CHAR_RE"),
+        ("urllib3.util.url", "_HOST_PERCENT_RE"),
+        ("urllib3.util.url", "partial"),
+        ("urllib3.util.url", "_normalize_host_percent_encoding"),
+        ("urllib3.util.url", "_normalize_zone_id_percent_encoding"),
+        ("urllib3.util.url", "_decode_percent_encoding"),
+    ):
+        for warm in (False, True):
+            _assert_matches_oracle(
+                f"""
+import importlib
+import sys
+from requests.models import PreparedRequest
+
+
+module = importlib.import_module({module!r})
+original = getattr(module, {name!r})
+if {warm!r}:
+    prepare_method_call(PreparedRequest(), "get")
+target = PreparedRequest.prepare_url.__code__
+seen = []
+
+
+def profile(frame, event, argument):
+    if event == "call" and frame.f_code is target:
+        seen.append(frame.f_code.co_qualname)
+
+
+replacement = object()
+if {name!r} == "partial":
+    class SpoofType(type):
+        def __getattribute__(cls, attribute):
+            if attribute == "__flags__":
+                return 1 << 8
+            return super().__getattribute__(attribute)
+
+    class partial(metaclass=SpoofType):
+        __module__ = "functools"
+
+    replacement = partial
+setattr(module, {name!r}, replacement)
+sys.setprofile(profile)
+try:
+    subject = PreparedRequest()
+    result = capture(
+        {name!r},
+        subject,
+        lambda: prepare_url_call(subject, "http://example.com/a path", "x=a+b"),
+    )
+finally:
+    sys.setprofile(None)
+    setattr(module, {name!r}, original)
+assert seen == ["PreparedRequest.prepare_url"], seen
+"""
+            )
 
 
 def test_prepare_url_nested_nonfunction_global_mutation_delegates() -> None:
@@ -3119,7 +3181,10 @@ from requests.models import PreparedRequest
 
 
 result = []
-for host in ("example.1", "example.01", "example.0x1"):
+for host in (
+    "example.1", "example.01", "example.0x1",
+    "127.1.", "0x7f000001.", "127.0.0.1.",
+):
     subject = PreparedRequest()
     result.append(
         capture(
@@ -3132,6 +3197,37 @@ for host in ("example.1", "example.01", "example.0x1"):
             ),
         )
     )
+"""
+    )
+
+
+def test_prepare_url_schemeless_invalid_hosts_delegate_before_missing_schema() -> None:
+    _assert_matches_oracle(
+        r"""
+import urllib3.util.url as url_utils
+from requests.models import PreparedRequest
+
+
+class ReboundLocationParseError(Exception):
+    pass
+
+
+result = []
+original = url_utils.LocationParseError
+try:
+    for error_type in (original, ReboundLocationParseError):
+        url_utils.LocationParseError = error_type
+        for url in ("example.com\x00", "example.com\x7f", "example.com%00", "foo bar"):
+            subject = PreparedRequest()
+            result.append(
+                capture(
+                    url,
+                    subject,
+                    lambda subject=subject, url=url: prepare_url_call(subject, url, None),
+                )
+            )
+finally:
+    url_utils.LocationParseError = original
 """
     )
 

@@ -1923,6 +1923,15 @@ def test_manifest_prepares_dependencies_and_can_reuse_qualified_artifacts() -> N
         step for step in steps if "actions/checkout@" in step.get("uses", "")
     )
     assert checkout["with"]["ref"] == "${{ steps.source.outputs.sha }}"
+    assert checkout["with"]["fetch-depth"] == 0
+    validator = next(
+        step for step in steps if step.get("name") == "Use current artifact validator"
+    )
+    assert validator["env"] == {"VALIDATOR_SHA": "${{ github.sha }}"}
+    assert (
+        'git show "$VALIDATOR_SHA:tests_rust/test_distribution.py"' in validator["run"]
+    )
+    assert steps.index(validator) < names.index("Validate exact artifact fan-out")
     for step in steps:
         if "actions/download-artifact@" in step.get("uses", ""):
             assert step["with"]["run-id"] == "${{ steps.source.outputs.run }}"
@@ -3064,7 +3073,7 @@ def wheel_key(path: Path) -> tuple[str, str]:
     distribution, python_tag, abi_tag, platform_tag = path.stem.rsplit("-", 3)
     if distribution != ARTIFACT_STEM:
         raise ValueError(f"unexpected wheel project/version: {path.name}")
-    if python_tag == "pp311" and abi_tag == "pypy311_pp73":
+    if python_tag == "pp311" and abi_tag in {"pypy311_pp73", "pypy311_pp80"}:
         python = "pypy-3.11"
     elif python_tag == "cp314" and abi_tag == "cp314t":
         python = "3.14t"
@@ -3763,6 +3772,12 @@ def test_release_set_rejects_invalid_github_artifact_provenance(
             ValueError, "GitHub artifact provenance"
         ):
             verify_release_set(release, manifest_path, source_commit)
+
+
+def test_wheel_key_accepts_qualified_pypy_311_abi() -> None:
+    assert wheel_key(
+        Path(f"{ARTIFACT_STEM}-pp311-pypy311_pp80-macosx_11_0_arm64.whl")
+    ) == ("pypy-3.11", "macos-latest")
 
 
 def test_wheel_key_rejects_wrong_version_abi_and_platform() -> None:

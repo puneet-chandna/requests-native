@@ -207,7 +207,9 @@ pub fn url_is_native_safe(raw_url: &str) -> bool {
     }
 
     let Some((scheme, remainder)) = raw_url.split_once("://") else {
-        return !starts_with_http(raw_url);
+        return !starts_with_http(raw_url)
+            && !raw_url.contains('%')
+            && !raw_url.bytes().any(|byte| byte <= b' ' || byte == 0x7f);
     };
     let scheme = scheme.to_ascii_lowercase();
     if !matches!(scheme.as_str(), "http" | "https" | "http+unix") {
@@ -256,6 +258,7 @@ pub fn url_is_native_safe(raw_url: &str) -> bool {
 
     let numeric_final_label = scheme != "http+unix"
         && authority
+            .trim_end_matches('.')
             .rsplit('.')
             .next()
             .is_some_and(|label| label.starts_with(|ch: char| ch.is_ascii_digit()));
@@ -592,6 +595,13 @@ mod tests {
             "http://example .com/path",
             "http://example%20.com/path",
             "http://exam|ple.com/path",
+            "example.com\x00",
+            "example.com\x7f",
+            "example.com%00",
+            "foo bar",
+            "http://127.1./",
+            "http://0x7f000001./",
+            "http://127.0.0.1./",
         ] {
             assert!(!super::url_is_native_safe(url), "{url}");
         }

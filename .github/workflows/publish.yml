@@ -105,7 +105,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ steps.source.outputs.sha }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Use current artifact validator
+        env:
+          VALIDATOR_SHA: ${{ github.sha }}
+        run: git show "$VALIDATOR_SHA:tests_rust/test_distribution.py" > tests_rust/test_distribution.py
       - name: Prepare locked Rust dependencies
         run: cargo fetch --locked
       - name: Download sdist
