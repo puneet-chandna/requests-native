@@ -103,7 +103,7 @@ jobs:
       run: |
         cargo test -p requests-native --locked
         cargo test --manifest-path benchmarks/rust-native/Cargo.toml --locked --target-dir target
-        python scripts/check_ledgers.py
+        python scripts/check_ledgers.py --completion
         python scripts/compare_windows_tls.py --self-check
         python -m unittest benchmarks.test_run benchmarks.test_evaluate
     - name: Build canonical artifacts for distribution regression checks

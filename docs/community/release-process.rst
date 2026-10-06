@@ -42,6 +42,21 @@ A release requires:
    23-wheel matrix, and a validated artifact manifest; and
 4. uploaded archives and checksums match that qualified release set.
 
+For stable 1.0.0, qualification must use the strict installed suites without
+the historical Windows exception. The owner accepts passing qualification on
+current supported Windows runners while keeping issue #1 open; its historical
+cause remains unproved.
+
+Stable releases also require the full paired performance gate for the
+candidate, with a recorded baseline and a ``passed`` decision. Run
+``.venv/bin/python benchmarks/evaluate.py --base <baseline> --candidate HEAD --gate``
+locally, or dispatch ``Release performance qualification`` on Namespace CI.
+Retain the raw reports, comparison and logs. Smoke mode verifies execution;
+regressions, inconclusive controls or insufficient evidence block performance
+qualification. Runtime changes require fresh qualification. See the
+`benchmark procedure <../../benchmarks/README.md>`_ and
+`current readiness evidence <../dev/release-readiness.md>`_.
+
 ``Validate beta artifacts`` builds the complete set when ``artifact_run_id``
 is empty. To recover final assembly without repeating successful builds,
 provide the existing qualified run ID. The workflow verifies its source and

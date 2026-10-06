@@ -92,7 +92,7 @@ these as separate maintenance changes with fresh compatibility qualification.
 
 ## Local verification
 
-- Native core: 317 tests passed; independently extracted crate: 107 unit tests
+- Native workspace: 317 tests passed; independently extracted core crate: 107 unit tests
   passed. The new archive boundary regression check also passed.
 - Native Python group: 213 passed, three skipped, nine deselected; the revised
   source-archive/install group covered the exclusions with nine passed and one
@@ -114,34 +114,37 @@ these as separate maintenance changes with fresh compatibility qualification.
   deselected. Twine strict, actionlint, Ruff, Rust formatting and Windows
   harness self-check passed. These checks are local Linux evidence.
 
+## Current correctness qualification
+
+At `757dd9bc3021b71fdbf0edb325c3b43525d62b30`,
+[source CI 37545318501](https://github.com/puneet-chandna/requests-native/actions/runs/37545318501)
+passed on Namespace: the full rewrite/differential suite passed 2,863 tests
+with 10 skips and a clean process exit. Native regression checks, canonical
+artifact checks, benchmark helper checks and the legacy urllib3/no-character-
+detection jobs also passed.
+
+[Artifact CI 37545638504](https://github.com/puneet-chandna/requests-native/actions/runs/37545638504)
+passed at the same source commit: all 23 wheels, the sdist, their installed
+suites and the exact-source release manifest. All seven Windows wheels passed
+without retries, wider fixture timeouts or accepted TLS failures. The owner
+accepts current supported Windows qualification for 1.0.0 while keeping
+[historical issue 1](https://github.com/puneet-chandna/requests-native/issues/1)
+open; the older runner, compiler and dependency changes do not prove its cause.
+
+The three cross-cutting compatibility rows now record this evidence. Strict
+ledger completion passes all 366 API rows and 106 lifetime rows. Source CI
+requires completion mode for future changes. These records qualify the beta
+candidate's correctness and packaging; performance remains a separate gate.
+
 ## Work still required before declaring 1.0.0
 
-1. Resolve [Windows TLS issue 1](https://github.com/puneet-chandna/requests-native/issues/1)
-   with a proven cause and fix. A passing isolated test or rerun is insufficient.
-   The strict workflow is ready. The owner has now explicitly authorized its
-   main push and dispatch. Strict installed release run
-   [37538288557](https://github.com/puneet-chandna/requests-native/actions/runs/37538288557)
-   passed at `3ed9c7da974dad5f976711fd491e807c4b726a80`; a pass establishes
-   compatibility on that runner, not the cause of the intermittent failure.
-   Patched-dependency strict run
-   [37539806412](https://github.com/puneet-chandna/requests-native/actions/runs/37539806412)
-   and all seven Windows wheels in
-   [37539810736](https://github.com/puneet-chandna/requests-native/actions/runs/37539810736)
-   also passed at `9fc5b46d037c96d7a63a03b1c7d71e28a73acac3`, with zero
-   accepted TLS failures. Issue 1 now records the runner/environment hypothesis
-   and these results. The newer runner image, compiler and dependencies changed
-   together, so attribution remains unproved.
-2. Qualify the final exact source commit: full 23-wheel matrix, source archive,
-   installed suites and artifact manifest, with no beta exception. Close the
-   three `IN_PROGRESS` cross-cutting compatibility rows using this evidence.
-   `python scripts/check_ledgers.py --completion` currently fails deliberately.
-3. Enable core crate publication only after qualification. The archive now
+1. Enable core crate publication only after qualification. The archive now
    carries canonical README/legal notices, the referenced unit-test modules
    and all nine TLS fixture files. An extracted archive passes its 107 unit
    tests; this boundary is now a regression check. The core still deliberately
    has `publish = false` during beta qualification. The Python binding crate
    can remain private.
-4. Complete performance qualification on the final candidate, calibrating the
+2. Complete performance qualification on the final candidate, calibrating the
    initial 20% budget and increasing samples if controls or CPU evidence are
    inconclusive. Smoke checks verify execution, not release performance. Initial
    Namespace run [37538303779](https://github.com/puneet-chandna/requests-native/actions/runs/37538303779)
@@ -149,10 +152,12 @@ these as separate maintenance changes with fresh compatibility qualification.
    comparison had no definite regression, but noisy oracle controls and the
    missing fifth pair made qualification inconclusive. The job limit is now
    90 minutes; measurement deadlines, samples and budgets are unchanged.
-5. Prepare stable version metadata and corresponding validators/docs only once
+3. Prepare stable version metadata and corresponding validators/docs only once
    the candidate qualifies: Rust `1.0.0`, Python distribution `1.0.0`, stable
    classifiers/history, while retaining `requests.__version__ == 2.34.2`.
-6. Configure registry publishing credentials/Trusted Publishers, verify account
+   Build and qualify the stable version's exact source commit and complete
+   release set; the qualified beta archives must retain their original identity.
+4. Configure registry publishing credentials/Trusted Publishers, verify account
    ownership and add protected upload jobs. Public registry metadata returned
    HTTP 404 for `requests-native` on both PyPI and crates.io on 2026-10-07;
    no package currently exists under that name, but this does not reserve it.

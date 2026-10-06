@@ -32,13 +32,18 @@ failures remain blockers. Published beta artifacts must include an exact-commit
 validation manifest recording accepted Windows failures; this is not a claim
 of complete parity.
 
-In the latest controlled Windows CPython 3.12 comparison, the old debug, old
+In the historical controlled Windows CPython 3.12 comparison, the old debug, old
 release, and current debug full suites passed; current release failed
 `test_pyopenssl_redirect` with `ConnectionError` / `RemoteDisconnected` and a
 server request-line read timeout after the server's TLS handshake. Earlier
 qualification also observed an initial-handshake timeout / Windows error
 10053. A shared cause, failure rate, and production impact remain unknown.
 One full-suite exposure per source/profile does not establish causation.
+
+Current strict Windows qualification and all seven Windows wheels pass without
+the beta exception. The owner accepts current supported-runner qualification
+for 1.0.0 while keeping the historical issue open; its cause remains unproved.
+See [current readiness evidence](docs/dev/release-readiness.md).
 
 The September 13 documentation build also exposed a Sphinx 7.2.6 integration
 gap: its intersphinx downloader assigns `response.raw.url` and replaces
@@ -50,19 +55,25 @@ by other callers.
 
 Exact pristine built-in `Session` and `HTTPAdapter` traffic uses the Rust
 backend by default. Unsupported, subclassed, custom, and dynamically mutated
-surfaces retain Python authority. The API ledger still has exactly three
-`IN_PROGRESS` cross-cutting rows: `platform matrix`, `distribution surface`, and
-`default backend`. They remain open for strict completion; the disclosed beta
-exception does not close them. Beta artifacts require the reusable and manually
-dispatched release-validation gate covering the complete 23-cell compiled wheel
-matrix with canonical legal bytes, recorded exceptions, and review. This is not
-a claim that the entire port is complete.
+surfaces retain Python authority. All 366 API rows and 106 lifetime rows now
+pass strict ledger completion. The cross-cutting platform, beta distribution
+and default-backend rows record exact-source CI and the complete strict artifact
+matrix at `757dd9bc3021b71fdbf0edb325c3b43525d62b30` in
+[run 37545638504](https://github.com/puneet-chandna/requests-native/actions/runs/37545638504).
+Artifacts require the reusable and manually dispatched release-validation gate
+covering the complete 23-cell compiled wheel matrix with canonical legal bytes,
+qualification records and review. Stable version preparation, performance
+qualification and registry setup remain tracked in the readiness checklist.
 
 The dependency-free loopback benchmark covers the frozen Python oracle,
 Rust-backed Python, and native Rust async/blocking surfaces. Its bounded default
 result is in `benchmarks/results/20260913-local-default.json`, with the earlier
 September 2 result retained; measurements have
-no numeric acceptance gate and do not change compatibility behavior. Paths in
+no numeric acceptance gate and do not change compatibility behavior. The new
+[paired release evaluator](benchmarks/README.md) runs locally and on Namespace
+CI with correctness checks, warm-up, repeated base/candidate pairs, an initial
+20% performance budget and unchanged-oracle controls. Regressions and
+inconclusive evidence fail release qualification. Paths in
 the public record use portable repository/oracle placeholders while preserving
 the measured values, toolchain versions, build hashes, and workload details.
 
@@ -115,9 +126,8 @@ not enough for a row to lack an `UNKNOWN` marker. Run
 `scripts/check_ledgers.py --completion` to enforce this boundary. Completion
 mode also rejects `VERIFIED` rows whose evidence or lifetime closure fields
 still say work is pending, incomplete, not ported, deferred to a numbered
-task, or future work. At the current candidate it intentionally fails on the
-`platform matrix`, `distribution surface`, and `default backend` rows, which
-remain `IN_PROGRESS` until their final review and remote evidence is recorded.
+task, or future work. Source CI now runs completion mode so an unfinished row
+cannot silently pass the regression gate.
 
 Ledger keys and evidence are also explicit:
 
