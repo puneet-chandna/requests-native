@@ -79,7 +79,7 @@ def test_maturin_mixed_project_preserves_import_and_splits_versions() -> None:
     assert metadata["dependencies"] == [
         "charset_normalizer>=2,<4",
         "idna>=2.5,<4",
-        "urllib3>=1.26,<3",
+        "urllib3>=2.8,<3",
         "certifi>=2023.5.7",
     ]
     assert metadata["optional-dependencies"] == {

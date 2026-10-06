@@ -27,10 +27,30 @@ The [CodeQL rule](https://codeql.github.com/codeql-query-help/python/py-weak-sen
 addresses sensitive-data/password-storage hashing. The implemented flow is
 `HTTPDigestAuth.build_digest_header`; [RFC 7616](https://datatracker.ietf.org/doc/html/rfc7616)
 defines its challenge/response hashing and legacy-algorithm limitations.
-No alert has been dismissed. Source fixes require a new CodeQL run after push
-before claiming the corresponding GitHub alerts are closed.
+No alert has been dismissed. CodeQL run
+[37538258198](https://github.com/puneet-chandna/requests-native/actions/runs/37538258198)
+on `3ed9c7da974dad5f976711fd491e807c4b726a80` closed alerts 7 and 1.
+Client alert 2 remains open despite the TLS 1.2 minimum dominating its socket
+wrap call. Runtime verification confirms TLS 1.2 minimum, required certificate
+validation and hostname checks; no further runtime weakening or suppression is
+justified. The four HTTP Digest alerts remain open for the compatibility reasons
+above.
 
-Dependabot returned zero open alerts. Secret scanning and secret push protection
+The initial Dependabot inventory was empty; the refreshed dependency graph
+reported four findings in the Windows diagnostic dependency lock. The lock now
+uses urllib3 2.8.0 and Werkzeug 3.1.9. The normal installation floor is
+`urllib3>=2.8,<3`, and the performance environment also pins 2.8.0. The legacy
+1.26 CI lane retains behavioral coverage outside the supported installation
+range. These changes address the advisory patch boundaries for
+[proxy TLS](https://github.com/advisories/GHSA-8988-9cw3-xx77),
+[unbounded chunk-size buffering](https://github.com/advisories/GHSA-vxq7-64xx-v4gw),
+[Deflate streaming](https://github.com/advisories/GHSA-gh4c-6fx4-qh6g), and
+[Werkzeug Windows device names](https://github.com/advisories/GHSA-g6x2-hccm-hh4m).
+Historical diagnostic runs retain their original immutable dependency evidence;
+new historical comparisons use the updated shared dependency lock. GitHub must
+refresh its graph after push before the alerts can be claimed closed.
+
+Secret scanning and secret push protection
 were disabled at the initial audit; both have now been enabled under the owner's
 delegation. They are [free for this public repository](https://github.blog/changelog/2023-05-09-secret-scannings-push-protection-is-available-on-public-repositories-for-free/).
 No paid feature was enabled. Generic/non-provider scanning and validity checks
@@ -53,7 +73,9 @@ alerts remain available for manual triage.
   stable; Windows/macOS jobs use GitHub runners.
 - Strict Windows qualification tests the selected current commit's ordinary
   sanitized release wheel against the frozen oracle with the full installed
-  suite. It excludes the historical diagnostic issue exception.
+  suite. It excludes the historical diagnostic issue exception. The full wheel
+  matrix retains the existing signed-to-wheel Windows report and requires its
+  status to pass with exit zero and no accepted failures before qualification.
 
 ## Local verification
 
@@ -78,7 +100,11 @@ alerts remain available for manual triage.
 1. Resolve [Windows TLS issue 1](https://github.com/puneet-chandna/requests-native/issues/1)
    with a proven cause and fix. A passing isolated test or rerun is insufficient.
    The strict workflow is ready. The owner has now explicitly authorized its
-   main push and dispatch; remote results must establish qualification.
+   main push and dispatch. Strict installed release run
+   [37538288557](https://github.com/puneet-chandna/requests-native/actions/runs/37538288557)
+   passed at `3ed9c7da974dad5f976711fd491e807c4b726a80`; a pass establishes
+   compatibility on that runner, not the cause of the intermittent failure.
+   Repeat final qualification with the patched dependency environment.
 2. Qualify the final exact source commit: full 23-wheel matrix, source archive,
    installed suites and artifact manifest, with no beta exception. Close the
    three `IN_PROGRESS` cross-cutting compatibility rows using this evidence.

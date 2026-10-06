@@ -60,7 +60,7 @@ def test_retry_snapshot_is_complete_and_nonmutating_for_supported_urllib3():
             retry_after_max=None,
         )
     else:
-        assert urllib3.__version__ == "2.7.0"
+        assert urllib3.__version__.startswith("2.")
         expected.update(
             backoff_max=7.0,
             backoff_jitter=0.25,

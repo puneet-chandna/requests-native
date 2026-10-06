@@ -103,7 +103,7 @@ EXPECTED_URLS = {
 EXPECTED_DEPENDENCIES = [
     "charset_normalizer>=2,<4",
     "idna>=2.5,<4",
-    "urllib3>=1.26,<3",
+    "urllib3>=2.8,<3",
     "certifi>=2023.5.7",
 ]
 EXPECTED_EXTRAS = {
@@ -1190,6 +1190,9 @@ def test_wheel_workflow_builds_and_smokes_the_complete_supported_matrix() -> Non
     assert 'if [[ "$RUNNER_OS" == "Windows" ]]' in suite
     assert '--accept-windows-tls-issue-1 "$wheel"' in suite
     assert '--source-commit "$GITHUB_SHA"' in suite
+    assert 'report["status"] == "passed"' in suite
+    assert 'report["upstream_returncode"] == 0' in suite
+    assert 'not report["accepted_failures"]' in suite
     assert steps["Upload wheel"]["if"] == "${{ !cancelled() }}"
     evidence = steps["Record free-threaded ABI evidence"]["run"]
     assert '"before_import"' in evidence
@@ -2306,7 +2309,7 @@ def verify_wheel(wheel: Path, source_commit: str) -> None:
     assert set(metadata.get_all("Requires-Dist")) == {
         "charset-normalizer>=2,<4",
         "idna>=2.5,<4",
-        "urllib3>=1.26,<3",
+        "urllib3>=2.8,<3",
         "certifi>=2023.5.7",
         "pysocks>=1.5.6,!=1.5.7 ; extra == 'socks'",
         "chardet>=3.0.2,<8 ; extra == 'use-chardet-on-py3'",

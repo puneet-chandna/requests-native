@@ -90,6 +90,9 @@ jobs:
             exception=(--accept-windows-tls-issue-1 "$wheel" --source-commit "$GITHUB_SHA")
           fi
           python tests_rust/test_distribution.py --installed-suite "$SMOKE_PYTHON" --oracle "$GITHUB_WORKSPACE/frozen-oracle" "${exception[@]}" "$GITHUB_WORKSPACE"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python -c 'import json, pathlib; report = json.loads(pathlib.Path("wheelhouse/windows-validation.json").read_text()); assert report["status"] == "passed" and report["upstream_returncode"] == 0 and not report["accepted_failures"], "Windows release qualification requires zero accepted TLS failures"'
+          fi
       - name: Upload wheel
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

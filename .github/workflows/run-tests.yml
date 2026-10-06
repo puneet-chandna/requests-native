@@ -109,6 +109,7 @@ jobs:
     - name: Build canonical artifacts for distribution regression checks
       shell: bash
       run: |
+        python -m pip install "maturin==1.15.0"
         export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
         python scripts/build_release_wheel.py --interpreter "$(command -v python)" --out dist --manylinux 2_34
         python -m maturin sdist --out dist

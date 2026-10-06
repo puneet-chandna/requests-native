@@ -261,7 +261,7 @@ result = {{
     assert state["http_error_identity"] is True
 
 
-def test_content_decoding_error_mro_under_urllib3_27() -> None:
+def test_content_decoding_error_mro_under_urllib3_2() -> None:
     state = _run_matching(
         """
 import urllib3
@@ -280,7 +280,7 @@ result = {
 """
     )
 
-    assert state["version"] == "2.7.0"
+    assert state["version"].startswith("2.")
     assert state["mro"][:6] == [
         ["requests.exceptions", "ContentDecodingError"],
         ["requests.exceptions", "RequestException"],

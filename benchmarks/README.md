@@ -39,7 +39,7 @@ commit is permitted. A fresh environment can use the same dependencies as CI:
 
 ```console
 python3 -m venv .venv
-.venv/bin/python -m pip install maturin==1.15.0 charset_normalizer==3.5.1 idna==3.19 urllib3==2.7.0 certifi==2026.7.22
+.venv/bin/python -m pip install maturin==1.15.0 charset_normalizer==3.5.1 idna==3.19 urllib3==2.8.0 certifi==2026.7.22
 ```
 
 Rust dependencies are prepared online by default; `--offline` needs a populated

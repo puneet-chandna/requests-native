@@ -28,6 +28,10 @@
 
 > **Beta software.** Requests Native is an independent Rust rewrite targeting strict compatibility with Requests **2.34.2**. The current beta has a known intermittent Windows TLS issue. Test your workload before replacing production Requests. It is not currently published to PyPI or crates.io.
 
+Normal installations require urllib3 2.8 or newer for its security fixes. The
+urllib3 1.26 CI lane checks legacy behavior only and is outside the supported
+installation dependency range.
+
 ---
 
 

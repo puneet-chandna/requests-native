@@ -34,7 +34,7 @@ jobs:
       - name: Prepare isolated evaluation environment
         run: |
           python -m venv .venv
-          .venv/bin/python -m pip install "maturin==1.15.0" "charset_normalizer==3.5.1" "idna==3.19" "urllib3==2.7.0" "certifi==2026.7.22"
+          .venv/bin/python -m pip install "maturin==1.15.0" "charset_normalizer==3.5.1" "idna==3.19" "urllib3==2.8.0" "certifi==2026.7.22"
       - name: Check out frozen Python oracle
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
