@@ -6,7 +6,7 @@
   <p>
     <!-- Release badge: current GitHub release is a prerelease (v1.0.0-beta), so shields.io reports repo not found. Restore when a stable release exists. -->
     <!-- <img src="https://img.shields.io/github/v/release/puneet-chandna/requests-native?display_name=tag&label=release&color=111827" alt="Release"> -->
-    <img src="https://img.shields.io/badge/status-beta-f59e0b" alt="Beta">
+    <img src="https://img.shields.io/badge/status-1.0_candidate-f59e0b" alt="1.0 candidate">
     <img src="https://img.shields.io/badge/license-Apache--2.0-111827" alt="Apache 2.0">
     <img src="https://img.shields.io/github/stars/puneet-chandna/requests-native?style=flat&color=111827" alt="GitHub stars">
   </p>
@@ -26,7 +26,7 @@
 
 
 
-> **Beta software.** Requests Native is an independent Rust rewrite targeting strict compatibility with Requests **2.34.2**. The current beta has a known intermittent Windows TLS issue. Test your workload before replacing production Requests. It is not currently published to PyPI or crates.io.
+> **1.0.0 release candidate.** Requests Native is an independent Rust rewrite targeting strict compatibility with Requests **2.34.2**. Stable metadata does not establish release qualification or registry availability. The existing beta has a known intermittent Windows TLS issue; stable qualification requires strict checks without that exception. It is not currently published to PyPI or crates.io.
 
 Normal installations require urllib3 2.8 or newer for its security fixes. The
 urllib3 1.26 CI lane checks legacy behavior only and is outside the supported
@@ -257,7 +257,7 @@ python -c "import requests; from importlib.metadata import version; print(versio
 The source build currently reports:
 
 ```text
-requests-native : 1.0.0b1
+requests-native : 1.0.0
 requests        : 2.34.2
 ```
 
@@ -533,11 +533,11 @@ The workspace is intentionally split so the Rust transport core does not depend 
 
 | Surface                                | Version / identity                 |
 | -------------------------------------- | ---------------------------------- |
-| Python distribution                    | `requests-native` — `1.0.0b1`      |
+| Python distribution                    | `requests-native` — `1.0.0`        |
 | Python import / compatibility baseline | `requests` — `2.34.2`              |
-| Rust package                           | `requests-native` — `1.0.0-beta.1` |
+| Rust package                           | `requests-native` — `1.0.0`        |
 | Rust library                           | `requests_native`                  |
-| GitHub milestone                       | `v1.0.0-beta`                      |
+| Existing GitHub beta                   | `v1.0.0-beta`                      |
 
 
 The distinction is intentional:

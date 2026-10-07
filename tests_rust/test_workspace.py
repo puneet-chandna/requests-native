@@ -27,6 +27,10 @@ def test_workspace_has_exactly_two_rust_crates() -> None:
     ]
     assert workspace["workspace"]["resolver"] == "3"
     assert workspace["workspace"]["package"]["edition"] == "2024"
+    assert (
+        workspace["workspace"]["package"]["rust-version"]
+        == (load_toml("rust-toolchain.toml")["toolchain"]["channel"])
+    )
     assert workspace["workspace"]["lints"]["rust"]["unsafe_code"] == "forbid"
 
 
@@ -35,9 +39,11 @@ def test_core_is_python_independent_and_binding_depends_on_core() -> None:
     binding = load_toml("crates/requests-python/Cargo.toml")
 
     assert "pyo3" not in core.get("dependencies", {})
+    assert core["package"]["rust-version"] == {"workspace": True}
+    assert binding["package"]["rust-version"] == {"workspace": True}
     assert core["package"]["name"] == "requests-native"
     assert core["lib"]["name"] == "requests_native"
-    assert core["package"]["publish"] is False
+    assert core["package"]["publish"] is True
     assert binding["package"]["name"] == "requests-native-python"
     assert binding["package"]["publish"] is False
     assert "requests" in binding["dependencies"]
@@ -75,7 +81,7 @@ def test_maturin_mixed_project_preserves_import_and_splits_versions() -> None:
     assert metadata["name"] == "requests-native"
     assert metadata["requires-python"] == ">=3.10"
     assert metadata["dynamic"] == ["version"]
-    assert workspace_version() == "1.0.0-beta.1"
+    assert workspace_version() == "1.0.0"
     assert metadata["dependencies"] == [
         "charset_normalizer>=2,<4",
         "idna>=2.5,<4",

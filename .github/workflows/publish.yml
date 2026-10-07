@@ -1,5 +1,5 @@
 # Requests Native modification notice: this retained file differs from Requests 2.34.2.
-name: Validate beta artifacts
+name: Validate release artifacts
 
 on:
   workflow_dispatch:
@@ -9,13 +9,29 @@ on:
         type: string
         required: false
         default: ""
+      publish_pypi:
+        description: "Publish the qualified stable release to PyPI after environment approval"
+        type: boolean
+        default: false
+      publish_crates:
+        description: "Publish the qualified stable core crate after environment approval"
+        type: boolean
+        default: false
+      source_run_id:
+        description: "Successful exact-source Tests run; required for publication"
+        type: string
+        default: ""
+      performance_run_id:
+        description: "Successful exact-source full performance gate run; required for publication"
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: beta-artifact-validation-${{ github.ref }}
-  cancel-in-progress: true
+  group: release-artifact-validation-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   sdist:
@@ -83,6 +99,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Resolve qualified artifact source
         id: source
@@ -150,7 +168,152 @@ jobs:
       - name: Upload complete release set
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: beta-release-set
+          name: release-set
           path: dist/
           if-no-files-found: error
           retention-days: 5
+
+  publication-gates:
+    if: ${{ inputs.publish_pypi || inputs.publish_crates }}
+    needs: manifest
+    runs-on: namespace-profile-puneet-chandna
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Verify exact-source qualification and environment protections
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.manifest.outputs.source_sha }}
+          SOURCE_RUN: ${{ inputs.source_run_id }}
+          PERFORMANCE_RUN: ${{ inputs.performance_run_id }}
+          PUBLISH_PYPI: ${{ inputs.publish_pypi }}
+          PUBLISH_CRATES: ${{ inputs.publish_crates }}
+        shell: bash
+        run: |
+          [[ "$GITHUB_REPOSITORY" == puneet-chandna/requests-native ]]
+          [[ "$GITHUB_REF" == refs/heads/main && "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+          for qualification in "$SOURCE_RUN:.github/workflows/run-tests.yml" "$PERFORMANCE_RUN:.github/workflows/evaluate.yml"; do
+            run_id=${qualification%%:*}
+            workflow=${qualification#*:}
+            [[ "$run_id" =~ ^[0-9]+$ ]]
+            gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id" | jq -e \
+              --arg repo "$GITHUB_REPOSITORY" --arg sha "$SOURCE_SHA" --arg workflow "$workflow" '
+                .head_repository.full_name == $repo and .head_sha == $sha and
+                .head_branch == "main" and .path == $workflow and
+                (.event == "push" or .event == "workflow_dispatch") and
+                .status == "completed" and .conclusion == "success"'
+          done
+          for environment in pypi crates-io; do
+            if [[ "$environment" == pypi && "$PUBLISH_PYPI" != true ]] || \
+               [[ "$environment" == crates-io && "$PUBLISH_CRATES" != true ]]; then continue; fi
+            gh api "/repos/$GITHUB_REPOSITORY/environments/$environment" | jq -e '
+              any(.protection_rules[]; .type == "required_reviewers" and (.reviewers | length) > 0) and
+              .deployment_branch_policy.protected_branches == false and
+              .deployment_branch_policy.custom_branch_policies == true'
+            gh api "/repos/$GITHUB_REPOSITORY/environments/$environment/deployment-branch-policies" | jq -e '
+              .branch_policies | length == 1 and .[0].name == "main" and .[0].type == "branch"'
+          done
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.manifest.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+      - name: Download qualified performance evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: performance-evidence
+          path: performance-evidence
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.performance_run_id }}
+      - name: Verify stable identity and recompute the full performance gate
+        env:
+          SOURCE_SHA: ${{ needs.manifest.outputs.source_sha }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import tomllib
+          from pathlib import Path
+          from benchmarks.evaluate import compare_pairs, evaluator_digest
+
+          workspace = tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]
+          assert workspace["version"] == "1.0.0", "Only the stable 1.0.0 candidate can publish"
+          assert tomllib.loads(Path("crates/requests/Cargo.toml").read_text())["package"]["publish"] is True
+          assert tomllib.loads(Path("crates/requests-python/Cargo.toml").read_text())["package"]["publish"] is False
+          evidence = Path("performance-evidence")
+          bases = sorted(evidence.glob("pair-*-base.json"))
+          candidates = sorted(evidence.glob("pair-*-candidate.json"))
+          assert candidates == [path.with_name(path.name.replace("-base.json", "-candidate.json")) for path in bases]
+          pairs = [(json.loads(base.read_text()), json.loads(candidate.read_text())) for base, candidate in zip(bases, candidates)]
+          assert all(report["evaluator_sha256"] == evaluator_digest() for pair in pairs for report in pair)
+          assert all(pair[0]["git"]["rewrite_commit"] == "2146b22ed25951a5483cbb13d69dc551f99ff352" for pair in pairs), "The first stable release must use the immutable beta baseline"
+          result = compare_pairs(pairs, budget=0.20, gate=True)
+          assert result["status"] == "passed" and result["sources"][1] == os.environ["SOURCE_SHA"]
+          assert json.loads((evidence / "comparison.json").read_text()) == {**result, "smoke_only": False}
+          PY
+
+  pypi:
+    if: ${{ inputs.publish_pypi }}
+    needs: [manifest, publication-gates]
+    runs-on: namespace-profile-puneet-chandna
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/requests-native/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.manifest.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: release-set
+          path: dist
+      - name: Verify the release set immediately before upload
+        env:
+          SOURCE_SHA: ${{ needs.manifest.outputs.source_sha }}
+        run: |
+          cargo fetch --locked
+          python tests_rust/test_distribution.py --verify-release-set dist --manifest dist/artifact-manifest.json --source-commit "$SOURCE_SHA"
+          mkdir packages
+          cp dist/*.whl dist/*.tar.gz packages/
+      - name: Publish qualified archives to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: packages/
+
+  crates:
+    if: ${{ inputs.publish_crates }}
+    needs: [manifest, publication-gates]
+    runs-on: namespace-profile-puneet-chandna
+    timeout-minutes: 30
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/requests-native
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.manifest.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify publishable core archive
+        run: |
+          cargo publish -p requests-native --locked --dry-run
+          cargo test --manifest-path target/package/requests-native-1.0.0/Cargo.toml --lib --locked
+      - name: Publish the qualified core crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN"
+          cargo publish -p requests-native --locked --no-verify

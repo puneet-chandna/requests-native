@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import runpy
 import sys
@@ -23,6 +24,74 @@ from benchmarks.run import (
 
 
 class BenchmarkHarnessTests(unittest.TestCase):
+    def test_oracle_only_preparation_does_not_build_or_install_native_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "oracle.json"
+            arguments = benchmark.parser().parse_args(
+                [
+                    "--surfaces",
+                    "python-oracle",
+                    "--requests",
+                    "2",
+                    "--warmup",
+                    "1",
+                    "--output",
+                    str(output),
+                ]
+            )
+            with (
+                mock.patch.object(
+                    benchmark,
+                    "build_python_extension",
+                    side_effect=AssertionError("native build"),
+                ),
+                mock.patch.object(
+                    benchmark,
+                    "build_native",
+                    side_effect=AssertionError("native build"),
+                ),
+            ):
+                self.assertEqual(benchmark.orchestrate(arguments), 0)
+            report = json.loads(output.read_text())
+            self.assertEqual(report["python_artifact"]["scope"], "oracle-only")
+            self.assertTrue(report["python_artifact"]["python_soabi"])
+            self.assertEqual(len(report["results"]), 16)
+
+    def test_checksum_detects_byte_order_and_matches_crc32(self):
+        self.assertEqual(benchmark.body_checksum(b"123456789"), 0xCBF43926)
+        self.assertNotEqual(
+            benchmark.body_checksum(b"abc"), benchmark.body_checksum(b"cba")
+        )
+
+    @unittest.skipUnless(benchmark.NATIVE_BINARY.is_file(), "native benchmark build")
+    def test_all_surfaces_preserve_crc32_across_stream_chunks(self):
+        body = b"123456789"
+        with benchmark.fixture_server(body, body) as server:
+            host, port = server.server_address
+            for surface in benchmark.SURFACES:
+                for read in ("buffered", "streaming"):
+                    with self.subTest(surface=surface, read=read):
+                        result = benchmark.run_json_command(
+                            benchmark.worker_command(
+                                surface,
+                                url=f"http://{host}:{port}/small",
+                                requests=5,
+                                concurrency=2,
+                                mode="pooled",
+                                read=read,
+                                chunk_size=2,
+                                warmup=2,
+                            ),
+                            cwd=benchmark.ROOT,
+                            timeout_seconds=15,
+                        )
+                        self.assertEqual(result["checksum"], 5 * 0xCBF43926)
+                        self.assertEqual(result["warmup_checksum"], 4 * 0xCBF43926)
+                        self.assertEqual(
+                            result["application_chunks"],
+                            25 if read == "streaming" else 0,
+                        )
+
     def test_surface_request_overrides_resolve_defaults_and_reject_invalid_values(self):
         resolve = benchmark.resolve_surface_requests
         expected = dict.fromkeys(benchmark.SURFACES, 100)
@@ -86,7 +155,9 @@ class BenchmarkHarnessTests(unittest.TestCase):
             self.assertEqual(len(result["warmup_latencies_ns"]), 4)
             self.assertEqual(result["body_bytes"], 12)
             self.assertEqual(result["warmup_body_bytes"], 12)
-            self.assertEqual(result["warmup_checksum"], 4 * sum(b"abc"))
+            self.assertEqual(
+                result["warmup_checksum"], 4 * benchmark.body_checksum(b"abc")
+            )
             self.assertEqual(result["warmup_application_chunks"], 8)
             self.assertEqual(
                 set(result["connection_ids"]), set(result["warmup_connection_ids"])

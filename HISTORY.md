@@ -1,6 +1,17 @@
 Release History
 ===============
 
+Requests Native 1.0.0 / Cargo 1.0.0 (unreleased)
+-----------------------------------------------
+
+- Prepared stable Python and Cargo distribution metadata; the import API and
+  compatibility version remain ``requests`` / ``2.34.2``.
+- Enabled core crate publication eligibility while keeping the Python binding
+  crate private. Registry publication and exact-commit release qualification
+  remain separate steps.
+- Preserved the original beta archives, validation manifest and history.
+
+
 Requests Native 1.0.0b1 / Cargo 1.0.0-beta.1 (2026-09-13)
 ---------------------------------------------------------
 

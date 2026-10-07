@@ -3,7 +3,8 @@
 Historical controls are the default. To test a committed main revision without
 isolated HTTPS warmups or accepting issue-1 failures, use CPython 3.12.10 on
 Windows with maturin 1.15.0. Strict qualification reads the selected revision's
-rust-toolchain.toml channel; the historical comparison retains Rust 1.98.0:
+rust-toolchain.toml channel and Cargo distribution version; the historical
+comparison retains Rust 1.98.0 and its original beta distribution identity:
 
 python scripts/compare_windows_tls.py --current-revision HEAD \
     --qualify-current-release --oracle-root frozen-oracle \
@@ -151,11 +152,19 @@ def build_command(python, output, profile):
     return command
 
 
-def test_commands(python, source, proof_path, expected_hash, *, qualification=None):
+def test_commands(
+    python,
+    source,
+    proof_path,
+    expected_hash,
+    *,
+    qualification=None,
+    distribution_version="1.0.0b1",
+):
     identity = (
         ("requests", "requests-rust", "2.34.2")
         if source == "old"
-        else ("requests-native", "requests-native", "1.0.0b1")
+        else ("requests-native", "requests-native", distribution_version)
     )
     provenance = (
         "provenance",
@@ -230,6 +239,17 @@ def release_toolchain(checkout, revision):
     return tomllib.loads(contents)["toolchain"]["channel"]
 
 
+def release_distribution_version(checkout, revision):
+    contents = subprocess.check_output(
+        ["git", "show", f"{revision}:Cargo.toml"],
+        cwd=checkout,
+        text=True,
+        timeout=30,
+    )
+    version = tomllib.loads(contents)["workspace"]["package"]["version"]
+    return version.replace("-beta.", "b")
+
+
 def compare(output, *, current_revision=None, oracle_root=None):
     assert sys.platform == "win32" and sys.version_info[:3] == (3, 12, 10)
     assert output.resolve().is_relative_to(Path(os.environ["RUNNER_TEMP"]).resolve())
@@ -252,6 +272,11 @@ def compare(output, *, current_revision=None, oracle_root=None):
             timeout=30,
         ).strip()
     qualification = (checkout, oracle_root) if oracle_root is not None else None
+    distribution_version = (
+        release_distribution_version(checkout, revisions["current"])
+        if qualification
+        else "1.0.0b1"
+    )
     cells = [("current", "release")] if qualification else CELLS
     if qualification:
         revisions = {"current": revisions["current"]}
@@ -549,6 +574,7 @@ def compare(output, *, current_revision=None, oracle_root=None):
                 proof_path,
                 extension_hashes[name],
                 qualification=qualification,
+                distribution_version=distribution_version,
             ):
                 record = run(
                     f"{name}-{label}",
@@ -621,7 +647,9 @@ def self_check():
         Path("proof.json"),
         "a" * 64,
         qualification=(checkout, Path("oracle")),
+        distribution_version="1.0.0",
     )
+    assert qualification[0][1][6] == "1.0.0"
     assert [item[0] for item in qualification] == ["provenance", "qualification"]
     assert qualification[-1][1] == [
         sys.executable,

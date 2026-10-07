@@ -9,6 +9,7 @@ import contextlib
 import datetime as dt
 import hashlib
 import http.client
+import importlib.metadata as package_metadata
 import json
 import math
 import os
@@ -20,9 +21,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import tracemalloc
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -200,7 +203,7 @@ def resolve_maturin(
 
 
 def body_checksum(body: bytes) -> int:
-    return sum(body)
+    return zlib.crc32(body)
 
 
 def enable_tcp_nodelay(connection) -> None:
@@ -457,7 +460,7 @@ def python_worker(arguments: argparse.Namespace) -> int:
                 application_chunks = 0
                 for chunk in response.iter_content(arguments.chunk_size):
                     size += len(chunk)
-                    checksum += body_checksum(chunk)
+                    checksum = zlib.crc32(chunk, checksum)
                     application_chunks += 1
         latency = time.perf_counter_ns() - start
         return (
@@ -920,14 +923,24 @@ def orchestrate(arguments: argparse.Namespace) -> int:
             [sys.executable, str(pathlib.Path(__file__).resolve()), *sys.argv[1:]]
         )
     ]
-    release_build, build_record = build_python_extension(commands)
-    build_native(commands)
-    python_provenance = python_artifact_provenance(
-        commands,
-        arguments.case_timeout_seconds,
-        release_build,
-        build_record,
-    )
+    if set(surfaces) == {"python-oracle"}:
+        python_provenance = {
+            "scope": "oracle-only",
+            "python_soabi": sysconfig.get_config_var("SOABI"),
+            "versions": {
+                name: package_metadata.version(name)
+                for name in ("urllib3", "certifi", "idna", "charset-normalizer")
+            },
+        }
+    else:
+        release_build, build_record = build_python_extension(commands)
+        build_native(commands)
+        python_provenance = python_artifact_provenance(
+            commands,
+            arguments.case_timeout_seconds,
+            release_build,
+            build_record,
+        )
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "generated_at_utc": dt.datetime.now(dt.UTC).isoformat(),
@@ -956,6 +969,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
             "small_bytes": small_size,
             "large_bytes": large_size,
             "stream_chunk_bytes": arguments.chunk_size,
+            "body_checksum": "crc32",
             "concurrency_levels": concurrencies,
             "surfaces": surfaces,
             "warmup_per_worker": arguments.warmup,

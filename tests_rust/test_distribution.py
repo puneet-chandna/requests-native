@@ -45,8 +45,8 @@ PYTHONS = [
 SYSTEMS = ["ubuntu-22.04", "macos-latest", "windows-latest"]
 FROZEN_ORACLE_COMMIT = "69f84847045bef7a849cc994a26fe7ba8a169e95"
 PYTHON_DISTRIBUTION = "requests-native"
-PYTHON_DISTRIBUTION_VERSION = "1.0.0b1"
-ARTIFACT_STEM = "requests_native-1.0.0b1"
+PYTHON_DISTRIBUTION_VERSION = "1.0.0"
+ARTIFACT_STEM = f"requests_native-{PYTHON_DISTRIBUTION_VERSION}"
 COMPATIBILITY_VERSION = "2.34.2"
 BACKEND_NAME = "requests-native"
 CORE_CARGO_PACKAGE = "requests-native"
@@ -73,7 +73,7 @@ WINDOWS_ISSUE1_SIGNATURES = {
 WINDOWS_JUNIT = "windows-upstream.xml"
 WINDOWS_REPORT = "windows-validation.json"
 EXPECTED_CLASSIFIERS = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Web Environment",
     "Intended Audience :: Developers",
     "Natural Language :: English",
@@ -296,7 +296,7 @@ if os.environ["REQUESTS_EDITABLE"] == "1":
 else:
     assert not extension_source.is_relative_to(checkout), extension_source
 distribution = metadata.distribution("requests-native")
-assert distribution.version == "1.0.0b1"
+assert distribution.version == "1.0.0"
 assert distribution.version != requests.__version__
 assert requests.__all__ == (
     "ConnectionError", "ConnectTimeout", "HTTPError", "JSONDecodeError",
@@ -436,7 +436,7 @@ def test_project_metadata_declares_license_files_dependencies_and_extras() -> No
 
     workspace = load_toml(ROOT / "Cargo.toml")["workspace"]["package"]
     assert workspace["authors"] == ["Puneet Chandna"]
-    assert workspace["version"] == "1.0.0-beta.1"
+    assert workspace["version"] == "1.0.0"
     assert workspace["homepage"] == "https://github.com/puneet-chandna/requests-native"
     assert workspace["repository"] == workspace["homepage"]
     for crate, expected_name in (
@@ -445,7 +445,7 @@ def test_project_metadata_declares_license_files_dependencies_and_extras() -> No
     ):
         package = load_toml(ROOT / f"crates/{crate}/Cargo.toml")["package"]
         assert package["name"] == expected_name
-        assert package["publish"] is False
+        assert package["publish"] is (crate == "requests")
         assert package["authors"]["workspace"] is True
         assert package["homepage"]["workspace"] is True
         assert package["repository"]["workspace"] is True
@@ -638,10 +638,11 @@ def test_notice_closes_curated_and_runtime_attribution_requirements() -> None:
 
 def test_history_separates_derivative_release_from_preserved_upstream_history() -> None:
     history = (ROOT / "HISTORY.md").read_text(encoding="utf-8")
-    derivative = history.index("Requests Native 1.0.0b1")
+    derivative = history.index("Requests Native 1.0.0 / Cargo 1.0.0")
+    beta = history.index("Requests Native 1.0.0b1")
     boundary = history.index("Preserved upstream Requests history")
     upstream = history.index("2.34.2 (2026-05-14)")
-    assert derivative < boundary < upstream
+    assert derivative < beta < boundary < upstream
 
 
 def test_release_sbom_is_deterministic_and_matches_locked_runtime_graph() -> None:
@@ -1946,12 +1947,17 @@ def test_manifest_prepares_dependencies_and_can_reuse_qualified_artifacts() -> N
     assert '--source-commit "$SOURCE_SHA"' in steps[-2]["run"]
 
 
-def test_publish_workflow_validates_one_shared_release_artifact_without_publishing() -> (
-    None
-):
+def test_publish_workflow_requires_explicit_protected_publication() -> None:
     workflow = load_workflow("publish.yml")
     jobs = workflow["jobs"]
-    assert set(jobs) == {"sdist", "wheels", "manifest"}
+    assert set(jobs) == {
+        "sdist",
+        "wheels",
+        "manifest",
+        "publication-gates",
+        "pypi",
+        "crates",
+    }
     assert jobs["wheels"]["uses"] == "./.github/workflows/wheels.yml"
     sdist_steps = jobs["sdist"]["steps"]
     sdist_by_name = {step.get("name"): step for step in sdist_steps}
@@ -1999,7 +2005,7 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     )
     assert "if" not in release_upload
     assert release_upload["with"] == {
-        "name": "beta-release-set",
+        "name": "release-set",
         "path": "dist/",
         "if-no-files-found": "error",
         "retention-days": 5,
@@ -2012,13 +2018,24 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     )
     triggers = workflow.get("on", workflow.get(True))
     assert set(triggers) == {"workflow_dispatch"}
-    assert set(triggers["workflow_dispatch"]["inputs"]) == {"artifact_run_id"}
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {
+        "artifact_run_id",
+        "publish_pypi",
+        "publish_crates",
+        "source_run_id",
+        "performance_run_id",
+    }
+    for flag in ("publish_pypi", "publish_crates"):
+        assert inputs[flag]["type"] == "boolean" and inputs[flag]["default"] is False
     assert workflow["concurrency"] == {
-        "group": "beta-artifact-validation-${{ github.ref }}",
-        "cancel-in-progress": True,
+        "group": "release-artifact-validation-${{ github.ref }}",
+        "cancel-in-progress": False,
     }
     assert workflow["permissions"] == {"contents": "read"}
-    for job in jobs.values():
+    for job in (
+        jobs[name] for name in ("sdist", "wheels", "manifest", "publication-gates")
+    ):
         assert "environment" not in job
         job_permissions = job.get("permissions") or {}
         assert isinstance(job_permissions, dict)
@@ -2027,13 +2044,9 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
     workflow_text = (ROOT / ".github/workflows/publish.yml").read_text()
     lowered = workflow_text.lower()
     for forbidden in (
-        "id-token: write",
         "write-all",
-        "gh-action-pypi-publish",
         "maturin-action",
-        "pypi.org",
         "test.pypi.org",
-        "crates.io",
         "twine upload",
         "maturin publish",
         "pip upload",
@@ -2042,6 +2055,177 @@ def test_publish_workflow_validates_one_shared_release_artifact_without_publishi
         "tags:",
     ):
         assert forbidden not in lowered
+    assert (
+        jobs["publication-gates"]["if"]
+        == "${{ inputs.publish_pypi || inputs.publish_crates }}"
+    )
+    assert jobs["publication-gates"]["needs"] == "manifest"
+    for name, flag, environment in (
+        ("pypi", "publish_pypi", "pypi"),
+        ("crates", "publish_crates", "crates-io"),
+    ):
+        job = jobs[name]
+        assert job["if"] == "${{ inputs." + flag + " }}"
+        assert set(job["needs"]) == {"manifest", "publication-gates"}
+        assert job["environment"]["name"] == environment
+        checkout = next(
+            step for step in job["steps"] if "actions/checkout@" in step.get("uses", "")
+        )
+        assert checkout["with"]["ref"] == "${{ needs.manifest.outputs.source_sha }}"
+        assert checkout["with"]["persist-credentials"] is False
+    assert jobs["pypi"]["permissions"] == {"contents": "read", "id-token": "write"}
+    assert jobs["crates"]["permissions"] == {"contents": "read"}
+    assert (
+        jobs["pypi"]["steps"][-1]["uses"]
+        == "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
+    )
+    assert jobs["pypi"]["steps"][-1]["with"] == {"packages-dir": "packages/"}
+    assert "--verify-release-set" in jobs["pypi"]["steps"][-2]["run"]
+    assert "--dry-run" in jobs["crates"]["steps"][-2]["run"]
+    assert jobs["crates"]["steps"][-1]["env"] == {
+        "CARGO_REGISTRY_TOKEN": "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+    }
+    assert (
+        "cargo publish -p requests-native --locked"
+        in jobs["crates"]["steps"][-1]["run"]
+    )
+
+
+def test_publication_preflight_rejects_unqualified_sources_and_unprotected_environments(
+    tmp_path: Path,
+) -> None:
+    script = load_workflow("publish.yml")["jobs"]["publication-gates"]["steps"][0][
+        "run"
+    ]
+    gh = tmp_path / "gh"
+    gh.write_text(
+        "#!" + sys.executable + "\nimport json, os, sys\n"
+        "print(json.dumps(json.loads(os.environ['FAKE_GITHUB'])[sys.argv[2]]))\n"
+    )
+    gh.chmod(0o755)
+    repo = "/repos/puneet-chandna/requests-native"
+    sha = "a" * 40
+    source = {
+        "head_repository": {"full_name": "puneet-chandna/requests-native"},
+        "head_sha": sha,
+        "head_branch": "main",
+        "path": ".github/workflows/run-tests.yml",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "success",
+    }
+    environment = {
+        "can_admins_bypass": False,
+        "protection_rules": [
+            {
+                "type": "required_reviewers",
+                "reviewers": [
+                    {"type": "User", "reviewer": {"login": "puneet-chandna"}}
+                ],
+            }
+        ],
+        "deployment_branch_policy": {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        },
+    }
+    original = {
+        repo + "/actions/runs/101": source,
+        repo + "/actions/runs/102": {
+            **source,
+            "path": ".github/workflows/evaluate.yml",
+            "event": "workflow_dispatch",
+        },
+    }
+    for name in ("pypi", "crates-io"):
+        original[repo + "/environments/" + name] = environment
+        original[repo + "/environments/" + name + "/deployment-branch-policies"] = {
+            "branch_policies": [{"name": "main", "type": "branch"}]
+        }
+    env = {
+        **os.environ,
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+        "GITHUB_REPOSITORY": "puneet-chandna/requests-native",
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_SHA": sha,
+        "SOURCE_SHA": sha,
+        "SOURCE_RUN": "101",
+        "PERFORMANCE_RUN": "102",
+        "PUBLISH_PYPI": "true",
+        "PUBLISH_CRATES": "true",
+    }
+    for change in (
+        "valid",
+        "source-sha",
+        "performance-failure",
+        "unreviewed",
+        "wildcard-branch",
+        "missing-environment",
+        "beta-tag",
+    ):
+        records = copy.deepcopy(original)
+        trial = dict(env)
+        if change == "source-sha":
+            records[repo + "/actions/runs/101"]["head_sha"] = "b" * 40
+        elif change == "performance-failure":
+            records[repo + "/actions/runs/102"]["conclusion"] = "failure"
+        elif change == "unreviewed":
+            records[repo + "/environments/pypi"]["protection_rules"] = []
+        elif change == "wildcard-branch":
+            records[repo + "/environments/pypi/deployment-branch-policies"][
+                "branch_policies"
+            ][0]["name"] = "*"
+        elif change == "missing-environment":
+            del records[repo + "/environments/pypi"]
+        elif change == "beta-tag":
+            trial["GITHUB_REF"] = "refs/tags/v1.0.0-beta"
+        trial["FAKE_GITHUB"] = json.dumps(records)
+        result = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+            env=trial,
+            text=True,
+            capture_output=True,
+        )
+        assert (result.returncode == 0) is (change == "valid"), (change, result.stderr)
+
+
+def test_publication_performance_gate_rejects_a_different_baseline(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.evaluate import evaluator_digest
+
+    step = load_workflow("publish.yml")["jobs"]["publication-gates"]["steps"][-1]
+    script = step["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    for name in (
+        "Cargo.toml",
+        "crates/requests/Cargo.toml",
+        "crates/requests-python/Cargo.toml",
+    ):
+        destination = tmp_path / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, destination)
+    evidence = tmp_path / "performance-evidence"
+    evidence.mkdir()
+    for side in ("base", "candidate"):
+        (evidence / f"pair-01-{side}.json").write_text(
+            json.dumps(
+                {
+                    "evaluator_sha256": evaluator_digest(),
+                    "git": {"rewrite_commit": "b" * 40},
+                }
+            )
+        )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": os.fspath(ROOT)},
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert (
+        "The first stable release must use the immutable beta baseline" in result.stderr
+    )
 
 
 def test_public_project_identity_is_derivative_and_registry_safe() -> None:
@@ -2657,7 +2841,9 @@ def test_sdist_validator_requires_one_exact_root(tmp_path: Path) -> None:
         sdist,
         wrong_root,
         renamed={
-            name: name.replace(f"{ARTIFACT_STEM}/", "wrong-1.0.0b1/", 1)
+            name: name.replace(
+                f"{ARTIFACT_STEM}/", f"wrong-{PYTHON_DISTRIBUTION_VERSION}/", 1
+            )
             for name in names
         },
     )

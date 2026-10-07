@@ -24,8 +24,9 @@ Why does it report version 2.34.2?
 
 The import surface reports ``requests.__version__ == "2.34.2"`` for strict
 compatibility. The distinct ``requests-native`` distribution uses version
-``1.0.0b1``, the Cargo package uses ``1.0.0-beta.1``, and the GitHub milestone
-is ``v1.0.0-beta``.
+``1.0.0`` as a stable candidate, and the Cargo package uses ``1.0.0``.
+The existing ``v1.0.0-beta`` release retains its original ``1.0.0b1`` /
+``1.0.0-beta.1`` archives and manifest.
 
 Does every request use Rust?
 ----------------------------

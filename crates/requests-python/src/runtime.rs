@@ -428,7 +428,9 @@ impl PythonCallContext {
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    py.detach(|| thread::sleep(WAKE_INTERVAL));
+                    // Completion wakes this wait; its result remains buffered so
+                    // the next iteration still checks signals before consumption.
+                    let _ = py.detach(|| submission.wait_ready_timeout(WAKE_INTERVAL));
                 }
             }
         }
@@ -526,7 +528,9 @@ impl PythonCallContext {
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    py.detach(|| thread::sleep(WAKE_INTERVAL));
+                    // Completion wakes this wait; its result remains buffered so
+                    // the next iteration still checks signals before consumption.
+                    let _ = py.detach(|| submission.wait_ready_timeout(WAKE_INTERVAL));
                 }
             }
         }
@@ -1026,14 +1030,15 @@ impl Drop for CancellationProbe {
 }
 
 #[pyfunction]
-fn _runtime_signal_probe(py: Python<'_>) -> PyResult<()> {
+#[pyo3(signature = (keep_actions_open = true))]
+fn _runtime_signal_probe(py: Python<'_>, keep_actions_open: bool) -> PyResult<()> {
     SIGNAL_FUTURE_CANCELLED.store(false, Ordering::Release);
     let context = PythonCallContext::capture(py)?;
     let runtime = driver()?;
     let (actions, receiver) = action_channel::<ProbeAction, ProbeReply>();
     let future = async move {
         let _cancel_probe = CancellationProbe;
-        let _keep_actions_open = actions;
+        let _keep_actions_open = keep_actions_open.then_some(actions);
         future::pending::<()>().await;
     };
     let submission = submit(&runtime, future)?;
@@ -1044,14 +1049,25 @@ fn _runtime_signal_probe(py: Python<'_>) -> PyResult<()> {
 
 #[pyfunction]
 fn _runtime_ready_error_probe(py: Python<'_>, error: Py<PyAny>) -> PyResult<()> {
+    let runtime = driver()?;
+    let mut submission = submit(&runtime, async { ProbeOutcome::Ready })?;
+    if !py
+        .detach(|| submission.wait_ready_timeout(Duration::from_secs(2)))
+        .map_err(task_error)?
+    {
+        return Err(internal_probe_error("ready-signal probe timed out"));
+    }
     let mut task_state_was_polled = false;
     let mut injected_signal = |py: Python<'_>| Err(PyErr::from_value(error.bind(py).clone()));
     let result = signal_before_task_state(py, &mut injected_signal, || {
         task_state_was_polled = true;
-        Ok(Some(ProbeOutcome::Ready))
+        submission.try_wait()
     });
     match result {
-        Err(error) if !task_state_was_polled => Err(error),
+        Err(error) if !task_state_was_polled => {
+            cancel_and_wait(py, &mut submission).map_err(task_error)?;
+            Err(error)
+        }
         Err(_) => Err(internal_probe_error(
             "runtime probe polled a ready result before its signal",
         )),

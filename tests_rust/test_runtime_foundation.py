@@ -96,7 +96,10 @@ def test_nested_action_pump_reuses_the_process_runtime() -> None:
     os.name != "posix" or not hasattr(signal, "SIGINT"),
     reason="signal injection probe requires POSIX SIGINT",
 )
-def test_pending_signal_cancels_a_never_completing_future() -> None:
+@pytest.mark.parametrize("keep_actions_open", (True, False))
+def test_pending_signal_cancels_a_never_completing_future(
+    keep_actions_open: bool,
+) -> None:
     probe = _requests_rust._runtime_signal_probe
 
     def interrupt() -> None:
@@ -107,7 +110,7 @@ def test_pending_signal_cancels_a_never_completing_future() -> None:
     interrupter.start()
     started = time.monotonic()
     with pytest.raises(KeyboardInterrupt):
-        probe()
+        probe(keep_actions_open)
     elapsed = time.monotonic() - started
     interrupter.join(2)
 

@@ -23,21 +23,42 @@ GitHub returned seven open CodeQL findings against main
 | --- | --- | --- |
 | [7](https://github.com/puneet-chandna/requests-native/security/code-scanning/7) | Exponential regex in release build configuration guard | Reproduced a bounded subprocess timeout; replaced regex scanning with TOML parsing. Quoted/escaped keys and Windows case-insensitive Rust flag environment names are rejected. Invalid TOML fails quickly. |
 | [2](https://github.com/puneet-chandna/requests-native/security/code-scanning/2), [1](https://github.com/puneet-chandna/requests-native/security/code-scanning/1) | Implicit TLS defaults in test client/server contexts | The server context lacked an explicit minimum. Both locations now explicitly require TLS 1.2 or newer; client certificate and hostname validation remain enabled. Existing TLS/loopback checks pass. |
-| [6](https://github.com/puneet-chandna/requests-native/security/code-scanning/6), [5](https://github.com/puneet-chandna/requests-native/security/code-scanning/5) | SHA-512/SHA-256 used with passwords | These functions implement HTTP Digest challenge-response, not stored password hashing. The algorithm and wire values are required by the protocol and Requests compatibility. Replacing them with a password-storage KDF breaks authentication. |
+| [6](https://github.com/puneet-chandna/requests-native/security/code-scanning/6), [5](https://github.com/puneet-chandna/requests-native/security/code-scanning/5) | SHA-512/SHA-256 used with passwords | These functions implement HTTP Digest challenge-response, not stored password hashing. The challenge/response wire values preserve Requests compatibility; SHA-256 is standardized by RFC 7616, while the retained full SHA-512 variant is a Requests extension. Replacing them with a password-storage KDF breaks authentication. |
 | [4](https://github.com/puneet-chandna/requests-native/security/code-scanning/4), [3](https://github.com/puneet-chandna/requests-native/security/code-scanning/3) | SHA-1/MD5 used with passwords | Same protocol flow, with real weaknesses in legacy algorithms. Compatibility retains server-selected legacy Digest algorithms; no stronger-security claim or automatic dismissal. Prefer HTTPS and modern server authentication policies. |
 
 The [CodeQL rule](https://codeql.github.com/codeql-query-help/python/py-weak-sensitive-data-hashing/)
 addresses sensitive-data/password-storage hashing. The implemented flow is
-`HTTPDigestAuth.build_digest_header`; [RFC 7616](https://datatracker.ietf.org/doc/html/rfc7616)
-defines its challenge/response hashing and legacy-algorithm limitations.
+`HTTPDigestAuth.build_digest_header`, which computes an HTTP Digest response rather
+than storing a password hash. [RFC 7616](https://datatracker.ietf.org/doc/html/rfc7616)
+defines the challenge/response construction and registers MD5, SHA-256 and
+SHA-512-256. Requests also retains SHA-1 and full SHA-512 compatibility variants;
+full SHA-512 is not RFC SHA-512-256.
+On 2026-10-07, a direct comparison with the frozen Requests oracle at
+`c5a69855228cc61120883a069e3cbeb78bd6f151` confirmed that the entire
+`src/requests/auth.py` file is byte-for-byte identical, including all four
+hashing branches, the challenge/response construction and resend flow. Its
+SHA256 is `fdc8bb34a8a5a088b169ca13277d107b0bc94ee63ed5e89dd4f5569d9b2bb04c`.
+The owner explicitly defers inherited Digest findings 3–6 for stable 1.0.0
+to preserve the faithful rewrite. No algorithm behavior change, suppression
+or dismissal is requested; the findings remain open.
 No alert has been dismissed. CodeQL run
 [37538258198](https://github.com/puneet-chandna/requests-native/actions/runs/37538258198)
 on `3ed9c7da974dad5f976711fd491e807c4b726a80` closed alerts 7 and 1.
-Client alert 2 remains open despite the TLS 1.2 minimum dominating its socket
-wrap call. Runtime verification confirms TLS 1.2 minimum, required certificate
-validation and hostname checks; no further runtime weakening or suppression is
-justified. The four HTTP Digest alerts remain open for the compatibility reasons
-above.
+At the 2026-10-07 05:06 UTC refresh, the latest CodeQL analysis still targets
+`29ef0b6908ac414e5e78309fe78fcc20760cde4a`: five open alerts and no analysis
+error. It does not qualify the final local candidate. Client alert 2 remains
+open despite the TLS 1.2 minimum dominating its socket wrap call. The exact
+CodeQL 2.27.1 ssl model assumes default contexts allow TLS 1.0/1.1 and has a
+minimum-version restriction model; the precise dataflow failure was not
+reproduced locally. Executing the actual context construction and assignment
+from the flagged test confirms TLS 1.2 minimum, `CERT_REQUIRED` and hostname
+checks. The diagnostic profiler does not modify that policy. The reported
+insecure-version behavior is contradicted by source and runtime evidence.
+This separate finding concerns the custom Windows diagnostic TLS context,
+so it is not covered by the inherited Digest deferral.
+Keep the alert open pending final analysis or an explicitly approved
+false-positive disposition. The four HTTP Digest alerts remain open for the
+compatibility reasons above. No suppression or authentication change is needed.
 
 The initial Dependabot inventory was empty; the refreshed dependency graph
 reported four findings in the Windows diagnostic dependency lock. The lock now
@@ -58,14 +79,26 @@ Secret scanning and secret push protection
 were disabled at the initial audit; both have now been enabled under the owner's
 delegation. They are [free for this public repository](https://github.blog/changelog/2023-05-09-secret-scannings-push-protection-is-available-on-public-repositories-for-free/).
 No paid feature was enabled. Generic/non-provider scanning and validity checks
-remain disabled. The initial disabled endpoint was not a clean secret inventory;
-the historical scan must complete before treating its inventory as assessed.
+remain disabled. The initial disabled endpoint was not a clean secret inventory. On 2026-10-07
+at 05:06 UTC, the enabled scanner API returned zero alerts, and the authenticated
+GitHub UI reported zero open and zero closed alerts with no progress banner.
+The historical scan completion timestamp could not be verified: the
+[scan-history API](https://docs.github.com/en/rest/secret-scanning/secret-scanning#get-secret-scanning-scan-history-for-a-repository)
+requires GitHub Advanced Security and returned HTTP 404 for this free public
+repository. That API limitation does not indicate a scanner failure. Record
+zero current provider alerts; do not claim a proven completed backfill or
+coverage for disabled generic patterns.
 Private vulnerability reporting is enabled. Automatic dependency update PRs
 stay paused because they can trigger extra Namespace CI work and runner cost;
 alerts remain available for manual triage.
 
 RustSec `cargo-audit 0.22.2` checked 169 locked dependencies against advisory
 database `ef6173cbc5c50ec8166f9a5b28f07834144373ee`: zero known vulnerabilities.
+A fresh network-backed audit on 2026-10-07 at 05:16 UTC again passed all 169
+locked dependencies with zero vulnerabilities and the two warnings below.
+The database commit is dated 2026-10-03, but a separate upstream `main` ref
+read confirmed it remains the current RustSec advisory revision after refresh;
+this result does not rely solely on the earlier four-day-old cache.
 Two maintenance warnings remain.
 [Unmaintained rustls-pemfile](https://rustsec.org/advisories/RUSTSEC-2025-0134.html)
 is a thin wrapper over the already-used rustls-pki-types parser; replacing it
@@ -203,12 +236,12 @@ does not qualify release performance. Its raw reports are retained under
 `target/evaluations/local-control-affinity-fn3j0pzq/`. Diagnose the remaining
 control variability before repeating the full evaluation.
 
-1. Enable core crate publication only after qualification. The archive now
+1. Qualify core crate publication on the final source. The archive now
    carries canonical README/legal notices, the referenced unit-test modules
    and all nine TLS fixture files. An extracted archive passes its 107 unit
-   tests; this boundary is now a regression check. The core still deliberately
-   has `publish = false` during beta qualification. The Python binding crate
-   can remain private.
+   tests; this boundary is now a regression check. The core
+   has `publish = true` in the stable candidate metadata; this permits a dry-run
+   publication check, not an upload. The Python binding crate remains private.
 2. Complete performance qualification on the final candidate, calibrating the
    initial 20% budget and increasing samples if controls or CPU evidence are
    inconclusive. Smoke checks verify execution, not release performance. Initial
@@ -227,20 +260,45 @@ control variability before repeating the full evaluation.
    regression. Oracle controls were unstable, so it failed qualification.
    Retain all ten reports and investigate sampling/noise locally before spending
    on another remote evaluation; do not weaken the budget to obtain a pass.
-3. Prepare stable version metadata and corresponding validators/docs only once
-   the candidate qualifies: Rust `1.0.0`, Python distribution `1.0.0`, stable
-   classifiers/history, while retaining `requests.__version__ == 2.34.2`.
-   Build and qualify the stable version's exact source commit and complete
-   release set; the qualified beta archives must retain their original identity.
-4. Configure registry publishing credentials/Trusted Publishers, verify account
-   ownership and add protected upload jobs. Public registry metadata returned
+3. Stable candidate metadata now uses Rust `1.0.0`, Python distribution `1.0.0`
+   and the stable development classifier, while retaining
+   `requests.__version__ == 2.34.2` and the existing free-threading classifier.
+   Ten selected local workspace/workflow/identity checks, Ruff and the Windows
+   harness self-check passed. The inherited Rust floor is the pinned `1.98.1`.
+   Review and commit this preparation with the remaining source fixes, then
+   qualify that final source once; a performance pass before metadata preparation
+   is not required. Build and qualify its exact source commit and complete
+   release set before release. Existing beta artifacts retain their original
+   identities and correctly fail the stable validator.
+4. Configure registry accounts and publisher credentials/Trusted Publishers.
+   Protected opt-in jobs now reuse the existing validated release manifest;
+   `publish_pypi` and `publish_crates` default to false. Publication requires
+   a manual dispatch on main, exact `1.0.0` source identity, successful source
+   and full performance runs at that commit, and a recomputed 20% performance
+   gate against beta `2146b22ed25951a5483cbb13d69dc551f99ff352`. The preflight
+   rejects missing environments, missing required reviewers and deployment
+   branch policies other than main. The free public-repository environments
+   `pypi` and `crates-io` were created and read back on 2026-10-07 at 05:15 UTC.
+   Each requires owner `puneet-chandna` (GitHub user ID `121252460`) as reviewer,
+   permits the sole owner to approve their own dispatch, and has exactly one
+   deployment rule: branch `main`. Both have zero environment secrets.
+   Repository administrators remain trusted to manage these rules; no
+   undocumented admin-bypass API field is required. No paid feature was enabled.
+   PyPI revalidates all archives immediately
+   before upload; crates.io first runs a locked publish dry run and the
+   extracted core archive's unit tests. Public registry metadata returned
    HTTP 404 for `requests-native` on both PyPI and crates.io on 2026-10-07;
    no package currently exists under that name, but this does not reserve it.
-   Current `publish.yml` validates artifacts and performs no PyPI/crates.io upload.
+   No workflow has been dispatched to publish and no registry upload has occurred.
    The owner has not created registry accounts yet. PyPI needs a verified email
    and two-factor authentication; crates.io can use the owner's GitHub login
    and requires a verified email before publishing. Account creation remains
-   an owner action; credentials must not be pasted into this chat.
+   an owner action; credentials must not be pasted into this chat. Register PyPI's
+   pending publisher for `requests-native`, GitHub owner `puneet-chandna`, repo
+   `requests-native`, workflow `publish.yml`, environment `pypi`. crates.io needs
+   the first-upload token stored directly as `CARGO_REGISTRY_TOKEN` in the
+   protected `crates-io` environment; revoke it after bootstrap, then configure
+   Trusted Publishing for later releases. See the [release procedure](../community/release-process.rst).
 
 Core crate README/legal and TLS fixture copies are regular files for portable
 Windows checkouts. When changing their canonical originals, update the matching

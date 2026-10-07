@@ -601,6 +601,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "requests-benchmark-native"
 version = "0.0.0"
 dependencies = [
+ "crc32fast",
  "futures-core",
  "requests-native",
  "tokio",
@@ -608,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "requests-native"
-version = "1.0.0-beta.1"
+version = "1.0.0"
 dependencies = [
  "async-compression",
  "base64",

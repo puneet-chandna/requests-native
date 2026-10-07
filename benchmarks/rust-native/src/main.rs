@@ -172,7 +172,7 @@ fn split_work(requests: usize, concurrency: usize) -> Vec<usize> {
 }
 
 fn checksum(bytes: &[u8]) -> u64 {
-    bytes.iter().map(|byte| u64::from(*byte)).sum()
+    u64::from(crc32fast::hash(bytes))
 }
 
 fn connection_id(headers: &requests::HeaderMap) -> Result<u64, DynError> {
@@ -197,22 +197,22 @@ async fn async_request(
         let mut body = response.into_body();
         let mut chunker = ApplicationChunker::new(config.chunk_size);
         let mut size = 0;
-        let mut digest = 0;
+        let mut digest = crc32fast::Hasher::new();
         let mut application_chunks = 0;
         while let Some(chunk) = poll_fn(|context| Pin::new(&mut body).poll_next(context)).await {
             let chunk = chunk?;
             for application_chunk in chunker.push(&chunk) {
                 size += application_chunk.len();
-                digest += checksum(&application_chunk);
+                digest.update(&application_chunk);
                 application_chunks += 1;
             }
         }
         if let Some(application_chunk) = chunker.finish() {
             size += application_chunk.len();
-            digest += checksum(&application_chunk);
+            digest.update(&application_chunk);
             application_chunks += 1;
         }
-        (size, digest, application_chunks)
+        (size, u64::from(digest.finalize()), application_chunks)
     };
     Ok((
         started.elapsed().as_nanos() as u64,
@@ -296,7 +296,7 @@ fn blocking_request(
         let mut chunker = ApplicationChunker::new(config.chunk_size);
         let mut buffer = vec![0; 8 * 1024];
         let mut size = 0;
-        let mut digest = 0;
+        let mut digest = crc32fast::Hasher::new();
         let mut application_chunks = 0;
         loop {
             let read = body.read(&mut buffer)?;
@@ -305,16 +305,16 @@ fn blocking_request(
             }
             for application_chunk in chunker.push(&buffer[..read]) {
                 size += application_chunk.len();
-                digest += checksum(&application_chunk);
+                digest.update(&application_chunk);
                 application_chunks += 1;
             }
         }
         if let Some(application_chunk) = chunker.finish() {
             size += application_chunk.len();
-            digest += checksum(&application_chunk);
+            digest.update(&application_chunk);
             application_chunks += 1;
         }
-        (size, digest, application_chunks)
+        (size, u64::from(digest.finalize()), application_chunks)
     };
     Ok((
         started.elapsed().as_nanos() as u64,
@@ -543,8 +543,15 @@ async fn main() -> Result<(), DynError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationChunker, begin_allocation_measurement, end_allocation_measurement, split_work,
+        ApplicationChunker, begin_allocation_measurement, checksum, end_allocation_measurement,
+        split_work,
     };
+
+    #[test]
+    fn checksum_detects_byte_order_and_matches_python_crc32() {
+        assert_eq!(checksum(b"123456789"), 0xcbf4_3926);
+        assert_ne!(checksum(b"abc"), checksum(b"cba"));
+    }
 
     #[test]
     fn split_work_preserves_all_requests() {

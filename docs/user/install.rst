@@ -5,7 +5,8 @@
 Installing Requests Native
 ==========================
 
-Requests Native is beta software and is not published to PyPI or crates.io.
+Requests Native has stable candidate 1.0.0 metadata and is not published to PyPI
+or crates.io. Stable release qualification remains required.
 The distribution is named ``requests-native`` while its drop-in import remains
 ``requests`` for compatibility.
 
@@ -56,11 +57,11 @@ repository::
 
 On Windows, use the activation command above before running Maturin.
 
-The built Python distribution reports version ``1.0.0b1`` through package
+The built Python distribution reports version ``1.0.0`` through package
 metadata, while ``requests.__version__`` reports compatibility version
-``2.34.2``. The Cargo package version is ``1.0.0-beta.1``. The GitHub tag
-``v1.0.0-beta`` names the rewrite milestone; these versions are separate by
-design.
+``2.34.2``. The Cargo package version is ``1.0.0``. The existing GitHub tag
+``v1.0.0-beta`` retains its original ``1.0.0b1`` / ``1.0.0-beta.1`` archives
+and manifest; it does not provide stable 1.0.0 artifacts.
 
 To install official PSF Requests from PyPI instead, follow the
 `upstream installation guide <https://requests.readthedocs.io/en/latest/user/install/>`_.

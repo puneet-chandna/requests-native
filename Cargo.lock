@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "requests-native"
-version = "1.0.0-beta.1"
+version = "1.0.0"
 dependencies = [
  "async-compression",
  "base64",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "requests-native-python"
-version = "1.0.0-beta.1"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "pyo3",

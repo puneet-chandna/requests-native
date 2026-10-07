@@ -5,6 +5,7 @@ use std::mem;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_core::Stream;
@@ -101,6 +102,7 @@ impl BlockingRuntimeDriver {
             parent_id,
             process_id: self.process_id(),
             receiver: Some(receiver),
+            ready: None,
             abort: Some(task.abort_handle()),
             cancelled,
         })
@@ -168,6 +170,7 @@ pub struct BlockingSubmission<T> {
     parent_id: Option<u64>,
     process_id: u32,
     receiver: Option<mpsc::Receiver<T>>,
+    ready: Option<T>,
     abort: Option<AbortHandle>,
     cancelled: Arc<AtomicBool>,
 }
@@ -181,6 +184,34 @@ impl<T> BlockingSubmission<T> {
         self.parent_id
     }
 
+    /// Wait for completion without consuming its result, allowing the origin
+    /// thread to check interrupts before `try_wait` observes the output.
+    #[doc(hidden)]
+    pub fn wait_ready_timeout(&mut self, timeout: Duration) -> Result<bool, BlockingTaskError> {
+        self.validate_process(std::process::id())?;
+        if self.ready.is_some() {
+            return Ok(true);
+        }
+        let receiver = self
+            .receiver
+            .as_ref()
+            .ok_or(BlockingTaskError::AlreadyCompleted)?;
+        let result = match Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| receiver.recv_timeout(timeout))
+            }
+            _ => receiver.recv_timeout(timeout),
+        };
+        match result {
+            Ok(output) => {
+                self.ready = Some(output);
+                Ok(true)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(false),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.stopped_error()),
+        }
+    }
+
     pub fn try_wait(&mut self) -> Result<Option<T>, BlockingTaskError> {
         self.try_wait_for_process(std::process::id())
     }
@@ -190,6 +221,10 @@ impl<T> BlockingSubmission<T> {
         current_process_id: u32,
     ) -> Result<Option<T>, BlockingTaskError> {
         self.validate_process(current_process_id)?;
+        if let Some(output) = self.ready.take() {
+            self.receiver = None;
+            return Ok(Some(output));
+        }
         let Some(receiver) = self.receiver.as_ref() else {
             return Err(BlockingTaskError::AlreadyCompleted);
         };
@@ -212,6 +247,10 @@ impl<T> BlockingSubmission<T> {
 
     fn wait_for_process(mut self, current_process_id: u32) -> Result<T, BlockingTaskError> {
         self.validate_process(current_process_id)?;
+        if let Some(output) = self.ready.take() {
+            self.receiver = None;
+            return Ok(output);
+        }
         let receiver = self
             .receiver
             .take()
@@ -948,6 +987,101 @@ mod tests {
     struct FutureOutput {
         value: String,
         worker: thread::ThreadId,
+    }
+
+    #[test]
+    fn submission_ready_wait_wakes_for_completion_without_consuming_output() {
+        let driver = BlockingRuntimeDriver::process_local().unwrap();
+        let (release, released) = mpsc::channel();
+        let mut submission = driver
+            .submit(async move {
+                released.recv().unwrap();
+                42_u16
+            })
+            .unwrap();
+        let (entered, entering) = mpsc::channel();
+        let (finished, completed) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            entered.send(()).unwrap();
+            let ready = submission.wait_ready_timeout(Duration::from_secs(60));
+            finished.send((ready, submission)).unwrap();
+        });
+        entering.recv_timeout(Duration::from_secs(2)).unwrap();
+        release.send(()).unwrap();
+        let (ready, mut submission) = completed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("completion must wake the wait before its sixty-second timeout");
+        waiter.join().unwrap();
+        assert_eq!(ready, Ok(true));
+        assert_eq!(submission.wait_ready_timeout(Duration::ZERO), Ok(true));
+        // Python checks signals before consuming buffered results and may cancel here.
+        assert_eq!(submission.cancel(), Ok(()));
+        assert_eq!(submission.try_wait(), Ok(Some(42)));
+        assert_eq!(
+            submission.try_wait(),
+            Err(BlockingTaskError::AlreadyCompleted)
+        );
+        assert_eq!(submission.wait(), Err(BlockingTaskError::AlreadyCompleted));
+    }
+
+    #[test]
+    fn submission_ready_wait_preserves_timeout_cancellation_and_disconnect() {
+        let driver = BlockingRuntimeDriver::process_local().unwrap();
+        let mut pending = driver.submit(future::pending::<()>()).unwrap();
+        assert_eq!(pending.wait_ready_timeout(Duration::ZERO), Ok(false));
+        assert_eq!(pending.try_wait(), Ok(None));
+        pending.cancel().unwrap();
+        assert_eq!(
+            pending.wait_ready_timeout(Duration::from_secs(2)),
+            Err(BlockingTaskError::Cancelled)
+        );
+        assert_eq!(pending.try_wait(), Err(BlockingTaskError::Cancelled));
+
+        let mut panicked = driver
+            .submit(async {
+                panic!("readiness disconnect probe");
+            })
+            .unwrap();
+        assert_eq!(
+            panicked.wait_ready_timeout(Duration::from_secs(2)),
+            Err(BlockingTaskError::WorkerStopped)
+        );
+        assert_eq!(panicked.wait(), Err(BlockingTaskError::WorkerStopped));
+    }
+
+    #[test]
+    fn submission_drop_releases_buffered_output_on_the_caller_once() {
+        struct DropThread(mpsc::Sender<thread::ThreadId>);
+        impl Drop for DropThread {
+            fn drop(&mut self) {
+                self.0.send(thread::current().id()).unwrap();
+            }
+        }
+        let driver = BlockingRuntimeDriver::process_local().unwrap();
+        let (dropped, observed) = mpsc::channel();
+        let mut submission = driver.submit(async move { DropThread(dropped) }).unwrap();
+        assert_eq!(
+            submission.wait_ready_timeout(Duration::from_secs(2)),
+            Ok(true)
+        );
+        submission.cancel().unwrap();
+        drop(submission);
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            thread::current().id()
+        );
+        assert_eq!(observed.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn submission_wait_consumes_buffered_output_once() {
+        let driver = BlockingRuntimeDriver::process_local().unwrap();
+        let mut submission = driver.submit(async { 42_u16 }).unwrap();
+        assert_eq!(
+            submission.wait_ready_timeout(Duration::from_secs(2)),
+            Ok(true)
+        );
+        assert_eq!(submission.wait(), Ok(42));
     }
 
     #[test]

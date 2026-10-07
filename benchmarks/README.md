@@ -69,6 +69,16 @@ clients, checks bytes/checksum/native routing, then releases workers through a
 shared timing barrier. All 64 cases cover four surfaces, one-shot/pooled clients,
 buffered/streaming reads, small/large bodies and serial/concurrent workloads.
 Allocation replay is separate from timed measurements.
+Body integrity uses incremental CRC32 on every surface, so ordered bytes are
+checked without Python byte-by-byte sums in the measured request. The
+algorithm is recorded in each report's configuration; historical byte-sum
+reports cannot be mixed with CRC32 reports in a paired comparison.
+The benchmark checker pins the same `crc32fast` version for both revisions.
+Independent driver resolution may adapt this shared dependency from the seeded
+release lock; driver hashes record that resolution, and the selected revision's
+core lock remains unchanged for its Python artifact build.
+Oracle-only diagnostics (`run.py --surfaces python-oracle`) skip native builds
+and editable installation, recording the Python ABI and dependency versions.
 The first Namespace run took about seven minutes per side; allow roughly
 75 minutes for the full gate, including builds. Use smoke mode for a quick
 local pipeline check; the full gate is a deliberate release qualification run.

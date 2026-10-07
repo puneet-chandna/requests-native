@@ -7,6 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
+crc32fast = "=1.5.2"
 futures-core = "0.3"
 requests = { package = "requests-native", path = "../../crates/requests" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }

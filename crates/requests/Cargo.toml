@@ -1,13 +1,14 @@
 [package]
 name = "requests-native"
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Native HTTP transport for the unofficial Requests Native rewrite"
 homepage.workspace = true
 repository.workspace = true
-publish = false
+publish = true
 readme = "README.md"
 include = ["Cargo.toml", "src/**/*.rs", "tests/fixtures/**/*", "README.md", "LICENSE", "NOTICE", "AUTHORS.rst", "RUST_RUNTIME_NOTICES.html"]
 
