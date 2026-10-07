@@ -96,8 +96,8 @@ throughput, p95 latency, peak RSS and allocation replay. CPU is summed per surfa
 to reduce Linux tick granularity; totals below 50 ms are insufficient evidence.
 A deterministic paired bootstrap reports a marginal 95% interval for each
 median cost ratio. An interval entirely above budget is a regression; one
-crossing budget is inconclusive. Qualification passes only when every measured
-case is within budget with sufficient evidence. The unchanged Python oracle
+crossing budget is inconclusive. The statistical status is `passed` only when
+every measured case is within budget with sufficient evidence. The unchanged Python oracle
 controls machine drift in either direction; noisy controls make the overall
 decision inconclusive. Calibrate this initial budget on the workload; it is not
 a universal statistical guarantee.
@@ -110,6 +110,16 @@ can resolve uncertainty without discarding a failing case:
 .venv/bin/python benchmarks/evaluate.py --base v1.0.0-beta --gate --pairs 7 --requests 300 --warmup 8 --case-timeout-seconds 120 --output target/evaluations/release-check
 .venv/bin/python -m unittest benchmarks.test_run benchmarks.test_evaluate
 ```
+
+Release acceptance is separate from that statistical classification. The CI
+evaluation and publication workflows recompute the complete evidence and accept
+`inconclusive` with a visible warning under the approved release policy. Ratios,
+95% intervals and raw status remain unchanged; acceptance does not establish
+performance parity or superiority. Any confirmed native regression still blocks
+release, including when unstable oracle controls make the overall status
+inconclusive. Incomplete samples, insufficient CPU totals, unmeasured RSS,
+malformed reports, correctness failures and source/evaluator mismatches also
+block release. Smoke evidence remains ineligible.
 
 For local calibration, fixed per-surface counts can lengthen fast cases without
 multiplying the slow Python/Rust workload. Both `run.py` and `evaluate.py` accept
@@ -127,7 +137,8 @@ This is an **unqualified calibration configuration**, not a passing result:
 ```
 
 All four surfaces, 64 cases, full metrics and the 20% budget remain in force.
-Noisy oracle controls or uncertain comparisons still block qualification.
+Noisy oracle controls or uncertain comparisons still prevent a statistical pass;
+release acceptance follows the warning policy above.
 For the same unqualified configuration in manually dispatched CI, set
 `surface_requests` to `python-oracle=1000 rust-async=3000 rust-blocking=3000`,
 keep `requests=100` and `pairs=5`, and set `warmup=8` and

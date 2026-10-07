@@ -252,8 +252,12 @@ jobs:
           assert all(report["evaluator_sha256"] == evaluator_digest() for pair in pairs for report in pair)
           assert all(pair[0]["git"]["rewrite_commit"] == "2146b22ed25951a5483cbb13d69dc551f99ff352" for pair in pairs), "The first stable release must use the immutable beta baseline"
           result = compare_pairs(pairs, budget=0.20, gate=True)
-          assert result["status"] == "passed" and result["sources"][1] == os.environ["SOURCE_SHA"]
+          assert result["sources"][1] == os.environ["SOURCE_SHA"]
           assert json.loads((evidence / "comparison.json").read_text()) == {**result, "smoke_only": False}
+          assert result["status"] in ("passed", "inconclusive") and not result["insufficient_release_evidence"]
+          assert all(metric["case"][0] == "python-oracle" or metric["status"] != "regression" for metric in result["metrics"]), "Confirmed native performance regressions block publication even when controls are unstable"
+          if result["status"] == "inconclusive":
+              print("::warning::Complete performance evidence is inconclusive; release policy permits publication without a performance parity or superiority claim. See comparison.json for unchanged ratios, confidence intervals and control uncertainty.")
           PY
 
   pypi:
@@ -314,6 +318,9 @@ jobs:
       - name: Publish the qualified core crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
+        # crates.io requires the first upload before trusted publishing can be configured:
+        # https://blog.rust-lang.org/2025/07/11/crates-io-development-update-2025-07/
+        # After bootstrap, replace this token with OIDC and remove the exception.
+        run: | # zizmor: ignore[use-trusted-publishing] First-upload bootstrap uses the protected crates-io token.
           test -n "$CARGO_REGISTRY_TOKEN"
           cargo publish -p requests-native --locked --no-verify

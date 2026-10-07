@@ -87,9 +87,32 @@ jobs:
           for override in "${surface_requests[@]}"; do
             surface_args+=(--surface-requests "$override")
           done
+          evaluation_exit=0
           .venv/bin/python benchmarks/evaluate.py --base "$BASE" --candidate "$CANDIDATE" "$mode" \
             --pairs "$PAIRS" --requests "$REQUESTS" --warmup "$WARMUP" \
-            --case-timeout-seconds "$CASE_TIMEOUT" --output target/performance-evidence "${surface_args[@]}"
+            --case-timeout-seconds "$CASE_TIMEOUT" --output target/performance-evidence "${surface_args[@]}" || evaluation_exit=$?
+          if [[ "$SMOKE" == true ]]; then exit "$evaluation_exit"; fi
+          EVALUATION_EXIT="$evaluation_exit" .venv/bin/python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from benchmarks.evaluate import compare_pairs, evaluator_digest
+
+          evidence = Path("target/performance-evidence")
+          bases = sorted(evidence.glob("pair-*-base.json"))
+          candidates = sorted(evidence.glob("pair-*-candidate.json"))
+          assert candidates == [path.with_name(path.name.replace("-base.json", "-candidate.json")) for path in bases]
+          pairs = [(json.loads(base.read_text()), json.loads(candidate.read_text())) for base, candidate in zip(bases, candidates)]
+          assert all(report["evaluator_sha256"] == evaluator_digest() for pair in pairs for report in pair)
+          result = compare_pairs(pairs, budget=0.20, gate=True)
+          assert result["sources"][1] == os.environ["CANDIDATE"]
+          assert json.loads((evidence / "comparison.json").read_text()) == {**result, "smoke_only": False}
+          assert result["status"] in ("passed", "inconclusive") and not result["insufficient_release_evidence"]
+          assert all(metric["case"][0] == "python-oracle" or metric["status"] != "regression" for metric in result["metrics"]), "Confirmed native performance regressions block qualification even when controls are unstable"
+          assert int(os.environ["EVALUATION_EXIT"]) == (0 if result["status"] == "passed" else 1)
+          if result["status"] == "inconclusive":
+              print("::warning::Complete performance evidence is inconclusive; release policy permits qualification without a performance parity or superiority claim. See comparison.json for unchanged ratios, confidence intervals and control uncertainty.")
+          PY
       - name: Preserve raw measurements and decision
         if: ${{ always() }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

@@ -6,6 +6,49 @@ Validation now proceeds locally first to limit runner cost. Do not repeatedly
 dispatch paid CI while local source, packaging and benchmark checks can resolve
 the problem; batch validated changes before any necessary platform qualification.
 
+## Measured native Rust gains
+
+In the retained five-pair local loopback comparison, native Rust clients had
+2.1–7.1 times original Requests throughput across matched cases. The Python
+wrapper completed the same measured workload about 15.5 times faster than the
+beta wrapper. These are concrete local observations; the complete evidence and
+release acceptance policy are described below.
+
+### Methodology and limits
+
+Original-Requests throughput ratios normalize each matched case by its request
+count before taking the median across five reports. The Python wrapper reached
+11–27% of original Requests throughput across all 16 matched cases, with a
+typical ratio of 0.178. The wrapper therefore remains slower than original
+Requests in these measurements; native Rust gains do not establish a blanket
+project-wide speedup. Counts differ by surface, and loopback measurements do
+not predict internet, proxy, TLS or DNS performance.
+
+The fixed comparison used candidate
+`1d74dcddbfe3c0a80ec790d87483cf1c430d25cf`, immutable beta
+`2146b22ed25951a5483cbb13d69dc551f99ff352`, all four surfaces and 64 cases,
+five pairs, eight warm-up requests per worker, and measured counts of 500 for
+the oracle, 100 for Python/Rust, and 3,000 for each native Rust surface.
+All ten reports and 640 case rows are retained under
+`target/evaluations/local-final-1d74dcdd-63gzl_dl/`; execution took 59.14 minutes
+and restored the editable environment. Its unchanged statistical result is
+`inconclusive`: 227 metrics passed, 33 were inconclusive, and none showed a
+confirmed regression. All native median cost estimates remained within the
+20% budget; 26 native intervals crossed it and oracle controls were unstable.
+This evidence supports the observations above, while leaving statistical
+performance qualification uncertain. It does not establish that every native
+uncertainty comes from the host.
+
+The owner approved accepting complete inconclusive evidence with a visible
+release warning. The workflows recompute the report at the unchanged 20% budget
+and 95% confidence level. Confirmed native regressions block acceptance even
+if unstable controls make the overall status inconclusive. Correctness failures,
+missing or malformed reports, incomplete samples, insufficient CPU accounting,
+unmeasured RSS, and source/evaluator mismatches still block acceptance. Raw
+statuses, ratios and intervals remain unchanged. Exact-source guards remain:
+this retained evidence does not automatically qualify a later commit, and no
+additional performance run is authorized merely to obtain a winning result.
+
 ## Existing beta
 
 The [v1.0.0-beta release](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta)
@@ -116,8 +159,9 @@ these as separate maintenance changes with fresh compatibility qualification.
   Windows harness self-check and benchmark helper checks.
 - The [performance evaluator](../../benchmarks/README.md) runs locally and in
   manual CI on `namespace-profile-puneet-chandna`, alternating warmed base/
-  candidate pairs and retaining raw evidence. Regressions and inconclusive
-  evidence fail release performance qualification.
+  candidate pairs and retaining raw evidence. Confirmed native regressions and
+  invalid/incomplete evidence block release acceptance. Complete inconclusive
+  evidence is accepted with a visible warning under the approved policy above.
 - Linux jobs use Namespace. Logical platform names in artifact matrices remain
   stable; Windows/macOS jobs use GitHub runners.
 - Strict Windows qualification tests the selected current commit's ordinary
@@ -242,9 +286,11 @@ control variability before repeating the full evaluation.
    tests; this boundary is now a regression check. The core
    has `publish = true` in the stable candidate metadata; this permits a dry-run
    publication check, not an upload. The Python binding crate remains private.
-2. Complete performance qualification on the final candidate, calibrating the
-   initial 20% budget and increasing samples if controls or CPU evidence are
-   inconclusive. Smoke checks verify execution, not release performance. Initial
+2. Apply the approved performance acceptance policy to complete evidence for
+   the exact final candidate. Keep the 20% budget and 95% intervals unchanged;
+   complete inconclusive evidence carries a warning, while confirmed native
+   regressions and invalid/incomplete evidence fail. Smoke checks verify
+   execution, not release performance. Initial
    Namespace run [37538303779](https://github.com/puneet-chandna/requests-native/actions/runs/37538303779)
    completed four pairs before its 60-minute deadline. The preserved partial
    comparison had no definite regression, but noisy oracle controls and the
@@ -258,8 +304,8 @@ control variability before repeating the full evaluation.
    [37545362862](https://github.com/puneet-chandna/requests-native/actions/runs/37545362862)
    finished with 179 passing and 81 inconclusive metrics, and no definite
    regression. Oracle controls were unstable, so it failed qualification.
-   Retain all ten reports and investigate sampling/noise locally before spending
-   on another remote evaluation; do not weaken the budget to obtain a pass.
+   Those earlier runs used the strict all-pass policy. Retain their reports;
+   do not rerun solely to obtain a winner or weaken the budget to obtain a pass.
 3. Stable candidate metadata now uses Rust `1.0.0`, Python distribution `1.0.0`
    and the stable development classifier, while retaining
    `requests.__version__ == 2.34.2` and the existing free-threading classifier.
@@ -275,7 +321,8 @@ control variability before repeating the full evaluation.
    `publish_pypi` and `publish_crates` default to false. Publication requires
    a manual dispatch on main, exact `1.0.0` source identity, successful source
    and full performance runs at that commit, and a recomputed 20% performance
-   gate against beta `2146b22ed25951a5483cbb13d69dc551f99ff352`. The preflight
+   comparison against beta `2146b22ed25951a5483cbb13d69dc551f99ff352`, accepted
+   with a warning if complete but statistically inconclusive. The preflight
    rejects missing environments, missing required reviewers and deployment
    branch policies other than main. The free public-repository environments
    `pypi` and `crates-io` were created and read back on 2026-10-07 at 05:15 UTC.
@@ -298,7 +345,10 @@ control variability before repeating the full evaluation.
    `requests-native`, workflow `publish.yml`, environment `pypi`. crates.io needs
    the first-upload token stored directly as `CARGO_REGISTRY_TOKEN` in the
    protected `crates-io` environment; revoke it after bootstrap, then configure
-   Trusted Publishing for later releases. See the [release procedure](../community/release-process.rst).
+   Trusted Publishing for later releases. The upload step carries a scoped
+   Zizmor exception for this first-publication limitation, linked to the official
+   Rust guidance; remove the exception when switching to OIDC. CI pins Zizmor
+   1.23.1 to match local audits. See the [release procedure](../community/release-process.rst).
 
 Core crate README/legal and TLS fixture copies are regular files for portable
 Windows checkouts. When changing their canonical originals, update the matching

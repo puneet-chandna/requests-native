@@ -33,3 +33,4 @@ jobs:
         with:
           advanced-security: false
           annotations: true
+          version: "1.23.1"

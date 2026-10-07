@@ -1868,6 +1868,7 @@ def test_security_workflows_use_private_repository_safe_reporting() -> None:
     assert zizmor_step["with"] == {
         "advanced-security": False,
         "annotations": True,
+        "version": "1.23.1",
     }
 
     codeql = load_workflow("codeql-analysis.yml")["jobs"]["analyze"]
@@ -2226,6 +2227,116 @@ def test_publication_performance_gate_rejects_a_different_baseline(
     assert (
         "The first stable release must use the immutable beta baseline" in result.stderr
     )
+
+
+def test_release_performance_acceptance_preserves_evidence_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    for workflow in ("evaluate.yml", "publish.yml"):
+        for change in (
+            "passed",
+            "inconclusive",
+            "regression",
+            "regression-with-control-drift",
+            "incomplete",
+            "cpu",
+            "rss",
+            "missing-case",
+            "different-source",
+            "different-evaluator",
+            "altered-comparison",
+            "smoke",
+        ):
+            trial = tmp_path / workflow / change
+            trial.mkdir(parents=True)
+            _check_release_performance_acceptance(trial, workflow, change)
+
+
+def _check_release_performance_acceptance(
+    tmp_path: Path, workflow: str, change: str
+) -> None:
+    from benchmarks.evaluate import compare_pairs, evaluator_digest
+    from benchmarks.test_evaluate import report
+
+    jobs = load_workflow(workflow)["jobs"]
+    if workflow == "publish.yml":
+        step = jobs["publication-gates"]["steps"][-1]
+        evidence = tmp_path / "performance-evidence"
+    else:
+        step = next(
+            step
+            for step in jobs["evaluate"]["steps"]
+            if step.get("name") == "Evaluate paired revisions"
+        )
+        evidence = tmp_path / "target/performance-evidence"
+    script = step["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    for name in (
+        "Cargo.toml",
+        "crates/requests/Cargo.toml",
+        "crates/requests-python/Cargo.toml",
+    ):
+        destination = tmp_path / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, destination)
+    evidence.mkdir(parents=True)
+    sha = "a" * 40
+    pairs = [
+        (report("2146b22ed25951a5483cbb13d69dc551f99ff352"), report(sha))
+        for _ in range(4 if change == "incomplete" else 5)
+    ]
+    if change == "inconclusive":
+        pairs[-1] = (pairs[-1][0], report(sha, 2.0))
+    if change.startswith("regression"):
+        pairs = [(base, report(sha, 1.4)) for base, _ in pairs]
+    for pair in pairs:
+        for document in pair:
+            document["evaluator_sha256"] = evaluator_digest()
+            for row in document["results"]:
+                if change == "cpu":
+                    row["cpu_seconds"] = 0.0
+                if change == "rss":
+                    row["rss_scope"] = "process"
+        if change == "regression-with-control-drift":
+            for row in pair[1]["results"]:
+                if row["surface"] == "python-oracle":
+                    row["latency_ms"]["p95"] *= 2
+    comparison = {**compare_pairs(pairs, gate=True), "smoke_only": change == "smoke"}
+    if change == "missing-case":
+        pairs[-1][1]["results"].pop()
+    if change == "different-source":
+        for _, candidate in pairs:
+            candidate["git"]["rewrite_commit"] = "b" * 40
+    if change == "different-evaluator":
+        for pair in pairs:
+            for document in pair:
+                document["evaluator_sha256"] = "b" * 64
+    if change == "altered-comparison":
+        comparison["metrics"][0]["median_cost_ratio"] = 0.5
+    for index, pair in enumerate(pairs, 1):
+        for side, document in zip(("base", "candidate"), pair):
+            (evidence / f"pair-{index:02}-{side}.json").write_text(json.dumps(document))
+    comparison_path = evidence / "comparison.json"
+    comparison_path.write_text(json.dumps(comparison))
+    original = comparison_path.read_bytes()
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PYTHONPATH": os.fspath(ROOT),
+            "SOURCE_SHA": sha,
+            "CANDIDATE": sha,
+            "EVALUATION_EXIT": "1" if change == "inconclusive" else "0",
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert (result.returncode == 0) is (change in ("passed", "inconclusive")), (
+        change,
+        result.stderr,
+    )
+    assert ("::warning::" in result.stdout) is (change == "inconclusive")
+    assert comparison_path.read_bytes() == original
 
 
 def test_public_project_identity_is_derivative_and_registry_safe() -> None:
