@@ -75,11 +75,97 @@ def report(commit, cost=1.0):
 
 
 class EvaluationTests(unittest.TestCase):
+    def surface_pairs(self, count=200):
+        pairs = self.pairs()
+        for pair in pairs:
+            for document in pair:
+                counts = dict.fromkeys(SURFACES, 100)
+                counts["rust-async"] = count
+                document["config"]["requests_per_surface"] = counts
+                for row in document["results"]:
+                    if row["surface"] == "rust-async":
+                        row["requests"] = count
+                        row["latency_ns_samples"] = [1_000_000] * count
+        return pairs
+
+    def test_fixed_surface_counts_pass_and_each_gate_surface_requires_100(self):
+        self.assertEqual(
+            evaluate.compare_pairs(self.surface_pairs(), gate=True)["status"],
+            "passed",
+        )
+        result = evaluate.compare_pairs(self.surface_pairs(99), gate=True)
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertTrue(result["insufficient_release_evidence"])
+
+    def test_surface_maps_and_rows_must_match_exactly(self):
+        for change in (
+            "missing",
+            "unknown",
+            "negative",
+            "boolean",
+            "fraction",
+            "null",
+            "row",
+            "pair",
+        ):
+            pairs = self.surface_pairs(200 if change in ("row", "pair") else 100)
+            if change in ("row", "pair"):
+                target = pairs[-1][1]
+                if change == "row":
+                    row = next(
+                        r for r in target["results"] if r["surface"] == "rust-async"
+                    )
+                    row["requests"] = 100
+                    row["latency_ns_samples"] = [1_000_000] * 100
+                else:
+                    target["config"]["requests_per_surface"]["rust-async"] = 201
+            else:
+                for pair in pairs:
+                    for document in pair:
+                        counts = document["config"]["requests_per_surface"]
+                        if change == "missing":
+                            counts.pop("python-rust")
+                        elif change == "unknown":
+                            counts["unknown"] = 100
+                        elif change == "null":
+                            document["config"]["requests_per_surface"] = None
+                        else:
+                            counts["rust-async"] = {
+                                "negative": -1,
+                                "boolean": True,
+                                "fraction": 100.5,
+                            }[change]
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                evaluate.compare_pairs(pairs, gate=True)
+
+    def test_equal_numeric_float_in_later_count_map_is_rejected(self):
+        pairs = self.surface_pairs()
+        pairs[-1][1]["config"]["requests_per_surface"]["rust-async"] = 200.0
+        with self.assertRaises(ValueError):
+            evaluate.compare_pairs(pairs, gate=True)
+
+    def test_equal_numeric_float_row_count_is_rejected(self):
+        pairs = self.pairs()
+        pairs[-1][1]["results"][0]["requests"] = 100.0
+        with self.assertRaises(ValueError):
+            evaluate.compare_pairs(pairs, gate=True)
+
     def test_invalid_release_samples_and_deadlines_fail_before_builds(self):
         for options, message in (
             (["--pairs", "4"], "at least 5 pairs"),
             (["--requests", "99"], "at least 5 pairs"),
             (["--warmup", "3"], "at least 5 pairs"),
+            (["--surface-requests", "rust-async=99"], "at least 5 pairs"),
+            (["--surface-requests", "unknown=100"], "unknown surface"),
+            (
+                [
+                    "--surface-requests",
+                    "rust-async=100",
+                    "--surface-requests",
+                    "rust-async=200",
+                ],
+                "duplicate surface",
+            ),
             (["--case-timeout-seconds", "0"], "invalid evaluation"),
             (["--case-timeout-seconds", "nan"], "invalid evaluation"),
             (["--case-timeout-seconds", "inf"], "invalid evaluation"),

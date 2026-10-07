@@ -101,6 +101,30 @@ can resolve uncertainty without discarding a failing case:
 .venv/bin/python -m unittest benchmarks.test_run benchmarks.test_evaluate
 ```
 
+For local calibration, fixed per-surface counts can lengthen fast cases without
+multiplying the slow Python/Rust workload. Both `run.py` and `evaluate.py` accept
+repeated `--surface-requests SURFACE=N` options; other surfaces retain the
+`--requests` default. Timing and allocation replay use the same count. Each
+report records the complete resolved map, which must match across every pair;
+release evidence still requires at least 100 requests for every surface.
+Overrides also apply in smoke mode; omit them to keep smoke checks short.
+Smoke reports remain ineligible for release qualification regardless of counts.
+
+This is an **unqualified calibration configuration**, not a passing result:
+
+```console
+.venv/bin/python benchmarks/evaluate.py --base v1.0.0-beta --candidate HEAD --gate --pairs 5 --requests 100 --surface-requests python-oracle=1000 --surface-requests rust-async=3000 --surface-requests rust-blocking=3000 --warmup 8 --case-timeout-seconds 120 --output target/evaluations/surface-calibration
+```
+
+All four surfaces, 64 cases, full metrics and the 20% budget remain in force.
+Noisy oracle controls or uncertain comparisons still block qualification.
+For the same unqualified configuration in manually dispatched CI, set
+`surface_requests` to `python-oracle=1000 rust-async=3000 rust-blocking=3000`,
+keep `requests=100` and `pairs=5`, and set `warmup=8` and
+`case_timeout_seconds=120`. The optional input defaults to empty, preserving
+the existing CI sampling defaults. These settings do not establish calibration
+success; local and Namespace runs must each produce their own evidence.
+
 Keep the machine idle during measurements. Loopback results do not predict
 internet/proxy/TLS/DNS performance or close the Windows TLS issue. Source CI
 separately runs native unit tests, frozen-oracle differential checks,

@@ -88,6 +88,7 @@ def compare_pairs(
         raise ValueError("pairs and a finite regression budget in (0, 1) are required")
     reference = pairs[0][0]
     config = reference["config"]
+    surface_requests = run.configured_surface_requests(config)
     expected = set(
         itertools.product(
             config["surfaces"],
@@ -100,7 +101,7 @@ def compare_pairs(
     ratios: dict[tuple, list[float]] = {}
     insufficient = (
         len(pairs) < 5
-        or config["requests_per_case"] < 100
+        or any(count < 100 for count in surface_requests.values())
         or config["warmup_per_worker"] < 4
     )
     insufficient |= set(config["surfaces"]) != set(run.SURFACES)
@@ -119,6 +120,8 @@ def compare_pairs(
                 )
             if document["git"]["rewrite_commit"] != commits[side]:
                 raise ValueError("source changed between paired runs")
+            if run.configured_surface_requests(document["config"]) != surface_requests:
+                raise ValueError("incomparable surface request counts")
             for key in ("machine", "toolchains", "config", "evaluator_sha256"):
                 if document[key] != reference[key]:
                     raise ValueError(f"incomparable {key}")
@@ -138,7 +141,7 @@ def compare_pairs(
             for row in rows.values():
                 run.validate_result_row(row)
                 insufficient |= row.get("rss_scope") != "measured-phase"
-                if row["requests"] != config["requests_per_case"]:
+                if row["requests"] != surface_requests[row["surface"]]:
                     raise ValueError("case request count differs from configuration")
                 metrics = (
                     row["throughput_requests_per_second"],
@@ -340,6 +343,13 @@ def main() -> int:
     )
     parser.add_argument("--pairs", type=int, default=5)
     parser.add_argument("--requests", type=int, default=100)
+    parser.add_argument(
+        "--surface-requests",
+        action="append",
+        default=[],
+        metavar="SURFACE=N",
+        help="Override a surface's fixed request count (repeat for other surfaces)",
+    )
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--max-regression-percent", type=float, default=20.0)
     parser.add_argument("--case-timeout-seconds", type=float, default=60)
@@ -364,7 +374,15 @@ def main() -> int:
         or args.case_timeout_seconds <= 0
     ):
         parser.error("invalid evaluation sizes, deadline or regression budget")
-    if args.gate and (args.pairs < 5 or args.requests < 100 or args.warmup < 4):
+    try:
+        surface_requests = run.resolve_surface_requests(
+            args.requests, args.surface_requests
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if args.gate and (
+        args.pairs < 5 or min(surface_requests.values()) < 100 or args.warmup < 4
+    ):
         parser.error(
             "release qualification requires at least 5 pairs, 100 requests and 4 warmups"
         )
@@ -450,6 +468,9 @@ def main() -> int:
                     ]
                     if not args.smoke:
                         command.extend(("--requests", str(args.requests)))
+                    # Pass validated fixed overrides as argv, never shell text.
+                    for override in args.surface_requests:
+                        command.extend(("--surface-requests", override))
                     with path.with_suffix(".log").open("w") as log:
                         switched_install = True
                         subprocess.run(

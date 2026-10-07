@@ -103,6 +103,44 @@ def value_or_default(value: int | None, default: int) -> int:
     return default if value is None else value
 
 
+def resolve_surface_requests(default: int, overrides: list[str]) -> dict[str, int]:
+    if type(default) is not int or default < 1:
+        raise ValueError("request counts must be positive integers")
+    counts = dict.fromkeys(SURFACES, default)
+    seen = set()
+    for override in overrides:
+        surface, separator, value = override.partition("=")
+        if surface not in counts:
+            raise ValueError(f"unknown surface: {surface}")
+        if surface in seen:
+            raise ValueError(f"duplicate surface: {surface}")
+        if (
+            not separator
+            or not value.isascii()
+            or not value.isdecimal()
+            or int(value) < 1
+        ):
+            raise ValueError("surface requests require SURFACE=POSITIVE_INTEGER")
+        counts[surface] = int(value)
+        seen.add(surface)
+    return counts
+
+
+def configured_surface_requests(config: dict) -> dict[str, int]:
+    counts = config.get("requests_per_surface")
+    if counts is None and "requests_per_surface" not in config:
+        return resolve_surface_requests(config["requests_per_case"], [])
+    if (
+        not isinstance(counts, dict)
+        or set(counts) != set(SURFACES)
+        or any(type(value) is not int or value < 1 for value in counts.values())
+    ):
+        raise ValueError(
+            "requests_per_surface must contain a positive integer for every surface"
+        )
+    return counts
+
+
 def resolve_workload(arguments: argparse.Namespace) -> tuple[int, int, int, int]:
     profile = {
         "smoke": (2, 64, 32 * 1024, 2),
@@ -241,6 +279,8 @@ def validate_result_row(row: dict[str, Any]) -> None:
     missing = required - row.keys()
     if missing:
         raise ValueError(f"result row missing keys: {sorted(missing)}")
+    if type(row["requests"]) is not int or row["requests"] < 1:
+        raise ValueError("result row requests must be a positive integer")
     if not valid_latencies(row["latency_ns_samples"], row["requests"]):
         raise ValueError("result row has the wrong latency sample count")
     validate_allocations(row, row["surface"])
@@ -863,11 +903,14 @@ def summarize(
 
 def orchestrate(arguments: argparse.Namespace) -> int:
     requests, small_size, large_size, maximum_concurrency = resolve_workload(arguments)
-    concurrencies = sorted({1, min(requests, maximum_concurrency)})
+    surface_requests = resolve_surface_requests(requests, arguments.surface_requests)
     surfaces = arguments.surfaces or list(SURFACES)
     unknown = set(surfaces) - set(SURFACES)
     if unknown:
         raise ValueError(f"unknown surfaces: {sorted(unknown)}")
+    concurrencies = sorted(
+        {1, min(maximum_concurrency, *(surface_requests[s] for s in surfaces))}
+    )
 
     small_body = bytes(index % 251 for index in range(small_size))
     large_body = bytes(index % 251 for index in range(large_size))
@@ -904,6 +947,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
         "config": {
             "profile": arguments.profile,
             "requests_per_case": requests,
+            "requests_per_surface": surface_requests,
             "small_bytes": small_size,
             "large_bytes": large_size,
             "stream_chunk_bytes": arguments.chunk_size,
@@ -917,6 +961,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
         fixture_self_check(server, small_body)
         host, port = server.server_address
         for surface in surfaces:
+            requests = surface_requests[surface]
             for mode in ("one-shot", "pooled"):
                 for body_name, expected_body in bodies.items():
                     for read in ("buffered", "streaming"):
@@ -1110,6 +1155,13 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--profile", choices=("smoke", "default"), default="default")
     command.add_argument("--surfaces", nargs="+", choices=SURFACES)
     command.add_argument("--requests", type=int)
+    command.add_argument(
+        "--surface-requests",
+        action="append",
+        default=[],
+        metavar="SURFACE=N",
+        help="Override a surface's fixed request count (repeat for other surfaces)",
+    )
     command.add_argument(
         "--warmup",
         type=int,

@@ -151,17 +151,33 @@ At `29ef0b6`, local loopback probes confirmed that the native raw object rejecte
 `response.raw.url = response.url` and replacement of `response.raw.read`.
 The local fix supports dynamic attributes, live stream callbacks and context
 management, preserves lazy argument handling and iterator-close behavior, and
-collects Python ownership cycles. The final focused run passed 276 tests with
-four skips and exit zero; all 52 new raw/proxy scenarios passed. Sphinx 7.2.6
+collects Python ownership cycles. The expanded focused run passed 314 tests with
+five skips and exit zero. Sphinx 7.2.6
 loaded both online inventories with zero warnings under `-E -W --keep-going`;
 profiling observed two native raw context entries and exits. The proxy helper
-dependency guards and canonical proxy wire target are corrected. Independent
-source review found no remaining actionable issue. The installed artifact
-suite now includes the seven new regression families, covering callbacks,
+dependency guards and canonical proxy wire target are corrected. Follow-up
+frozen-oracle and socket regressions reproduced lost explicit default ports,
+mixed-case raw hosts and lexical port normalization before the fix; all 19
+targeted cases now pass. Signed port spellings fall back before native effects.
+Independent source review found no remaining actionable issue. The installed artifact
+suite now includes the eight new regression families, covering callbacks,
 ownership, URL metadata and wire behavior on each qualified platform.
 Complete fresh source, packaged and platform checks on this candidate before
 declaring this blocker closed. Earlier beta qualification does not cover these
 changes.
+
+The full preceding local source run passed 2,913 tests with ten skips and one
+failure in the pinned source-authority inventory. The new parser dependency
+guard was reviewed and added to its exact hash list; the scanner now passes
+with all 17 audited authority lines and unchanged forbidden-token rules.
+Fresh qualification must cover the follow-up proxy fix as well as this audit.
+
+The local/Namespace evaluator now supports fixed per-surface request counts,
+so fast native cases can receive longer samples without multiplying the slower
+Python/Rust workload. All 31 benchmark helper tests pass, including strict
+matching-map and integer sample-count checks. The calibration vector in
+`benchmarks/README.md` is unqualified; all four surfaces, warmed paired runs,
+full metrics and the unchanged 20% regression budget remain required.
 
 1. Enable core crate publication only after qualification. The archive now
    carries canonical README/legal notices, the referenced unit-test modules

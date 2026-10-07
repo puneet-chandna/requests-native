@@ -19,6 +19,10 @@ on:
         description: "Measured requests per case (release gate needs at least 100)"
         type: number
         default: 100
+      surface_requests:
+        description: "Optional space-separated SURFACE=N overrides; each needs at least 100"
+        type: string
+        default: ""
       warmup:
         description: "Warm-up requests per worker (release gate needs at least 4)"
         type: number
@@ -71,15 +75,21 @@ jobs:
           SMOKE: ${{ inputs.smoke }}
           PAIRS: ${{ inputs.pairs }}
           REQUESTS: ${{ inputs.requests }}
+          SURFACE_REQUESTS: ${{ inputs.surface_requests }}
           WARMUP: ${{ inputs.warmup }}
           CASE_TIMEOUT: ${{ inputs.case_timeout_seconds }}
         shell: bash
         run: |
           mode=--gate
           if [[ "$SMOKE" == true ]]; then mode=--smoke; fi
+          read -r -a surface_requests <<< "${SURFACE_REQUESTS//$'\n'/ }"
+          surface_args=()
+          for override in "${surface_requests[@]}"; do
+            surface_args+=(--surface-requests "$override")
+          done
           .venv/bin/python benchmarks/evaluate.py --base "$BASE" --candidate "$CANDIDATE" "$mode" \
             --pairs "$PAIRS" --requests "$REQUESTS" --warmup "$WARMUP" \
-            --case-timeout-seconds "$CASE_TIMEOUT" --output target/performance-evidence
+            --case-timeout-seconds "$CASE_TIMEOUT" --output target/performance-evidence "${surface_args[@]}"
       - name: Preserve raw measurements and decision
         if: ${{ always() }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

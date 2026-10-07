@@ -23,6 +23,29 @@ from benchmarks.run import (
 
 
 class BenchmarkHarnessTests(unittest.TestCase):
+    def test_surface_request_overrides_resolve_defaults_and_reject_invalid_values(self):
+        resolve = benchmark.resolve_surface_requests
+        expected = dict.fromkeys(benchmark.SURFACES, 100)
+        self.assertEqual(resolve(100, []), expected)
+        expected["rust-async"] = 3000
+        arguments = benchmark.parser().parse_args(
+            ["--requests", "100", "--surface-requests", "rust-async=3000"]
+        )
+        self.assertEqual(
+            resolve(arguments.requests, arguments.surface_requests), expected
+        )
+        for overrides in (
+            ["unknown=100"],
+            ["rust-async=0"],
+            ["rust-async=-1"],
+            ["rust-async=1.5"],
+            ["rust-async=nan"],
+            ["rust-async"],
+            ["rust-async=100", "rust-async=200"],
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                resolve(100, overrides)
+
     @unittest.skipUnless(sys.platform == "linux", "Linux RSS measurement")
     def test_measured_rss_discards_released_warmup_peak(self):
         result = benchmark.run_json_command(
