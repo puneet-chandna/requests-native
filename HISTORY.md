@@ -1,7 +1,7 @@
 Release History
 ===============
 
-Requests Native 1.0.1 documentation patch (2026-10-08 UTC)
+Requests Native 1.0.1 documentation patch (2026-10-08)
 --------------------------------------------------------
 
 - Refreshed the crate README with the logo, installation instructions, five
