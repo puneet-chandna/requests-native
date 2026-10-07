@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import os
@@ -24,6 +25,96 @@ from benchmarks.run import (
 
 
 class BenchmarkHarnessTests(unittest.TestCase):
+    def test_failed_warmup_retains_case_worker_and_expected_contract(self):
+        body = bytes(index % 251 for index in range(128))
+        worker = {
+            "warmup_latencies_ns": [1],
+            "warmup_body_bytes": len(body),
+            "warmup_checksum": benchmark.body_checksum(body),
+            "warmup_application_chunks": 0,
+            "warmup_native_responses": 1,
+            "warmup_connection_ids": [1],
+            "connection_ids": [1],
+        }
+        server = mock.Mock(server_address=("127.0.0.1", 1))
+        server.snapshot.side_effect = [(0, 0), (3, 1)]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "pair-03-base.json"
+            arguments = benchmark.parser().parse_args(
+                [
+                    "--surfaces",
+                    "python-oracle",
+                    "--requests",
+                    "2",
+                    "--warmup",
+                    "1",
+                    "--output",
+                    str(output),
+                ]
+            )
+            with (
+                mock.patch.object(benchmark, "git_metadata", return_value={}),
+                mock.patch.object(benchmark, "tool_version", return_value=None),
+                mock.patch.object(
+                    benchmark,
+                    "fixture_server",
+                    return_value=contextlib.nullcontext(server),
+                ),
+                mock.patch.object(benchmark, "fixture_self_check"),
+                mock.patch.object(benchmark, "run_json_command", return_value=worker),
+            ):
+                with self.assertRaisesRegex(ValueError, "warm-up violates"):
+                    benchmark.orchestrate(arguments)
+            self.assertFalse(output.exists())
+            failure = json.loads(output.with_suffix(".failure.json").read_text())
+            self.assertEqual(
+                failure["case"], "python-oracle/one-shot/small/buffered/concurrency-1"
+            )
+            self.assertEqual(failure["worker"], worker)
+            self.assertEqual(failure["expected"]["warmup_native_responses"], 0)
+            self.assertEqual(failure["expected"]["warmup_requests"], 1)
+            self.assertEqual(failure["expected"]["fixture_requests"], 3)
+            self.assertEqual(failure["actual"]["fixture_requests"], 3)
+            self.assertEqual(failure["actual"]["fixture_connections"], 1)
+            self.assertIn("ValueError: warm-up violates", failure["error"])
+
+    def test_core_scope_builds_only_rust_driver_without_python_install(self):
+        arguments = benchmark.parser().parse_args(["--scope", "core"])
+        with (
+            mock.patch.object(
+                benchmark,
+                "build_python_extension",
+                side_effect=AssertionError("Python build"),
+            ),
+            mock.patch.object(
+                benchmark,
+                "python_artifact_provenance",
+                side_effect=AssertionError("Python probe"),
+            ),
+            mock.patch.object(benchmark, "build_native") as native,
+            mock.patch.object(benchmark, "git_metadata", return_value={}),
+            mock.patch.object(benchmark, "tool_version", return_value=None),
+            mock.patch.object(
+                benchmark, "fixture_server", side_effect=RuntimeError("prepared core")
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "prepared core"):
+                benchmark.orchestrate(arguments)
+            native.assert_called_once()
+
+    def test_core_scope_rejects_missing_or_extra_surface_before_build(self):
+        for surfaces in (("rust-async",), benchmark.SURFACES):
+            arguments = benchmark.parser().parse_args(
+                ["--scope", "core", "--surfaces", *surfaces]
+            )
+            with (
+                self.subTest(surfaces=surfaces),
+                mock.patch.object(benchmark, "build_native") as native,
+            ):
+                with self.assertRaisesRegex(ValueError, "core.*surfaces"):
+                    benchmark.orchestrate(arguments)
+                native.assert_not_called()
+
     def test_oracle_only_preparation_does_not_build_or_install_native_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "oracle.json"

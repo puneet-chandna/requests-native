@@ -2095,9 +2095,16 @@ def test_publish_workflow_requires_explicit_protected_publication() -> None:
 def test_publication_preflight_rejects_unqualified_sources_and_unprotected_environments(
     tmp_path: Path,
 ) -> None:
-    script = load_workflow("publish.yml")["jobs"]["publication-gates"]["steps"][0][
-        "run"
-    ]
+    for workflow in ("publish.yml", "publish-crate.yml"):
+        trial = tmp_path / workflow
+        trial.mkdir()
+        _check_publication_preflight(trial, workflow)
+
+
+def _check_publication_preflight(tmp_path: Path, workflow: str) -> None:
+    core = workflow == "publish-crate.yml"
+    job = "qualify" if core else "publication-gates"
+    script = load_workflow(workflow)["jobs"][job]["steps"][0]["run"]
     gh = tmp_path / "gh"
     gh.write_text(
         "#!" + sys.executable + "\nimport json, os, sys\n"
@@ -2106,6 +2113,8 @@ def test_publication_preflight_rejects_unqualified_sources_and_unprotected_envir
     gh.chmod(0o755)
     repo = "/repos/puneet-chandna/requests-native"
     sha = "a" * 40
+    driver = "d" * 40 if core else sha
+    protected_environment = "crates-io" if core else "pypi"
     source = {
         "head_repository": {"full_name": "puneet-chandna/requests-native"},
         "head_sha": sha,
@@ -2121,7 +2130,10 @@ def test_publication_preflight_rejects_unqualified_sources_and_unprotected_envir
             {
                 "type": "required_reviewers",
                 "reviewers": [
-                    {"type": "User", "reviewer": {"login": "puneet-chandna"}}
+                    {
+                        "type": "User",
+                        "reviewer": {"login": "puneet-chandna", "id": 121252460},
+                    }
                 ],
             }
         ],
@@ -2134,6 +2146,7 @@ def test_publication_preflight_rejects_unqualified_sources_and_unprotected_envir
         repo + "/actions/runs/101": source,
         repo + "/actions/runs/102": {
             **source,
+            "head_sha": driver,
             "path": ".github/workflows/evaluate.yml",
             "event": "workflow_dispatch",
         },
@@ -2148,7 +2161,8 @@ def test_publication_preflight_rejects_unqualified_sources_and_unprotected_envir
         "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
         "GITHUB_REPOSITORY": "puneet-chandna/requests-native",
         "GITHUB_REF": "refs/heads/main",
-        "GITHUB_SHA": sha,
+        "GITHUB_SHA": driver,
+        "DRIVER_SHA": driver,
         "SOURCE_SHA": sha,
         "SOURCE_RUN": "101",
         "PERFORMANCE_RUN": "102",
@@ -2163,6 +2177,11 @@ def test_publication_preflight_rejects_unqualified_sources_and_unprotected_envir
         "wildcard-branch",
         "missing-environment",
         "beta-tag",
+        "different-driver",
+        "wrong-workflow",
+        "fork-source",
+        "pull-request-event",
+        "input-injection",
     ):
         records = copy.deepcopy(original)
         trial = dict(env)
@@ -2171,15 +2190,32 @@ def test_publication_preflight_rejects_unqualified_sources_and_unprotected_envir
         elif change == "performance-failure":
             records[repo + "/actions/runs/102"]["conclusion"] = "failure"
         elif change == "unreviewed":
-            records[repo + "/environments/pypi"]["protection_rules"] = []
+            records[repo + "/environments/" + protected_environment][
+                "protection_rules"
+            ] = []
         elif change == "wildcard-branch":
-            records[repo + "/environments/pypi/deployment-branch-policies"][
-                "branch_policies"
-            ][0]["name"] = "*"
+            records[
+                repo
+                + "/environments/"
+                + protected_environment
+                + "/deployment-branch-policies"
+            ]["branch_policies"][0]["name"] = "*"
         elif change == "missing-environment":
-            del records[repo + "/environments/pypi"]
+            del records[repo + "/environments/" + protected_environment]
         elif change == "beta-tag":
             trial["GITHUB_REF"] = "refs/tags/v1.0.0-beta"
+        elif change == "different-driver":
+            records[repo + "/actions/runs/102"]["head_sha"] = "e" * 40
+        elif change == "wrong-workflow":
+            records[repo + "/actions/runs/101"]["path"] = ".github/workflows/lint.yml"
+        elif change == "fork-source":
+            records[repo + "/actions/runs/101"]["head_repository"]["full_name"] = (
+                "other/fork"
+            )
+        elif change == "pull-request-event":
+            records[repo + "/actions/runs/102"]["event"] = "pull_request"
+        elif change == "input-injection":
+            trial["SOURCE_RUN"] = "101; true"
         trial["FAKE_GITHUB"] = json.dumps(records)
         result = subprocess.run(
             ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
@@ -2188,6 +2224,216 @@ def test_publication_preflight_rejects_unqualified_sources_and_unprotected_envir
             capture_output=True,
         )
         assert (result.returncode == 0) is (change == "valid"), (change, result.stderr)
+
+
+def test_evaluation_workflow_requires_immutable_candidate_in_driver_ancestry(
+    tmp_path: Path,
+) -> None:
+    workflow = load_workflow("evaluate.yml")
+    inputs = workflow[True]["workflow_dispatch"]["inputs"]
+    assert (
+        inputs["scope"]["options"] == ["full", "core"]
+        and inputs["scope"]["default"] == "full"
+    )
+    step = next(
+        step
+        for step in workflow["jobs"]["evaluate"]["steps"]
+        if step.get("name") == "Evaluate paired revisions"
+    )
+    script = (
+        step["run"].split("          mode=--gate", 1)[0]
+        if "          mode=--gate" in step["run"]
+        else step["run"].split("mode=--gate", 1)[0]
+    )
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Qualification test",
+        "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+        "GIT_COMMITTER_NAME": "Qualification test",
+        "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+    }
+
+    def git(*arguments):
+        return subprocess.check_output(
+            ["git", *arguments], cwd=tmp_path, env=env, text=True
+        ).strip()
+
+    git("init", "--quiet")
+    git("commit", "--allow-empty", "--quiet", "-m", "candidate")
+    candidate = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "--quiet", "-m", "driver")
+    driver = git("rev-parse", "HEAD")
+    divergent = git(
+        "commit-tree", "HEAD^{tree}", "-p", candidate, "-m", "not in main ancestry"
+    )
+    original = {
+        **env,
+        "SCOPE": "core",
+        "CANDIDATE": candidate,
+        "DRIVER_SHA": driver,
+        "GITHUB_REPOSITORY": "puneet-chandna/requests-native",
+        "GITHUB_REF": "refs/heads/main",
+    }
+    for change in (
+        "valid",
+        "non-ancestor",
+        "unknown-sha",
+        "input-injection",
+        "beta-tag",
+        "fork",
+        "scope",
+        "wrong-driver",
+    ):
+        trial = dict(original)
+        if change == "non-ancestor":
+            trial["CANDIDATE"] = divergent
+        elif change == "unknown-sha":
+            trial["CANDIDATE"] = "b" * 40
+        elif change == "input-injection":
+            trial["CANDIDATE"] = candidate + "; true"
+        elif change == "beta-tag":
+            trial["GITHUB_REF"] = "refs/tags/v1.0.0-beta"
+        elif change == "fork":
+            trial["GITHUB_REPOSITORY"] = "other/fork"
+        elif change == "scope":
+            trial["SCOPE"] = "partial"
+        elif change == "wrong-driver":
+            trial["DRIVER_SHA"] = candidate
+        result = subprocess.run(
+            ["bash", "-eo", "pipefail", "-c", script],
+            cwd=tmp_path,
+            env=trial,
+            capture_output=True,
+            text=True,
+        )
+        assert (result.returncode == 0) is (change == "valid"), (change, result.stderr)
+
+
+def test_core_upload_rejects_changed_digest_driver_and_scope_before_token_exposure(
+    tmp_path: Path,
+) -> None:
+    job = load_workflow("publish-crate.yml")["jobs"]["publish"]
+    script = next(
+        step["run"]
+        for step in job["steps"]
+        if step.get("name") == "Verify qualified bytes before token exposure"
+    )
+    qualified = tmp_path / "qualified-core"
+    qualified.mkdir()
+    archive = qualified / "requests-native-1.0.0.crate"
+    archive.write_bytes(b"qualified archive bytes")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    sha = "c1087413e54b7817a05d4080c3aaeca8e5c27db0"
+    driver = "d" * 40
+    original = {
+        "source_sha": sha,
+        "sha256": digest,
+        "filename": archive.name,
+        "rust_toolchain": "1.98.1",
+        "evaluator_commit": driver,
+        "qualification_scope": "core",
+    }
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "git").write_text(
+        '#!/bin/sh\ncase "$1" in rev-parse) echo '
+        + sha
+        + ";; status) :;; show) echo 1;; *) exit 1;; esac\n"
+    )
+    (tools / "cargo").write_text(
+        "#!"
+        + sys.executable
+        + "\nimport os, pathlib, shutil\np = pathlib.Path(os.environ['CARGO_TARGET_DIR']) / 'package' / 'requests-native-1.0.0.crate'\np.parent.mkdir(parents=True, exist_ok=True)\nshutil.copyfile('qualified-core/requests-native-1.0.0.crate', p)\npathlib.Path('cargo-entered').touch()\n"
+    )
+    for tool in tools.iterdir():
+        tool.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+        "SOURCE_SHA": sha,
+        "DRIVER_SHA": driver,
+        "QUALIFIED_SHA256": digest,
+        "CARGO_TARGET_DIR": str(tmp_path / "target"),
+    }
+    for change in (
+        "valid",
+        "source",
+        "driver",
+        "scope",
+        "digest",
+        "archive",
+        "filename",
+        "toolchain",
+    ):
+        manifest = dict(original)
+        archive.write_bytes(b"qualified archive bytes")
+        if change == "source":
+            manifest["source_sha"] = "b" * 40
+        elif change == "driver":
+            manifest["evaluator_commit"] = "e" * 40
+        elif change == "scope":
+            manifest["qualification_scope"] = "full"
+        elif change == "digest":
+            manifest["sha256"] = "b" * 64
+        elif change == "archive":
+            archive.write_bytes(b"changed archive bytes")
+        elif change == "filename":
+            manifest["filename"] = "other.crate"
+        elif change == "toolchain":
+            manifest["rust_toolchain"] = "stable"
+        (qualified / "manifest.json").write_text(json.dumps(manifest))
+        marker = tmp_path / "cargo-entered"
+        marker.unlink(missing_ok=True)
+        result = subprocess.run(
+            ["bash", "-eo", "pipefail", "-c", script],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert (result.returncode == 0) is (change == "valid"), (change, result.stderr)
+        assert marker.exists() is (change == "valid"), (
+            "Invalid handoff must fail before Cargo or token exposure"
+        )
+
+
+def test_core_publication_separates_source_driver_and_protected_token() -> None:
+    workflow = load_workflow("publish-crate.yml")
+    assert workflow["env"]["SOURCE_SHA"] == "c1087413e54b7817a05d4080c3aaeca8e5c27db0"
+    assert workflow["env"]["DRIVER_SHA"] == "${{ github.sha }}"
+    assert workflow["env"]["RUSTUP_TOOLCHAIN"] == "1.98.1"
+    assert workflow[True]["workflow_dispatch"]["inputs"]["publish"]["default"] is False
+    assert workflow["concurrency"]["cancel-in-progress"] is False
+    jobs = workflow["jobs"]
+    assert set(jobs) == {"qualify", "publish"}
+    checkouts = [
+        step for step in jobs["qualify"]["steps"] if "checkout@" in step.get("uses", "")
+    ]
+    assert checkouts[0]["with"]["ref"] == "${{ github.sha }}"
+    assert checkouts[1]["with"] == {
+        "ref": "${{ env.SOURCE_SHA }}",
+        "path": "core-source",
+        "persist-credentials": False,
+    }
+    assert jobs["publish"]["needs"] == "qualify"
+    assert jobs["publish"]["environment"]["name"] == "crates-io"
+    for job in jobs.values():
+        assert job["runs-on"] == "namespace-profile-puneet-chandna"
+        assert all(
+            step["with"]["persist-credentials"] is False
+            for step in job["steps"]
+            if "checkout@" in step.get("uses", "")
+        )
+    secrets = [
+        step
+        for job in jobs.values()
+        for step in job["steps"]
+        if "CRATES_IO_API_TOKEN" in str(step)
+    ]
+    assert (
+        len(secrets) == 1 and secrets[0]["name"] == "Publish the qualified core crate"
+    )
+    assert "--no-verify" in secrets[0]["run"] and "cargo test" not in secrets[0]["run"]
 
 
 def test_publication_performance_gate_rejects_a_different_baseline(
@@ -2232,7 +2478,7 @@ def test_publication_performance_gate_rejects_a_different_baseline(
 def test_release_performance_acceptance_preserves_evidence_and_fails_closed(
     tmp_path: Path,
 ) -> None:
-    for workflow in ("evaluate.yml", "publish.yml"):
+    for workflow in ("evaluate.yml", "publish.yml", "publish-crate.yml"):
         for change in (
             "passed",
             "inconclusive",
@@ -2246,7 +2492,16 @@ def test_release_performance_acceptance_preserves_evidence_and_fails_closed(
             "different-evaluator",
             "altered-comparison",
             "smoke",
+            "different-driver",
+            "wrong-scope",
+            "different-baseline",
         ):
+            if workflow == "publish.yml" and change in (
+                "different-driver",
+                "wrong-scope",
+                "different-baseline",
+            ):
+                continue
             trial = tmp_path / workflow / change
             trial.mkdir(parents=True)
             _check_release_performance_acceptance(trial, workflow, change)
@@ -2259,7 +2514,16 @@ def _check_release_performance_acceptance(
     from benchmarks.test_evaluate import report
 
     jobs = load_workflow(workflow)["jobs"]
-    if workflow == "publish.yml":
+    scope = "core" if workflow == "publish-crate.yml" else "full"
+    if workflow == "publish-crate.yml":
+        step = next(
+            step
+            for step in jobs["qualify"]["steps"]
+            if step.get("name")
+            == "Recompute immutable-source performance qualification"
+        )
+        evidence = tmp_path / "performance-evidence"
+    elif workflow == "publish.yml":
         step = jobs["publication-gates"]["steps"][-1]
         evidence = tmp_path / "performance-evidence"
     else:
@@ -2291,6 +2555,19 @@ def _check_release_performance_acceptance(
     for pair in pairs:
         for document in pair:
             document["evaluator_sha256"] = evaluator_digest()
+            document["evaluator_commit"] = "d" * 40
+            document["config"]["qualification_scope"] = scope
+            if scope == "core":
+                document["config"]["surfaces"] = [
+                    "python-oracle",
+                    "rust-async",
+                    "rust-blocking",
+                ]
+                document["results"] = [
+                    row
+                    for row in document["results"]
+                    if row["surface"] != "python-rust"
+                ]
             for row in document["results"]:
                 if change == "cpu":
                     row["cpu_seconds"] = 0.0
@@ -2300,7 +2577,10 @@ def _check_release_performance_acceptance(
             for row in pair[1]["results"]:
                 if row["surface"] == "python-oracle":
                     row["latency_ms"]["p95"] *= 2
-    comparison = {**compare_pairs(pairs, gate=True), "smoke_only": change == "smoke"}
+    comparison = {
+        **compare_pairs(pairs, gate=True, scope=scope),
+        "smoke_only": change == "smoke",
+    }
     if change == "missing-case":
         pairs[-1][1]["results"].pop()
     if change == "different-source":
@@ -2310,6 +2590,19 @@ def _check_release_performance_acceptance(
         for pair in pairs:
             for document in pair:
                 document["evaluator_sha256"] = "b" * 64
+    if change == "different-driver":
+        for pair in pairs:
+            for document in pair:
+                document["evaluator_commit"] = "e" * 40
+    if change == "wrong-scope":
+        for pair in pairs:
+            for document in pair:
+                document["config"]["qualification_scope"] = (
+                    "core" if scope == "full" else "full"
+                )
+    if change == "different-baseline":
+        for base, _ in pairs:
+            base["git"]["rewrite_commit"] = "b" * 40
     if change == "altered-comparison":
         comparison["metrics"][0]["median_cost_ratio"] = 0.5
     for index, pair in enumerate(pairs, 1):
@@ -2326,6 +2619,8 @@ def _check_release_performance_acceptance(
             "PYTHONPATH": os.fspath(ROOT),
             "SOURCE_SHA": sha,
             "CANDIDATE": sha,
+            "DRIVER_SHA": "d" * 40,
+            "SCOPE": scope,
             "EVALUATION_EXIT": "1" if change == "inconclusive" else "0",
         },
         text=True,

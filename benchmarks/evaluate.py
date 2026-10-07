@@ -20,10 +20,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-try:
-    from packaging.requirements import Requirement
-except ImportError:  # pip is already required by the isolated evaluation venv.
-    from pip._vendor.packaging.requirements import Requirement
+from packaging.requirements import Requirement
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -49,6 +46,20 @@ def evaluator_digest() -> str:
         digest.update(name.encode())
         digest.update((ROOT / name).read_bytes())
     return digest.hexdigest()
+
+
+def evaluator_commit(*, gate: bool) -> str:
+    commit = (
+        subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()
+    )
+    changed = subprocess.check_output(
+        ["git", "diff", "--name-only", "HEAD", "--", *EVALUATOR_FILES], cwd=ROOT
+    ).strip()
+    if changed:
+        if gate:
+            raise ValueError("release evaluator files must be committed")
+        return "WORKTREE:" + evaluator_digest()
+    return commit
 
 
 def check_runtime_dependencies(root: Path) -> None:
@@ -82,12 +93,39 @@ def confidence_interval(ratios: list[float]) -> tuple[float, float]:
 
 
 def compare_pairs(
-    pairs: list[tuple[dict, dict]], *, budget: float = 0.20, gate: bool = False
+    pairs: list[tuple[dict, dict]],
+    *,
+    budget: float = 0.20,
+    gate: bool = False,
+    scope: str = "full",
 ) -> dict:
+    if scope not in run.SURFACE_SCOPES:
+        raise ValueError("unknown qualification scope")
     if not pairs or not math.isfinite(budget) or not 0 < budget < 1:
         raise ValueError("pairs and a finite regression budget in (0, 1) are required")
     reference = pairs[0][0]
     config = reference["config"]
+    if config.get("qualification_scope", "full") != scope:
+        raise ValueError("report qualification scope differs from requested scope")
+    if scope == "core" and (
+        len(config["surfaces"]) != 3
+        or set(config["surfaces"]) != set(run.SURFACE_SCOPES[scope])
+    ):
+        raise ValueError("core qualification requires oracle and both Rust surfaces")
+    driver_commit = reference.get("evaluator_commit")
+    if scope == "core" and (
+        not isinstance(driver_commit, str)
+        or (
+            gate
+            and (
+                len(driver_commit) != 40
+                or any(c not in "0123456789abcdef" for c in driver_commit)
+            )
+        )
+    ):
+        raise ValueError(
+            "core qualification requires immutable evaluator commit provenance"
+        )
     surface_requests = run.configured_surface_requests(config)
     expected = set(
         itertools.product(
@@ -101,10 +139,10 @@ def compare_pairs(
     ratios: dict[tuple, list[float]] = {}
     insufficient = (
         len(pairs) < 5
-        or any(count < 100 for count in surface_requests.values())
+        or any(surface_requests[surface] < 100 for surface in config["surfaces"])
         or config["warmup_per_worker"] < 4
     )
-    insufficient |= set(config["surfaces"]) != set(run.SURFACES)
+    insufficient |= set(config["surfaces"]) != set(run.SURFACE_SCOPES[scope])
     insufficient |= 1 not in config["concurrency_levels"] or not any(
         level > 1 for level in config["concurrency_levels"]
     )
@@ -127,6 +165,8 @@ def compare_pairs(
                     raise ValueError(f"incomparable {key}")
             if not document["evaluator_sha256"]:
                 raise ValueError("missing evaluator identity")
+            if document.get("evaluator_commit") != driver_commit:
+                raise ValueError("evaluator source changed between runs")
             if document["git"]["oracle_commit"] != reference["git"]["oracle_commit"]:
                 raise ValueError("oracle changed between runs")
             for key in ("versions", "python_soabi"):
@@ -240,6 +280,8 @@ def compare_pairs(
     else:
         status = "passed"
     return {
+        "qualification_scope": scope,
+        "evaluator_commit": driver_commit,
         "status": status,
         "release_gate": gate,
         "pairs": len(pairs),
@@ -326,6 +368,7 @@ def main() -> int:
         default="HEAD",
         help="Git revision or WORKTREE for local uncommitted changes (default HEAD)",
     )
+    parser.add_argument("--scope", choices=run.SURFACE_SCOPES, default="full")
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -381,17 +424,28 @@ def main() -> int:
     except ValueError as error:
         parser.error(str(error))
     if args.gate and (
-        args.pairs < 5 or min(surface_requests.values()) < 100 or args.warmup < 4
+        args.pairs < 5
+        or min(surface_requests[s] for s in run.SURFACE_SCOPES[args.scope]) < 100
+        or args.warmup < 4
     ):
         parser.error(
             "release qualification requires at least 5 pairs, 100 requests and 4 warmups"
         )
+    if args.scope == "core" and any(
+        override.partition("=")[0] not in run.SURFACE_SCOPES["core"]
+        for override in args.surface_requests
+    ):
+        parser.error("request override is outside core scope")
     if sys.prefix == sys.base_prefix:
         parser.error(
             "run with an isolated Python environment containing maturin and Requests dependencies"
         )
     if not (run.ORACLE_ROOT / "src/requests/__init__.py").is_file():
         parser.error("set REQUESTS_ORACLE_ROOT to the frozen psf/requests checkout")
+    try:
+        driver_commit = evaluator_commit(gate=args.gate)
+    except ValueError as error:
+        parser.error(str(error))
     output = args.output.resolve()
     if output.exists() and any(output.iterdir()):
         parser.error("output directory must be empty (preserve previous evidence)")
@@ -459,6 +513,8 @@ def main() -> int:
                         str(ROOT / "benchmarks/run.py"),
                         "--profile",
                         "smoke" if args.smoke else "default",
+                        "--scope",
+                        args.scope,
                         "--warmup",
                         str(args.warmup),
                         "--case-timeout-seconds",
@@ -472,7 +528,9 @@ def main() -> int:
                     for override in args.surface_requests:
                         command.extend(("--surface-requests", override))
                     with path.with_suffix(".log").open("w") as log:
-                        switched_install = True
+                        switched_install = (
+                            "python-rust" in run.SURFACE_SCOPES[args.scope]
+                        )
                         subprocess.run(
                             command,
                             cwd=roots[side],
@@ -490,6 +548,7 @@ def main() -> int:
                         "WORKTREE:"
                     )
                     reports[side]["evaluator_sha256"] = identity
+                    reports[side]["evaluator_commit"] = driver_commit
                     reports[side]["transport_lock_sha256"] = run.sha256(
                         roots[side] / "Cargo.lock"
                     )
@@ -501,7 +560,10 @@ def main() -> int:
                     )
                 pairs.append(tuple(reports))
             result = compare_pairs(
-                pairs, budget=args.max_regression_percent / 100, gate=args.gate
+                pairs,
+                budget=args.max_regression_percent / 100,
+                gate=args.gate,
+                scope=args.scope,
             )
             result["smoke_only"] = args.smoke
     except (OSError, ValueError, subprocess.SubprocessError) as error:

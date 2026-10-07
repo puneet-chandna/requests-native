@@ -3,8 +3,9 @@
 Release process
 ===============
 
-Requests Native releases are GitHub milestones for the independent rewrite.
-They are not PSF Requests releases and are not published to PyPI or crates.io.
+Requests Native releases belong to the independent rewrite, not PSF Requests.
+The current beta is distributed on GitHub. Python registry publication is
+deferred; the first stable Rust core is being qualified for crates.io.
 The stable candidate Python distribution and Cargo package are
 ``requests-native`` version ``1.0.0``. Metadata alone does not qualify a release.
 The installed Python import remains ``requests`` and ``requests.__version__`` remains
@@ -33,7 +34,7 @@ artifact checks and strict Twine validation passed before release upload.
 Qualification procedure
 -----------------------
 
-A release requires:
+A Python distribution release requires:
 
 1. local compatibility, Rust, metadata, and benchmark checks pass;
 2. source and installed-artifact checks qualify the exact source commit, with
@@ -92,6 +93,22 @@ The first stable upload requires the immutable beta baseline
 ``2146b22ed25951a5483cbb13d69dc551f99ff352``; choosing another baseline cannot
 bypass this publication gate.
 
+The separate ``Qualify and publish immutable stable core`` workflow qualifies
+only the Rust core at ``c1087413e54b7817a05d4080c3aaeca8e5c27db0``. It does not
+require Python wheels or an sdist and does not authorize Python publication.
+Its source Tests run must identify that exact commit. Its performance run must
+identify the current clean evaluator driver commit separately and explicitly
+use ``core`` scope: Python oracle controls plus Rust async and blocking across
+all 48 cases, with at least five complete pairs and the same CPU/RSS, fixture,
+source, evaluator and confirmed-regression checks. ``full`` remains the default
+for Python plus Rust qualification. Core qualification makes no Python parity
+or performance claim. The workflow packages the immutable core source,
+checks canonical notices and metadata, tests the extracted archive, and retains
+its digest for owner review before the protected upload job. Repackaging must
+match those bytes, and the public registry checksum is checked after upload.
+``publish`` defaults to false; registry upload requires an explicit dispatch
+and the owner's ``crates-io`` environment approval.
+
 Before an upload job can start, the workflow verifies that its GitHub environment
 exists, requires a human reviewer and permits only the ``main`` branch. Configure
 ``pypi`` and ``crates-io`` under repository Settings → Environments, with the
@@ -104,7 +121,7 @@ have no environment secrets. Repository administrators remain trusted to manage
 these protection rules. Missing environments are a failure; the workflow does
 not rely on automatically created environments.
 
-The owner must create the registry accounts and verify their email addresses.
+The owner must complete PyPI account and publisher setup before Python publication.
 For PyPI, enable two-factor authentication and configure a pending Trusted
 Publisher for project ``requests-native``, owner ``puneet-chandna``, repository
 ``requests-native``, workflow ``publish.yml`` and environment ``pypi``.

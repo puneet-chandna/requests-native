@@ -7,6 +7,15 @@ on:
         description: "Baseline tag or commit in this repository"
         type: string
         required: true
+      scope:
+        description: "Full Python+Rust qualification or Rust-core qualification with Python oracle controls"
+        type: choice
+        options: ["full", "core"]
+        default: "full"
+      candidate:
+        description: "Immutable candidate SHA in the workflow commit ancestry; empty uses that commit"
+        type: string
+        default: ""
       smoke:
         description: "Short harness check only; does not qualify a release"
         type: boolean
@@ -59,7 +68,7 @@ jobs:
       - name: Prepare isolated evaluation environment
         run: |
           python -m venv .venv
-          .venv/bin/python -m pip install "maturin==1.15.0" "charset_normalizer==3.5.1" "idna==3.19" "urllib3==2.8.0" "certifi==2026.7.22"
+          .venv/bin/python -m pip install "maturin==1.15.0" "packaging==26.3" "charset_normalizer==3.5.1" "idna==3.19" "urllib3==2.8.0" "certifi==2026.7.22"
       - name: Check out frozen Python oracle
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -71,7 +80,9 @@ jobs:
         env:
           REQUESTS_ORACLE_ROOT: ${{ github.workspace }}/frozen-oracle
           BASE: ${{ inputs.base }}
-          CANDIDATE: ${{ github.sha }}
+          CANDIDATE: ${{ inputs.candidate || github.sha }}
+          DRIVER_SHA: ${{ github.sha }}
+          SCOPE: ${{ inputs.scope }}
           SMOKE: ${{ inputs.smoke }}
           PAIRS: ${{ inputs.pairs }}
           REQUESTS: ${{ inputs.requests }}
@@ -80,6 +91,14 @@ jobs:
           CASE_TIMEOUT: ${{ inputs.case_timeout_seconds }}
         shell: bash
         run: |
+          [[ "$SCOPE" == full || "$SCOPE" == core ]]
+          [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "$CANDIDATE^{commit}"
+          git merge-base --is-ancestor "$CANDIDATE" "$DRIVER_SHA"
+          [[ "$(git rev-parse HEAD)" == "$DRIVER_SHA" ]]
+          if [[ "$SCOPE" == core ]]; then
+            [[ "$GITHUB_REPOSITORY" == puneet-chandna/requests-native && "$GITHUB_REF" == refs/heads/main ]]
+          fi
           mode=--gate
           if [[ "$SMOKE" == true ]]; then mode=--smoke; fi
           read -r -a surface_requests <<< "${SURFACE_REQUESTS//$'\n'/ }"
@@ -88,7 +107,7 @@ jobs:
             surface_args+=(--surface-requests "$override")
           done
           evaluation_exit=0
-          .venv/bin/python benchmarks/evaluate.py --base "$BASE" --candidate "$CANDIDATE" "$mode" \
+          .venv/bin/python benchmarks/evaluate.py --base "$BASE" --candidate "$CANDIDATE" --scope "$SCOPE" "$mode" \
             --pairs "$PAIRS" --requests "$REQUESTS" --warmup "$WARMUP" \
             --case-timeout-seconds "$CASE_TIMEOUT" --output target/performance-evidence "${surface_args[@]}" || evaluation_exit=$?
           if [[ "$SMOKE" == true ]]; then exit "$evaluation_exit"; fi
@@ -104,7 +123,10 @@ jobs:
           assert candidates == [path.with_name(path.name.replace("-base.json", "-candidate.json")) for path in bases]
           pairs = [(json.loads(base.read_text()), json.loads(candidate.read_text())) for base, candidate in zip(bases, candidates)]
           assert all(report["evaluator_sha256"] == evaluator_digest() for pair in pairs for report in pair)
-          result = compare_pairs(pairs, budget=0.20, gate=True)
+          assert all(report["evaluator_commit"] == os.environ["DRIVER_SHA"] for pair in pairs for report in pair)
+          assert all(report["config"]["qualification_scope"] == os.environ["SCOPE"] for pair in pairs for report in pair)
+          result = compare_pairs(pairs, budget=0.20, gate=True, scope=os.environ["SCOPE"])
+          assert result["qualification_scope"] == os.environ["SCOPE"] and result["evaluator_commit"] == os.environ["DRIVER_SHA"]
           assert result["sources"][1] == os.environ["CANDIDATE"]
           assert json.loads((evidence / "comparison.json").read_text()) == {**result, "smoke_only": False}
           assert result["status"] in ("passed", "inconclusive") and not result["insufficient_release_evidence"]

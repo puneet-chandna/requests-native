@@ -52,6 +52,10 @@ NATIVE_BINARY = ROOT / "target" / "release" / "requests-benchmark-native"
 NATIVE_MANIFEST = ROOT / "benchmarks" / "rust-native" / "Cargo.toml"
 SCHEMA_VERSION = 3
 SURFACES = ("python-oracle", "python-rust", "rust-async", "rust-blocking")
+SURFACE_SCOPES = {
+    "full": SURFACES,
+    "core": ("python-oracle", "rust-async", "rust-blocking"),
+}
 _PERSONAL_HOME = re.compile(
     r"(?:/(?:home|Users)/[^/\s]+|[A-Za-z]:[\\/]Users[\\/][^\\/\s]+)"
 )
@@ -907,10 +911,14 @@ def summarize(
 def orchestrate(arguments: argparse.Namespace) -> int:
     requests, small_size, large_size, maximum_concurrency = resolve_workload(arguments)
     surface_requests = resolve_surface_requests(requests, arguments.surface_requests)
-    surfaces = arguments.surfaces or list(SURFACES)
+    surfaces = arguments.surfaces or list(SURFACE_SCOPES[arguments.scope])
     unknown = set(surfaces) - set(SURFACES)
     if unknown:
         raise ValueError(f"unknown surfaces: {sorted(unknown)}")
+    if arguments.scope == "core" and (
+        len(surfaces) != 3 or set(surfaces) != set(SURFACE_SCOPES["core"])
+    ):
+        raise ValueError("core scope requires oracle and both Rust surfaces")
     concurrencies = sorted(
         {1, min(maximum_concurrency, *(surface_requests[s] for s in surfaces))}
     )
@@ -923,15 +931,19 @@ def orchestrate(arguments: argparse.Namespace) -> int:
             [sys.executable, str(pathlib.Path(__file__).resolve()), *sys.argv[1:]]
         )
     ]
-    if set(surfaces) == {"python-oracle"}:
+    if "python-rust" not in surfaces:
         python_provenance = {
-            "scope": "oracle-only",
+            "scope": "oracle-only"
+            if set(surfaces) == {"python-oracle"}
+            else "oracle-control",
             "python_soabi": sysconfig.get_config_var("SOABI"),
             "versions": {
                 name: package_metadata.version(name)
                 for name in ("urllib3", "certifi", "idna", "charset-normalizer")
             },
         }
+        if any(surface.startswith("rust-") for surface in surfaces):
+            build_native(commands)
     else:
         release_build, build_record = build_python_extension(commands)
         build_native(commands)
@@ -963,6 +975,7 @@ def orchestrate(arguments: argparse.Namespace) -> int:
         "git": git_metadata(),
         "python_artifact": python_provenance,
         "config": {
+            "qualification_scope": arguments.scope,
             "profile": arguments.profile,
             "requests_per_case": requests,
             "requests_per_surface": surface_requests,
@@ -1018,25 +1031,85 @@ def orchestrate(arguments: argparse.Namespace) -> int:
                             warmup_requests = arguments.warmup * min(
                                 concurrency, requests
                             )
-                            if request_delta != requests + warmup_requests:
-                                raise RuntimeError(
-                                    f"fixture observed {request_delta} requests, expected {requests}"
+                            try:
+                                if request_delta != requests + warmup_requests:
+                                    raise RuntimeError(
+                                        f"fixture observed {request_delta} requests, expected {requests}"
+                                    )
+                                if accepted_delta != len(
+                                    set(worker["connection_ids"])
+                                    | set(worker["warmup_connection_ids"])
+                                ):
+                                    raise RuntimeError(
+                                        "fixture and worker disagree on accepted connections"
+                                    )
+                                validate_warmup(
+                                    worker,
+                                    warmup_requests,
+                                    expected_body,
+                                    arguments.chunk_size,
+                                    read,
+                                    surface,
                                 )
-                            if accepted_delta != len(
-                                set(worker["connection_ids"])
-                                | set(worker["warmup_connection_ids"])
-                            ):
-                                raise RuntimeError(
-                                    "fixture and worker disagree on accepted connections"
+                            except (RuntimeError, ValueError) as error:
+                                failure_output = arguments.output or (
+                                    ROOT
+                                    / "benchmarks/results"
+                                    / f"failure-{time.time_ns()}.json"
                                 )
-                            validate_warmup(
-                                worker,
-                                warmup_requests,
-                                expected_body,
-                                arguments.chunk_size,
-                                read,
-                                surface,
-                            )
+                                failure_path = (
+                                    pathlib.Path(failure_output)
+                                    .resolve()
+                                    .with_suffix(".failure.json")
+                                )
+                                failure = {
+                                    "case": case_name,
+                                    "error": f"{type(error).__name__}: {error}",
+                                    "worker": worker,
+                                    "expected": {
+                                        "fixture_requests": requests + warmup_requests,
+                                        "fixture_connections": len(
+                                            set(worker["connection_ids"])
+                                            | set(worker["warmup_connection_ids"])
+                                        ),
+                                        "warmup_requests": warmup_requests,
+                                        "warmup_body_bytes": warmup_requests
+                                        * len(expected_body),
+                                        "warmup_checksum": warmup_requests
+                                        * body_checksum(expected_body),
+                                        "warmup_application_chunks": 0
+                                        if read == "buffered"
+                                        else warmup_requests
+                                        * math.ceil(
+                                            len(expected_body) / arguments.chunk_size
+                                        ),
+                                        "warmup_native_responses": warmup_requests
+                                        if surface != "python-oracle"
+                                        else 0,
+                                    },
+                                    "actual": {
+                                        "fixture_requests": request_delta,
+                                        "fixture_connections": accepted_delta,
+                                    },
+                                }
+                                try:
+                                    failure_path.parent.mkdir(
+                                        parents=True, exist_ok=True
+                                    )
+                                    failure_path.write_text(
+                                        json.dumps(
+                                            sanitize_public_report(failure),
+                                            indent=2,
+                                            sort_keys=True,
+                                        )
+                                        + "\n"
+                                    )
+                                except (OSError, ValueError) as diagnostic_error:
+                                    print(
+                                        f"Could not preserve failed case {case_name}: {diagnostic_error}",
+                                        file=sys.stderr,
+                                    )
+                                raise
                             validate_worker_result(
                                 worker,
                                 requests=requests,
@@ -1172,6 +1245,7 @@ def parser() -> argparse.ArgumentParser:
         "--measure-allocations", action="store_true", help=argparse.SUPPRESS
     )
     command.add_argument("--profile", choices=("smoke", "default"), default="default")
+    command.add_argument("--scope", choices=SURFACE_SCOPES, default="full")
     command.add_argument("--surfaces", nargs="+", choices=SURFACES)
     command.add_argument("--requests", type=int)
     command.add_argument(

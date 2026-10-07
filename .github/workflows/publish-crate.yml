@@ -1,0 +1,260 @@
+# One-time first stable Rust-core publication; Python publication is deferred.
+name: Qualify and publish immutable stable core
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Successful c1087413 Tests run"
+        type: string
+        required: true
+      performance_run_id:
+        description: "Successful core-scope c1087413 performance run using this workflow commit as driver"
+        type: string
+        required: true
+      publish:
+        description: "Publish after qualified digest review and crates-io environment approval"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: c1087413e54b7817a05d4080c3aaeca8e5c27db0
+  RUSTUP_TOOLCHAIN: "1.98.1"
+  DRIVER_SHA: ${{ github.sha }}
+
+concurrency:
+  group: immutable-stable-core-publication
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: namespace-profile-puneet-chandna
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - name: Verify source runs and required owner approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run_id }}
+          PERFORMANCE_RUN: ${{ inputs.performance_run_id }}
+        shell: bash
+        run: |
+          [[ "$GITHUB_REPOSITORY" == puneet-chandna/requests-native ]]
+          [[ "$GITHUB_REF" == refs/heads/main && "$DRIVER_SHA" == "$GITHUB_SHA" ]]
+          for qualification in "$SOURCE_RUN:.github/workflows/run-tests.yml" "$PERFORMANCE_RUN:.github/workflows/evaluate.yml"; do
+            run_id=${qualification%%:*}
+            workflow=${qualification#*:}
+            [[ "$run_id" =~ ^[0-9]+$ ]]
+            expected_sha=$SOURCE_SHA
+            expected_event=push
+            if [[ "$workflow" == .github/workflows/evaluate.yml ]]; then
+              expected_sha=$DRIVER_SHA
+              expected_event=workflow_dispatch
+            fi
+            gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id" | jq -e \
+              --arg repo "$GITHUB_REPOSITORY" --arg sha "$expected_sha" --arg workflow "$workflow" --arg event "$expected_event" '
+                .head_repository.full_name == $repo and .head_sha == $sha and
+                .head_branch == "main" and .path == $workflow and
+                .event == $event and
+                .status == "completed" and .conclusion == "success"'
+          done
+          gh api "/repos/$GITHUB_REPOSITORY/environments/crates-io" | jq -e '
+            any(.protection_rules[]; .type == "required_reviewers" and
+              any(.reviewers[]; .type == "User" and .reviewer.id == 121252460)) and
+            .deployment_branch_policy.protected_branches == false and
+            .deployment_branch_policy.custom_branch_policies == true'
+          gh api "/repos/$GITHUB_REPOSITORY/environments/crates-io/deployment-branch-policies" | jq -e '
+            .branch_policies | length == 1 and .[0].name == "main" and .[0].type == "branch"'
+      - name: Check out the immutable evaluator driver
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+      - name: Install the pinned evaluator requirement
+        run: python -m pip install "packaging==26.3"
+      - name: Download qualified performance evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: performance-evidence
+          path: performance-evidence
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.performance_run_id }}
+      - name: Recompute immutable-source performance qualification
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from benchmarks.evaluate import compare_pairs, evaluator_digest
+
+          evidence = Path("performance-evidence")
+          bases = sorted(evidence.glob("pair-*-base.json"))
+          candidates = sorted(evidence.glob("pair-*-candidate.json"))
+          assert candidates == [path.with_name(path.name.replace("-base.json", "-candidate.json")) for path in bases]
+          pairs = [(json.loads(base.read_text()), json.loads(candidate.read_text())) for base, candidate in zip(bases, candidates)]
+          assert all(report["evaluator_sha256"] == evaluator_digest() for pair in pairs for report in pair)
+          assert all(pair[0]["git"]["rewrite_commit"] == "2146b22ed25951a5483cbb13d69dc551f99ff352" for pair in pairs), "The first stable release must use the immutable beta baseline"
+          assert all(report["evaluator_commit"] == os.environ["DRIVER_SHA"] for pair in pairs for report in pair)
+          assert all(report["config"]["qualification_scope"] == "core" for pair in pairs for report in pair)
+          result = compare_pairs(pairs, budget=0.20, gate=True, scope="core")
+          assert result["qualification_scope"] == "core" and result["evaluator_commit"] == os.environ["DRIVER_SHA"]
+          assert result["sources"][1] == os.environ["SOURCE_SHA"]
+          assert json.loads((evidence / "comparison.json").read_text()) == {**result, "smoke_only": False}
+          assert result["status"] in ("passed", "inconclusive") and not result["insufficient_release_evidence"]
+          assert all(metric["case"][0] == "python-oracle" or metric["status"] != "regression" for metric in result["metrics"]), "Confirmed native performance regressions block publication even when controls are unstable"
+          if result["status"] == "inconclusive":
+              print("::warning::Complete performance evidence is inconclusive; release policy permits publication without a performance parity or superiority claim. See comparison.json for unchanged ratios, confidence intervals and control uncertainty.")
+          PY
+      - name: Check out the immutable core source separately
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: core-source
+          persist-credentials: false
+      - name: Qualify exact core package and record digest
+        id: package
+        working-directory: core-source
+        env:
+          SOURCE_RUN: ${{ inputs.source_run_id }}
+          PERFORMANCE_RUN: ${{ inputs.performance_run_id }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/core-target
+        shell: bash
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$SOURCE_SHA")
+          cargo publish -p requests-native --locked --dry-run
+          cargo package -p requests-native --locked --no-verify
+          cmp "$CARGO_TARGET_DIR/package/tmp-crate/requests-native-1.0.0.crate" "$CARGO_TARGET_DIR/package/requests-native-1.0.0.crate"
+          mkdir qualified-core
+          cp "$CARGO_TARGET_DIR/package/requests-native-1.0.0.crate" qualified-core/
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import tarfile
+          import tomllib
+          from pathlib import Path
+
+          sha = os.environ["SOURCE_SHA"]
+          def source(path):
+              return subprocess.check_output(["git", "show", f"{sha}:{path}"])
+          workspace = tomllib.loads(source("Cargo.toml").decode())["workspace"]["package"]
+          assert workspace["version"] == "1.0.0" and workspace["rust-version"] == os.environ["RUSTUP_TOOLCHAIN"]
+          assert tomllib.loads(source("crates/requests/Cargo.toml").decode())["package"]["publish"] is True
+          assert tomllib.loads(source("crates/requests-python/Cargo.toml").decode())["package"]["publish"] is False
+          legal = ("LICENSE", "NOTICE", "AUTHORS.rst", "RUST_RUNTIME_NOTICES.html")
+          tracked = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", sha, "crates/requests"]).decode().splitlines()
+          original = {path.removeprefix("crates/requests/"): source(path) for path in tracked
+                      if (path.startswith("crates/requests/src/") and path.endswith(".rs"))
+                      or path.startswith("crates/requests/tests/fixtures/")
+                      or Path(path).name in (*legal, "README.md")}
+          original["Cargo.toml.orig"] = source("crates/requests/Cargo.toml")
+          crate = Path("qualified-core/requests-native-1.0.0.crate")
+          with tarfile.open(crate, "r:gz") as archive:
+              members = archive.getmembers()
+              assert all(member.isfile() and member.name.startswith("requests-native-1.0.0/") for member in members)
+              contents = {member.name.removeprefix("requests-native-1.0.0/"): archive.extractfile(member).read() for member in members}
+              assert len(contents) == len(members), "Duplicate archive members"
+          assert set(contents) == set(original) | {"Cargo.toml", "Cargo.lock", ".cargo_vcs_info.json"}
+          assert all(contents[path] == content for path, content in original.items()), "Archive differs from immutable core source"
+          assert all(contents[name] == source(name) for name in (*legal, "README.md")), "Canonical notices must be retained"
+          vcs = json.loads(contents[".cargo_vcs_info.json"])
+          assert vcs["git"]["sha1"] == sha and not vcs["git"].get("dirty", False) and vcs["path_in_vcs"] == "crates/requests"
+          package = tomllib.loads(contents["Cargo.toml"].decode())["package"]
+          for key in ("version", "rust-version", "edition", "license", "authors", "homepage", "repository"):
+              assert package[key] == workspace[key], key
+          assert package["name"] == "requests-native" and package["publish"] is True and package["readme"] == "README.md"
+          locked = tomllib.loads(source("Cargo.lock").decode())["package"]
+          assert all(package in locked for package in tomllib.loads(contents["Cargo.lock"].decode())["package"]), "Packaged dependencies differ from the qualified lock"
+          assert all(b"/home/puneet/" not in value and b"/Users/" not in value for value in contents.values())
+          digest = hashlib.sha256(crate.read_bytes()).hexdigest()
+          manifest = {"source_sha": sha, "sha256": digest, "filename": crate.name,
+                      "source_run_id": os.environ["SOURCE_RUN"], "performance_run_id": os.environ["PERFORMANCE_RUN"],
+                      "rust_toolchain": os.environ["RUSTUP_TOOLCHAIN"],
+                      "evaluator_commit": os.environ["DRIVER_SHA"], "qualification_scope": "core"}
+          Path("qualified-core/manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"sha256={digest}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"Qualified source: `{sha}`\n\nEvaluator driver: `{os.environ['DRIVER_SHA']}` (core scope)\n\nCore archive SHA256: `{digest}`\n")
+          PY
+          mkdir "$RUNNER_TEMP/extracted-core"
+          tar -xzf qualified-core/requests-native-1.0.0.crate -C "$RUNNER_TEMP/extracted-core"
+          cargo test --manifest-path "$RUNNER_TEMP/extracted-core/requests-native-1.0.0/Cargo.toml" --locked
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+      - name: Retain qualified core archive and manifest
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: qualified-core
+          path: core-source/qualified-core/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: ${{ inputs.publish }}
+    needs: qualify
+    runs-on: namespace-profile-puneet-chandna
+    timeout-minutes: 15
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/requests-native
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: qualified-core
+          path: qualified-core
+      - name: Verify qualified bytes before token exposure
+        env:
+          QUALIFIED_SHA256: ${{ needs.qualify.outputs.sha256 }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/core-target
+        shell: bash
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+          [[ "$QUALIFIED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          jq -e --arg sha "$SOURCE_SHA" --arg digest "$QUALIFIED_SHA256" --arg driver "$DRIVER_SHA" '
+            .source_sha == $sha and .sha256 == $digest and
+            .filename == "requests-native-1.0.0.crate" and .rust_toolchain == "1.98.1" and
+            .evaluator_commit == $driver and .qualification_scope == "core"' qualified-core/manifest.json
+          echo "$QUALIFIED_SHA256  qualified-core/requests-native-1.0.0.crate" | sha256sum --check --strict
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$SOURCE_SHA")
+          cargo package -p requests-native --locked --no-verify
+          cmp qualified-core/requests-native-1.0.0.crate "$CARGO_TARGET_DIR/package/requests-native-1.0.0.crate"
+      - name: Publish the qualified core crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/core-target
+        # First upload is required before crates.io trusted publishing can be configured.
+        # https://blog.rust-lang.org/2025/07/11/crates-io-development-update-2025-07/
+        run: | # zizmor: ignore[use-trusted-publishing] First-upload bootstrap requires protected owner approval and exact qualified bytes.
+          test -n "$CARGO_REGISTRY_TOKEN"
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$SOURCE_SHA")
+          cargo publish -p requests-native --locked --no-verify
+          cmp qualified-core/requests-native-1.0.0.crate "$CARGO_TARGET_DIR/package/tmp-crate/requests-native-1.0.0.crate"
+      - name: Verify public registry checksum
+        env:
+          QUALIFIED_SHA256: ${{ needs.qualify.outputs.sha256 }}
+        shell: bash
+        run: |
+          curl --fail --silent --show-error \
+            -H "User-Agent: requests-native-release (github.com/puneet-chandna/requests-native)" \
+            https://crates.io/api/v1/crates/requests-native/1.0.0 | \
+            jq -e --arg digest "$QUALIFIED_SHA256" '.version.checksum == $digest'
