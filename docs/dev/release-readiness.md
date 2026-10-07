@@ -166,11 +166,19 @@ Complete fresh source, packaged and platform checks on this candidate before
 declaring this blocker closed. Earlier beta qualification does not cover these
 changes.
 
-The full preceding local source run passed 2,913 tests with ten skips and one
-failure in the pinned source-authority inventory. The new parser dependency
-guard was reviewed and added to its exact hash list; the scanner now passes
-with all 17 audited authority lines and unchanged forbidden-token rules.
-Fresh qualification must cover the follow-up proxy fix as well as this audit.
+The fresh source/package run at `259ccdfacafc066eeaf40a64b54757ba66f4a478`
+passed 2,924 rewrite/differential tests with ten skips and exit zero. The upstream
+suite passed 620 tests with 15 skips and one pre-existing expected-failure test
+that passed. A fresh canonical wheel and sdist passed strict Twine checks.
+The source-authority inventory now passes with all 17 audited authority lines
+and unchanged forbidden-token rules. The preceding inventory failure was fixed
+by reviewing and recording the new parser dependency guard.
+
+Local Python 3.10 CI-equivalent no-detector and legacy urllib3 lanes each passed
+620 upstream tests, with 15 skips and one expected failure. Their boundary/property
+checks passed 11 with three skips and 13 with one skip, respectively. After restoring
+supported urllib3 2.8, all 62 selected raw/proxy regressions passed. These are local
+Linux results; final platform/artifact qualification still remains.
 
 The local/Namespace evaluator now supports fixed per-surface request counts,
 so fast native cases can receive longer samples without multiplying the slower
@@ -178,6 +186,17 @@ Python/Rust workload. All 31 benchmark helper tests pass, including strict
 matching-map and integer sample-count checks. The calibration vector in
 `benchmarks/README.md` is unqualified; all four surfaces, warmed paired runs,
 full metrics and the unchanged 20% regression budget remain required.
+
+The five-pair local comparison against `v1.0.0-beta` at `259ccdf` completed all
+ten reports with the trial per-surface counts and restored the environment.
+It reported 240 passing metrics, 20 inconclusive metrics and no definite regression.
+Oracle controls remained unstable, so release qualification failed; the evidence
+is retained under `target/evaluations/local-gate-259-u1ZSFA/`. The local HEAD/HEAD
+smoke also completed all 64 cases per side and restoration, without qualifying
+performance. The laptop has distinct performance/efficiency CPU sets; this is a
+possible noise source, not a proved cause. Affinity telemetry now records the
+allowed CPU set. An oracle-only homogeneous-core probe remains unqualified and
+will precede another full evaluation.
 
 1. Enable core crate publication only after qualification. The archive now
    carries canonical README/legal notices, the referenced unit-test modules

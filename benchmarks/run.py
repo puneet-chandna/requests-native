@@ -936,6 +936,11 @@ def orchestrate(arguments: argparse.Namespace) -> int:
             "architecture": platform.machine(),
             "processor": platform.processor(),
             "logical_cpu_count": os.cpu_count(),
+            "allowed_cpus": (
+                sorted(os.sched_getaffinity(0))
+                if hasattr(os, "sched_getaffinity")
+                else None
+            ),
         },
         "toolchains": {
             "python": sys.version,

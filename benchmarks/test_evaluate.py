@@ -54,7 +54,7 @@ def report(commit, cost=1.0):
     return {
         "schema_version": 3,
         "evaluator_sha256": "a" * 64,
-        "machine": {"platform": "linux"},
+        "machine": {"platform": "linux", "allowed_cpus": [0, 1]},
         "toolchains": {"rustc": "same"},
         "git": {
             "rewrite_commit": commit,
@@ -284,6 +284,9 @@ class EvaluationTests(unittest.TestCase):
             lambda r: r["results"].pop(),
             lambda r: r["results"].append(copy.deepcopy(r["results"][0])),
             lambda r: r["config"].update(requests_per_case=101),
+            lambda r: r["machine"].update(allowed_cpus=[0]),
+            lambda r: r["machine"].update(allowed_cpus=None),
+            lambda r: r["machine"].pop("allowed_cpus"),
             lambda r: r["toolchains"].update(rustc="different"),
             lambda r: r.update(evaluator_sha256="different"),
             lambda r: r["results"][0].update(throughput_requests_per_second=math.nan),

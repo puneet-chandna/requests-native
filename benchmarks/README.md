@@ -131,6 +131,15 @@ separately runs native unit tests, frozen-oracle differential checks,
 distribution/fresh-install checks and benchmark helper checks on relevant
 changes. Full platform artifact qualification remains a release requirement.
 
+On Linux machines with mixed performance/efficiency cores, scheduling can add
+timing variation. For local calibration, choose a homogeneous set from
+`lscpu --extended=CPU,CORE,MAXMHZ` and launch the evaluator with
+`taskset --cpu-list <CPU-list>`. The fixture and workers inherit that affinity.
+Reports record the allowed CPU IDs; paired comparisons reject different masks.
+Platforms without the affinity API record `null`. This records the allowed set,
+not continuous scheduling or CPU frequency. Keep the chosen set fixed across
+comparisons and label control-only probes as calibration, not qualification.
+
 ## Historical observations
 
 The checked-in 20260902 result predates the Requests Native rename; its
