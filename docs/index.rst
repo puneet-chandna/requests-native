@@ -3,7 +3,8 @@
 Requests Native
 ===============
 
-Requests compatibility version |version|. Stable candidate 1.0.0; existing GitHub prerelease
+Rust core 1.0.0 is stable on `crates.io <https://crates.io/crates/requests-native/1.0.0>`_.
+Python publication is deferred; the existing GitHub Python prerelease is
 `v1.0.0-beta <https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta>`_.
 
 Requests Native is an unofficial, independent Rust rewrite of
@@ -13,16 +14,18 @@ transport, with compatibility fallback for unsupported extension behavior.
 
 .. warning::
 
-   Stable 1.0.0 metadata is prepared; release qualification remains required. It is not affiliated with the Python
-   Software Foundation and is not published to PyPI or crates.io. Install it
-   from this repository's release assets or source. Historical
+   The Python distribution is not published to PyPI. Its complete stable
+   artifact set remains unqualified after a PyPy compatibility failure;
+   the Rust release does not qualify Python wheels. It is not affiliated with
+   the Python Software Foundation. Python beta assets and source builds remain
+   available. Historical
    `Windows TLS issue #1 <https://github.com/puneet-chandna/requests-native/issues/1>`_
    remains open. Stable releases must pass strict qualification on current
    supported Windows runners with no accepted TLS failures. The historical
    beta exception does not apply to stable releases. Follow :ref:`install`
    and test your own workload before production use.
 
-The Python distribution is ``requests-native`` version ``1.0.0``. Its
+The Python distribution has ``requests-native`` version ``1.0.0`` metadata. Its
 drop-in import remains ``requests`` and reports compatibility version
 ``2.34.2``. The Rust package version is ``1.0.0``. The existing GitHub beta tag
 retains its original ``1.0.0b1`` / ``1.0.0-beta.1`` archives and manifest.

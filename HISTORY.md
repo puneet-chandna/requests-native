@@ -1,14 +1,23 @@
 Release History
 ===============
 
-Requests Native 1.0.0 / Cargo 1.0.0 (unreleased)
------------------------------------------------
+Requests Native Rust core 1.0.0 (2026-10-07 UTC)
+------------------------------------------------
 
-- Prepared stable Python and Cargo distribution metadata; the import API and
+- Published the stable async/blocking Rust core on crates.io from immutable
+  source `c1087413e54b7817a05d4080c3aaeca8e5c27db0`, with Rust 1.98.1 as the
+  supported compiler floor. Canonical legal notices and exact package bytes
+  were validated before and after protected publication.
+- Qualified five complete core performance pairs with no confirmed native
+  regression and all native median cost estimates within the 20% budget.
+  Statistical uncertainty was accepted with a visible warning; no parity or
+  superiority claim is made. The unchanged decision and intervals remain in
+  the retained evidence and release-readiness document.
+- Python publication remains deferred: the complete stable platform artifact
+  set is unqualified after a PyPy compatibility failure.
+- Retained stable Python distribution metadata; the import API and
   compatibility version remain ``requests`` / ``2.34.2``.
-- Enabled core crate publication eligibility while keeping the Python binding
-  crate private. Registry publication and exact-commit release qualification
-  remain separate steps.
+- Kept the Python binding crate private.
 - Preserved the original beta archives, validation manifest and history.
 
 

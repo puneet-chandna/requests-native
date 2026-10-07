@@ -4,12 +4,29 @@ Release process
 ===============
 
 Requests Native releases belong to the independent rewrite, not PSF Requests.
-The current beta is distributed on GitHub. Python registry publication is
-deferred; the first stable Rust core is being qualified for crates.io.
-The stable candidate Python distribution and Cargo package are
-``requests-native`` version ``1.0.0``. Metadata alone does not qualify a release.
+The stable Rust core ``requests-native`` version ``1.0.0`` is published on
+`crates.io <https://crates.io/crates/requests-native/1.0.0>`_. Python registry
+publication is deferred; its complete stable artifact set remains unqualified
+after a PyPy compatibility failure. The existing Python beta is distributed on
+GitHub. Stable Python metadata alone does not qualify a release.
 The installed Python import remains ``requests`` and ``requests.__version__`` remains
 ``2.34.2`` as the compatibility baseline.
+
+Published Rust core
+-------------------
+
+Protected publication
+`37667367591 <https://github.com/puneet-chandna/requests-native/actions/runs/37667367591>`_
+completed on 2026-10-07 at 19:05 UTC. The immutable package source is
+``c1087413e54b7817a05d4080c3aaeca8e5c27db0``; Rust 1.98.1 is the supported
+compiler floor. The registry archive is 199,704 bytes and its SHA256 matches
+the qualified package:
+``43170f424e6ec6c63939367d7680dde58a28a2fbf81f434daecf825bc78b1cbf``.
+Source tests, locked publish dry run, exact-source/legal checks, extracted
+archive tests and complete core performance recomputation preceded upload.
+The owner approved the protected deployment; the workflow then verified the
+public registry checksum. Later main documentation updates do not change this
+released source or its package bytes.
 
 Current beta
 ------------
@@ -155,8 +172,8 @@ requires reviewer approval and the exact ``main`` branch before any step runs;
 the token is repository-scoped, not an environment secret. Do not paste it into
 chat or commit it. The job runs a locked publish dry run and the extracted
 archive's unit tests before exposing the token to the upload step. Only the core
-crate publishes; the Python binding remains private. After the first release,
-revoke the bootstrap token and configure a Trusted Publisher for subsequent
+crate publishes; the Python binding remains private. The first release has
+completed. Revoke the bootstrap token and configure a Trusted Publisher for subsequent
 releases. Account and publisher configuration do not declare the candidate ready.
 
 Python package metadata intentionally omits aggregate ``License`` and

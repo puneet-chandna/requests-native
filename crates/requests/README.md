@@ -4,14 +4,15 @@
   <h1>Requests Native</h1>
   <h3>The familiar <code>requests</code> API, backed by native Rust.</h3>
   <p>
-    <!-- Release badge: current GitHub release is a prerelease (v1.0.0-beta), so shields.io reports repo not found. Restore when a stable release exists. -->
-    <!-- <img src="https://img.shields.io/github/v/release/puneet-chandna/requests-native?display_name=tag&label=release&color=111827" alt="Release"> -->
-    <img src="https://img.shields.io/badge/status-1.0_candidate-f59e0b" alt="1.0 candidate">
+    <img src="https://img.shields.io/crates/v/requests-native?label=Rust%20core&color=111827" alt="Rust core release">
+    <img src="https://img.shields.io/badge/Python-publication_deferred-f59e0b" alt="Python publication deferred">
     <img src="https://img.shields.io/badge/license-Apache--2.0-111827" alt="Apache 2.0">
     <img src="https://img.shields.io/github/stars/puneet-chandna/requests-native?style=flat&color=111827" alt="GitHub stars">
   </p>
   <p>
-    <a href="https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta">Download beta</a> ·
+    <a href="https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0">1.0.0 release</a> ·
+    <a href="https://crates.io/crates/requests-native/1.0.0">Rust crate</a> ·
+    <a href="https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta">Python beta</a> ·
     <a href="https://github.com/puneet-chandna/requests-native/issues">Issues</a> ·
     <a href="PORTING.md">Architecture &amp; Porting</a> ·
     <a href="API_COMPATIBILITY.tsv">Compatibility</a>
@@ -26,9 +27,9 @@
 
 
 
-> **1.0.0 release candidate.** Requests Native is an independent Rust rewrite targeting strict compatibility with Requests **2.34.2**. Stable metadata does not establish release qualification or registry availability. The existing beta has a known intermittent Windows TLS issue; stable qualification requires strict checks without that exception. It is not currently published to PyPI or crates.io.
+> **Rust core 1.0.0 is stable and published on crates.io.** Requests Native is an independent Rust rewrite targeting compatibility with Requests **2.34.2**. Python publication is deferred and the Python distribution is not published to PyPI. Its complete stable wheel matrix remains unqualified after a PyPy compatibility failure; the existing GitHub Python beta remains available with its disclosed Windows TLS issue.
 
-Normal installations require urllib3 2.8 or newer for its security fixes. The
+Python installations require urllib3 2.8 or newer for its security fixes. The
 urllib3 1.26 CI lane checks legacy behavior only and is outside the supported
 installation dependency range.
 
@@ -273,11 +274,11 @@ Requests Native also exposes its native Rust API directly.
 
 ## Add the crate
 
-The crate is currently consumed as a local path dependency:
+Use the published stable crate with Rust **1.98.1** or newer:
 
 ```toml
 [dependencies]
-requests-native = { path = "../requests-native/crates/requests" }
+requests-native = "1.0.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -293,7 +294,10 @@ and the Rust library is:
 requests_native
 ```
 
-It is currently **not published to crates.io**.
+The published crate is built from immutable source
+[`c1087413e54b7817a05d4080c3aaeca8e5c27db0`](https://github.com/puneet-chandna/requests-native/commit/c1087413e54b7817a05d4080c3aaeca8e5c27db0).
+Its SHA256 is `43170f424e6ec6c63939367d7680dde58a28a2fbf81f434daecf825bc78b1cbf`.
+Later documentation updates on main do not change those published bytes.
 
 ---
 
@@ -425,11 +429,15 @@ The goal is:
 
 
 
-# Beta Status
+# Release Status
 
-Requests Native is currently **beta software**.
+The native async and blocking Rust APIs are released as **1.0.0** on crates.io.
+The Python distribution remains unpublished on PyPI. Its stable artifact run
+passed all seven Windows lanes without accepted TLS failures, but failed a
+Linux PyPy compatibility check and did not produce a complete release set.
+The Rust release does not qualify the Python package.
 
-The `v1.0.0-beta` release contains:
+The existing Python `v1.0.0-beta` prerelease retains:
 
 - **23 platform wheels**
 - a source distribution
@@ -446,7 +454,7 @@ Some Windows HTTPS scenarios can experience connection or timeout failures, incl
 
 The shared cause, failure rate, and production impact are not yet established.
 
-This is a disclosed beta qualification — **not** a claim of complete Requests parity.
+This is a disclosed Python beta limitation; it is not a claim of complete Requests parity.
 
 If you're testing the project, please test your actual workload before considering it a production replacement.
 
@@ -455,6 +463,18 @@ If you're testing the project, please test your actual workload before consideri
 
 
 # Performance
+
+Rust 1.0.0 qualification used five complete local pairs against the immutable
+beta, with Python oracle controls and Rust async/blocking across 48 cases per
+report. No confirmed native regression was found, and all native median cost
+estimates stayed within the 20% budget. Samples and CPU/RSS evidence were
+sufficient. Statistical uncertainty and unstable oracle controls were accepted
+with a visible warning, without a performance parity or superiority claim.
+Namespace independently recomputed the retained evidence before publication.
+See [release readiness](docs/dev/release-readiness.md) for the unchanged raw
+decision, confidence intervals and exact provenance.
+
+### Historical beta measurement
 
 A controlled Linux loopback benchmark run on **September 13, 2026** produced the following median throughput:
 
@@ -533,9 +553,9 @@ The workspace is intentionally split so the Rust transport core does not depend 
 
 | Surface                                | Version / identity                 |
 | -------------------------------------- | ---------------------------------- |
-| Python distribution                    | `requests-native` — `1.0.0`        |
+| Python distribution                    | `requests-native` — `1.0.0` metadata; publication deferred |
 | Python import / compatibility baseline | `requests` — `2.34.2`              |
-| Rust package                           | `requests-native` — `1.0.0`        |
+| Rust package                           | `requests-native` — `1.0.0`, published on crates.io |
 | Rust library                           | `requests_native`                  |
 | Existing GitHub beta                   | `v1.0.0-beta`                      |
 

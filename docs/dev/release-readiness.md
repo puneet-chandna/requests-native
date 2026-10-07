@@ -1,10 +1,52 @@
-# Requests Native 1.0.0 readiness
+# Requests Native 1.0.0 release status and readiness history
 
-Audit date: 2026-10-07. Development remains on main. The owner has approved pushing the reviewed
-changes and running remote qualification; the candidate is not yet stable.
-Validation now proceeds locally first to limit runner cost. Do not repeatedly
-dispatch paid CI while local source, packaging and benchmark checks can resolve
-the problem; batch validated changes before any necessary platform qualification.
+## Published Rust core
+
+Status updated: 2026-10-08. Rust crate [`requests-native` 1.0.0](https://crates.io/crates/requests-native/1.0.0)
+is stable and published from immutable source
+`c1087413e54b7817a05d4080c3aaeca8e5c27db0`. The supported Rust compiler floor is
+1.98.1. [Protected publication 37667367591](https://github.com/puneet-chandna/requests-native/actions/runs/37667367591)
+succeeded after owner review, with the registry checksum matching the qualified
+199,704-byte archive: `43170f424e6ec6c63939367d7680dde58a28a2fbf81f434daecf825bc78b1cbf`.
+
+- [Exact-source Tests 37602576382](https://github.com/puneet-chandna/requests-native/actions/runs/37602576382)
+  passed 2,929 rewrite/differential tests with 10 skips on Namespace.
+- The locked Cargo dry run, archive source/metadata/legal checks and all 112
+  extracted-core tests passed. Fresh local Cargo audit found no known
+  vulnerabilities; the recorded maintenance/yanked-package warnings remain.
+- Core performance used driver `b51b43005239ed1be632b7f570daa2f991860e49`, beta
+  `2146b22ed25951a5483cbb13d69dc551f99ff352` and c108: five complete local pairs,
+  10 reports, 48 cases per report (480 rows), with Python oracle controls and
+  native Rust async/blocking. Samples and CPU/RSS evidence are sufficient.
+  The unchanged result is **inconclusive**: 148 metrics passed, 47 were
+  inconclusive and none showed a confirmed regression; oracle controls are
+  unstable. The approved warning policy makes no parity or superiority claim.
+  Namespace recomputed the exact reports before publishing; it did not repeat
+  or relabel the local measurement as a CI benchmark.
+- The unchanged reports, comparison and local-origin metadata are committed in
+  [`core-1.0.0-c108.tar.gz`](../../benchmarks/release-evidence/core-1.0.0-c108.tar.gz),
+  5,733,313 bytes, SHA256
+  `fafe8c5c0b5075485617058481d2efd0b1792d0f66b8d62658f0edd023ee42bf`.
+
+## Python publication remains deferred
+
+The Python distribution is not published to PyPI. Its `1.0.0` metadata and
+`requests.__version__ == 2.34.2` remain distinct. The c108
+[artifact run 37602930857](https://github.com/puneet-chandna/requests-native/actions/runs/37602930857)
+passed all seven Windows lanes without accepted TLS failures, but failed a
+Linux PyPy compatibility check and cancelled the remaining fan-out; no complete
+stable Python artifact set exists. The independent Rust release does not
+qualify Python artifacts. The immutable GitHub beta remains available, with
+historical [Windows issue #1](https://github.com/puneet-chandna/requests-native/issues/1)
+still open. The earlier full-scope remote performance run also remains failed
+and incomplete; it is not the evidence used for this core release.
+
+## Historical audit snapshots
+
+The sections below retain preparation evidence and decisions from 2026-10-07
+and earlier. Their pending-work statements and earlier source identities are
+historical; the published-core and deferred-Python status above supersedes them.
+Earlier measurements do not automatically qualify later source commits.
 
 ## Measured native Rust gains
 
@@ -194,7 +236,7 @@ these as separate maintenance changes with fresh compatibility qualification.
   deselected. Twine strict, actionlint, Ruff, Rust formatting and Windows
   harness self-check passed. These checks are local Linux evidence.
 
-## Current correctness qualification
+## Historical correctness qualification
 
 At `757dd9bc3021b71fdbf0edb325c3b43525d62b30`,
 [source CI 37545318501](https://github.com/puneet-chandna/requests-native/actions/runs/37545318501)
@@ -222,7 +264,7 @@ The ledger-closure commit `63f04bc58cb5228383d087da5131d0ffdd0d24f4`
 also passed [source CI 37548904822](https://github.com/puneet-chandna/requests-native/actions/runs/37548904822)
 with 2,862 tests, 10 skips and a clean exit, plus lint and security workflows.
 
-## Work still required before declaring 1.0.0
+## Historical work required before publication
 
 At `29ef0b6`, local loopback probes confirmed that the native raw object rejected
 `response.raw.url = response.url` and replacement of `response.raw.read`.

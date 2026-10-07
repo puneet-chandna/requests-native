@@ -638,7 +638,7 @@ def test_notice_closes_curated_and_runtime_attribution_requirements() -> None:
 
 def test_history_separates_derivative_release_from_preserved_upstream_history() -> None:
     history = (ROOT / "HISTORY.md").read_text(encoding="utf-8")
-    derivative = history.index("Requests Native 1.0.0 / Cargo 1.0.0")
+    derivative = history.index("Requests Native Rust core 1.0.0")
     beta = history.index("Requests Native 1.0.0b1")
     boundary = history.index("Preserved upstream Requests history")
     upstream = history.index("2.34.2 (2026-05-14)")

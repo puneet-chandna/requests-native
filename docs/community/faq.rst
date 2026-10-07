@@ -15,16 +15,17 @@ at `github.com/psf/requests <https://github.com/psf/requests>`_.
 Can I install it from PyPI?
 ---------------------------
 
-No. Requests Native is not published to PyPI or crates.io. Install a wheel from
-the GitHub beta release or build from source by following :ref:`install`.
-There is no ``requests-native`` package on PyPI maintained by this project.
+No. Python publication is deferred and the Python distribution is not published
+to PyPI. The Rust core ``requests-native`` version ``1.0.0`` is stable and
+published on `crates.io <https://crates.io/crates/requests-native/1.0.0>`_. See
+:ref:`install` for the Rust dependency, Python beta wheels and source builds.
 
 Why does it report version 2.34.2?
 ----------------------------------
 
 The import surface reports ``requests.__version__ == "2.34.2"`` for strict
 compatibility. The distinct ``requests-native`` distribution uses version
-``1.0.0`` as a stable candidate, and the Cargo package uses ``1.0.0``.
+``1.0.0`` metadata; the published Cargo package uses ``1.0.0``.
 The existing ``v1.0.0-beta`` release retains its original ``1.0.0b1`` /
 ``1.0.0-beta.1`` archives and manifest.
 

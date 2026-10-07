@@ -5,10 +5,25 @@
 Installing Requests Native
 ==========================
 
-Requests Native has stable candidate 1.0.0 metadata and is not published to PyPI
-or crates.io. Stable release qualification remains required.
-The distribution is named ``requests-native`` while its drop-in import remains
-``requests`` for compatibility.
+The Rust core ``requests-native`` version ``1.0.0`` is published on crates.io.
+Python publication is deferred and the Python distribution is not published to PyPI.
+Its complete stable artifact set remains unqualified after a PyPy compatibility
+failure. The Python distribution is named ``requests-native`` while its drop-in
+import remains ``requests`` for compatibility.
+
+Install the stable Rust crate
+-----------------------------
+
+Use Rust 1.98.1 or newer and add this dependency to ``Cargo.toml``::
+
+    [dependencies]
+    requests-native = "1.0.0"
+
+The Rust import is ``requests_native``. Async clients use Tokio; the blocking
+client is available with the default features. See the repository README for
+examples. The published source is
+``c1087413e54b7817a05d4080c3aaeca8e5c27db0``; later main documentation does not
+change the released crate.
 
 Install the beta wheel
 -----------------------
@@ -42,8 +57,8 @@ The beta includes an unresolved `Windows TLS issue
 <https://github.com/puneet-chandna/requests-native/issues/1>`_. Test your own
 workload before considering production use.
 
-Build from source
------------------
+Build Python from source
+------------------------
 
 Install Python 3.10 or later, Rust, and Maturin, then build from this
 repository::
