@@ -117,6 +117,7 @@ jobs:
       env:
         REQUESTS_ORACLE_ROOT: ${{ github.workspace }}/frozen-oracle
       run: |
+        export RUSTUP_TOOLCHAIN="$(python -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
         python -m pytest -q tests_rust tests_differential
 
   no_chardet:
