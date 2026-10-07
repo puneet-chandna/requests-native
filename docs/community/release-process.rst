@@ -96,18 +96,34 @@ bypass this publication gate.
 The separate ``Qualify and publish immutable stable core`` workflow qualifies
 only the Rust core at ``c1087413e54b7817a05d4080c3aaeca8e5c27db0``. It does not
 require Python wheels or an sdist and does not authorize Python publication.
-Its source Tests run must identify that exact commit. Its performance run must
-identify the current clean evaluator driver commit separately and explicitly
-use ``core`` scope: Python oracle controls plus Rust async and blocking across
-all 48 cases, with at least five complete pairs and the same CPU/RSS, fixture,
-source, evaluator and confirmed-regression checks. ``full`` remains the default
-for Python plus Rust qualification. Core qualification makes no Python parity
-or performance claim. The workflow packages the immutable core source,
-checks canonical notices and metadata, tests the extracted archive, and retains
-its digest for owner review before the protected upload job. Repackaging must
-match those bytes, and the public registry checksum is checked after upload.
-``publish`` defaults to false; registry upload requires an explicit dispatch
-and the owner's ``crates-io`` environment approval.
+Its source Tests run must identify that exact commit. The owner approved using
+complete locally measured ``core`` evidence, with Python oracle controls plus
+Rust async and blocking across all 48 cases and five complete pairs. The
+unchanged ten reports, comparison and explicit local-origin metadata are
+committed at ``benchmarks/release-evidence/core-1.0.0-c108.tar.gz``. The bounded
+archive is 5,733,313 bytes, with SHA256
+``fafe8c5c0b5075485617058481d2efd0b1792d0f66b8d62658f0edd023ee42bf``.
+Its fixed evaluator is ``b51b43005239ed1be632b7f570daa2f991860e49``; the workflow
+verifies that driver is an ancestor of the current ``main`` evidence commit.
+It checks exact archive bytes and inventory, local origin and source identities,
+then recomputes the unchanged core decision using that driver's evaluator.
+This Namespace job validates local measurements; it does not claim a successful
+Actions benchmark run. The earlier incomplete full-scope remote run remains
+failed and is excluded from qualification.
+
+The raw local result remains ``inconclusive``: 148 metrics passed, 47 were
+inconclusive and none showed a confirmed regression. Samples and CPU/RSS
+evidence are sufficient, but oracle controls are unstable. The approved warning
+policy applies without a parity or superiority claim. ``full`` remains the
+default for Python plus Rust qualification; core evidence makes no Python
+qualification claim. The workflow packages the immutable core source, checks
+canonical notices and metadata, tests the extracted archive, and retains its
+digest and explicit local-evidence/Namespace-validation provenance before the
+protected upload job. Package bytes must match SHA256
+``43170f424e6ec6c63939367d7680dde58a28a2fbf81f434daecf825bc78b1cbf``;
+repackaging and the public registry checksum are also checked. ``publish``
+defaults to false. One explicit dispatch may validate and then pause for the
+owner's ``crates-io`` approval after the actual package digest is reviewed.
 
 Before an upload job can start, the workflow verifies that its GitHub environment
 exists, requires a human reviewer and permits only the ``main`` branch. Configure

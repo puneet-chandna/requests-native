@@ -8,10 +8,6 @@ on:
         description: "Successful c1087413 Tests run"
         type: string
         required: true
-      performance_run_id:
-        description: "Successful core-scope c1087413 performance run using this workflow commit as driver"
-        type: string
-        required: true
       publish:
         description: "Publish after qualified digest review and crates-io environment approval"
         type: boolean
@@ -23,7 +19,12 @@ permissions:
 env:
   SOURCE_SHA: c1087413e54b7817a05d4080c3aaeca8e5c27db0
   RUSTUP_TOOLCHAIN: "1.98.1"
-  DRIVER_SHA: ${{ github.sha }}
+  DRIVER_SHA: b51b43005239ed1be632b7f570daa2f991860e49
+  EVALUATOR_SHA256: bcc89aa8637084a72c72b7caa6b6a1d72f0eb7fde6f2f4bf9e1b56bcabf44955
+  EVIDENCE_PATH: benchmarks/release-evidence/core-1.0.0-c108.tar.gz
+  EVIDENCE_SHA256: fafe8c5c0b5075485617058481d2efd0b1792d0f66b8d62658f0edd023ee42bf
+  EVIDENCE_BYTES: "5733313"
+  CORE_SHA256: 43170f424e6ec6c63939367d7680dde58a28a2fbf81f434daecf825bc78b1cbf
 
 concurrency:
   group: immutable-stable-core-publication
@@ -43,28 +44,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN: ${{ inputs.source_run_id }}
-          PERFORMANCE_RUN: ${{ inputs.performance_run_id }}
         shell: bash
         run: |
           [[ "$GITHUB_REPOSITORY" == puneet-chandna/requests-native ]]
-          [[ "$GITHUB_REF" == refs/heads/main && "$DRIVER_SHA" == "$GITHUB_SHA" ]]
-          for qualification in "$SOURCE_RUN:.github/workflows/run-tests.yml" "$PERFORMANCE_RUN:.github/workflows/evaluate.yml"; do
-            run_id=${qualification%%:*}
-            workflow=${qualification#*:}
-            [[ "$run_id" =~ ^[0-9]+$ ]]
-            expected_sha=$SOURCE_SHA
-            expected_event=push
-            if [[ "$workflow" == .github/workflows/evaluate.yml ]]; then
-              expected_sha=$DRIVER_SHA
-              expected_event=workflow_dispatch
-            fi
-            gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id" | jq -e \
-              --arg repo "$GITHUB_REPOSITORY" --arg sha "$expected_sha" --arg workflow "$workflow" --arg event "$expected_event" '
-                .head_repository.full_name == $repo and .head_sha == $sha and
-                .head_branch == "main" and .path == $workflow and
-                .event == $event and
-                .status == "completed" and .conclusion == "success"'
-          done
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" | jq -e \
+            --arg repo "$GITHUB_REPOSITORY" --arg sha "$SOURCE_SHA" '
+              .head_repository.full_name == $repo and .head_sha == $sha and
+              .head_branch == "main" and .path == ".github/workflows/run-tests.yml" and
+              .event == "push" and .status == "completed" and .conclusion == "success"'
           gh api "/repos/$GITHUB_REPOSITORY/environments/crates-io" | jq -e '
             any(.protection_rules[]; .type == "required_reviewers" and
               any(.reviewers[]; .type == "User" and .reviewer.id == 121252460)) and
@@ -75,43 +64,88 @@ jobs:
       - name: Check out the immutable evaluator driver
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.DRIVER_SHA }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.14"
       - name: Install the pinned evaluator requirement
         run: python -m pip install "packaging==26.3"
-      - name: Download qualified performance evidence
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
-        with:
-          name: performance-evidence
-          path: performance-evidence
-          github-token: ${{ github.token }}
-          run-id: ${{ inputs.performance_run_id }}
+      - name: Verify and extract the approved local evidence from main
+        shell: bash
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$DRIVER_SHA" ]]
+          git merge-base --is-ancestor "$DRIVER_SHA" "$GITHUB_SHA"
+          git show "$GITHUB_SHA:$EVIDENCE_PATH" > "$RUNNER_TEMP/core-evidence.tar.gz"
+          python - <<'PY'
+          import hashlib
+          import os
+          import tarfile
+          from pathlib import Path
+
+          archive = Path(os.environ["RUNNER_TEMP"]) / "core-evidence.tar.gz"
+          assert archive.stat().st_size == int(os.environ["EVIDENCE_BYTES"]), "Unapproved evidence size"
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == os.environ["EVIDENCE_SHA256"], "Unapproved evidence hash"
+          expected = {"comparison.json", "local-origin.json"} | {
+              f"pair-{pair:02}-{side}.json" for pair in range(1, 6) for side in ("base", "candidate")
+          }
+          with tarfile.open(archive, "r:gz") as data:
+              members = data.getmembers()
+              assert len(members) == 12 and {member.name for member in members} == expected, "Unexpected evidence inventory"
+              assert all(member.isfile() and member.size <= 3_000_000 for member in members), "Evidence requires bounded regular files"
+              evidence = Path("performance-evidence")
+              evidence.mkdir()
+              for member in members:
+                  (evidence / member.name).write_bytes(data.extractfile(member).read())
+          PY
       - name: Recompute immutable-source performance qualification
         run: |
           python - <<'PY'
           import json
           import os
+          from collections import Counter
           from pathlib import Path
           from benchmarks.evaluate import compare_pairs, evaluator_digest
 
           evidence = Path("performance-evidence")
+          origin = json.loads((evidence / "local-origin.json").read_text())
+          assert origin["schema_version"] == 1 and origin["evidence_origin"] == "local"
+          assert origin["source_commit"] == os.environ["SOURCE_SHA"]
+          assert origin["baseline_commit"] == "2146b22ed25951a5483cbb13d69dc551f99ff352"
+          assert origin["evaluator_commit"] == os.environ["DRIVER_SHA"]
+          assert origin["evaluator_sha256"] == evaluator_digest() == os.environ["EVALUATOR_SHA256"]
+          assert origin["qualification_scope"] == "core" and origin["pairs"] == 5 and origin["cases_per_report"] == 48
+          plan = origin["fixed_plan"]
+          assert plan["adaptive_retries"] == 0 and plan["budget_percent"] == 20.0 and plan["bootstrap_confidence_percent"] == 95
+          assert plan["offline_locked_builds"] is True and plan["case_timeout_seconds"] == 120.0
           bases = sorted(evidence.glob("pair-*-base.json"))
           candidates = sorted(evidence.glob("pair-*-candidate.json"))
-          assert candidates == [path.with_name(path.name.replace("-base.json", "-candidate.json")) for path in bases]
+          assert len(bases) == 5 and candidates == [path.with_name(path.name.replace("-base.json", "-candidate.json")) for path in bases]
           pairs = [(json.loads(base.read_text()), json.loads(candidate.read_text())) for base, candidate in zip(bases, candidates)]
           assert all(report["evaluator_sha256"] == evaluator_digest() for pair in pairs for report in pair)
           assert all(pair[0]["git"]["rewrite_commit"] == "2146b22ed25951a5483cbb13d69dc551f99ff352" for pair in pairs), "The first stable release must use the immutable beta baseline"
           assert all(report["evaluator_commit"] == os.environ["DRIVER_SHA"] for pair in pairs for report in pair)
-          assert all(report["config"]["qualification_scope"] == "core" for pair in pairs for report in pair)
+          assert all(report["config"]["qualification_scope"] == "core" and len(report["results"]) == 48 for pair in pairs for report in pair)
+          assert all(report["machine"] == origin["machine"] and report["toolchains"] == origin["toolchains"] for pair in pairs for report in pair)
+          config = pairs[0][0]["config"]
+          for key in ("body_checksum", "concurrency_levels", "warmup_per_worker", "small_bytes", "large_bytes", "stream_chunk_bytes"):
+              assert config[key] == plan[key], key
+          assert config["requests_per_case"] == plan["requests_per_case_default"] == 100
+          assert {surface: config["requests_per_surface"][surface] for surface in config["surfaces"]} == plan["requests_per_surface"]
           result = compare_pairs(pairs, budget=0.20, gate=True, scope="core")
           assert result["qualification_scope"] == "core" and result["evaluator_commit"] == os.environ["DRIVER_SHA"]
           assert result["sources"][1] == os.environ["SOURCE_SHA"]
           assert json.loads((evidence / "comparison.json").read_text()) == {**result, "smoke_only": False}
           assert result["status"] in ("passed", "inconclusive") and not result["insufficient_release_evidence"]
           assert all(metric["case"][0] == "python-oracle" or metric["status"] != "regression" for metric in result["metrics"]), "Confirmed native performance regressions block publication even when controls are unstable"
+          assert origin["statistical_status"] == result["status"]
+          assert origin["final_exit_code"] == (0 if result["status"] == "passed" else 1)
+          assert origin["insufficient_release_evidence"] is result["insufficient_release_evidence"]
+          assert origin["oracle_control_unstable"] is result["oracle_control_unstable"]
+          counts = Counter(metric["status"] for metric in result["metrics"])
+          assert origin["metric_status_counts"] == {status: counts[status] for status in ("passed", "inconclusive", "regression")}
+          print("Revalidated locally measured core evidence; this job is not a CI benchmark measurement.")
           if result["status"] == "inconclusive":
               print("::warning::Complete performance evidence is inconclusive; release policy permits publication without a performance parity or superiority claim. See comparison.json for unchanged ratios, confidence intervals and control uncertainty.")
           PY
@@ -121,12 +155,13 @@ jobs:
           ref: ${{ env.SOURCE_SHA }}
           path: core-source
           persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Qualify exact core package and record digest
         id: package
         working-directory: core-source
         env:
           SOURCE_RUN: ${{ inputs.source_run_id }}
-          PERFORMANCE_RUN: ${{ inputs.performance_run_id }}
           CARGO_TARGET_DIR: ${{ runner.temp }}/core-target
         shell: bash
         run: |
@@ -180,8 +215,11 @@ jobs:
           assert all(package in locked for package in tomllib.loads(contents["Cargo.lock"].decode())["package"]), "Packaged dependencies differ from the qualified lock"
           assert all(b"/home/puneet/" not in value and b"/Users/" not in value for value in contents.values())
           digest = hashlib.sha256(crate.read_bytes()).hexdigest()
+          assert digest == os.environ["CORE_SHA256"], "Core package differs from the reviewed qualified bytes"
           manifest = {"source_sha": sha, "sha256": digest, "filename": crate.name,
-                      "source_run_id": os.environ["SOURCE_RUN"], "performance_run_id": os.environ["PERFORMANCE_RUN"],
+                      "source_run_id": os.environ["SOURCE_RUN"],
+                      "evidence_origin": "local", "evidence_archive_sha256": os.environ["EVIDENCE_SHA256"],
+                      "evidence_commit": os.environ["GITHUB_SHA"], "qualification_run_id": os.environ["GITHUB_RUN_ID"],
                       "rust_toolchain": os.environ["RUSTUP_TOOLCHAIN"],
                       "evaluator_commit": os.environ["DRIVER_SHA"], "qualification_scope": "core"}
           Path("qualified-core/manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
@@ -221,6 +259,8 @@ jobs:
         with:
           name: qualified-core
           path: qualified-core
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Verify qualified bytes before token exposure
         env:
           QUALIFIED_SHA256: ${{ needs.qualify.outputs.sha256 }}
@@ -229,11 +269,14 @@ jobs:
         run: |
           [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
           [[ -z "$(git status --porcelain --untracked-files=no)" ]]
-          [[ "$QUALIFIED_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          jq -e --arg sha "$SOURCE_SHA" --arg digest "$QUALIFIED_SHA256" --arg driver "$DRIVER_SHA" '
+          [[ "$QUALIFIED_SHA256" =~ ^[0-9a-f]{64}$ && "$QUALIFIED_SHA256" == "$CORE_SHA256" ]]
+          jq -e --arg sha "$SOURCE_SHA" --arg digest "$QUALIFIED_SHA256" --arg driver "$DRIVER_SHA" \
+            --arg evidence "$EVIDENCE_SHA256" --arg commit "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" '
             .source_sha == $sha and .sha256 == $digest and
             .filename == "requests-native-1.0.0.crate" and .rust_toolchain == "1.98.1" and
-            .evaluator_commit == $driver and .qualification_scope == "core"' qualified-core/manifest.json
+            .evaluator_commit == $driver and .qualification_scope == "core" and
+            .evidence_origin == "local" and .evidence_archive_sha256 == $evidence and
+            .evidence_commit == $commit and .qualification_run_id == $run' qualified-core/manifest.json
           echo "$QUALIFIED_SHA256  qualified-core/requests-native-1.0.0.crate" | sha256sum --check --strict
           export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$SOURCE_SHA")
           cargo package -p requests-native --locked --no-verify

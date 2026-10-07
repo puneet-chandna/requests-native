@@ -2183,12 +2183,16 @@ def _check_publication_preflight(tmp_path: Path, workflow: str) -> None:
         "pull-request-event",
         "input-injection",
     ):
+        if core and change == "different-driver":
+            continue
         records = copy.deepcopy(original)
         trial = dict(env)
         if change == "source-sha":
             records[repo + "/actions/runs/101"]["head_sha"] = "b" * 40
         elif change == "performance-failure":
-            records[repo + "/actions/runs/102"]["conclusion"] = "failure"
+            records[repo + "/actions/runs/101" if core else repo + "/actions/runs/102"][
+                "conclusion"
+            ] = "failure"
         elif change == "unreviewed":
             records[repo + "/environments/" + protected_environment][
                 "protection_rules"
@@ -2213,7 +2217,9 @@ def _check_publication_preflight(tmp_path: Path, workflow: str) -> None:
                 "other/fork"
             )
         elif change == "pull-request-event":
-            records[repo + "/actions/runs/102"]["event"] = "pull_request"
+            records[repo + "/actions/runs/101" if core else repo + "/actions/runs/102"][
+                "event"
+            ] = "pull_request"
         elif change == "input-injection":
             trial["SOURCE_RUN"] = "101; true"
         trial["FAKE_GITHUB"] = json.dumps(records)
@@ -2332,6 +2338,10 @@ def test_core_upload_rejects_changed_digest_driver_and_scope_before_token_exposu
         "rust_toolchain": "1.98.1",
         "evaluator_commit": driver,
         "qualification_scope": "core",
+        "evidence_origin": "local",
+        "evidence_archive_sha256": "f" * 64,
+        "evidence_commit": "e" * 40,
+        "qualification_run_id": "303",
     }
     tools = tmp_path / "bin"
     tools.mkdir()
@@ -2353,6 +2363,10 @@ def test_core_upload_rejects_changed_digest_driver_and_scope_before_token_exposu
         "SOURCE_SHA": sha,
         "DRIVER_SHA": driver,
         "QUALIFIED_SHA256": digest,
+        "CORE_SHA256": digest,
+        "EVIDENCE_SHA256": "f" * 64,
+        "GITHUB_SHA": "e" * 40,
+        "GITHUB_RUN_ID": "303",
         "CARGO_TARGET_DIR": str(tmp_path / "target"),
     }
     for change in (
@@ -2364,6 +2378,10 @@ def test_core_upload_rejects_changed_digest_driver_and_scope_before_token_exposu
         "archive",
         "filename",
         "toolchain",
+        "origin",
+        "evidence",
+        "commit",
+        "run",
     ):
         manifest = dict(original)
         archive.write_bytes(b"qualified archive bytes")
@@ -2381,6 +2399,14 @@ def test_core_upload_rejects_changed_digest_driver_and_scope_before_token_exposu
             manifest["filename"] = "other.crate"
         elif change == "toolchain":
             manifest["rust_toolchain"] = "stable"
+        elif change == "origin":
+            manifest["evidence_origin"] = "ci"
+        elif change == "evidence":
+            manifest["evidence_archive_sha256"] = "b" * 64
+        elif change == "commit":
+            manifest["evidence_commit"] = "b" * 40
+        elif change == "run":
+            manifest["qualification_run_id"] = "404"
         (qualified / "manifest.json").write_text(json.dumps(manifest))
         marker = tmp_path / "cargo-entered"
         marker.unlink(missing_ok=True)
@@ -2397,10 +2423,108 @@ def test_core_upload_rejects_changed_digest_driver_and_scope_before_token_exposu
         )
 
 
+def test_local_core_evidence_handoff_rejects_archive_tampering_and_bad_ancestry(
+    tmp_path: Path,
+) -> None:
+    workflow = load_workflow("publish-crate.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["qualify"]["steps"]
+        if step.get("name")
+        == "Verify and extract the approved local evidence from main"
+    )
+    names = {"comparison.json", "local-origin.json"} | {
+        f"pair-{pair:02}-{side}.json"
+        for pair in range(1, 6)
+        for side in ("base", "candidate")
+    }
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    git = tools / "git"
+    git.write_text(
+        "#!"
+        + sys.executable
+        + "\nimport os,sys\na=sys.argv[1:]\nif a==['rev-parse','HEAD']: print(os.environ['DRIVER_SHA'])\nelif a==['merge-base','--is-ancestor',os.environ['DRIVER_SHA'],os.environ['GITHUB_SHA']]: sys.exit(1 if os.environ['FAIL_ANCESTRY']=='true' else 0)\nelif a==['show',os.environ['GITHUB_SHA']+':'+os.environ['EVIDENCE_PATH']]: sys.stdout.buffer.write(open(os.environ['TEST_ARCHIVE'],'rb').read())\nelse: sys.exit(2)\n"
+    )
+    git.chmod(0o755)
+    (tools / "python").symlink_to(sys.executable)
+    for change in (
+        "valid",
+        "hash",
+        "size",
+        "missing",
+        "extra",
+        "duplicate",
+        "link",
+        "traversal",
+        "large-member",
+        "ancestry",
+    ):
+        trial = tmp_path / change
+        trial.mkdir()
+        archive = trial / "input.tar.gz"
+        with tarfile.open(archive, "w:gz") as data:
+            selected = sorted(names)
+            if change == "missing":
+                selected.pop()
+            if change == "extra":
+                selected.append("unexpected.json")
+            if change == "duplicate":
+                selected.append("comparison.json")
+            if change == "traversal":
+                selected[0] = "../comparison.json"
+            for index, name in enumerate(selected):
+                member = tarfile.TarInfo(name)
+                content = b"{}"
+                if change == "large-member" and index == 0:
+                    content = b"x" * 3_000_001
+                if change == "link" and index == 0:
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = "outside"
+                    data.addfile(member)
+                else:
+                    member.size = len(content)
+                    data.addfile(member, io.BytesIO(content))
+        env = {
+            **os.environ,
+            **workflow["env"],
+            "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+            "GITHUB_SHA": "e" * 40,
+            "RUNNER_TEMP": str(trial),
+            "TEST_ARCHIVE": str(archive),
+            "FAIL_ANCESTRY": "true" if change == "ancestry" else "false",
+            "EVIDENCE_BYTES": str(archive.stat().st_size),
+            "EVIDENCE_SHA256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        }
+        if change == "hash":
+            env["EVIDENCE_SHA256"] = "b" * 64
+        if change == "size":
+            env["EVIDENCE_BYTES"] = str(archive.stat().st_size + 1)
+        result = subprocess.run(
+            ["bash", "-eo", "pipefail", "-c", step["run"]],
+            cwd=trial,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        assert (result.returncode == 0) is (change == "valid"), (change, result.stderr)
+        assert (trial / "performance-evidence").exists() is (change == "valid")
+
+
 def test_core_publication_separates_source_driver_and_protected_token() -> None:
     workflow = load_workflow("publish-crate.yml")
     assert workflow["env"]["SOURCE_SHA"] == "c1087413e54b7817a05d4080c3aaeca8e5c27db0"
-    assert workflow["env"]["DRIVER_SHA"] == "${{ github.sha }}"
+    assert workflow["env"]["DRIVER_SHA"] == "b51b43005239ed1be632b7f570daa2f991860e49"
+    assert (
+        workflow["env"]["EVIDENCE_SHA256"]
+        == "fafe8c5c0b5075485617058481d2efd0b1792d0f66b8d62658f0edd023ee42bf"
+    )
+    assert workflow["env"]["EVIDENCE_BYTES"] == "5733313"
+    assert (
+        workflow["env"]["CORE_SHA256"]
+        == "43170f424e6ec6c63939367d7680dde58a28a2fbf81f434daecf825bc78b1cbf"
+    )
+    assert "performance_run_id" not in workflow[True]["workflow_dispatch"]["inputs"]
     assert workflow["env"]["RUSTUP_TOOLCHAIN"] == "1.98.1"
     assert workflow[True]["workflow_dispatch"]["inputs"]["publish"]["default"] is False
     assert workflow["concurrency"]["cancel-in-progress"] is False
@@ -2409,7 +2533,8 @@ def test_core_publication_separates_source_driver_and_protected_token() -> None:
     checkouts = [
         step for step in jobs["qualify"]["steps"] if "checkout@" in step.get("uses", "")
     ]
-    assert checkouts[0]["with"]["ref"] == "${{ github.sha }}"
+    assert checkouts[0]["with"]["ref"] == "${{ env.DRIVER_SHA }}"
+    assert checkouts[0]["with"]["fetch-depth"] == 0
     assert checkouts[1]["with"] == {
         "ref": "${{ env.SOURCE_SHA }}",
         "path": "core-source",
@@ -2419,6 +2544,18 @@ def test_core_publication_separates_source_driver_and_protected_token() -> None:
     assert jobs["publish"]["environment"]["name"] == "crates-io"
     for job in jobs.values():
         assert job["runs-on"] == "namespace-profile-puneet-chandna"
+        steps = job["steps"]
+        installs = [
+            index
+            for index, step in enumerate(steps)
+            if step.get("run")
+            == 'rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal'
+        ]
+        assert len(installs) == 1
+        assert installs[0] < next(
+            index for index, step in enumerate(steps) if "cargo " in step.get("run", "")
+        )
+        assert "CRATES_IO_API_TOKEN" not in str(steps[installs[0]])
         assert all(
             step["with"]["persist-credentials"] is False
             for step in job["steps"]
@@ -2495,12 +2632,21 @@ def test_release_performance_acceptance_preserves_evidence_and_fails_closed(
             "different-driver",
             "wrong-scope",
             "different-baseline",
+            "origin",
+            "origin-source",
+            "origin-driver",
+            "origin-scope",
+            "origin-exit",
+            "origin-counts",
+            "origin-plan",
         ):
             if workflow == "publish.yml" and change in (
                 "different-driver",
                 "wrong-scope",
                 "different-baseline",
             ):
+                continue
+            if workflow != "publish-crate.yml" and change.startswith("origin"):
                 continue
             trial = tmp_path / workflow / change
             trial.mkdir(parents=True)
@@ -2568,6 +2714,23 @@ def _check_release_performance_acceptance(
                     for row in document["results"]
                     if row["surface"] != "python-rust"
                 ]
+                counts = {
+                    "python-oracle": 500,
+                    "python-rust": 100,
+                    "rust-async": 3000,
+                    "rust-blocking": 3000,
+                }
+                document["config"].update(
+                    requests_per_surface=counts,
+                    body_checksum="crc32",
+                    warmup_per_worker=8,
+                    small_bytes=128,
+                    large_bytes=262144,
+                    stream_chunk_bytes=16384,
+                )
+                for row in document["results"]:
+                    row["requests"] = counts[row["surface"]]
+                    row["latency_ns_samples"] *= row["requests"] // 100
             for row in document["results"]:
                 if change == "cpu":
                     row["cpu_seconds"] = 0.0
@@ -2581,6 +2744,73 @@ def _check_release_performance_acceptance(
         **compare_pairs(pairs, gate=True, scope=scope),
         "smoke_only": change == "smoke",
     }
+    if scope == "core":
+        from collections import Counter
+
+        config = pairs[0][0]["config"]
+        counts = Counter(metric["status"] for metric in comparison["metrics"])
+        origin = {
+            "schema_version": 1,
+            "evidence_origin": "local",
+            "source_commit": sha,
+            "baseline_commit": "2146b22ed25951a5483cbb13d69dc551f99ff352",
+            "evaluator_commit": "d" * 40,
+            "evaluator_sha256": evaluator_digest(),
+            "qualification_scope": "core",
+            "pairs": 5,
+            "cases_per_report": 48,
+            "machine": pairs[0][0]["machine"],
+            "toolchains": pairs[0][0]["toolchains"],
+            "statistical_status": comparison["status"],
+            "final_exit_code": 0 if comparison["status"] == "passed" else 1,
+            "insufficient_release_evidence": comparison[
+                "insufficient_release_evidence"
+            ],
+            "oracle_control_unstable": comparison["oracle_control_unstable"],
+            "metric_status_counts": {
+                status: counts[status]
+                for status in ("passed", "inconclusive", "regression")
+            },
+            "fixed_plan": {
+                key: config[key]
+                for key in (
+                    "body_checksum",
+                    "concurrency_levels",
+                    "warmup_per_worker",
+                    "small_bytes",
+                    "large_bytes",
+                    "stream_chunk_bytes",
+                    "requests_per_surface",
+                )
+            },
+        }
+        origin["fixed_plan"]["requests_per_surface"] = {
+            surface: config["requests_per_surface"][surface]
+            for surface in config["surfaces"]
+        }
+        origin["fixed_plan"].update(
+            adaptive_retries=0,
+            budget_percent=20.0,
+            bootstrap_confidence_percent=95,
+            offline_locked_builds=True,
+            case_timeout_seconds=120.0,
+            requests_per_case_default=100,
+        )
+        if change == "origin":
+            origin["evidence_origin"] = "ci"
+        elif change == "origin-source":
+            origin["source_commit"] = "b" * 40
+        elif change == "origin-driver":
+            origin["evaluator_commit"] = "e" * 40
+        elif change == "origin-scope":
+            origin["qualification_scope"] = "full"
+        elif change == "origin-exit":
+            origin["final_exit_code"] = 7
+        elif change == "origin-counts":
+            origin["metric_status_counts"]["passed"] = 999
+        elif change == "origin-plan":
+            origin["fixed_plan"]["adaptive_retries"] = 1
+        (evidence / "local-origin.json").write_text(json.dumps(origin))
     if change == "missing-case":
         pairs[-1][1]["results"].pop()
     if change == "different-source":
@@ -2621,6 +2851,7 @@ def _check_release_performance_acceptance(
             "CANDIDATE": sha,
             "DRIVER_SHA": "d" * 40,
             "SCOPE": scope,
+            "EVALUATOR_SHA256": evaluator_digest(),
             "EVALUATION_EXIT": "1" if change == "inconclusive" else "0",
         },
         text=True,
