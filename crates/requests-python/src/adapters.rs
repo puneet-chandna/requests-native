@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use pyo3::exceptions::{PyNameError, PyRuntimeError, PyTypeError};
+use pyo3::PyTraverseError;
+use pyo3::basic::CompareOp;
+use pyo3::exceptions::{PyNameError, PyRuntimeError, PyStopIteration, PyTypeError, PyValueError};
+use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -84,6 +87,8 @@ struct AdapterState {
     key_fn_by_scheme: MappingProof,
     methods: Vec<(String, BehaviorProof)>,
     globals: Vec<(String, BehaviorProof)>,
+    url_helper_dependencies: Vec<(Py<PyDict>, String, BehaviorProof)>,
+    url_helper_sequences: Vec<(String, SequenceProof)>,
     send_globals: Py<PyDict>,
     send_builtins: Py<PyDict>,
     exception_globals: Vec<AdapterGlobalProof>,
@@ -246,7 +251,7 @@ fn _adapter_fork_reset_trial() -> PyResult<()> {
 
 // Python GC may drop these owned, Send + Sync fields on any attached thread.
 // API access stays on the creator thread so decoder callbacks cannot migrate.
-#[pyclass(module = "requests._requests_rust")]
+#[pyclass(dict, module = "requests._requests_rust")]
 struct NativeAdapterRaw {
     origin_thread: std::thread::ThreadId,
     // The body is Send, not Sync; this wrapper is never locked. Exclusive
@@ -272,9 +277,11 @@ struct NativeAdapterRaw {
 struct NativeAdapterStream {
     // Decoder callbacks can access this stream while raw is already borrowed.
     origin_thread: std::thread::ThreadId,
-    raw: Py<NativeAdapterRaw>,
-    amount: Option<usize>,
-    decode_content: bool,
+    raw: Option<Py<NativeAdapterRaw>>,
+    amount: Option<Py<PyAny>>,
+    decode_content: Option<Py<PyAny>>,
+    started: bool,
+    executing: bool,
     done: bool,
 }
 
@@ -1251,6 +1258,71 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
             .and_then(|value| behavior_proof(py, &value).map(|proof| (name.to_owned(), proof)))
     })
     .collect::<PyResult<Vec<_>>>()?;
+    let utils_globals = adapters
+        .getattr("urldefragauth")?
+        .getattr("__globals__")?
+        .cast_into::<PyDict>()?;
+    let parse_globals = PyModule::import(py, "urllib.parse")?.dict();
+    let mut url_helper_dependencies = Vec::new();
+    for (dictionary, names) in [
+        (&utils_globals, &["urlparse", "urlunparse"][..]),
+        (
+            &parse_globals,
+            &[
+                "urlparse",
+                "urlunparse",
+                "urlsplit",
+                "urlunsplit",
+                "_urlparse",
+                "_urlsplit",
+                "_urlunsplit",
+                "_coerce_args",
+                "_splitparams",
+                "_splitnetloc",
+                "_checknetloc",
+                "_check_bracketed_netloc",
+                "_check_bracketed_host",
+                "_noop",
+                "_decode_args",
+                "_encode_result",
+                "ParseResult",
+                "SplitResult",
+                "scheme_chars",
+                "_WHATWG_C0_CONTROL_OR_SPACE",
+            ][..],
+        ),
+    ] {
+        for &name in names {
+            if let Some(value) = dictionary.get_item(name)? {
+                url_helper_dependencies.push((
+                    dictionary.clone().unbind(),
+                    name.to_owned(),
+                    behavior_proof(py, &value)?,
+                ));
+            }
+        }
+    }
+    if let Some(split) = parse_globals.get_item("urlsplit")?
+        && let Ok(dictionary) = split
+            .getattr("__dict__")
+            .and_then(|value| value.cast_into::<PyDict>().map_err(Into::into))
+        && let Some(wrapped) = dictionary.get_item("__wrapped__")?
+    {
+        url_helper_dependencies.push((
+            dictionary.unbind(),
+            "__wrapped__".to_owned(),
+            behavior_proof(py, &wrapped)?,
+        ));
+    }
+    let mut url_helper_sequences = Vec::new();
+    for name in ["uses_params", "uses_netloc", "_UNSAFE_URL_BYTES_TO_REMOVE"] {
+        if let Some(value) = parse_globals.get_item(name)? {
+            url_helper_sequences.push((
+                name.to_owned(),
+                sequence_proof_inner(py, &value, &mut HashSet::new())?,
+            ));
+        }
+    }
     let poolmanager_type = adapters.getattr("PoolManager")?;
     let poolmanager_module = PyModule::import(py, "urllib3.poolmanager")?;
     let poolmanager_behavior = behavior_proof(py, &poolmanager_type)?;
@@ -1324,6 +1396,8 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
         key_fn_by_scheme,
         methods,
         globals,
+        url_helper_dependencies,
+        url_helper_sequences,
         send_globals: send_globals.unbind(),
         send_builtins: send_builtins.unbind(),
         exception_globals,
@@ -1340,6 +1414,25 @@ fn adapter_identity_is_pristine(
     request: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
     let state = adapter_state(py)?;
+    for (dictionary, name, proof) in &state.url_helper_dependencies {
+        let Some(current) = dictionary.bind(py).get_item(name)? else {
+            return Ok(false);
+        };
+        if !behavior_proof_is_pristine(py, &current, proof)? {
+            return Ok(false);
+        }
+    }
+    let parse_globals = PyModule::import(py, "urllib.parse")?.dict();
+    for (name, proof) in &state.url_helper_sequences {
+        let Some(current) = parse_globals.get_item(name)? else {
+            return Ok(false);
+        };
+        if !(current.is_exact_instance_of::<PyList>() || current.is_exact_instance_of::<PyTuple>())
+            || !sequence_attribute_is_pristine(py, &current, proof)?
+        {
+            return Ok(false);
+        }
+    }
     let adapter_type = state.adapter_type.bind(py);
     if !adapter.get_type().as_any().is(adapter_type)
         || !request
@@ -1687,6 +1780,33 @@ fn request_body(request: &Bound<'_, PyAny>) -> PyResult<Option<Option<Vec<u8>>>>
     Ok(None)
 }
 
+// Admission has already proved an HTTP URI with a scheme and authority.
+// Keep its spelling while matching urlparse/urlunparse's empty delimiters.
+fn proxy_request_url(url: &str) -> String {
+    let url = url.split_once('#').map_or(url, |(head, _)| head);
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = rest[..end].rsplit('@').next().unwrap_or(&rest[..end]);
+    let tail = &rest[end..];
+    let (path, query) = tail
+        .split_once('?')
+        .map_or((tail, ""), |(path, query)| (path, query));
+    let last_segment = path.rsplit('/').next().unwrap_or(path);
+    let path = if last_segment.find(';') == Some(last_segment.len().saturating_sub(1)) {
+        path.strip_suffix(';').unwrap_or(path)
+    } else {
+        path
+    };
+    let mut result = format!("{}://{authority}{path}", scheme.to_ascii_lowercase());
+    if !query.is_empty() {
+        result.push('?');
+        result.push_str(query);
+    }
+    result
+}
+
 fn native_send_input(
     py: Python<'_>,
     adapter: &Bound<'_, PyAny>,
@@ -1762,15 +1882,16 @@ fn native_send_input(
     let Some((proxy, selected_proxy)) = proxy_value(py, &url, proxies)? else {
         return Ok(Err("proxy settings are unsupported".to_owned()));
     };
-    let urllib3_url = match selected_proxy.as_ref() {
-        Some(_) => url.clone(),
-        None => {
-            let path_url = request.getattr("path_url")?;
-            if !path_url.is_exact_instance_of::<PyString>() {
-                return Ok(Err("request path URL is unsupported".to_owned()));
-            }
-            path_url.extract::<String>()?
+    let urllib3_url = if !scheme.eq_ignore_ascii_case("https")
+        && matches!(proxy.as_ref(), Some(Proxy::Http(_) | Proxy::Https(_)))
+    {
+        proxy_request_url(&url)
+    } else {
+        let path_url = request.getattr("path_url")?;
+        if !path_url.is_exact_instance_of::<PyString>() {
+            return Ok(Err("request path URL is unsupported".to_owned()));
         }
+        path_url.extract::<String>()?
     };
     if !adapter_identity_is_pristine(py, adapter, request)?
         || !registered_adapter_pristine(py, adapter)?
@@ -3778,6 +3899,7 @@ fn build_python_response(
     request: &Bound<'_, PyAny>,
     pool: &Bound<'_, PyAny>,
     response: AdapterResponse,
+    request_url: &str,
 ) -> PyResult<Py<PyAny>> {
     let status = response.status().as_u16();
     let reason = response.reason().to_owned();
@@ -3811,6 +3933,7 @@ fn build_python_response(
             closed: false,
         },
     )?;
+    raw.bind(py).setattr("_request_url", request_url)?;
     Ok(adapter
         .call_method1("build_response", (request, raw))?
         .unbind())
@@ -3929,7 +4052,13 @@ fn native_adapter_leaf(
 
     loop {
         let method = input.method.clone();
-        let url = input.url.clone();
+        let url = if matches!(input.proxy.as_ref(), Some(Proxy::Http(_) | Proxy::Https(_)))
+            && input.urllib3_url.starts_with("http://")
+        {
+            input.urllib3_url.clone()
+        } else {
+            input.url.clone()
+        };
         let headers = input.headers.clone();
         let header_names = input.header_names.clone();
         let body = input
@@ -4002,7 +4131,14 @@ fn native_adapter_leaf(
             .get("retry-after")
             .is_some_and(|value| !value.as_bytes().is_empty());
         if !retry_state.is_retry(&input.method_name, status, has_retry_after) {
-            return build_python_response(py, adapter, request, &python_pool, response);
+            return build_python_response(
+                py,
+                adapter,
+                request,
+                &python_pool,
+                response,
+                &input.urllib3_url,
+            );
         }
         let incremented = retry_state.increment(
             RetryReason::Status { status },
@@ -4026,7 +4162,14 @@ fn native_adapter_leaf(
                 return Err(map_adapter_surrogate(py, state, original, request));
             }
             Err(_) => {
-                return build_python_response(py, adapter, request, &python_pool, response);
+                return build_python_response(
+                    py,
+                    adapter,
+                    request,
+                    &python_pool,
+                    response,
+                    &input.urllib3_url,
+                );
             }
         };
         let headers = response.headers().clone();
@@ -4636,6 +4779,53 @@ impl NativeAdapterRaw {
 
 #[pymethods]
 impl NativeAdapterRaw {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.pool)?;
+        visit.call(&self.headers)?;
+        visit.call(&self.original_response)?;
+        visit.call(&self.decoder)
+    }
+
+    fn __clear__(&mut self) {
+        self.decoder = None;
+    }
+
+    #[getter]
+    fn url(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        slf.try_borrow()?.ensure_origin_thread()?;
+        Ok(slf.getattr("_request_url")?.unbind())
+    }
+
+    #[setter]
+    fn set_url(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        slf.try_borrow()?.ensure_origin_thread()?;
+        slf.setattr("_request_url", value)
+    }
+
+    fn geturl(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        slf.try_borrow()?.ensure_origin_thread()?;
+        Ok(slf.getattr("url")?.unbind())
+    }
+
+    fn __enter__(slf: &Bound<'_, Self>) -> PyResult<Py<Self>> {
+        slf.try_borrow()?.ensure_origin_thread()?;
+        if slf.getattr("closed")?.is_truthy()? {
+            return Err(PyValueError::new_err("I/O operation on closed file."));
+        }
+        Ok(slf.clone().unbind())
+    }
+
+    fn __exit__(
+        slf: &Bound<'_, Self>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        slf.try_borrow()?.ensure_origin_thread()?;
+        slf.call_method0("close")?;
+        Ok(())
+    }
+
     #[getter]
     fn status(&self) -> PyResult<u16> {
         self.ensure_origin_thread()?;
@@ -4678,11 +4868,15 @@ impl NativeAdapterRaw {
         cache_content: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
         self.ensure_origin_thread()?;
-        let decode_content = pyo3::impl_::extract_argument::extract_argument::<bool, true>(
-            decode_content.bind(py).as_borrowed(),
-            &mut (),
-            "decode_content",
-        )?;
+        let decode_content = if decode_content.bind(py).is_none() {
+            false
+        } else {
+            pyo3::impl_::extract_argument::extract_argument::<bool, true>(
+                decode_content.bind(py).as_borrowed(),
+                &mut (),
+                "decode_content",
+            )?
+        };
         let _ = pyo3::impl_::extract_argument::extract_argument::<bool, true>(
             cache_content.bind(py).as_borrowed(),
             &mut (),
@@ -4710,32 +4904,17 @@ impl NativeAdapterRaw {
         decode_content: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<NativeAdapterStream>> {
         slf.ensure_origin_thread()?;
-        let amt = pyo3::impl_::extract_argument::extract_argument::<Option<isize>, true>(
-            amt.bind(py).as_borrowed(),
-            &mut (),
-            "amt",
-        )?;
-        let decode_content = decode_content
-            .map(|value| {
-                pyo3::impl_::extract_argument::extract_argument::<bool, true>(
-                    value.as_borrowed(),
-                    &mut (),
-                    "decode_content",
-                )
-            })
-            .transpose()?;
-        let amount = match amt {
-            None => None,
-            Some(value) if value < 0 => None,
-            Some(value) => Some(value as usize),
-        };
         Py::new(
             py,
             NativeAdapterStream {
                 origin_thread: slf.origin_thread,
-                raw: slf.into_pyobject(py)?.unbind(),
-                amount,
-                decode_content: decode_content.unwrap_or(false),
+                raw: Some(slf.into_pyobject(py)?.unbind()),
+                amount: Some(amt),
+                decode_content: Some(
+                    decode_content.map_or_else(|| py.None(), |value| value.clone().unbind()),
+                ),
+                started: false,
+                executing: false,
                 done: false,
             },
         )
@@ -4790,37 +4969,106 @@ impl NativeAdapterStream {
 
 #[pymethods]
 impl NativeAdapterStream {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.raw)?;
+        visit.call(&self.amount)?;
+        visit.call(&self.decode_content)
+    }
+
+    fn __clear__(&mut self) {
+        self.raw = None;
+        self.amount = None;
+        self.decode_content = None;
+        self.done = true;
+    }
+
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
         slf.ensure_origin_thread()?;
         Ok(slf)
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        self.ensure_origin_thread()?;
-        if self.done {
-            return Ok(None);
-        }
-        if self.amount == Some(0) {
-            self.done = true;
-            return Ok(None);
-        }
-        loop {
-            let mut raw = self.raw.bind(py).borrow_mut();
-            let chunk = raw.read_amount(py, self.amount, self.decode_content)?;
-            if chunk.bind(py).len()? != 0 {
-                return Ok(Some(chunk));
+    fn __next__(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        {
+            let mut state = slf.try_borrow_mut()?;
+            state.ensure_origin_thread()?;
+            if state.executing {
+                return Err(PyValueError::new_err("generator already executing"));
             }
-            if raw.closed {
-                self.done = true;
+            if state.done {
                 return Ok(None);
             }
+            state.executing = true;
         }
+        let returned: PyResult<Option<Py<PyAny>>> = (|| {
+            let first_amount = {
+                let mut state = slf.try_borrow_mut()?;
+                if state.started {
+                    None
+                } else {
+                    state.started = true;
+                    state.amount.as_ref().map(|value| value.clone_ref(py))
+                }
+            };
+            if let Some(amount) = first_amount
+                && amount
+                    .bind(py)
+                    .rich_compare(0, CompareOp::Eq)?
+                    .is_truthy()?
+            {
+                return Ok(None);
+            }
+            loop {
+                let (raw, amount, decode_content) = {
+                    let state = slf.try_borrow()?;
+                    (
+                        state.raw.as_ref().map(|value| value.clone_ref(py)),
+                        state.amount.as_ref().map(|value| value.clone_ref(py)),
+                        state
+                            .decode_content
+                            .as_ref()
+                            .map(|value| value.clone_ref(py)),
+                    )
+                };
+                let Some(raw) = raw else {
+                    return Ok(None);
+                };
+                if raw.bind(py).try_borrow()?.closed {
+                    return Ok(None);
+                }
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("amt", amount)?;
+                kwargs.set_item("decode_content", decode_content)?;
+                let chunk = raw.bind(py).call_method("read", (), Some(&kwargs))?;
+                if chunk.is_truthy()? {
+                    return Ok(Some(chunk.unbind()));
+                }
+            }
+        })();
+        let mut state = slf.try_borrow_mut()?;
+        state.executing = false;
+        if let Err(error) = returned {
+            state.__clear__();
+            if error.is_instance_of::<PyStopIteration>(py) {
+                let wrapped = PyRuntimeError::new_err("generator raised StopIteration");
+                wrapped.set_context(py, Some(error.clone_ref(py)));
+                wrapped.set_cause(py, Some(error));
+                return Err(wrapped);
+            }
+            return Err(error);
+        }
+        if matches!(returned, Ok(None)) {
+            state.__clear__();
+        }
+        returned
     }
 
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        self.ensure_origin_thread()?;
-        self.raw.bind(py).borrow_mut().close(py)?;
-        self.done = true;
+    fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let mut state = slf.try_borrow_mut()?;
+        state.ensure_origin_thread()?;
+        if state.executing {
+            return Err(PyValueError::new_err("generator already executing"));
+        }
+        state.__clear__();
         Ok(())
     }
 }

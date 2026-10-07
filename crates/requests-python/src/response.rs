@@ -5,11 +5,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+use pyo3::PyTraverseError;
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{
     PyAssertionError, PyAttributeError, PyLookupError, PyRuntimeError, PyStopIteration,
     PyTypeError, PyUnicodeDecodeError,
 };
+use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -567,6 +569,19 @@ impl NativeContentIterator {
 
 #[pymethods]
 impl NativeContentIterator {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.subject)?;
+        visit.call(&self.chunk_size)?;
+        if let ContentSource::Stream(iterator) = &self.source {
+            visit.call(iterator)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&mut self) {
+        self.source = ContentSource::Done;
+    }
+
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -1274,6 +1289,25 @@ impl NativeLinesIterator {
 
 #[pymethods]
 impl NativeLinesIterator {
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.subject)?;
+        visit.call(&self.chunk_size)?;
+        visit.call(&self.delimiter)?;
+        visit.call(&self.chunks)?;
+        visit.call(&self.pending)?;
+        for chunk in &self.ready {
+            visit.call(chunk)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&mut self) {
+        self.chunks = None;
+        self.pending = None;
+        self.ready.clear();
+        self.done = true;
+    }
+
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }

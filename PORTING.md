@@ -45,13 +45,15 @@ the beta exception. The owner accepts current supported-runner qualification
 for 1.0.0 while keeping the historical issue open; its cause remains unproved.
 See [current readiness evidence](docs/dev/release-readiness.md).
 
-The September 13 documentation build also exposed a Sphinx 7.2.6 integration
-gap: its intersphinx downloader assigns `response.raw.url` and replaces
-`response.raw.read`. A native `NativeAdapterRaw` rejects the first assignment
-with `AttributeError`. On September 25, the pinned Sphinx 9.1.0 completed a
-normal online `dirhtml` build with this checkout's native extension and both
-inventories. That build does not prove the old raw-object mutation is accepted
-by other callers.
+The September 13 documentation build exposed a Sphinx 7.2.6 integration gap:
+its intersphinx downloader assigns `response.raw.url` and replaces
+`response.raw.read`. The native raw object previously rejected these mutations.
+The current local fix supports dynamic attributes, live read callbacks and raw
+context management, and preserves iterator-close and garbage-collection
+behavior. On October 7, Sphinx 7.2.6 completed an online `dirhtml` build with
+both inventories and zero warnings using this checkout's native extension.
+Focused differential tests pass; the changed candidate still needs full source,
+packaged and platform qualification. See the readiness checklist for status.
 
 Exact pristine built-in `Session` and `HTTPAdapter` traffic uses the Rust
 backend by default. Unsupported, subclassed, custom, and dynamically mutated

@@ -1776,6 +1776,13 @@ def test_installed_suite_isolates_mutating_test_groups(
                 "tests_differential/test_adapters.py::test_native_raw_foreign_access_keeps_decoder_on_origin",
                 "tests_differential/test_adapters.py::test_native_stream_guard_does_not_borrow_busy_raw",
                 "tests_differential/test_adapters.py::test_native_stream_argument_conversion_keeps_defaults_and_errors",
+                "tests_differential/test_adapters.py::test_native_raw_initial_url_matches_canonical_request_target",
+                "tests_differential/test_adapters.py::test_replaced_raw_url_helper_dependency_falls_back_before_callbacks",
+                "tests_differential/test_adapters.py::test_mutated_raw_url_parser_sequence_falls_back_before_effects",
+                "tests_differential/test_adapters.py::test_native_http_proxy_wire_target_uses_canonical_request_url",
+                "tests_differential/test_adapters.py::test_native_raw_proxy_url_retains_canonical_spelling",
+                "tests_differential/test_adapters.py::test_live_native_raw_mutations_match_frozen_oracle",
+                "tests_differential/test_adapters.py::test_native_raw_mutation_cycles_are_collectible_on_any_thread",
             ],
         ]
 
@@ -2970,6 +2977,13 @@ def run_installed_suite(
                 "tests_differential/test_adapters.py::test_native_raw_foreign_access_keeps_decoder_on_origin",
                 "tests_differential/test_adapters.py::test_native_stream_guard_does_not_borrow_busy_raw",
                 "tests_differential/test_adapters.py::test_native_stream_argument_conversion_keeps_defaults_and_errors",
+                "tests_differential/test_adapters.py::test_native_raw_initial_url_matches_canonical_request_target",
+                "tests_differential/test_adapters.py::test_replaced_raw_url_helper_dependency_falls_back_before_callbacks",
+                "tests_differential/test_adapters.py::test_mutated_raw_url_parser_sequence_falls_back_before_effects",
+                "tests_differential/test_adapters.py::test_native_http_proxy_wire_target_uses_canonical_request_url",
+                "tests_differential/test_adapters.py::test_native_raw_proxy_url_retains_canonical_spelling",
+                "tests_differential/test_adapters.py::test_live_native_raw_mutations_match_frozen_oracle",
+                "tests_differential/test_adapters.py::test_native_raw_mutation_cycles_are_collectible_on_any_thread",
             ),
         )
         for index, group in enumerate(groups):

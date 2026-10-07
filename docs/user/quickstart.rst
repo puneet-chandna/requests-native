@@ -174,10 +174,14 @@ server, you can access ``r.raw``. If you want to do this, make sure you set
     >>> r = requests.get('https://api.github.com/events', stream=True)
 
     >>> r.raw
-    <urllib3.response.HTTPResponse object at 0x101194810>
+    <requests._requests_rust.NativeAdapterRaw object at ...>
 
     >>> r.raw.read(10)
     b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'
+
+The built-in native transport returns a native file-like raw object. Python
+compatibility paths can return urllib3's ``HTTPResponse`` instead. Use the raw
+read/stream protocol; the object's concrete type depends on the transport path.
 
 In general, however, you should use a pattern like this to save what is being
 streamed to a file::

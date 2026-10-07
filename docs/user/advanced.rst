@@ -317,9 +317,10 @@ remains open, hence allowing us to make content retrieval conditional::
 
 You can further control the workflow by use of the :meth:`Response.iter_content() <requests.Response.iter_content>`
 and :meth:`Response.iter_lines() <requests.Response.iter_lines>` methods.
-Alternatively, you can read the undecoded body from the underlying
-urllib3 :class:`urllib3.HTTPResponse <urllib3.response.HTTPResponse>` at
-:attr:`Response.raw <requests.Response.raw>`.
+Alternatively, you can read the undecoded body through
+:attr:`Response.raw <requests.Response.raw>`. The built-in Rust transport
+returns a native file-like raw object; Python compatibility paths can return
+urllib3's :class:`HTTPResponse <urllib3.response.HTTPResponse>`.
 
 If you set ``stream`` to ``True`` when making a request, Requests cannot
 release the connection back to the pool unless you consume all the data or call

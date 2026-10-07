@@ -2,6 +2,9 @@
 
 Audit date: 2026-10-07. Development remains on main. The owner has approved pushing the reviewed
 changes and running remote qualification; the candidate is not yet stable.
+Validation now proceeds locally first to limit runner cost. Do not repeatedly
+dispatch paid CI while local source, packaging and benchmark checks can resolve
+the problem; batch validated changes before any necessary platform qualification.
 
 ## Existing beta
 
@@ -90,7 +93,7 @@ these as separate maintenance changes with fresh compatibility qualification.
   matrix retains the Windows report bound to the wheel's SHA256 and requires its
   status to pass with exit zero and no accepted failures before qualification.
 
-## Local verification
+## Earlier local verification
 
 - Native workspace: 317 tests passed; independently extracted core crate: 107 unit tests
   passed. The new archive boundary regression check also passed.
@@ -133,13 +136,32 @@ open; the older runner, compiler and dependency changes do not prove its cause.
 
 The three cross-cutting compatibility rows now record this evidence. Strict
 ledger completion passes all 366 API rows and 106 lifetime rows. Source CI
-requires completion mode for future changes. These records qualify the beta
-candidate's correctness and packaging; performance remains a separate gate.
+requires completion mode for future changes. These records establish the tested
+beta candidate's correctness and packaging; they do not cover every extension
+behavior. A local raw-object compatibility fix is undergoing qualification;
+those earlier runs do not qualify its changed native code. Performance remains
+a separate gate.
 The ledger-closure commit `63f04bc58cb5228383d087da5131d0ffdd0d24f4`
 also passed [source CI 37548904822](https://github.com/puneet-chandna/requests-native/actions/runs/37548904822)
 with 2,862 tests, 10 skips and a clean exit, plus lint and security workflows.
 
 ## Work still required before declaring 1.0.0
+
+At `29ef0b6`, local loopback probes confirmed that the native raw object rejected
+`response.raw.url = response.url` and replacement of `response.raw.read`.
+The local fix supports dynamic attributes, live stream callbacks and context
+management, preserves lazy argument handling and iterator-close behavior, and
+collects Python ownership cycles. The final focused run passed 276 tests with
+four skips and exit zero; all 52 new raw/proxy scenarios passed. Sphinx 7.2.6
+loaded both online inventories with zero warnings under `-E -W --keep-going`;
+profiling observed two native raw context entries and exits. The proxy helper
+dependency guards and canonical proxy wire target are corrected. Independent
+source review found no remaining actionable issue. The installed artifact
+suite now includes the seven new regression families, covering callbacks,
+ownership, URL metadata and wire behavior on each qualified platform.
+Complete fresh source, packaged and platform checks on this candidate before
+declaring this blocker closed. Earlier beta qualification does not cover these
+changes.
 
 1. Enable core crate publication only after qualification. The archive now
    carries canonical README/legal notices, the referenced unit-test modules
@@ -159,6 +181,12 @@ with 2,862 tests, 10 skips and a clean exit, plus lint and security workflows.
    per-case deadline, with a deliberate 90- or 180-minute job limit. Defaults
    and the 20% budget are unchanged. Invalid deadlines and undersized release
    samples fail before builds; all 26 benchmark helper checks passed.
+   Full five-pair run
+   [37545362862](https://github.com/puneet-chandna/requests-native/actions/runs/37545362862)
+   finished with 179 passing and 81 inconclusive metrics, and no definite
+   regression. Oracle controls were unstable, so it failed qualification.
+   Retain all ten reports and investigate sampling/noise locally before spending
+   on another remote evaluation; do not weaken the budget to obtain a pass.
 3. Prepare stable version metadata and corresponding validators/docs only once
    the candidate qualifies: Rust `1.0.0`, Python distribution `1.0.0`, stable
    classifiers/history, while retaining `requests.__version__ == 2.34.2`.

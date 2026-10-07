@@ -4,6 +4,8 @@ import builtins
 import functools
 import gc
 import gzip
+import importlib
+import inspect
 import pickle
 import random
 import socket
@@ -330,14 +332,16 @@ def test_native_stream_argument_conversion_keeps_defaults_and_errors():
         raw = response.raw
         assert type(raw).__name__ == "NativeAdapterRaw"
         for amount, exception in [(object(), TypeError), (1 << 200, OverflowError)]:
-            with pytest.raises(exception) as caught:
-                raw.stream(amount)
-            if hasattr(BaseException, "add_note"):
-                assert caught.value.__notes__ == ["while processing 'amt'"]
+            iterator = raw.stream(amount)
+            with pytest.raises(exception):
+                next(iterator)
+            assert next(iterator, None) is None
+        iterator = raw.stream(1, object())
         with pytest.raises(TypeError) as caught:
-            raw.stream(1, object())
+            next(iterator)
         if hasattr(BaseException, "add_note"):
             assert caught.value.__notes__ == ["while processing 'decode_content'"]
+        assert next(iterator, None) is None
         iterator = raw.stream()
         assert len(next(iterator)) == 65_536
         assert b"".join(iterator) == b"x" * (70_000 - 65_536)
@@ -816,6 +820,471 @@ def test_raw_stream_decode_content_true_decodes_but_false_preserves_wire():
             assert b"".join(decoded.stream(3, decode_content=True)) == b"payload"
             adapter.close()
         assert server.requests == 2
+
+
+@pytest.mark.parametrize("route", ["direct", "http_proxy", "socks_proxy"])
+def test_native_raw_initial_url_matches_canonical_request_target(route):
+    context = (
+        socks5_loopback(b"body")
+        if route == "socks_proxy"
+        else loopback((200, {}, b"body"))
+    )
+    with context as (_, endpoint):
+        adapter = HTTPAdapter()
+        request = prepared(
+            endpoint
+            if route == "direct"
+            else "http://user:pass@origin.example/resource?q=1#fragment"
+        )
+        proxies = {} if route == "direct" else {"http": endpoint}
+        expected = adapter.request_url(request, proxies)
+        with _rust_adapter_trial():
+            response = adapter.send(request, stream=True, proxies=proxies)
+        assert type(response.raw).__name__ == "NativeAdapterRaw"
+        try:
+            assert response.content == b"body"
+            assert response.raw.url == response.raw.geturl() == expected
+        finally:
+            response.close()
+            adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("requests.utils", "urlparse"),
+        ("requests.utils", "urlunparse"),
+        ("urllib.parse", "urlparse"),
+        ("urllib.parse", "urlunparse"),
+        ("urllib.parse", "urlsplit"),
+        ("urllib.parse", "_coerce_args"),
+    ],
+)
+@pytest.mark.parametrize("before_constructor", [False, True])
+def test_replaced_raw_url_helper_dependency_falls_back_before_callbacks(
+    monkeypatch, module, name, before_constructor
+):
+    request = prepared("http://origin.example/resource")
+    adapter = None if before_constructor else HTTPAdapter()
+    calls = []
+
+    def replaced(*args, **kwargs):
+        calls.append(name)
+        raise AssertionError("mutated URL helper executed during admission")
+
+    monkeypatch.setattr(importlib.import_module(module), name, replaced)
+    if adapter is None:
+        adapter = HTTPAdapter()
+    marker = object()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    before = requests._requests_rust._adapter_pool_side_table_trial()
+    with _rust_adapter_trial():
+        assert adapter.send(request, proxies={"http": "http://127.0.0.1:1"}) is marker
+    assert calls == []
+    assert requests._requests_rust._adapter_pool_side_table_trial() == before
+    adapter.close()
+
+
+@pytest.mark.parametrize("name", ["uses_params", "uses_netloc"])
+def test_mutated_raw_url_parser_sequence_falls_back_before_effects(monkeypatch, name):
+    parser = importlib.import_module("urllib.parse")
+    request = prepared("http://origin.example/path;")
+    adapter = HTTPAdapter()
+    sequence = getattr(parser, name)
+    original = sequence[:]
+    marker = object()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    before = requests._requests_rust._adapter_pool_side_table_trial()
+    try:
+        sequence.remove("http")
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(request, proxies={"http": "http://127.0.0.1:1"}) is marker
+            )
+        assert requests._requests_rust._adapter_pool_side_table_trial() == before
+    finally:
+        sequence[:] = original
+        adapter.close()
+
+
+def test_native_http_proxy_wire_target_uses_canonical_request_url():
+    source = (
+        """
+import os
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import requests
+"""
+        + inspect.getsource(_Handler)
+        + "\n"
+        + inspect.getsource(loopback)
+        + "\n"
+        + """
+original = _Handler.do_GET
+def observed(self):
+    self.server.target = self.path
+    original(self)
+_Handler.do_GET = observed
+with loopback((200, {}, b"body")) as (server, proxy):
+    request = requests.Request("GET", "http://user:pass@origin.example:8080/path;?#fragment").prepare()
+    adapter = requests.adapters.HTTPAdapter()
+    try:
+        if os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "rewrite":
+            from requests.adapters import _rust_adapter_trial
+            with _rust_adapter_trial():
+                response = adapter.send(request, proxies={"http": proxy}, stream=True)
+            assert type(response.raw).__name__ == "NativeAdapterRaw"
+        else:
+            response = adapter.send(request, proxies={"http": proxy}, stream=True)
+        with response:
+            assert response.content == b"body"
+            result = {"target": server.target, "url": response.url}
+    finally:
+        adapter.close()
+"""
+    )
+    oracle = run_oracle_case({"source": source})
+    rewrite = run_rewrite_case({"source": source})
+    assert oracle.observations["exception"] is None, oracle.observations
+    assert rewrite.observations["exception"] is None, rewrite.observations
+    assert rewrite.observations["result"] == oracle.observations["result"]
+    assert oracle.stderr == rewrite.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://user:pass@origin.example:80/path;params?q=one#fragment",
+        "http://user:p%40ss@[::1]:80/path?q=one#fragment",
+        "http://origin.example:80/",
+        "http://origin.example/path;?#fragment",
+        "http://origin.example/path;?q=one#fragment",
+        "http://origin.example/path;;?q=one#fragment",
+        "http://origin.example/path??#fragment",
+        "HTTP://user:pass@origin.example:80/path?q=one#fragment",
+    ],
+)
+def test_native_raw_proxy_url_retains_canonical_spelling(target):
+    with loopback((200, {}, b"body")) as (_, proxy):
+        adapter = HTTPAdapter()
+        request = prepared(target)
+        request.url = target
+        proxies = {"http": proxy}
+        expected = adapter.request_url(request, proxies)
+        with _rust_adapter_trial():
+            response = adapter.send(request, stream=True, proxies=proxies)
+        assert type(response.raw).__name__ == "NativeAdapterRaw"
+        try:
+            assert response.content == b"body"
+            assert response.raw.url == response.raw.geturl() == expected
+        finally:
+            response.close()
+            adapter.close()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "sphinx",
+        "instance_read",
+        "class_read",
+        "changing_read",
+        "instance_stream",
+        "callback_protocol",
+        "argument_identity",
+        "opaque_arguments",
+        "stop_iteration",
+        "truth_stop_iteration",
+        "context_manager",
+        "reentrant_next",
+        "reentrant_close",
+        "close",
+    ],
+)
+def test_live_native_raw_mutations_match_frozen_oracle(mode):
+    source = (
+        """
+import functools
+import gzip
+import os
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import requests
+"""
+        + inspect.getsource(_Handler)
+        + "\n"
+        + inspect.getsource(loopback)
+        + "\n"
+        + """
+mode = MODE
+body = gzip.compress(b"body") if mode == "sphinx" else b"body"
+headers = {"Content-Encoding": "gzip"} if mode == "sphinx" else {}
+with loopback((200, headers, body)) as (_, url):
+    with requests.Session() as session:
+        session.trust_env = False
+        with session.get(url, stream=True) as response:
+            raw = response.raw
+            if os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "rewrite":
+                assert type(raw).__name__ == "NativeAdapterRaw"
+            if mode == "sphinx":
+                assert raw.url == "/resource"
+                assert raw.geturl() == raw.url
+                raw.url = response.url
+                assert raw.url == response.url
+                assert raw.geturl() == response.url
+                marker = object()
+                raw.url = marker
+                assert raw.url is raw.geturl() is marker
+                raw.url = response.url
+                raw.metadata = marker
+                assert raw.metadata is marker
+                del raw.metadata
+                raw.read = functools.partial(raw.read, decode_content=True)
+                result = raw.read().decode()
+            elif mode == "class_read":
+                cls = type(raw)
+                original = cls.read
+                def patched(self, *args, **kwargs):
+                    return original(self, *args, **kwargs).upper()
+                cls.read = patched
+                try:
+                    result = b"".join(raw.stream(1)).decode()
+                finally:
+                    cls.read = original
+            elif mode in ("instance_read", "changing_read"):
+                original = raw.read
+                iterator = raw.stream(1)
+                def patched(*args, **kwargs):
+                    chunk = original(*args, **kwargs).upper()
+                    if mode == "changing_read":
+                        raw.read = original
+                    return chunk
+                raw.read = patched
+                result = b"".join(iterator).decode()
+                del raw.read
+            elif mode == "instance_stream":
+                raw.stream = lambda *args, **kwargs: iter([b"overridden"])
+                result = response.content.decode()
+                del raw.stream
+                assert raw.read() == b"body"
+            elif mode in ("reentrant_next", "reentrant_close"):
+                original = raw.read
+                iterator = raw.stream(1)
+                events = []
+                def patched(*args, **kwargs):
+                    assert iter(iterator) is iterator
+                    operation = iterator.close if mode == "reentrant_close" else lambda: next(iterator)
+                    try:
+                        operation()
+                    except ValueError as error:
+                        assert error.args == ("generator already executing",)
+                        events.append("rejected")
+                    else:
+                        raise AssertionError("active generator reentered")
+                    return original(*args, **kwargs)
+                raw.read = patched
+                result = b"".join(iterator).decode()
+                assert events
+                del raw.read
+            elif mode == "context_manager":
+                original = raw.close
+                calls = []
+                failure = ValueError("body failed")
+                def close(): calls.append("close")
+                raw.close = close
+                try:
+                    with raw as entered:
+                        assert entered is raw
+                        raise failure
+                except ValueError as error:
+                    assert error is failure
+                else:
+                    raise AssertionError("context manager swallowed error")
+                assert calls == ["close"]
+                assert raw.__exit__(None, None, None) is None
+                assert calls == ["close"] * 2
+                close_failure = RuntimeError("close failed")
+                def failing_close(): raise close_failure
+                raw.close = failing_close
+                try:
+                    with raw: pass
+                except RuntimeError as error:
+                    assert error is close_failure
+                else:
+                    raise AssertionError("close error swallowed")
+                del raw.close
+                assert raw.read() == b"body"
+                original()
+                try:
+                    raw.__enter__()
+                except ValueError as error:
+                    assert error.args == ("I/O operation on closed file.",)
+                else:
+                    raise AssertionError("closed raw entered")
+                result = "closed"
+            elif mode == "opaque_arguments":
+                events = []
+                class Amount:
+                    def __eq__(self, other):
+                        events.append("eq")
+                        assert other == 0
+                        return False
+                    def __index__(self): raise AssertionError("converted amount")
+                amount, decode = Amount(), object()
+                def patched(*args, **kwargs):
+                    assert args == ()
+                    assert kwargs["amt"] is amount
+                    assert kwargs["decode_content"] is decode
+                    return b"custom"
+                iterator = raw.stream(amount, decode_content=decode)
+                assert events == []
+                raw.read = patched
+                result = next(iterator).decode()
+                assert events == ["eq"]
+                iterator.close()
+                del raw.read
+                assert raw.read() == b"body"
+            elif mode in ("stop_iteration", "truth_stop_iteration"):
+                failure = StopIteration("callback ended")
+                class Chunk:
+                    def __bool__(self): raise failure
+                def patched(*args, **kwargs):
+                    if mode == "stop_iteration": raise failure
+                    return Chunk()
+                raw.read = patched
+                iterator = raw.stream(1)
+                try:
+                    next(iterator)
+                except RuntimeError as error:
+                    assert error.args == ("generator raised StopIteration",)
+                    assert error.__cause__ is failure
+                    assert error.__context__ is failure
+                    assert error.__suppress_context__ is True
+                else:
+                    raise AssertionError("StopIteration was not wrapped")
+                assert next(iterator, None) is None
+                del raw.read
+                result = raw.read().decode()
+            elif mode == "argument_identity":
+                original = raw.read
+                def patched(*args, **kwargs):
+                    assert args == ()
+                    assert kwargs["amt"] is True
+                    assert kwargs["decode_content"] is True
+                    return original(*args, **kwargs)
+                raw.read = patched
+                result = b"".join(raw.stream(True, decode_content=True)).decode()
+                del raw.read
+            elif mode == "callback_protocol":
+                class Chunk:
+                    def __init__(self, truth): self.truth = truth
+                    def __bool__(self): return self.truth
+                    def __len__(self): raise AssertionError("stream used len")
+                calls = []
+                def patched(*args, **kwargs):
+                    assert args == ()
+                    assert kwargs == {"amt": -1, "decode_content": None}, kwargs
+                    calls.append("read")
+                    if len(calls) == 3:
+                        raise ValueError("callback failed")
+                    return Chunk(len(calls) == 2)
+                raw.read = patched
+                iterator = raw.stream(-1)
+                assert type(next(iterator)) is Chunk
+                try:
+                    next(iterator)
+                except ValueError as error:
+                    assert error.args == ("callback failed",)
+                else:
+                    raise AssertionError("callback did not raise")
+                assert next(iterator, None) is None
+                assert calls == ["read"] * 3
+                del raw.read
+                result = raw.read(1, None).decode()
+            else:
+                iterator = raw.stream(1)
+                first = next(iterator)
+                iterator.close()
+                result = (first + raw.read()).decode()
+"""
+    )
+    source = source.replace("MODE", repr(mode))
+    oracle = run_oracle_case({"source": source})
+    rewrite = run_rewrite_case({"source": source})
+    assert oracle.observations["exception"] is None, oracle.observations
+    assert rewrite.observations["exception"] is None, rewrite.observations
+    assert rewrite.observations["result"] == oracle.observations["result"]
+    assert oracle.stderr == rewrite.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "mode", ["partial", "raw_stream", "stream_argument", "content", "lines", "decoder"]
+)
+@pytest.mark.parametrize("foreign", [False, True])
+def test_native_raw_mutation_cycles_are_collectible_on_any_thread(mode, foreign):
+    with loopback((200, {"Content-Encoding": "gzip"}, gzip.compress(b"body"))) as (
+        _,
+        url,
+    ):
+        session = requests.Session()
+        session.trust_env = False
+        response = session.get(url, stream=True)
+        raw = response.raw
+        assert type(raw).__name__ == "NativeAdapterRaw"
+
+        class Marker:
+            pass
+
+        marker = Marker()
+        reference = weakref.ref(marker)
+        raw.marker = marker
+        if mode == "partial":
+            raw.read = functools.partial(raw.read, decode_content=True)
+        elif mode == "raw_stream":
+            raw.iterator = raw.stream(1)
+        elif mode == "stream_argument":
+
+            class Amount:
+                def __index__(self):
+                    return 1
+
+            amount = Amount()
+            amount.raw = raw
+            raw.iterator = raw.stream(amount)
+            del amount
+        elif mode == "content":
+            raw.iterator = response.iter_content(1)
+        elif mode == "lines":
+            raw.iterator = response.iter_lines()
+        else:
+            decoder = urllib3.response.GzipDecoder()
+            decoder.raw = raw
+            original = urllib3.response._get_decoder
+            urllib3.response._get_decoder = lambda encoding: decoder
+            try:
+                assert raw.read(1, decode_content=True) == b"b"
+            finally:
+                urllib3.response._get_decoder = original
+            del decoder
+        del marker, raw, response
+        try:
+
+            def collect():
+                gc.collect()
+                gc.collect()
+
+            if foreign:
+                thread = threading.Thread(target=collect)
+                thread.start()
+                thread.join(5)
+                assert not thread.is_alive()
+            else:
+                collect()
+            assert reference() is None
+        finally:
+            session.close()
 
 
 def test_retry_drain_ignores_invalid_content_encoding():
