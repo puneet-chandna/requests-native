@@ -15,10 +15,11 @@ at `github.com/psf/requests <https://github.com/psf/requests>`_.
 Can I install it from PyPI?
 ---------------------------
 
-No. Python publication is deferred and the Python distribution is not published
-to PyPI. The Rust core ``requests-native`` version ``1.0.0`` is stable and
+Not yet. PyPI publication is planned for the coming days; publishing setup is
+being finalized. The Python distribution is not published to PyPI yet. The
+Rust core ``requests-native`` version ``1.0.0`` is stable and
 published on `crates.io <https://crates.io/crates/requests-native/1.0.0>`_. See
-:ref:`install` for the Rust dependency, Python beta wheels and source builds.
+:ref:`install` for the Rust dependency and improved ``v1.0.0`` Python source.
 
 Why does it report version 2.34.2?
 ----------------------------------
@@ -40,11 +41,12 @@ the repository for the current evidence and boundary.
 Are all Requests integrations supported?
 ----------------------------------------
 
-No. The historical Windows TLS issue remains open, although current strict
-Windows qualification passes. The native ``raw`` mutation gap found by Sphinx
-7.2.6 has a locally tested fix, including an online documentation build with
-zero warnings. The changed candidate still needs release qualification; other
-integrations need testing against their actual workload.
+Not every extension behavior is qualified. Current Windows checks passed
+without accepted TLS failures. Historical
+`issue #1 <https://github.com/puneet-chandna/requests-native/issues/1>`_ remains
+open without a reproduced cause; those checks do not prove it fixed. Test
+integrations with your own workload. The `readiness record
+<https://github.com/puneet-chandna/requests-native/blob/main/docs/dev/release-readiness.md>`_ retains the complete qualification details.
 
 Is it faster than Requests?
 ---------------------------

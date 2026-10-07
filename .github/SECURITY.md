@@ -1,7 +1,7 @@
 <!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
 # Security policy
 
-Requests Native is beta software and is not published to PyPI or crates.io.
+The Rust core 1.0.0 is stable and published on crates.io; Python publication on PyPI is planned and remains pending.
 
 To report a suspected vulnerability privately, use the repository's
 **Security** tab and choose **Report a vulnerability** when available.
