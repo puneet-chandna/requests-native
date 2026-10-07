@@ -907,7 +907,43 @@ def test_mutated_raw_url_parser_sequence_falls_back_before_effects(monkeypatch, 
         adapter.close()
 
 
-def test_native_http_proxy_wire_target_uses_canonical_request_url():
+@pytest.mark.parametrize("port", ["+80", "+0"])
+def test_unsupported_raw_proxy_lexical_port_falls_back_before_effects(
+    monkeypatch, port
+):
+    request = prepared("http://origin.example/path")
+    request.url = f"http://origin.example:{port}/path"
+    adapter = HTTPAdapter()
+    marker = object()
+    monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
+    before = requests._requests_rust._adapter_pool_side_table_trial()
+    try:
+        with _rust_adapter_trial():
+            assert (
+                adapter.send(request, proxies={"http": "http://127.0.0.1:1"}) is marker
+            )
+        assert requests._requests_rust._adapter_pool_side_table_trial() == before
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://user:pass@origin.example:8080/path;?#fragment",
+        "http://origin.example:80/path?q=one#fragment",
+        "http://origin.example:080/path?q=one#fragment",
+        "http://MiXeD.Example:8080/path?q=one#fragment",
+        "http://user:pass@MiXeD.Example:080/path?q=one#fragment",
+        "http://[::1]:80/path?q=one#fragment",
+        "http://[::1]:080/path?q=one#fragment",
+    ],
+)
+def test_native_http_proxy_wire_target_uses_canonical_request_url(target):
+    _assert_native_proxy_wire_matches_frozen(target)
+
+
+def _assert_native_proxy_wire_matches_frozen(target):
     source = (
         """
 import os
@@ -927,7 +963,8 @@ def observed(self):
     original(self)
 _Handler.do_GET = observed
 with loopback((200, {}, b"body")) as (server, proxy):
-    request = requests.Request("GET", "http://user:pass@origin.example:8080/path;?#fragment").prepare()
+    request = requests.Request("GET", _WIRE_REQUEST_URL).prepare()
+    request.url = _WIRE_REQUEST_URL
     adapter = requests.adapters.HTTPAdapter()
     try:
         if os.environ["REQUESTS_DIFFERENTIAL_TARGET"] == "rewrite":
@@ -939,11 +976,18 @@ with loopback((200, {}, b"body")) as (server, proxy):
             response = adapter.send(request, proxies={"http": proxy}, stream=True)
         with response:
             assert response.content == b"body"
-            result = {"target": server.target, "url": response.url}
+            assert response.url == _WIRE_REQUEST_URL
+            result = {
+                "target": server.target,
+                "url": response.url,
+                "raw_url": response.raw.url,
+                "raw_geturl": response.raw.geturl(),
+            }
     finally:
         adapter.close()
 """
     )
+    source = source.replace("_WIRE_REQUEST_URL", repr(target))
     oracle = run_oracle_case({"source": source})
     rewrite = run_rewrite_case({"source": source})
     assert oracle.observations["exception"] is None, oracle.observations
@@ -963,24 +1007,12 @@ with loopback((200, {}, b"body")) as (server, proxy):
         "http://origin.example/path;;?q=one#fragment",
         "http://origin.example/path??#fragment",
         "HTTP://user:pass@origin.example:80/path?q=one#fragment",
+        "http://origin.example:080/path?q=one#fragment",
+        "http://MiXeD.Example:8080/path?q=one#fragment",
     ],
 )
 def test_native_raw_proxy_url_retains_canonical_spelling(target):
-    with loopback((200, {}, b"body")) as (_, proxy):
-        adapter = HTTPAdapter()
-        request = prepared(target)
-        request.url = target
-        proxies = {"http": proxy}
-        expected = adapter.request_url(request, proxies)
-        with _rust_adapter_trial():
-            response = adapter.send(request, stream=True, proxies=proxies)
-        assert type(response.raw).__name__ == "NativeAdapterRaw"
-        try:
-            assert response.content == b"body"
-            assert response.raw.url == response.raw.geturl() == expected
-        finally:
-            response.close()
-            adapter.close()
+    _assert_native_proxy_wire_matches_frozen(target)
 
 
 @pytest.mark.parametrize(

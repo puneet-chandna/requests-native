@@ -31204,6 +31204,11 @@ def test_session_native_source_rejects_compatibility_escape_hatches() -> None:
             "crates/requests-python/src/adapters.rs",
             "00f28b5517641d3be07c8953c0edcc548c4512e64515a6b18fd8a1c7f9d51784",
         ),
+        # urldefragauth globals identify URL dependencies for admission guards.
+        (
+            "crates/requests-python/src/adapters.rs",
+            "aaacda9d63aa87742a187db5c7c0d1426edb8e5ba790460fd8b199883fb88ab9",
+        ),
         (
             "crates/requests-python/src/adapters.rs",
             "7775e84e0f087a8a48c391b14c6299a50d3d5b994d09693124a614c05cd465e9",

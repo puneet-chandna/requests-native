@@ -1848,9 +1848,29 @@ fn outgoing_request_with_session_runtime(
             .map_err(|_| Error::invalid_url(&request.url))?;
         url.set_password(None)
             .map_err(|_| Error::invalid_url(&request.url))?;
-        url.as_str()
+        let mut target = url
+            .as_str()
             .parse::<http::Uri>()
-            .map_err(|_| Error::invalid_url(&request.url))?
+            .map_err(|_| Error::invalid_url(&request.url))?;
+        // Url removes an explicit default port. Keep the caller's numeric
+        // port in absolute-form targets without restoring auth or fragments.
+        if let Some(port) = request.uri.port_u16()
+            && target.port_u16().is_none()
+        {
+            let mut parts = target.into_parts();
+            let host = parts
+                .authority
+                .as_ref()
+                .ok_or_else(|| Error::invalid_url(&request.url))?
+                .host();
+            parts.authority = Some(
+                format!("{host}:{port}")
+                    .parse()
+                    .map_err(|_| Error::invalid_url(&request.url))?,
+            );
+            target = http::Uri::from_parts(parts).map_err(|_| Error::invalid_url(&request.url))?;
+        }
+        target
     } else {
         request
             .uri
@@ -2377,6 +2397,44 @@ mod tests {
             .unwrap();
 
         validate_request(&request).unwrap();
+    }
+
+    #[test]
+    fn outgoing_absolute_form_retains_explicit_numeric_default_ports() {
+        for (input, expected) in [
+            (
+                "http://origin.invalid:80/path?q=one#fragment",
+                "http://origin.invalid:80/path?q=one",
+            ),
+            (
+                "http://user:pass@MiXeD.Example:080/path#fragment",
+                "http://mixed.example:80/path",
+            ),
+            (
+                "http://user:pass@[::1]:080/path?q=one#fragment",
+                "http://[::1]:80/path?q=one",
+            ),
+            (
+                "http://origin.invalid:08123/path",
+                "http://origin.invalid:8123/path",
+            ),
+            (
+                "http://origin.invalid:0/path",
+                "http://origin.invalid:0/path",
+            ),
+            ("http://origin.invalid/path", "http://origin.invalid/path"),
+            ("http://[::1]/path", "http://[::1]/path"),
+            (
+                "https://origin.invalid:443/path",
+                "https://origin.invalid:443/path",
+            ),
+        ] {
+            let request = RequestBuilder::new(Method::GET, input).build().unwrap();
+            let (outgoing, original_url, _) =
+                outgoing_request(request.into_parts(), false, true).unwrap();
+            assert_eq!(outgoing.uri().to_string(), expected, "{input}");
+            assert_eq!(original_url, input);
+        }
     }
 
     #[test]

@@ -89,6 +89,37 @@ fn http_proxy_receives_absolute_form_and_basic_credentials_only_as_a_header() {
     assert!(!request.contains("#fragment"), "{request:?}");
 }
 
+#[test]
+fn http_proxy_wire_retains_explicit_default_port_and_normalizes_lexical_zeroes() {
+    for (input, expected) in [
+        (
+            "http://origin.invalid:80/path",
+            "http://origin.invalid:80/path",
+        ),
+        (
+            "http://origin.invalid:080/path",
+            "http://origin.invalid:80/path",
+        ),
+        ("http://[::1]:80/path", "http://[::1]:80/path"),
+        ("http://[::1]:080/path", "http://[::1]:80/path"),
+    ] {
+        let (proxy_address, proxy_task) = spawn_http_proxy();
+        let client = Client::builder()
+            .proxy(Proxy::Http(
+                format!("http://{proxy_address}").parse().unwrap(),
+            ))
+            .build()
+            .unwrap();
+        let response = runtime().block_on(client.get(input).send()).unwrap();
+        assert_eq!(runtime().block_on(response.bytes()).unwrap(), "proxy-ok");
+        let head = String::from_utf8(proxy_task.join().unwrap()).unwrap();
+        assert!(
+            head.starts_with(&format!("GET {expected} HTTP/1.1\r\n")),
+            "{head:?}"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum SocksKind {
     Four,

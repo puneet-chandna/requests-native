@@ -1781,14 +1781,35 @@ fn request_body(request: &Bound<'_, PyAny>) -> PyResult<Option<Option<Vec<u8>>>>
 }
 
 // Admission has already proved an HTTP URI with a scheme and authority.
-// Keep its spelling while matching urlparse/urlunparse's empty delimiters.
-fn proxy_request_url(url: &str) -> String {
+// Match urllib3's host and numeric port normalization without rewriting the path.
+fn proxy_request_url(url: &str, request_uri: &Uri) -> Option<String> {
+    let authority = request_uri.authority()?;
+    let host = authority.host();
+    // Scoped IPv6 needs urllib3's separate zone-ID normalization.
+    if host.contains('%') {
+        return None;
+    }
+    let port = authority.port_u16();
+    let port_suffix = authority.as_str().rsplit('@').next()?.strip_prefix(host)?;
+    // Uri accepts lexical ports that urllib3 rejects. Do not erase them.
+    if !matches!(port_suffix, "" | ":")
+        && (port.is_none()
+            || !port_suffix
+                .strip_prefix(':')?
+                .bytes()
+                .all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let authority = match port {
+        Some(port) => format!("{}:{port}", host.to_ascii_lowercase()),
+        None => host.to_ascii_lowercase(),
+    };
     let url = url.split_once('#').map_or(url, |(head, _)| head);
     let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_owned();
+        return None;
     };
     let end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let authority = rest[..end].rsplit('@').next().unwrap_or(&rest[..end]);
     let tail = &rest[end..];
     let (path, query) = tail
         .split_once('?')
@@ -1804,7 +1825,7 @@ fn proxy_request_url(url: &str) -> String {
         result.push('?');
         result.push_str(query);
     }
-    result
+    Some(result)
 }
 
 fn native_send_input(
@@ -1885,7 +1906,10 @@ fn native_send_input(
     let urllib3_url = if !scheme.eq_ignore_ascii_case("https")
         && matches!(proxy.as_ref(), Some(Proxy::Http(_) | Proxy::Https(_)))
     {
-        proxy_request_url(&url)
+        let Some(url) = proxy_request_url(&url, &request_uri) else {
+            return Ok(Err("request URL is unsupported".to_owned()));
+        };
+        url
     } else {
         let path_url = request.getattr("path_url")?;
         if !path_url.is_exact_instance_of::<PyString>() {
@@ -5095,7 +5119,64 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_stable_urllib3_126;
+    use super::{is_stable_urllib3_126, proxy_request_url};
+    use requests::Uri;
+
+    #[test]
+    fn proxy_url_normalizes_only_authority_and_empty_delimiters() {
+        for (input, expected) in [
+            (
+                "http://origin.example:080/path?q=one#fragment",
+                "http://origin.example:80/path?q=one",
+            ),
+            (
+                "http://MiXeD.Example:8080/path",
+                "http://mixed.example:8080/path",
+            ),
+            (
+                "http://user:pass@MiXeD.Example:080/path;?#fragment",
+                "http://mixed.example:80/path",
+            ),
+            (
+                "http://user:pass@[::1]:080/path?q=one#fragment",
+                "http://[::1]:80/path?q=one",
+            ),
+            (
+                "http://origin.example:08123/path",
+                "http://origin.example:8123/path",
+            ),
+            (
+                "http://origin.example:0/path",
+                "http://origin.example:0/path",
+            ),
+            ("http://origin.example:/path", "http://origin.example/path"),
+            (
+                "HTTP://MiXeD.Example/path;params?q=one#fragment",
+                "http://mixed.example/path;params?q=one",
+            ),
+        ] {
+            let uri = input.parse::<Uri>().unwrap();
+            assert_eq!(
+                proxy_request_url(input, &uri).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_url_does_not_erase_unsupported_ports_or_normalize_zone_ids() {
+        for input in [
+            "http://origin.example:+80/path",
+            "http://origin.example:+0/path",
+            "http://origin.example:invalid/path",
+            "http://origin.example:65536/path",
+            "http://[fe80::1%25Zone]:80/path",
+        ] {
+            let uri = input.parse::<Uri>().unwrap();
+            assert_eq!(proxy_request_url(input, &uri), None, "{input}");
+        }
+    }
 
     #[test]
     fn stable_urllib3_126_version_boundary_is_exact() {
