@@ -122,4 +122,4 @@ jobs:
             target/performance-evidence/*.json
             target/performance-evidence/*.log
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: ${{ inputs.smoke && 14 || 30 }}

@@ -100,4 +100,4 @@ jobs:
           name: wheel-${{ inputs.python }}-${{ inputs.os }}
           path: wheelhouse/
           if-no-files-found: error
-          retention-days: 5
+          retention-days: ${{ github.event_name == 'pull_request' && 5 || 30 }}

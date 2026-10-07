@@ -47,13 +47,20 @@ the historical Windows exception. The owner accepts passing qualification on
 current supported Windows runners while keeping issue #1 open; its historical
 cause remains unproved.
 
-Stable releases also require the full paired performance gate for the
-candidate, with a recorded baseline and a ``passed`` decision. Run
+Stable releases also require complete paired performance evidence for the
+candidate, with a recorded baseline. Release workflows accept ``passed`` or
+complete ``inconclusive`` evidence with a visible warning under the owner's
+approved policy. Run
 ``.venv/bin/python benchmarks/evaluate.py --base <baseline> --candidate HEAD --gate``
 locally, or dispatch ``Release performance qualification`` on Namespace CI.
-Retain the raw reports, comparison and logs. Smoke mode verifies execution;
-regressions, inconclusive controls or insufficient evidence block performance
-qualification. Runtime changes require fresh qualification. See the
+Retain the raw reports, comparison and logs. The statistical CLI keeps its
+strict exit behavior and leaves raw statuses, ratios and 95% intervals
+unchanged. Confirmed native regressions block release even when unstable
+controls make the overall status inconclusive. Correctness failures,
+insufficient samples/CPU/RSS evidence, malformed or missing reports, and
+source/evaluator mismatches also block release. Smoke mode only verifies
+execution. Warning acceptance does not establish performance parity or
+superiority. Runtime changes require fresh qualification. See the
 `benchmark procedure <../../benchmarks/README.md>`_ and
 `current readiness evidence <../dev/release-readiness.md>`_.
 
@@ -64,6 +71,14 @@ provide the existing qualified run ID. The workflow verifies its source and
 documentation or validation-workflow corrections must not relabel those
 archives as a newer source commit. Runtime or packaged-source changes require
 fresh artifact qualification.
+
+New stable wheel fan-out, sdist, assembled release-set and full performance
+evidence artifacts are retained for 30 days. Pull-request wheels retain five
+days and smoke performance evidence retains 14 days. These periods apply to
+new uploads, not existing artifact expirations. Reuse still requires the
+original sdist and wheel fan-out; preserving only the assembled release-set
+does not satisfy the current reuse path. Download required evidence before
+expiry if account setup will take longer than the retention period.
 
 The workflow stores a ``release-set`` artifact for review. Both
 ``publish_pypi`` and ``publish_crates`` default to false; version tags do not
@@ -100,9 +115,11 @@ before upload and publishes only its 23 wheels and sdist; the manifest is retain
 as qualification evidence.
 
 `crates.io Trusted Publishing <https://crates.io/docs/trusted-publishing>`_
-requires an existing crate. For the first upload, create a short-lived API token
-limited to publishing ``requests-native`` and store it directly as the GitHub
-``crates-io`` environment secret ``CARGO_REGISTRY_TOKEN``. Do not paste it into
+requires an existing crate. The owner has stored the bootstrap token as the
+GitHub repository secret ``CRATES_IO_API_TOKEN``. The upload step maps it to
+Cargo's ``CARGO_REGISTRY_TOKEN`` variable. The protected ``crates-io`` job still
+requires reviewer approval and the exact ``main`` branch before any step runs;
+the token is repository-scoped, not an environment secret. Do not paste it into
 chat or commit it. The job runs a locked publish dry run and the extracted
 archive's unit tests before exposing the token to the upload step. Only the core
 crate publishes; the Python binding remains private. After the first release,

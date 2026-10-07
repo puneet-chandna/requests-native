@@ -4817,6 +4817,7 @@ impl SessionRuntimeSignalHandler {
 struct SessionRuntimeInterrupter {
     ready: Py<PyAny>,
     armed: Py<PyAny>,
+    origin_thread: u64,
 }
 
 #[pyclass(module = "requests._requests_rust")]
@@ -4876,12 +4877,20 @@ impl SessionRuntimeInterrupter {
                 "runtime interrupt arm gate expired",
             ));
         }
-        let os = py.import("os")?;
         let signal = py.import("signal")?;
-        os.call_method1(
-            "kill",
-            (os.call_method0("getpid")?, signal.getattr("SIGINT")?),
-        )?;
+        // A process-directed signal can reach this helper instead of the blocked reader.
+        if signal.hasattr("pthread_kill")? {
+            signal.call_method1(
+                "pthread_kill",
+                (self.origin_thread, signal.getattr("SIGINT")?),
+            )?;
+        } else {
+            let os = py.import("os")?;
+            os.call_method1(
+                "kill",
+                (os.call_method0("getpid")?, signal.getattr("SIGINT")?),
+            )?;
+        }
         Ok(())
     }
 }
@@ -4913,6 +4922,7 @@ where
         SessionRuntimeInterrupter {
             ready: ready.clone().unbind(),
             armed: armed.clone().unbind(),
+            origin_thread: threading.call_method0("get_ident")?.extract()?,
         },
     )?;
     let kwargs = PyDict::new(py);

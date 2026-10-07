@@ -2009,7 +2009,7 @@ def test_publish_workflow_requires_explicit_protected_publication() -> None:
         "name": "release-set",
         "path": "dist/",
         "if-no-files-found": "error",
-        "retention-days": 5,
+        "retention-days": 30,
     }
     assert (
         sum(
@@ -2084,7 +2084,7 @@ def test_publish_workflow_requires_explicit_protected_publication() -> None:
     assert "--verify-release-set" in jobs["pypi"]["steps"][-2]["run"]
     assert "--dry-run" in jobs["crates"]["steps"][-2]["run"]
     assert jobs["crates"]["steps"][-1]["env"] == {
-        "CARGO_REGISTRY_TOKEN": "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        "CARGO_REGISTRY_TOKEN": "${{ secrets.CRATES_IO_API_TOKEN }}"
     }
     assert (
         "cargo publish -p requests-native --locked"

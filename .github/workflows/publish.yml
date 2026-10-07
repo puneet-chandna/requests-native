@@ -84,7 +84,7 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
           if-no-files-found: error
-          retention-days: 5
+          retention-days: 30
 
   wheels:
     if: ${{ inputs.artifact_run_id == '' }}
@@ -171,7 +171,7 @@ jobs:
           name: release-set
           path: dist/
           if-no-files-found: error
-          retention-days: 5
+          retention-days: 30
 
   publication-gates:
     if: ${{ inputs.publish_pypi || inputs.publish_crates }}
@@ -317,10 +317,10 @@ jobs:
           cargo test --manifest-path target/package/requests-native-1.0.0/Cargo.toml --lib --locked
       - name: Publish the qualified core crate
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
         # crates.io requires the first upload before trusted publishing can be configured:
         # https://blog.rust-lang.org/2025/07/11/crates-io-development-update-2025-07/
         # After bootstrap, replace this token with OIDC and remove the exception.
-        run: | # zizmor: ignore[use-trusted-publishing] First-upload bootstrap uses the protected crates-io token.
+        run: | # zizmor: ignore[use-trusted-publishing] First-upload bootstrap is gated by protected crates-io job approval.
           test -n "$CARGO_REGISTRY_TOKEN"
           cargo publish -p requests-native --locked --no-verify

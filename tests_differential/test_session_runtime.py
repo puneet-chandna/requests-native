@@ -154,7 +154,10 @@ def exact_interrupt(marker, ready, operation, release):
     def interrupt():
         assert ready.wait(2)
         assert armed.wait(2)
-        os.kill(os.getpid(), signal.SIGINT)
+        if hasattr(signal, "pthread_kill"):
+            signal.pthread_kill(entry_thread, signal.SIGINT)
+        else:
+            os.kill(os.getpid(), signal.SIGINT)
     signal.signal(signal.SIGINT, raise_marker)
     interrupter = threading.Thread(target=interrupt)
     interrupter.start()
@@ -1205,6 +1208,30 @@ def test_phase_b_clean_oracle_and_native_runtime_available(case: RuntimeCase) ->
     assert not is_missing_session_runtime_trial(rewrite.observations)
     assert rewrite.observations["exception"] is None
     assert rewrite.stderr == ""
+
+
+def test_b07_interrupt_reaches_origin_when_process_signal_would_reach_sender() -> None:
+    case = next(case for case in PHASE_B_CASES if case.case_id == "B07")
+    source = runtime_case_source(case)
+    oracle = run_oracle_case({"source": source})
+    signal_routing = r"""
+original_kill = os.kill
+def process_signal_to_sender(pid, signum):
+    assert pid == os.getpid()
+    if hasattr(signal, "pthread_kill"):
+        # Process-directed signals may reach the sender instead of the reader.
+        signal.pthread_kill(threading.get_ident(), signum)
+    else:
+        original_kill(pid, signum)
+os.kill = process_signal_to_sender
+"""
+    anchor = "entry_thread = threading.get_ident()\n"
+    assert source.count(anchor) == 1
+    source = source.replace(anchor, anchor + dedent(signal_routing), 1)
+    rewrite = run_rewrite_case({"source": source})
+    assert rewrite.observations == oracle.observations
+    assert rewrite.observations["exception"] is None
+    assert rewrite.stderr == oracle.stderr == ""
 
 
 @pytest.mark.parametrize("case", PHASE_B_CASES, ids=lambda case: case.case_id)

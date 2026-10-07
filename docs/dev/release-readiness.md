@@ -337,15 +337,19 @@ control variability before repeating the full evaluation.
    HTTP 404 for `requests-native` on both PyPI and crates.io on 2026-10-07;
    no package currently exists under that name, but this does not reserve it.
    No workflow has been dispatched to publish and no registry upload has occurred.
-   The owner has not created registry accounts yet. PyPI needs a verified email
-   and two-factor authentication; crates.io can use the owner's GitHub login
-   and requires a verified email before publishing. Account creation remains
+   The owner confirmed crates.io username `puneet-chandna` and creation of the
+   PyPI account. PyPI username, completed two-factor authentication enrollment
+   and pending publisher setup still await confirmation. PyPI needs a verified
+   email and two-factor authentication; crates.io can use the owner's GitHub
+   login and requires a verified email before publishing. Account creation remains
    an owner action; credentials must not be pasted into this chat. Register PyPI's
    pending publisher for `requests-native`, GitHub owner `puneet-chandna`, repo
    `requests-native`, workflow `publish.yml`, environment `pypi`. crates.io needs
-   the first-upload token stored directly as `CARGO_REGISTRY_TOKEN` in the
-   protected `crates-io` environment; revoke it after bootstrap, then configure
-   Trusted Publishing for later releases. The upload step carries a scoped
+   the first-upload token now stored as the repository secret
+   `CRATES_IO_API_TOKEN`, mapped to the upload step's `CARGO_REGISTRY_TOKEN`.
+   The protected `crates-io` job still requires reviewer approval and exact
+   `main`, but the secret is repository-scoped. Revoke it after bootstrap, then
+   configure Trusted Publishing for later releases. The upload step carries a scoped
    Zizmor exception for this first-publication limitation, linked to the official
    Rust guidance; remove the exception when switching to OIDC. CI pins Zizmor
    1.23.1 to match local audits. See the [release procedure](../community/release-process.rst).
