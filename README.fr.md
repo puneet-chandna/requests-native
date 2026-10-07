@@ -1,10 +1,16 @@
 <!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
 # Requests Native
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/puneet-chandna/requests-native/main/docs/assets/logo.png" alt="Requests Native" width="250">
+</p>
+
 [English](https://github.com/puneet-chandna/requests-native/blob/main/README.md) · [Español](https://github.com/puneet-chandna/requests-native/blob/main/README.es.md) · [简体中文](https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md) · [Français](https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md) · [हिन्दी](https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md) · [日本語](https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md)
 
 Requests Native relie l'API Python `requests` à un cœur HTTP commun écrit en Rust.
 Ce même cœur est aussi accessible directement en Rust, avec des clients natifs asynchrones et bloquants.
+Les deux clients Rust prennent en charge les pools de connexions, les délais d'attente configurables, les réglages de proxy et de TLS
+et la transmission en flux des corps de requêtes et de réponses.
 
 [Version 1.0.0](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0) ·
 [crates.io](https://crates.io/crates/requests-native) ·
@@ -109,12 +115,13 @@ Les vérifications Windows actuelles ont réussi sans accepter d'échecs TLS ; l
 
 Le cœur Rust 1.0.0 publié a été mesuré sur cinq paires dans une comparaison en boucle locale, avec 16 charges de travail correspondantes pour chaque client natif.
 
-| Client natif | Débit par rapport à Requests d'origine | Débit par rapport à la bêta |
-| --- | --- | --- |
-| Asynchrone | 2.65x | 1.005x |
-| Bloquant | 2.23x | 1.055x |
+| Client natif | Rapport médian de débit par rapport à Requests d'origine | Rapport maximal observé par rapport à Requests d'origine | Débit maximal observé (requêtes/s) | Rapport médian de débit par rapport à la bêta |
+| --- | --- | --- | --- | --- |
+| Asynchrone | 2.65x | 11.92x | 13,479 | 1.005x |
+| Bloquant | 2.23x | 9.96x | 10,513 | 1.055x |
 
-Pour chaque charge de travail, on prend la médiane des rapports sur cinq paires, puis la médiane de ces 16 valeurs.
+Les rapports médians résument les 16 médianes par charge de travail calculées sur cinq paires.
+Les pics sont les observations les plus élevées pour une seule mesure dans les rapports, pas les performances typiques ; le rapport maximal et le débit maximal peuvent provenir de mesures différentes.
 Les gains varient selon la charge de travail ; les contrôles de l'oracle sont instables, ce qui laisse une incertitude statistique.
 Consultez la [méthodologie](https://github.com/puneet-chandna/requests-native/blob/main/benchmarks/README.md) et les [preuves liées aux sources exactes](https://github.com/puneet-chandna/requests-native/blob/main/docs/dev/release-readiness.md).
 

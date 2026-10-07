@@ -1,10 +1,16 @@
 <!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
 # Requests Native
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/puneet-chandna/requests-native/main/docs/assets/logo.png" alt="Requests Native" width="250">
+</p>
+
 [English](https://github.com/puneet-chandna/requests-native/blob/main/README.md) · [Español](https://github.com/puneet-chandna/requests-native/blob/main/README.es.md) · [简体中文](https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md) · [Français](https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md) · [हिन्दी](https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md) · [日本語](https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md)
 
 Requests Native, Python की परिचित `requests` API को Rust में लिखे एक साझा HTTP कोर से जोड़ता है।
 यही कोर Rust के लिए नेटिव असिंक्रोनस और ब्लॉकिंग क्लाइंट के रूप में भी सीधे उपलब्ध है।
+दोनों Rust क्लाइंट कनेक्शन पूलिंग, कॉन्फ़िगर किए जा सकने वाले टाइमआउट, proxy और TLS सेटिंग्स
+और अनुरोध व प्रतिक्रिया बॉडी की स्ट्रीमिंग का समर्थन करते हैं।
 
 [1.0.0 रिलीज़](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0) ·
 [crates.io](https://crates.io/crates/requests-native) ·
@@ -109,12 +115,13 @@ Windows की मौजूदा जाँचें बिना किसी T
 
 प्रकाशित 1.0.0 Rust कोर को स्थानीय लूपबैक तुलना में पाँच जोड़ी मापों से जाँचा गया, जिसमें हर नेटिव क्लाइंट के लिए 16 समान कार्यभार थे।
 
-| नेटिव क्लाइंट | मूल Requests के मुकाबले प्रति सेकंड अनुरोध | बीटा के मुकाबले प्रति सेकंड अनुरोध |
-| --- | --- | --- |
-| असिंक्रोनस | 2.65x | 1.005x |
-| ब्लॉकिंग | 2.23x | 1.055x |
+| नेटिव क्लाइंट | मूल Requests के मुकाबले थ्रूपुट का माध्यिका अनुपात | मूल Requests के मुकाबले थ्रूपुट का अधिकतम मापा गया अनुपात | अधिकतम मापा गया थ्रूपुट (अनुरोध/सेकंड) | बीटा के मुकाबले थ्रूपुट का माध्यिका अनुपात |
+| --- | --- | --- | --- | --- |
+| असिंक्रोनस | 2.65x | 11.92x | 13,479 | 1.005x |
+| ब्लॉकिंग | 2.23x | 9.96x | 10,513 | 1.055x |
 
-हर मान पाँच जोड़ी मापों में हर कार्यभार के अनुपातों की माध्यिका निकालकर मिले 16 मानों की माध्यिका है।
+माध्यिका अनुपात पाँच जोड़ी मापों में हर कार्यभार के लिए निकाले गए 16 माध्यिका अनुपातों की माध्यिका हैं।
+अधिकतम मान रिपोर्टों में किसी एक माप के सबसे ऊँचे मान हैं, सामान्य प्रदर्शन नहीं; अधिकतम अनुपात और अधिकतम अनुरोध/सेकंड अलग-अलग मापों से मिल सकते हैं।
 लाभ कार्यभार के अनुसार बदलते हैं; ऑरेकल नियंत्रणों की अस्थिरता के कारण सांख्यिकीय अनिश्चितता बनी हुई है।
 [पद्धति](https://github.com/puneet-chandna/requests-native/blob/main/benchmarks/README.md) और [सटीक सोर्स कोड से जुड़े प्रमाण](https://github.com/puneet-chandna/requests-native/blob/main/docs/dev/release-readiness.md) देखें।
 

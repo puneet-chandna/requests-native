@@ -1,10 +1,16 @@
 <!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
 # Requests Native
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/puneet-chandna/requests-native/main/docs/assets/logo.png" alt="Requests Native" width="250">
+</p>
+
 [English](https://github.com/puneet-chandna/requests-native/blob/main/README.md) · [Español](https://github.com/puneet-chandna/requests-native/blob/main/README.es.md) · [简体中文](https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md) · [Français](https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md) · [हिन्दी](https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md) · [日本語](https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md)
 
 Requests Native brings the familiar Python `requests` API to a shared Rust HTTP core.
 The same core is available directly as native async and blocking clients for Rust.
+Both Rust clients support connection pooling, configurable timeouts, proxy and TLS settings,
+and streaming request and response bodies.
 
 [1.0.0 release](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0) ·
 [crates.io](https://crates.io/crates/requests-native) ·
@@ -109,12 +115,13 @@ Current Windows checks passed without accepted TLS failures; the unreproduced hi
 
 The published 1.0.0 Rust core was measured in a local loopback comparison in five pairs, with 16 matched workloads per native client.
 
-| Native client | Throughput vs original Requests | Throughput vs beta |
-| --- | --- | --- |
-| Async | 2.65x | 1.005x |
-| Blocking | 2.23x | 1.055x |
+| Native client | Median throughput ratio vs original Requests | Max observed throughput ratio vs original Requests | Peak observed throughput (requests/s) | Median throughput ratio vs beta |
+| --- | --- | --- | --- | --- |
+| Async | 2.65x | 11.92x | 13,479 | 1.005x |
+| Blocking | 2.23x | 9.96x | 10,513 | 1.055x |
 
-Each value is the median of the 16 per-workload median ratios across five pairs.
+Median ratios summarize the 16 per-workload median ratios across five pairs.
+Peaks are the highest single-report observations, not typical performance; the maximum ratio and peak requests/s can come from different observations.
 Gains vary by workload; unstable oracle controls leave statistical uncertainty.
 See the [methodology](https://github.com/puneet-chandna/requests-native/blob/main/benchmarks/README.md) and [exact-source evidence](https://github.com/puneet-chandna/requests-native/blob/main/docs/dev/release-readiness.md).
 

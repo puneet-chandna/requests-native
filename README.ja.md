@@ -1,10 +1,16 @@
 <!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
 # Requests Native
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/puneet-chandna/requests-native/main/docs/assets/logo.png" alt="Requests Native" width="250">
+</p>
+
 [English](https://github.com/puneet-chandna/requests-native/blob/main/README.md) · [Español](https://github.com/puneet-chandna/requests-native/blob/main/README.es.md) · [简体中文](https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md) · [Français](https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md) · [हिन्दी](https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md) · [日本語](https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md)
 
 Requests Native は、使い慣れた Python の `requests` API を、Rust で実装した共通の HTTP コアにつなぎます。
 同じコアを、Rust 向けのネイティブな非同期クライアントとブロッキングクライアントとして直接利用することもできます。
+両方の Rust クライアントは、接続プール、設定可能なタイムアウト、プロキシと TLS の設定、
+リクエストとレスポンスのボディのストリーミングに対応しています。
 
 [1.0.0 リリース](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0) ·
 [crates.io](https://crates.io/crates/requests-native) ·
@@ -109,12 +115,13 @@ with requests.Session() as session:
 
 公開された 1.0.0 の Rust コアを、各ネイティブクライアントで対応する 16 種類のワークロードを使い、ローカルのループバック比較で五組の測定により評価しました。
 
-| ネイティブクライアント | 元の Requests に対するスループット比 | ベータ版に対するスループット比 |
-| --- | --- | --- |
-| 非同期 | 2.65x | 1.005x |
-| ブロッキング | 2.23x | 1.055x |
+| ネイティブクライアント | 元の Requests に対するスループット比の中央値 | 元の Requests に対する最大観測スループット比 | 最大観測スループット（リクエスト/秒） | ベータ版に対するスループット比の中央値 |
+| --- | --- | --- | --- | --- |
+| 非同期 | 2.65x | 11.92x | 13,479 | 1.005x |
+| ブロッキング | 2.23x | 9.96x | 10,513 | 1.055x |
 
-各値は、五組の測定でワークロードごとの比率の中央値を求め、その 16 個の中央値を示したものです。
+比率の中央値は、五組の測定でワークロードごとに求めた 16 個の比率の中央値を、さらに中央値でまとめたものです。
+ピーク値は各レポートの単一測定で観測された最大値であり、通常の性能を表すものではありません。最大比率と最大リクエスト数/秒は、異なる測定から得られる場合があります。
 改善幅はワークロードによって異なります。オラクルの対照測定が不安定なため、統計的な不確実性が残っています。
 [測定方法](https://github.com/puneet-chandna/requests-native/blob/main/benchmarks/README.md)と[正確なソースに紐づく検証記録](https://github.com/puneet-chandna/requests-native/blob/main/docs/dev/release-readiness.md)を参照してください。
 
