@@ -195,8 +195,13 @@ is retained under `target/evaluations/local-gate-259-u1ZSFA/`. The local HEAD/HE
 smoke also completed all 64 cases per side and restoration, without qualifying
 performance. The laptop has distinct performance/efficiency CPU sets; this is a
 possible noise source, not a proved cause. Affinity telemetry now records the
-allowed CPU set. An oracle-only homogeneous-core probe remains unqualified and
-will precede another full evaluation.
+allowed CPU set. The three-pair oracle-only probe at `680ce0f`, pinned to CPUs
+4–11, completed with 62 passing metrics and three inconclusive p95 latency
+metrics. Individual paired latency ratios reached 1.21–1.46 despite identical
+source revisions. CPU pinning did not resolve control instability; this probe
+does not qualify release performance. Its raw reports are retained under
+`target/evaluations/local-control-affinity-fn3j0pzq/`. Diagnose the remaining
+control variability before repeating the full evaluation.
 
 1. Enable core crate publication only after qualification. The archive now
    carries canonical README/legal notices, the referenced unit-test modules
