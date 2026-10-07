@@ -87,7 +87,7 @@ these as separate maintenance changes with fresh compatibility qualification.
 - Strict Windows qualification tests the selected current commit's ordinary
   sanitized release wheel against the frozen oracle with the full installed
   suite. It excludes the historical diagnostic issue exception. The full wheel
-  matrix retains the existing signed-to-wheel Windows report and requires its
+  matrix retains the Windows report bound to the wheel's SHA256 and requires its
   status to pass with exit zero and no accepted failures before qualification.
 
 ## Local verification
@@ -135,6 +135,9 @@ The three cross-cutting compatibility rows now record this evidence. Strict
 ledger completion passes all 366 API rows and 106 lifetime rows. Source CI
 requires completion mode for future changes. These records qualify the beta
 candidate's correctness and packaging; performance remains a separate gate.
+The ledger-closure commit `63f04bc58cb5228383d087da5131d0ffdd0d24f4`
+also passed [source CI 37548904822](https://github.com/puneet-chandna/requests-native/actions/runs/37548904822)
+with 2,862 tests, 10 skips and a clean exit, plus lint and security workflows.
 
 ## Work still required before declaring 1.0.0
 
@@ -152,6 +155,10 @@ candidate's correctness and packaging; performance remains a separate gate.
    comparison had no definite regression, but noisy oracle controls and the
    missing fifth pair made qualification inconclusive. The job limit is now
    90 minutes; measurement deadlines, samples and budgets are unchanged.
+   Manual CI now exposes the existing local pair/request/warm-up counts and
+   per-case deadline, with a deliberate 90- or 180-minute job limit. Defaults
+   and the 20% budget are unchanged. Invalid deadlines and undersized release
+   samples fail before builds; all 26 benchmark helper checks passed.
 3. Prepare stable version metadata and corresponding validators/docs only once
    the candidate qualifies: Rust `1.0.0`, Python distribution `1.0.0`, stable
    classifiers/history, while retaining `requests.__version__ == 2.34.2`.

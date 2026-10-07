@@ -11,6 +11,27 @@ on:
         description: "Short harness check only; does not qualify a release"
         type: boolean
         default: false
+      pairs:
+        description: "Paired repetitions (release gate needs at least 5)"
+        type: number
+        default: 5
+      requests:
+        description: "Measured requests per case (release gate needs at least 100)"
+        type: number
+        default: 100
+      warmup:
+        description: "Warm-up requests per worker (release gate needs at least 4)"
+        type: number
+        default: 4
+      case_timeout_seconds:
+        description: "Per-case process deadline; increase for larger samples"
+        type: number
+        default: 60
+      timeout_minutes:
+        description: "Job deadline; larger samples can need longer than the default"
+        type: choice
+        options: ["90", "180"]
+        default: "90"
 
 permissions:
   contents: read
@@ -22,7 +43,7 @@ concurrency:
 jobs:
   evaluate:
     runs-on: namespace-profile-puneet-chandna
-    timeout-minutes: 90
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -48,11 +69,17 @@ jobs:
           BASE: ${{ inputs.base }}
           CANDIDATE: ${{ github.sha }}
           SMOKE: ${{ inputs.smoke }}
+          PAIRS: ${{ inputs.pairs }}
+          REQUESTS: ${{ inputs.requests }}
+          WARMUP: ${{ inputs.warmup }}
+          CASE_TIMEOUT: ${{ inputs.case_timeout_seconds }}
         shell: bash
         run: |
           mode=--gate
           if [[ "$SMOKE" == true ]]; then mode=--smoke; fi
-          .venv/bin/python benchmarks/evaluate.py --base "$BASE" --candidate "$CANDIDATE" "$mode" --output target/performance-evidence
+          .venv/bin/python benchmarks/evaluate.py --base "$BASE" --candidate "$CANDIDATE" "$mode" \
+            --pairs "$PAIRS" --requests "$REQUESTS" --warmup "$WARMUP" \
+            --case-timeout-seconds "$CASE_TIMEOUT" --output target/performance-evidence
       - name: Preserve raw measurements and decision
         if: ${{ always() }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

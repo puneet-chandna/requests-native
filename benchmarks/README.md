@@ -29,6 +29,10 @@ The `.github/workflows/evaluate.yml` workflow runs this identical command on
 `namespace-profile-puneet-chandna`; its smoke input selects the quick check.
 Windows/macOS packaging and qualification retain their GitHub runners. Neither
 mode publishes packages or creates a GitHub release.
+Manual CI exposes the same pair/request/warm-up counts and per-case deadline,
+with a 90- or 180-minute job deadline. Defaults remain five pairs, 100 requests,
+four warm-ups and a 60-second per-case deadline. Select a longer job deadline
+deliberately when increasing samples; it can consume more runner time.
 
 Prerequisites: an isolated Python environment with maturin and runtime
 dependencies, Git, rustup, a clean frozen oracle checkout (the sibling `requests`
@@ -93,7 +97,7 @@ correctness errors, and rejects smoke mode and uncommitted source. Larger sample
 can resolve uncertainty without discarding a failing case:
 
 ```console
-.venv/bin/python benchmarks/evaluate.py --base v1.0.0-beta --gate --pairs 7 --requests 300 --warmup 8 --output target/evaluations/release-check
+.venv/bin/python benchmarks/evaluate.py --base v1.0.0-beta --gate --pairs 7 --requests 300 --warmup 8 --case-timeout-seconds 120 --output target/evaluations/release-check
 .venv/bin/python -m unittest benchmarks.test_run benchmarks.test_evaluate
 ```
 

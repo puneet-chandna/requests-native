@@ -360,8 +360,14 @@ def main() -> int:
         or args.requests < 1
         or args.warmup < 0
         or not 0 < args.max_regression_percent < 100
+        or not math.isfinite(args.case_timeout_seconds)
+        or args.case_timeout_seconds <= 0
     ):
-        parser.error("invalid evaluation sizes or regression budget")
+        parser.error("invalid evaluation sizes, deadline or regression budget")
+    if args.gate and (args.pairs < 5 or args.requests < 100 or args.warmup < 4):
+        parser.error(
+            "release qualification requires at least 5 pairs, 100 requests and 4 warmups"
+        )
     if sys.prefix == sys.base_prefix:
         parser.error(
             "run with an isolated Python environment containing maturin and Requests dependencies"

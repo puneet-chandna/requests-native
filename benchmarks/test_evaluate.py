@@ -75,6 +75,31 @@ def report(commit, cost=1.0):
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_invalid_release_samples_and_deadlines_fail_before_builds(self):
+        for options, message in (
+            (["--pairs", "4"], "at least 5 pairs"),
+            (["--requests", "99"], "at least 5 pairs"),
+            (["--warmup", "3"], "at least 5 pairs"),
+            (["--case-timeout-seconds", "0"], "invalid evaluation"),
+            (["--case-timeout-seconds", "nan"], "invalid evaluation"),
+            (["--case-timeout-seconds", "inf"], "invalid evaluation"),
+        ):
+            with (
+                self.subTest(options=options),
+                mock.patch(
+                    "sys.argv", ["evaluate", "--base", "HEAD", "--gate", *options]
+                ),
+                mock.patch("sys.stderr") as stderr,
+                mock.patch.object(evaluate, "snapshot") as snapshot,
+                self.assertRaises(SystemExit) as error,
+            ):
+                evaluate.main()
+            self.assertEqual(error.exception.code, 2)
+            snapshot.assert_not_called()
+            self.assertIn(
+                message, "".join(call.args[0] for call in stderr.write.call_args_list)
+            )
+
     def test_preflight_rejects_missing_or_incompatible_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
