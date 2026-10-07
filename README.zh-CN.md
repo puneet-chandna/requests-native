@@ -1,27 +1,36 @@
 <!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
-# Requests Native
-
 <p align="center">
   <img src="https://raw.githubusercontent.com/puneet-chandna/requests-native/main/docs/assets/logo.png" alt="Requests Native" width="250">
 </p>
 
-[English](https://github.com/puneet-chandna/requests-native/blob/main/README.md) · [Español](https://github.com/puneet-chandna/requests-native/blob/main/README.es.md) · [简体中文](https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md) · [Français](https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md) · [हिन्दी](https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md) · [日本語](https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md)
+<h1 align="center">Requests Native</h1>
 
-Requests Native 将熟悉的 Python `requests` API 接入共用的 Rust HTTP 核心。
+<p align="center">
+<a href="https://github.com/puneet-chandna/requests-native/blob/main/README.md">English</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.es.md">Español</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md">简体中文</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md">Français</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md">हिन्दी</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md">日本語</a>
+</p>
+
+<p align="center">
+Requests Native 将熟悉的 Python <code>requests</code> API 接入共用的 Rust HTTP 核心。
 Rust 开发者也可以直接使用同一核心提供的原生异步和阻塞客户端。
 两个 Rust 客户端均支持连接池、可配置的超时、代理和 TLS 设置，以及流式请求体和响应体。
+</p>
 
-[1.0.0 版本](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0) ·
-[crates.io](https://crates.io/crates/requests-native) ·
-[安装](https://github.com/puneet-chandna/requests-native/blob/main/docs/user/install.rst) · [问题反馈](https://github.com/puneet-chandna/requests-native/issues)
+<p align="center">
+<a href="https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.1">1.0.1 版本</a> ·
+<a href="https://crates.io/crates/requests-native">crates.io</a> ·
+<a href="https://github.com/puneet-chandna/requests-native/blob/main/docs/user/install.rst">安装</a> · <a href="https://github.com/puneet-chandna/requests-native/issues">问题反馈</a>
 
-## Rust：稳定版 1.0.0
+</p>
 
-Rust crate 已发布到 crates.io。请使用 **Rust 1.98.1 或更高版本**，并添加：
+## Rust：稳定版 1.0.1
+
+本次更新仅涉及文档和版本元数据，实现与 1.0.0 相同。
+
+请使用 **Rust 1.98.1 或更高版本**，并添加：
 
 ```toml
 [dependencies]
-requests-native = "1.0.0"
+requests-native = "1.0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -57,10 +66,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 复用客户端即可复用其连接池。
 
-## Python：从源码安装改进后的 1.0.0
+## Python：从源码安装改进后的 1.0.1
 
 计划在未来几天内发布到 PyPI，目前正在完成发布配置。
-Python 发行包**尚未发布到 PyPI**；现在可以使用改进后的 `v1.0.0` 源码。
+Python 发行包**尚未发布到 PyPI**；现在可以使用改进后的 `v1.0.1` 源码。
 本次发布不包含稳定版 Python wheel。
 
 你需要 **CPython 3.10+**、Git、仓库固定的 **Rust 1.98.1** 工具链，
@@ -87,7 +96,7 @@ source .venv/bin/activate
 安装带版本标签的源码：
 
 ```console
-python -m pip install "requests-native @ git+https://github.com/puneet-chandna/requests-native.git@v1.0.0"
+python -m pip install "requests-native @ git+https://github.com/puneet-chandna/requests-native.git@v1.0.1"
 ```
 
 使用熟悉的 API：
@@ -101,7 +110,7 @@ with requests.Session() as session:
     print(response.json())
 ```
 
-发行包是 `requests-native` **1.0.0**；`import requests` 和
+发行包是 `requests-native` **1.0.1**；`import requests` 和
 `requests.__version__ == "2.34.2"` 保留了与 Requests 兼容的标识。
 
 **请与上游 `requests` 使用不同的环境。** 两个发行包占用相同的导入路径；
@@ -113,6 +122,7 @@ with requests.Session() as session:
 ## 性能
 
 对已发布的 1.0.0 Rust 核心进行了五组本地回环配对对比测量，每个原生客户端各有 16 项对应的工作负载。
+[1.0.1](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.1) 的运行时实现与之相同。
 
 | 原生客户端 | 相对原版 Requests 的吞吐量比值中位数 | 相对原版 Requests 的最大实测吞吐量比值 | 最大实测吞吐量（请求/秒） | 相对 beta 版的吞吐量比值中位数 |
 | --- | --- | --- | --- | --- |

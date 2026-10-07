@@ -17,16 +17,17 @@ Can I install it from PyPI?
 
 Not yet. PyPI publication is planned for the coming days; publishing setup is
 being finalized. The Python distribution is not published to PyPI yet. The
-Rust core ``requests-native`` version ``1.0.0`` is stable and
-published on `crates.io <https://crates.io/crates/requests-native/1.0.0>`_. See
-:ref:`install` for the Rust dependency and improved ``v1.0.0`` Python source.
+Rust core ``requests-native`` version ``1.0.1`` is a documentation and
+version-metadata patch of published 1.0.0, with unchanged implementation. See
+`crates.io <https://crates.io/crates/requests-native>`_ and
+:ref:`install` for the Rust dependency and improved ``v1.0.1`` Python source.
 
 Why does it report version 2.34.2?
 ----------------------------------
 
 The import surface reports ``requests.__version__ == "2.34.2"`` for strict
 compatibility. The distinct ``requests-native`` distribution uses version
-``1.0.0`` metadata; the published Cargo package uses ``1.0.0``.
+``1.0.1`` metadata; the Cargo package also uses ``1.0.1``.
 The existing ``v1.0.0-beta`` release retains its original ``1.0.0b1`` /
 ``1.0.0-beta.1`` archives and manifest.
 

@@ -1,7 +1,7 @@
 <!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
 # Security policy
 
-The Rust core 1.0.0 is stable and published on crates.io; Python publication on PyPI is planned and remains pending.
+Rust core 1.0.1 is a documentation and version-metadata patch with the unchanged implementation of published 1.0.0; Python publication on PyPI is planned and remains pending.
 
 To report a suspected vulnerability privately, use the repository's
 **Security** tab and choose **Report a vulnerability** when available.

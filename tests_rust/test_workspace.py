@@ -81,7 +81,7 @@ def test_maturin_mixed_project_preserves_import_and_splits_versions() -> None:
     assert metadata["name"] == "requests-native"
     assert metadata["requires-python"] == ">=3.10"
     assert metadata["dynamic"] == ["version"]
-    assert workspace_version() == "1.0.0"
+    assert workspace_version() == "1.0.1"
     assert metadata["dependencies"] == [
         "charset_normalizer>=2,<4",
         "idna>=2.5,<4",

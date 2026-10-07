@@ -1,6 +1,18 @@
-# Requests Native 1.0.0 release status and readiness history
+# Requests Native 1.0.1 release status and 1.0.0 readiness history
 
-## Published Rust core
+## Documentation-only 1.0.1 patch
+
+Rust crate [`requests-native` 1.0.1](https://crates.io/crates/requests-native/1.0.1)
+is the published documentation and version-metadata patch. Its runtime
+implementation is unchanged from 1.0.0; Rust and Python distribution metadata
+are aligned at 1.0.1, while Requests import compatibility remains 2.34.2.
+The [v1.0.1 release](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.1)
+includes the crate and its qualification manifest, which records the exact
+source, archive checksum and equivalence to published 1.0.0.
+The measurements, source IDs, checksums and original publication record below
+remain historical 1.0.0 evidence; no new performance run is claimed.
+
+## Published 1.0.0 Rust core (historical)
 
 Status updated: 2026-10-08. Rust crate [`requests-native` 1.0.0](https://crates.io/crates/requests-native/1.0.0)
 is stable and published from immutable source
@@ -30,8 +42,11 @@ succeeded after owner review, with the registry checksum matching the qualified
 
 ## Python publication remains deferred
 
-The Python distribution is not published to PyPI. Its `1.0.0` metadata and
-`requests.__version__ == 2.34.2` remain distinct. The c108
+The Python distribution is not published to PyPI. Publishing setup is being
+finalized for planned publication in the coming days. Its current `1.0.1`
+metadata and `requests.__version__ == 2.34.2` remain distinct; source installation
+targets `v1.0.1`. No complete stable Python artifact set is qualified. The
+historical 1.0.0 c108
 [artifact run 37602930857](https://github.com/puneet-chandna/requests-native/actions/runs/37602930857)
 passed all seven Windows lanes without accepted TLS failures, but failed a
 Linux PyPy compatibility check and cancelled the remaining fan-out; no complete

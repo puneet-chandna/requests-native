@@ -1,28 +1,37 @@
 <!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
-# Requests Native
-
 <p align="center">
   <img src="https://raw.githubusercontent.com/puneet-chandna/requests-native/main/docs/assets/logo.png" alt="Requests Native" width="250">
 </p>
 
-[English](https://github.com/puneet-chandna/requests-native/blob/main/README.md) · [Español](https://github.com/puneet-chandna/requests-native/blob/main/README.es.md) · [简体中文](https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md) · [Français](https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md) · [हिन्दी](https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md) · [日本語](https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md)
+<h1 align="center">Requests Native</h1>
 
-Requests Native relie l'API Python `requests` à un cœur HTTP commun écrit en Rust.
+<p align="center">
+<a href="https://github.com/puneet-chandna/requests-native/blob/main/README.md">English</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.es.md">Español</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md">简体中文</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md">Français</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md">हिन्दी</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md">日本語</a>
+</p>
+
+<p align="center">
+Requests Native relie l'API Python <code>requests</code> à un cœur HTTP commun écrit en Rust.
 Ce même cœur est aussi accessible directement en Rust, avec des clients natifs asynchrones et bloquants.
 Les deux clients Rust prennent en charge les pools de connexions, les délais d'attente configurables, les réglages de proxy et de TLS
 et la transmission en flux des corps de requêtes et de réponses.
+</p>
 
-[Version 1.0.0](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0) ·
-[crates.io](https://crates.io/crates/requests-native) ·
-[Installation](https://github.com/puneet-chandna/requests-native/blob/main/docs/user/install.rst) · [Signalement de problèmes](https://github.com/puneet-chandna/requests-native/issues)
+<p align="center">
+<a href="https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.1">Version 1.0.1</a> ·
+<a href="https://crates.io/crates/requests-native">crates.io</a> ·
+<a href="https://github.com/puneet-chandna/requests-native/blob/main/docs/user/install.rst">Installation</a> · <a href="https://github.com/puneet-chandna/requests-native/issues">Signalement de problèmes</a>
 
-## Rust : version stable 1.0.0
+</p>
 
-La crate Rust est publiée sur crates.io. Utilisez **Rust 1.98.1 ou une version plus récente** et ajoutez :
+## Rust : version stable 1.0.1
+
+Cette mise à jour concerne la documentation et les métadonnées de version ; l'implémentation reste celle de 1.0.0.
+
+Utilisez **Rust 1.98.1 ou une version plus récente** et ajoutez :
 
 ```toml
 [dependencies]
-requests-native = "1.0.0"
+requests-native = "1.0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -58,11 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Réutilisez un client pour réutiliser son pool de connexions.
 
-## Python : installer la version améliorée 1.0.0 depuis les sources
+## Python : installer la version améliorée 1.0.1 depuis les sources
 
 La publication sur PyPI est prévue dans les prochains jours ; sa configuration est en cours de finalisation.
 La distribution Python **n'est pas encore publiée sur PyPI** ; vous pouvez dès maintenant utiliser
-les sources améliorées de `v1.0.0`. Cette version ne contient pas de wheels Python stables.
+les sources améliorées de `v1.0.1`. Cette version ne contient pas de wheels Python stables.
 
 Il vous faut **CPython 3.10+**, Git, la chaîne d'outils **Rust 1.98.1** fixée par le dépôt,
 ainsi qu'un compilateur C/C++ natif (MSVC Build Tools sous Windows). Installez Rust avec
@@ -88,7 +97,7 @@ Ou dans Windows PowerShell :
 Installez les sources du tag :
 
 ```console
-python -m pip install "requests-native @ git+https://github.com/puneet-chandna/requests-native.git@v1.0.0"
+python -m pip install "requests-native @ git+https://github.com/puneet-chandna/requests-native.git@v1.0.1"
 ```
 
 Utilisez l'API habituelle :
@@ -102,7 +111,7 @@ with requests.Session() as session:
     print(response.json())
 ```
 
-La distribution est `requests-native` **1.0.0** ; `import requests` et
+La distribution est `requests-native` **1.0.1** ; `import requests` et
 `requests.__version__ == "2.34.2"` conservent l'identité de compatibilité avec Requests.
 
 **Utilisez un environnement distinct de celui de `requests` amont.** Les deux distributions
@@ -114,6 +123,7 @@ Les vérifications Windows actuelles ont réussi sans accepter d'échecs TLS ; l
 ## Performances
 
 Le cœur Rust 1.0.0 publié a été mesuré sur cinq paires dans une comparaison en boucle locale, avec 16 charges de travail correspondantes pour chaque client natif.
+La version [1.0.1](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.1) conserve la même implémentation à l'exécution.
 
 | Client natif | Rapport médian de débit par rapport à Requests d'origine | Rapport maximal observé par rapport à Requests d'origine | Débit maximal observé (requêtes/s) | Rapport médian de débit par rapport à la bêta |
 | --- | --- | --- | --- | --- |

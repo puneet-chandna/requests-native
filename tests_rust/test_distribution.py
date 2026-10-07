@@ -45,7 +45,7 @@ PYTHONS = [
 SYSTEMS = ["ubuntu-22.04", "macos-latest", "windows-latest"]
 FROZEN_ORACLE_COMMIT = "69f84847045bef7a849cc994a26fe7ba8a169e95"
 PYTHON_DISTRIBUTION = "requests-native"
-PYTHON_DISTRIBUTION_VERSION = "1.0.0"
+PYTHON_DISTRIBUTION_VERSION = "1.0.1"
 ARTIFACT_STEM = f"requests_native-{PYTHON_DISTRIBUTION_VERSION}"
 COMPATIBILITY_VERSION = "2.34.2"
 BACKEND_NAME = "requests-native"
@@ -296,7 +296,7 @@ if os.environ["REQUESTS_EDITABLE"] == "1":
 else:
     assert not extension_source.is_relative_to(checkout), extension_source
 distribution = metadata.distribution("requests-native")
-assert distribution.version == "1.0.0"
+assert distribution.version == "1.0.1"
 assert distribution.version != requests.__version__
 assert requests.__all__ == (
     "ConnectionError", "ConnectTimeout", "HTTPError", "JSONDecodeError",
@@ -436,7 +436,7 @@ def test_project_metadata_declares_license_files_dependencies_and_extras() -> No
 
     workspace = load_toml(ROOT / "Cargo.toml")["workspace"]["package"]
     assert workspace["authors"] == ["Puneet Chandna"]
-    assert workspace["version"] == "1.0.0"
+    assert workspace["version"] == "1.0.1"
     assert workspace["homepage"] == "https://github.com/puneet-chandna/requests-native"
     assert workspace["repository"] == workspace["homepage"]
     for crate, expected_name in (

@@ -1053,7 +1053,7 @@ separate. The existing `v1.0.0-beta` archives and manifest retain their original
 `1.0.0b1` / `1.0.0-beta.1` identity:
 
 - the stable candidate Python distribution and Cargo package are
-  `requests-native` version `1.0.0`, the Python import stays
+  `requests-native` version `1.0.1`, the Python import stays
   `requests`, and `requests.__version__` stays `2.34.2` solely as the strict
   Requests compatibility baseline;
 - Python requirement, language/platform classifiers, dependencies, and the

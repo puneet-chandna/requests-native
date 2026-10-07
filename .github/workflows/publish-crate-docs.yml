@@ -1,0 +1,115 @@
+name: Publish documentation-only crate 1.0.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact clean main commit locally qualified for 1.0.1"
+        type: string
+        required: true
+      archive_sha256:
+        description: "Reviewed SHA256 of the committed-source 1.0.1 crate"
+        type: string
+        required: true
+      publish:
+        description: "Upload after protected crates-io owner approval"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+  RUSTUP_TOOLCHAIN: "1.98.1"
+  CARGO_TARGET_DIR: target/crate-docs-target
+
+concurrency:
+  group: immutable-stable-core-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: namespace-profile-puneet-chandna
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/requests-native
+    steps:
+      - name: Require exact main source and protected owner review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          [[ "$GITHUB_REPOSITORY" == puneet-chandna/requests-native ]]
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+          [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          gh api "/repos/$GITHUB_REPOSITORY/commits/main" | jq -e --arg sha "$SOURCE_SHA" '.sha == $sha'
+          gh api "/repos/$GITHUB_REPOSITORY/environments/crates-io" | jq -e '
+            any(.protection_rules[]; .type == "required_reviewers" and
+              any(.reviewers[]; .type == "User" and .reviewer.id == 121252460)) and
+            .deployment_branch_policy.protected_branches == false and
+            .deployment_branch_policy.custom_branch_policies == true'
+          gh api "/repos/$GITHUB_REPOSITORY/environments/crates-io/deployment-branch-policies" | jq -e '
+            .branch_policies | length == 1 and .[0].name == "main" and .[0].type == "branch"'
+      - name: Check out the exact approved source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Repackage and verify documentation-only equivalence before token exposure
+        shell: bash
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$SOURCE_SHA")
+          cargo package -p requests-native --locked --no-verify
+          mkdir "$RUNNER_TEMP/qualified-core"
+          cp "$CARGO_TARGET_DIR/package/requests-native-1.0.1.crate" "$RUNNER_TEMP/qualified-core/"
+          curl --fail --silent --show-error --max-time 60 \
+            -H "User-Agent: requests-native-release (github.com/puneet-chandna/requests-native)" \
+            https://static.crates.io/crates/requests-native/requests-native-1.0.0.crate \
+            -o "$RUNNER_TEMP/published-1.0.0.crate"
+          python scripts/verify_crate_docs_release.py \
+            --source-sha "$SOURCE_SHA" --archive-sha256 "$ARCHIVE_SHA256" \
+            --baseline "$RUNNER_TEMP/published-1.0.0.crate" \
+            --candidate "$RUNNER_TEMP/qualified-core/requests-native-1.0.1.crate" \
+            --manifest "$RUNNER_TEMP/qualified-core/manifest.json"
+          printf 'Source: `%s`\n\nQualified 1.0.1 archive SHA256: `%s`\n\nRuntime matches published c108 1.0.0. Its retained benchmark evidence remains labeled 1.0.0.\n' \
+            "$SOURCE_SHA" "$ARCHIVE_SHA256" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain the exact archive and qualification manifest
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: qualified-core-1.0.1
+          path: ${{ runner.temp }}/qualified-core/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish the qualified documentation crate
+        if: ${{ inputs.publish }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+        # Existing-token route explicitly approved by the owner; no credential migration.
+        run: | # zizmor: ignore[use-trusted-publishing] Owner-approved existing token is restricted to protected crates-io publication of exact qualified bytes.
+          test -n "$CARGO_REGISTRY_TOKEN"
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$SOURCE_SHA")
+          cargo publish -p requests-native --locked --no-verify
+          cmp "$RUNNER_TEMP/qualified-core/requests-native-1.0.1.crate" "$CARGO_TARGET_DIR/package/tmp-crate/requests-native-1.0.1.crate"
+      - name: Verify the public registry checksum
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --max-time 60 \
+            -H "User-Agent: requests-native-release (github.com/puneet-chandna/requests-native)" \
+            https://crates.io/api/v1/crates/requests-native/1.0.1 | \
+            jq -e --arg digest "$ARCHIVE_SHA256" '.version.checksum == $digest'

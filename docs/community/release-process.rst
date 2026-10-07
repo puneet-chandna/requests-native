@@ -4,16 +4,30 @@ Release process
 ===============
 
 Requests Native releases belong to the independent rewrite, not PSF Requests.
-The stable Rust core ``requests-native`` version ``1.0.0`` is published on
-`crates.io <https://crates.io/crates/requests-native/1.0.0>`_. Python registry
-publication is deferred; its complete stable artifact set remains unqualified
-after a PyPy compatibility failure. The existing Python beta is distributed on
-GitHub. Stable Python metadata alone does not qualify a release.
+The current documentation patch aligns the Rust workspace and Python
+distribution metadata at ``1.0.1``, while retaining the implementation of
+published Rust core ``1.0.0``. The import compatibility version stays ``2.34.2``.
+Python publication is planned for the coming days while publishing setup is
+finalized. Source installation targets ``v1.0.1``; no complete stable Python
+artifact set is qualified. The old beta remains a historical GitHub release.
+Stable Python metadata alone does not qualify registry publication.
 The installed Python import remains ``requests`` and ``requests.__version__`` remains
 ``2.34.2`` as the compatibility baseline.
 
-Published Rust core
--------------------
+Documentation-only 1.0.1 publication
+------------------------------------
+
+The documentation-patch route checks the clean release commit and package
+version ``1.0.1`` against the actual published ``1.0.0`` archive. Rust sources,
+fixtures, legal files, dependency versions, features and compiler requirements
+must match; only README, own-package version metadata and truthful package
+provenance may differ. Retained core performance remains explicitly measured
+on ``1.0.0``; equivalence does not relabel it as a new measurement or qualify
+Python artifacts. The final committed archive needs its own digest and a
+protected ``crates-io`` owner review before upload.
+
+Published 1.0.0 Rust core (historical)
+------------------------------------------------
 
 Protected publication
 `37667367591 <https://github.com/puneet-chandna/requests-native/actions/runs/37667367591>`_
@@ -28,8 +42,8 @@ The owner approved the protected deployment; the workflow then verified the
 public registry checksum. Later main documentation updates do not change this
 released source or its package bytes.
 
-Current beta
-------------
+Historical beta
+---------------
 
 The `v1.0.0-beta prerelease
 <https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta>`_
@@ -60,7 +74,7 @@ A Python distribution release requires:
    23-wheel matrix, and a validated artifact manifest; and
 4. uploaded archives and checksums match that qualified release set.
 
-For stable 1.0.0, qualification must use the strict installed suites without
+For stable Python publication, qualification must use the strict installed suites without
 the historical Windows exception. The owner accepts passing qualification on
 current supported Windows runners while keeping issue #1 open; its historical
 cause remains unproved.
@@ -98,7 +112,7 @@ original sdist and wheel fan-out; preserving only the assembled release-set
 does not satisfy the current reuse path. Download required evidence before
 expiry if account setup will take longer than the retention period.
 
-The workflow stores a ``release-set`` artifact for review. Both
+The original 1.0.0 full-release workflow stores a ``release-set`` artifact for review. Both
 ``publish_pypi`` and ``publish_crates`` default to false; version tags do not
 start registry publishing. Publication requires an explicit manual dispatch on
 ``main``, the exact ``1.0.0`` candidate source, and successful ``source_run_id``

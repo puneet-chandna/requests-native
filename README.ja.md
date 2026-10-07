@@ -1,28 +1,37 @@
 <!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
-# Requests Native
-
 <p align="center">
   <img src="https://raw.githubusercontent.com/puneet-chandna/requests-native/main/docs/assets/logo.png" alt="Requests Native" width="250">
 </p>
 
-[English](https://github.com/puneet-chandna/requests-native/blob/main/README.md) · [Español](https://github.com/puneet-chandna/requests-native/blob/main/README.es.md) · [简体中文](https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md) · [Français](https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md) · [हिन्दी](https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md) · [日本語](https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md)
+<h1 align="center">Requests Native</h1>
 
-Requests Native は、使い慣れた Python の `requests` API を、Rust で実装した共通の HTTP コアにつなぎます。
+<p align="center">
+<a href="https://github.com/puneet-chandna/requests-native/blob/main/README.md">English</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.es.md">Español</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md">简体中文</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md">Français</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md">हिन्दी</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md">日本語</a>
+</p>
+
+<p align="center">
+Requests Native は、使い慣れた Python の <code>requests</code> API を、Rust で実装した共通の HTTP コアにつなぎます。
 同じコアを、Rust 向けのネイティブな非同期クライアントとブロッキングクライアントとして直接利用することもできます。
 両方の Rust クライアントは、接続プール、設定可能なタイムアウト、プロキシと TLS の設定、
 リクエストとレスポンスのボディのストリーミングに対応しています。
+</p>
 
-[1.0.0 リリース](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0) ·
-[crates.io](https://crates.io/crates/requests-native) ·
-[インストール](https://github.com/puneet-chandna/requests-native/blob/main/docs/user/install.rst) · [Issue](https://github.com/puneet-chandna/requests-native/issues)
+<p align="center">
+<a href="https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.1">1.0.1 リリース</a> ·
+<a href="https://crates.io/crates/requests-native">crates.io</a> ·
+<a href="https://github.com/puneet-chandna/requests-native/blob/main/docs/user/install.rst">インストール</a> · <a href="https://github.com/puneet-chandna/requests-native/issues">Issue</a>
 
-## Rust：安定版 1.0.0
+</p>
 
-Rust クレートは crates.io で公開されています。**Rust 1.98.1 以降**を使い、次の依存関係を追加してください。
+## Rust：安定版 1.0.1
+
+この更新はドキュメントとバージョンのメタデータのみを変更し、実装は 1.0.0 と同じです。
+
+**Rust 1.98.1 以降**を使い、次の依存関係を追加してください。
 
 ```toml
 [dependencies]
-requests-native = "1.0.0"
+requests-native = "1.0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -58,11 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 接続プールを再利用するには、同じクライアントを使い続けてください。
 
-## Python：改良された 1.0.0 のソースをインストール
+## Python：改良された 1.0.1 のソースをインストール
 
 PyPI への公開は近日中を予定しており、公開設定を仕上げています。
 Python の配布パッケージは**まだ PyPI に公開されていません**。
-今は改良された `v1.0.0` のソースを利用してください。このリリースには Python の安定版 wheel は含まれていません。
+今は改良された `v1.0.1` のソースを利用してください。このリリースには Python の安定版 wheel は含まれていません。
 
 **CPython 3.10+**、Git、リポジトリで固定された **Rust 1.98.1** ツールチェーン、
 ネイティブ C/C++ コンパイラ（Windows では MSVC Build Tools）が必要です。
@@ -88,7 +97,7 @@ Windows PowerShell では、次のコマンドを使います。
 タグ付きのソースをインストールします。
 
 ```console
-python -m pip install "requests-native @ git+https://github.com/puneet-chandna/requests-native.git@v1.0.0"
+python -m pip install "requests-native @ git+https://github.com/puneet-chandna/requests-native.git@v1.0.1"
 ```
 
 使い慣れた API を利用できます。
@@ -102,7 +111,7 @@ with requests.Session() as session:
     print(response.json())
 ```
 
-配布パッケージは `requests-native` **1.0.0** です。`import requests` と
+配布パッケージは `requests-native` **1.0.1** です。`import requests` と
 `requests.__version__ == "2.34.2"` は、Requests との互換性のために元の識別情報を維持しています。
 
 **元の `requests` とは別の環境を使ってください。** 両方の配布パッケージは
@@ -114,6 +123,7 @@ with requests.Session() as session:
 ## 性能
 
 公開された 1.0.0 の Rust コアを、各ネイティブクライアントで対応する 16 種類のワークロードを使い、ローカルのループバック比較で五組の測定により評価しました。
+[1.0.1](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.1) のランタイム実装は同じです。
 
 | ネイティブクライアント | 元の Requests に対するスループット比の中央値 | 元の Requests に対する最大観測スループット比 | 最大観測スループット（リクエスト/秒） | ベータ版に対するスループット比の中央値 |
 | --- | --- | --- | --- | --- |

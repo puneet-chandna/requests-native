@@ -3,9 +3,10 @@
 Requests Native
 ===============
 
-Rust core 1.0.0 is stable on `crates.io <https://crates.io/crates/requests-native/1.0.0>`_.
+Rust core 1.0.1 is a documentation and version-metadata patch of published 1.0.0,
+with unchanged implementation. See `crates.io <https://crates.io/crates/requests-native>`_.
 The improved Python source is available from
-`v1.0.0 <https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0>`_.
+`v1.0.1 <https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.1>`_.
 PyPI publication is planned for the coming days while publishing setup is
 finalized. Follow :ref:`install` for the current source installation.
 
@@ -16,14 +17,14 @@ transport, with compatibility fallback for unsupported extension behavior.
 
 .. warning::
 
-   The Python distribution is not published to PyPI yet and the 1.0.0 release
+   The Python distribution is not published to PyPI yet and the 1.0.1 release
    does not include stable Python wheels. Use a fresh environment for the
    source install: upstream ``requests`` owns the same import paths. Test
    integrations with your own workload; see :ref:`faq` for compatibility details.
 
-The Python distribution has ``requests-native`` version ``1.0.0`` metadata. Its
+The Python distribution has ``requests-native`` version ``1.0.1`` metadata. Its
 drop-in import remains ``requests`` and reports compatibility version
-``2.34.2``. The Rust package version is ``1.0.0``. The existing GitHub beta tag
+``2.34.2``. The Rust package version is ``1.0.1``. The existing GitHub beta tag
 retains its original ``1.0.0b1`` / ``1.0.0-beta.1`` archives and manifest.
 Distribution and compatibility versions intentionally describe different surfaces.
 

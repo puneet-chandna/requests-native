@@ -1,28 +1,37 @@
 <!-- Requests Native modification notice: this retained file differs from Requests 2.34.2. -->
-# Requests Native
-
 <p align="center">
   <img src="https://raw.githubusercontent.com/puneet-chandna/requests-native/main/docs/assets/logo.png" alt="Requests Native" width="250">
 </p>
 
-[English](https://github.com/puneet-chandna/requests-native/blob/main/README.md) · [Español](https://github.com/puneet-chandna/requests-native/blob/main/README.es.md) · [简体中文](https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md) · [Français](https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md) · [हिन्दी](https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md) · [日本語](https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md)
+<h1 align="center">Requests Native</h1>
 
-Requests Native, Python की परिचित `requests` API को Rust में लिखे एक साझा HTTP कोर से जोड़ता है।
+<p align="center">
+<a href="https://github.com/puneet-chandna/requests-native/blob/main/README.md">English</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.es.md">Español</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.zh-CN.md">简体中文</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.fr.md">Français</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.hi.md">हिन्दी</a> · <a href="https://github.com/puneet-chandna/requests-native/blob/main/README.ja.md">日本語</a>
+</p>
+
+<p align="center">
+Requests Native, Python की परिचित <code>requests</code> API को Rust में लिखे एक साझा HTTP कोर से जोड़ता है।
 यही कोर Rust के लिए नेटिव असिंक्रोनस और ब्लॉकिंग क्लाइंट के रूप में भी सीधे उपलब्ध है।
 दोनों Rust क्लाइंट कनेक्शन पूलिंग, कॉन्फ़िगर किए जा सकने वाले टाइमआउट, proxy और TLS सेटिंग्स
 और अनुरोध व प्रतिक्रिया बॉडी की स्ट्रीमिंग का समर्थन करते हैं।
+</p>
 
-[1.0.0 रिलीज़](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0) ·
-[crates.io](https://crates.io/crates/requests-native) ·
-[इंस्टॉलेशन](https://github.com/puneet-chandna/requests-native/blob/main/docs/user/install.rst) · [समस्याएँ](https://github.com/puneet-chandna/requests-native/issues)
+<p align="center">
+<a href="https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.1">1.0.1 रिलीज़</a> ·
+<a href="https://crates.io/crates/requests-native">crates.io</a> ·
+<a href="https://github.com/puneet-chandna/requests-native/blob/main/docs/user/install.rst">इंस्टॉलेशन</a> · <a href="https://github.com/puneet-chandna/requests-native/issues">समस्याएँ</a>
 
-## Rust: स्थिर संस्करण 1.0.0
+</p>
 
-Rust क्रेट crates.io पर प्रकाशित है। **Rust 1.98.1 या उससे नया संस्करण** इस्तेमाल करें और यह जोड़ें:
+## Rust: स्थिर संस्करण 1.0.1
+
+यह दस्तावेज़ों और संस्करण मेटाडेटा का अपडेट है; कार्यान्वयन 1.0.0 से नहीं बदला है।
+
+**Rust 1.98.1 या उससे नया संस्करण** इस्तेमाल करें और यह जोड़ें:
 
 ```toml
 [dependencies]
-requests-native = "1.0.0"
+requests-native = "1.0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -58,11 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 कनेक्शन पूल का दोबारा इस्तेमाल करने के लिए उसी क्लाइंट का दोबारा इस्तेमाल करें।
 
-## Python: 1.0.0 का बेहतर सोर्स कोड इंस्टॉल करें
+## Python: 1.0.1 का बेहतर सोर्स कोड इंस्टॉल करें
 
 अगले कुछ दिनों में PyPI पर प्रकाशन की योजना है; प्रकाशन की तैयारी
 पूरी की जा रही है। Python वितरण **अभी PyPI पर प्रकाशित नहीं हुआ है**;
-फ़िलहाल `v1.0.0` का बेहतर सोर्स कोड इस्तेमाल करें। इस रिलीज़ में Python के स्थिर wheels शामिल नहीं हैं।
+फ़िलहाल `v1.0.1` का बेहतर सोर्स कोड इस्तेमाल करें। इस रिलीज़ में Python के स्थिर wheels शामिल नहीं हैं।
 
 आपको **CPython 3.10+**, Git, रिपॉज़िटरी में तय किया गया **Rust 1.98.1** टूलचेन
 और एक नेटिव C/C++ कंपाइलर (Windows पर MSVC Build Tools) चाहिए।
@@ -88,7 +97,7 @@ source .venv/bin/activate
 टैग वाला सोर्स कोड इंस्टॉल करें:
 
 ```console
-python -m pip install "requests-native @ git+https://github.com/puneet-chandna/requests-native.git@v1.0.0"
+python -m pip install "requests-native @ git+https://github.com/puneet-chandna/requests-native.git@v1.0.1"
 ```
 
 परिचित API इस्तेमाल करें:
@@ -102,7 +111,7 @@ with requests.Session() as session:
     print(response.json())
 ```
 
-वितरण `requests-native` **1.0.0** है; `import requests` और
+वितरण `requests-native` **1.0.1** है; `import requests` और
 `requests.__version__ == "2.34.2"`, Requests के साथ संगतता की पहचान बनाए रखते हैं।
 
 **मूल `requests` पैकेज से अलग एनवायरनमेंट इस्तेमाल करें।** दोनों वितरण
@@ -114,6 +123,7 @@ Windows की मौजूदा जाँचें बिना किसी T
 ## प्रदर्शन
 
 प्रकाशित 1.0.0 Rust कोर को स्थानीय लूपबैक तुलना में पाँच जोड़ी मापों से जाँचा गया, जिसमें हर नेटिव क्लाइंट के लिए 16 समान कार्यभार थे।
+संस्करण [1.0.1](https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.1) का रनटाइम कार्यान्वयन वही है।
 
 | नेटिव क्लाइंट | मूल Requests के मुकाबले थ्रूपुट का माध्यिका अनुपात | मूल Requests के मुकाबले थ्रूपुट का अधिकतम मापा गया अनुपात | अधिकतम मापा गया थ्रूपुट (अनुरोध/सेकंड) | बीटा के मुकाबले थ्रूपुट का माध्यिका अनुपात |
 | --- | --- | --- | --- | --- |

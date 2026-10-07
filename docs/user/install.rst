@@ -5,10 +5,11 @@
 Installing Requests Native
 ==========================
 
-The Rust core ``requests-native`` version ``1.0.0`` is published on crates.io.
+The Rust core ``requests-native`` version ``1.0.1`` is a documentation and
+version-metadata patch of 1.0.0, with unchanged implementation.
 PyPI publication is planned for the coming days; publishing setup is being
 finalized. The Python distribution is not published to PyPI yet. Install the
-improved ``v1.0.0`` Python source below; stable Python wheels are not included
+improved ``v1.0.1`` Python source below; stable Python wheels are not included
 in that release.
 
 Install the stable Rust crate
@@ -17,13 +18,13 @@ Install the stable Rust crate
 Use Rust 1.98.1 or newer and add this dependency to ``Cargo.toml``::
 
     [dependencies]
-    requests-native = "1.0.0"
+    requests-native = "1.0.1"
 
 The Rust import is ``requests_native``. Async clients use Tokio; the blocking
 client is available with default features. See the repository README for both
 examples.
 
-Install Python from the 1.0.0 source
+Install Python from the 1.0.1 source
 ------------------------------------
 
 Install CPython 3.10 or later, Git, Rust through
@@ -41,13 +42,13 @@ Activate the fresh environment on Linux or macOS::
 On Windows, use ``.venv\Scripts\activate.bat`` in Command Prompt or
 ``.venv\Scripts\Activate.ps1`` in PowerShell. Then install the tagged source::
 
-    $ python -m pip install "requests-native @ git+https://github.com/puneet-chandna/requests-native.git@v1.0.0"
+    $ python -m pip install "requests-native @ git+https://github.com/puneet-chandna/requests-native.git@v1.0.1"
 
 Confirm the installed distribution and compatibility identity::
 
     $ python -c "import requests; from importlib.metadata import version; print(version('requests-native'), requests.__version__, requests.__file__)"
 
-The distribution version is ``1.0.0`` and ``requests.__version__`` is
+The distribution version is ``1.0.1`` and ``requests.__version__`` is
 ``2.34.2``. Import it as ``requests``. Python distribution and Requests
 compatibility versions intentionally identify different surfaces.
 
@@ -71,7 +72,7 @@ The older `v1.0.0-beta release
 <https://github.com/puneet-chandna/requests-native/releases/tag/v1.0.0-beta>`_
 retains its original ``1.0.0b1`` wheels for Linux x86-64, Windows x86-64 and
 macOS Apple silicon, plus its original source archive and validation manifest.
-These are historical beta artifacts, not stable 1.0.0 wheels. Prefer the
+These are historical beta artifacts, not stable 1.0.1 wheels. Prefer the
 improved source above. To try a beta wheel, use a separate fresh environment
 and install the downloaded file with ``python -m pip install /path/to/downloaded.whl``.
 

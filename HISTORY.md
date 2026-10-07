@@ -1,6 +1,20 @@
 Release History
 ===============
 
+Requests Native 1.0.1 documentation patch (2026-10-08 UTC)
+--------------------------------------------------------
+
+- Refreshed the crate README with the logo, installation instructions, five
+  translations and explicit median versus peak local performance observations.
+- Aligned the Rust workspace and Python distribution metadata at ``1.0.1``;
+  the import compatibility identity remains ``requests`` / ``2.34.2``.
+- Kept the runtime implementation, dependency graph, legal files and fixtures
+  unchanged from published Rust core 1.0.0. Its retained measurement source,
+  raw evidence and statistical uncertainty remain unchanged.
+- Python publication remains pending while publishing setup is finalized;
+  source installation targets ``v1.0.1`` and no stable Python wheels are included.
+
+
 Requests Native Rust core 1.0.0 (2026-10-07 UTC)
 ------------------------------------------------
 
