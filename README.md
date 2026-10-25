@@ -137,9 +137,14 @@ See the [methodology](https://github.com/puneet-chandna/requests-native/blob/mai
 
 ## Compatibility and development
 
-Built-in `Session`/`HTTPAdapter` traffic uses the native transport. Custom
-adapters, subclasses, monkeypatching and unsupported extension behavior can
-fall back to Python before native I/O. Test integrations with your own workload.
+Built-in `Session`/`HTTPAdapter` traffic uses the native transport. The exact
+built-in facade is proven once per adapter and each request re-checks the cheap
+dispatch facts plus the identity of every method, global and URL helper the
+native path depends on. Custom adapters, subclasses, monkeypatching and
+unsupported extension behavior fall back to Python before native I/O. Set
+`REQUESTS_NATIVE_STRICT_ADMISSION` to re-enable the exhaustive per-request
+proof walk; see the [porting guide](https://github.com/puneet-chandna/requests-native/blob/main/PORTING.md).
+Test integrations with your own workload.
 
 See the [API compatibility inventory](https://github.com/puneet-chandna/requests-native/blob/main/API_COMPATIBILITY.tsv),
 [porting guide](https://github.com/puneet-chandna/requests-native/blob/main/PORTING.md) and

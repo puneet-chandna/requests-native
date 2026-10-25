@@ -33,6 +33,9 @@ _REWRITE_ROOT_ENVIRONMENT = "REQUESTS_DIFFERENTIAL_REWRITE_ROOT"
 _MAX_DIAGNOSTIC_CHARS = 2048
 _PRESERVED_ENVIRONMENT = (
     "COMSPEC",
+    # Cases that pin the exhaustive per-request facade admission opt in through
+    # this variable, which their child processes must inherit.
+    "REQUESTS_NATIVE_STRICT_ADMISSION",
     "DYLD_LIBRARY_PATH",
     "LANG",
     "LC_ALL",

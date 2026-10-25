@@ -165,6 +165,7 @@ def test_effectful_collections_and_unsupported_history_rows_fall_back_inertly():
     assert snapshot(retry)["eligible"] is False
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_retry_instance_method_and_constant_shadows_are_ineligible():
     retry = Retry(total=1)
     retry.get_retry_after = lambda response: 0
@@ -190,6 +191,7 @@ def test_urllib3_126_post_init_method_whitelist_takes_precedence():
     assert snapshot(retry)["allowed_methods"] == ["post"]
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_retry_class_and_module_mutations_fall_back_then_restore(monkeypatch):
     retry = Retry(total=1)
     with monkeypatch.context() as patched:
@@ -203,6 +205,7 @@ def test_retry_class_and_module_mutations_fall_back_then_restore(monkeypatch):
     assert snapshot(retry)["eligible"] is True
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_retry_getattribute_version_and_module_dependencies_are_frozen(monkeypatch):
     retry = Retry(total=1)
     mutations = (
@@ -222,6 +225,7 @@ def test_retry_getattribute_version_and_module_dependencies_are_frozen(monkeypat
         assert snapshot(retry)["eligible"] is True
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_complete_retry_behavior_dependencies_fall_back_then_restore(monkeypatch):
     retry = Retry(total=1)
     class_names = [
@@ -256,6 +260,7 @@ def test_complete_retry_behavior_dependencies_fall_back_then_restore(monkeypatch
         assert snapshot(retry)["eligible"] is True
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_retry_function_behavior_mutations_fall_back_then_restore():
     retry = Retry(total=1)
     function = Retry.is_retry

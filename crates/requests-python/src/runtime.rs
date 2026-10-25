@@ -391,7 +391,7 @@ impl PythonCallContext {
         &self,
         py: Python<'_>,
         mut submission: BlockingSubmission<T>,
-        mut actions: ActionReceiver<A, R>,
+        actions: ActionReceiver<A, R>,
         mut execute: F,
         mut check_signals: S,
     ) -> PyResult<T>
@@ -405,6 +405,7 @@ impl PythonCallContext {
         let _active_submission = ActiveOriginSubmissionGuard::enter(submission.id());
         self.ensure_affinity(py)?;
         reap_origin_quarantine();
+        let wake = actions.wake();
         loop {
             let task_state =
                 match signal_before_task_state(py, &mut check_signals, || submission.try_wait()) {
@@ -420,18 +421,14 @@ impl PythonCallContext {
                 Err(error) => return Err(task_error(error)),
             }
 
-            match py.detach(|| actions.recv_timeout(WAKE_INTERVAL)) {
-                Ok(request) => {
-                    self.ensure_affinity(py)?;
-                    let (action, reply) = request.into_parts();
-                    let _ = reply.send(execute(py, action));
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    // Completion wakes this wait; its result remains buffered so
-                    // the next iteration still checks signals before consumption.
-                    let _ = py.detach(|| submission.wait_ready_timeout(WAKE_INTERVAL));
-                }
+            // Sleep until the worker queues an action or the submission
+            // completes; the interval is only a backstop that keeps Python
+            // signal checks prompt.
+            py.detach(|| wake.wait_timeout(WAKE_INTERVAL));
+            while let Ok(request) = actions.try_recv() {
+                self.ensure_affinity(py)?;
+                let (action, reply) = request.into_parts();
+                let _ = reply.send(execute(py, action));
             }
         }
     }
@@ -467,7 +464,7 @@ impl PythonCallContext {
         &self,
         py: Python<'_>,
         mut submission: BlockingSubmission<T>,
-        mut actions: ActionReceiver<A, R>,
+        actions: ActionReceiver<A, R>,
         mut owner: O,
         mut execute: F,
         mut check_signals: S,
@@ -483,6 +480,7 @@ impl PythonCallContext {
         let _active_submission = ActiveOriginSubmissionGuard::enter(submission.id());
         self.ensure_affinity(py)?;
         reap_origin_quarantine();
+        let wake = actions.wake();
         let mut cancellation_phase = SessionCancellationPhase::CancelBeforePoll;
         let mut withheld_replies = Vec::new();
         loop {
@@ -511,26 +509,22 @@ impl PythonCallContext {
                 Err(error) => return Err(task_error(error)),
             }
 
-            match py.detach(|| actions.recv_timeout(WAKE_INTERVAL)) {
-                Ok(request) => {
-                    self.ensure_affinity(py)?;
-                    let (action, reply) = request.into_parts();
-                    match execute(py, action, &mut owner) {
-                        ActionReplyDisposition::Reply(value) => {
-                            let _ = reply.send(value);
-                            cancellation_phase = SessionCancellationPhase::CancelReplyObserved;
-                        }
-                        ActionReplyDisposition::Withhold(phase) => {
-                            withheld_replies.push(reply);
-                            cancellation_phase = phase;
-                        }
+            // Sleep until the worker queues an action or the submission
+            // completes; the interval is only a backstop that keeps Python
+            // signal checks prompt.
+            py.detach(|| wake.wait_timeout(WAKE_INTERVAL));
+            while let Ok(request) = actions.try_recv() {
+                self.ensure_affinity(py)?;
+                let (action, reply) = request.into_parts();
+                match execute(py, action, &mut owner) {
+                    ActionReplyDisposition::Reply(value) => {
+                        let _ = reply.send(value);
+                        cancellation_phase = SessionCancellationPhase::CancelReplyObserved;
                     }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    // Completion wakes this wait; its result remains buffered so
-                    // the next iteration still checks signals before consumption.
-                    let _ = py.detach(|| submission.wait_ready_timeout(WAKE_INTERVAL));
+                    ActionReplyDisposition::Withhold(phase) => {
+                        withheld_replies.push(reply);
+                        cancellation_phase = phase;
+                    }
                 }
             }
         }
@@ -595,7 +589,22 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let submission = driver.submit(future).map_err(driver_error)?;
+    submit_with_notify(driver, future, || {})
+}
+
+fn submit_with_notify<F, N>(
+    driver: &BlockingRuntimeDriver,
+    future: F,
+    notify: N,
+) -> PyResult<BlockingSubmission<F::Output>>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+    N: Fn() + Send + 'static,
+{
+    let submission = driver
+        .submit_with_notify(future, notify)
+        .map_err(driver_error)?;
     let parent_id = submission
         .parent_id()
         .or_else(|| ACTIVE_ORIGIN_SUBMISSION.with(Cell::get));
@@ -732,7 +741,8 @@ where
     let context = PythonCallContext::capture(py)?;
     let runtime = driver()?;
     let (actions, receiver) = action_channel();
-    let submission = submit(&runtime, build(actions))?;
+    let wake = receiver.wake();
+    let submission = submit_with_notify(&runtime, build(actions), move || wake.notify())?;
     context.drive_with_signal_checker(py, submission, receiver, execute, check_signals)
 }
 
@@ -772,7 +782,8 @@ where
     let context = PythonCallContext::capture(py)?;
     let runtime = driver()?;
     let (actions, receiver) = action_channel();
-    let submission = submit(&runtime, build(actions))?;
+    let wake = receiver.wake();
+    let submission = submit_with_notify(&runtime, build(actions), move || wake.notify())?;
     context.drive_owned_with_reply_disposition_and_signal_checker(
         py,
         submission,
@@ -812,7 +823,8 @@ where
     let context = PythonCallContext::capture(py)?;
     let runtime = driver()?;
     let (actions, receiver) = action_channel();
-    let submission = submit(&runtime, build(actions))?;
+    let wake = receiver.wake();
+    let submission = submit_with_notify(&runtime, build(actions), move || wake.notify())?;
     context.drive_owned_with_signal_checker(py, submission, receiver, owner, execute, check_signals)
 }
 

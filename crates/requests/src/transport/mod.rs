@@ -16,6 +16,7 @@ use std::future::Future;
 use std::io;
 use std::net::Shutdown;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -314,11 +315,34 @@ impl ActiveExchangeGuard {
     }
 }
 
+/// Idle connections are re-probed for a peer close only after a checkout wait
+/// this long; the probe before the wait already covered the immediate case.
+const PEER_RECHECK_INTERVAL: Duration = Duration::from_millis(1);
+
 const MAX_RESPONSE_HEAD_BYTES: usize = 8192 + 4096 * 100;
 const MAX_RESPONSE_HEADERS: usize = 100;
 
-#[derive(Clone, Default)]
-struct ResponseHeadObservation(Arc<Mutex<ResponseHeadState>>);
+/// Per-connection response-head observer.
+///
+/// The generation and request-head-rewrite facts are mirrored into atomics so
+/// the connection I/O polls can consult them without taking the state mutex on
+/// every read and write.
+#[derive(Default)]
+struct ResponseHeadObservation {
+    state: Arc<Mutex<ResponseHeadState>>,
+    generation: Arc<AtomicU64>,
+    rewrite_request_head: Arc<AtomicBool>,
+}
+
+impl Clone for ResponseHeadObservation {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            generation: Arc::clone(&self.generation),
+            rewrite_request_head: Arc::clone(&self.rewrite_request_head),
+        }
+    }
+}
 
 #[derive(Default)]
 struct ResponseHeadState {
@@ -343,8 +367,13 @@ enum ContentLengthNormalization {
 
 impl ResponseHeadObservation {
     fn begin(&self, python_header_names: Option<Vec<String>>) {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         let generation = state.generation.wrapping_add(1);
+        self.rewrite_request_head
+            .store(python_header_names.is_some(), Ordering::Release);
         *state = ResponseHeadState {
             generation,
             active: true,
@@ -361,10 +390,14 @@ impl ResponseHeadObservation {
                     .collect()
             }),
         };
+        self.generation.store(generation, Ordering::Release);
     }
 
     fn observe(&self, bytes: &[u8]) {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         if !state.active {
             return;
         }
@@ -376,12 +409,18 @@ impl ResponseHeadObservation {
     }
 
     fn buffers_python_response_head(&self) -> bool {
-        let state = self.0.lock().expect("response-head observer lock poisoned");
+        let state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         state.active && state.python_header_names.is_some()
     }
 
     fn buffer_python_response_bytes(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         let remaining = MAX_RESPONSE_HEAD_BYTES.saturating_sub(state.captured.len());
         if bytes.len() > remaining {
             let mut passthrough = std::mem::take(&mut state.captured);
@@ -396,7 +435,10 @@ impl ResponseHeadObservation {
     }
 
     fn complete_python_response_on_eof(&self) -> Option<Vec<u8>> {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         if !state.active || state.captured.is_empty() {
             return None;
         }
@@ -414,7 +456,10 @@ impl ResponseHeadObservation {
     }
 
     fn complete_on_eof(&self) -> Option<Vec<u8>> {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         if !state.active || state.captured.is_empty() {
             return None;
         }
@@ -439,7 +484,7 @@ impl ResponseHeadObservation {
     }
 
     fn conflicting_content_length(&self) -> Option<String> {
-        self.0
+        self.state
             .lock()
             .expect("response-head observer lock poisoned")
             .conflicting_content_length
@@ -447,21 +492,30 @@ impl ResponseHeadObservation {
     }
 
     fn take_raw_headers(&self) -> Vec<(String, Vec<u8>)> {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         state.captured = Vec::new();
         state.python_header_names = None;
         std::mem::take(&mut state.raw_headers)
     }
 
     fn generation(&self) -> u64 {
-        self.0
-            .lock()
-            .expect("response-head observer lock poisoned")
-            .generation
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Whether the request head for the current exchange may need rewriting,
+    /// which is the only reason `ResponseHeadIo` stages outgoing bytes.
+    fn needs_request_head_rewrite(&self) -> bool {
+        self.rewrite_request_head.load(Ordering::Acquire)
     }
 
     fn rewrite_python_request_head(&self, bytes: &mut Vec<u8>) {
-        let state = self.0.lock().expect("response-head observer lock poisoned");
+        let state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         let Some(names) = &state.python_header_names else {
             return;
         };
@@ -821,11 +875,17 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for ResponseHeadIo<IO> {
         let this = self.get_mut();
         let generation = this.observation.generation();
         if generation != this.generation {
-            debug_assert_eq!(this.outgoing_offset, this.outgoing.len());
             this.outgoing = Vec::new();
             this.outgoing_offset = 0;
             this.outgoing_head_complete = false;
             this.generation = generation;
+        }
+        if !this.observation.needs_request_head_rewrite() {
+            // Without requested Python header spellings the head rewrite is a
+            // no-op, so outgoing bytes need no staging: hyper's own write path
+            // already orders head before body.
+            debug_assert_eq!(this.outgoing_offset, this.outgoing.len());
+            return Pin::new(&mut this.inner).poll_write(context, buffer);
         }
         if this.outgoing_offset < this.outgoing.len() {
             match this.poll_drain_outgoing(context) {
@@ -1543,11 +1603,18 @@ impl Transport {
             let Some(mut lease) = candidate else {
                 break;
             };
-            if !lease.is_live() || !lease.peer_is_open() {
-                TransportLease::new(Arc::clone(&self.pool), lease, self.session_runtime.clone())
+            let peer_checked_at = {
+                if !lease.is_live() || !lease.peer_is_open() {
+                    TransportLease::new(
+                        Arc::clone(&self.pool),
+                        lease,
+                        self.session_runtime.clone(),
+                    )
                     .finish_now(false);
-                continue;
-            }
+                    continue;
+                }
+                Instant::now()
+            };
             let ready = {
                 let (sender, _) = lease.connection_mut().network_parts_mut();
                 match deadlines.total_deadline {
@@ -1572,7 +1639,12 @@ impl Transport {
                         .expect("total deadline exists only when timeout is configured"),
                 ));
             };
-            if ready.is_ok() && lease.is_live() && lease.peer_is_open() {
+            // `sender.ready()` normally resolves immediately, so the peer probe
+            // taken just before it still describes the connection. Re-probe only
+            // after a wait long enough for the peer to have gone away in between.
+            let peer_is_open =
+                peer_checked_at.elapsed() < PEER_RECHECK_INTERVAL || lease.peer_is_open();
+            if ready.is_ok() && lease.is_live() && peer_is_open {
                 self.observe_pool_acquire(&lease);
                 return Ok(lease);
             }
@@ -2276,7 +2348,7 @@ mod tests {
         );
         {
             let state = observation
-                .0
+                .state
                 .lock()
                 .expect("response-head observer lock poisoned");
             assert_eq!(state.captured.capacity(), 0);
