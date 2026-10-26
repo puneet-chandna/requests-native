@@ -55,7 +55,7 @@ fn parse_options() -> Result<Options, DynError> {
         }
     }
     if !matches!(options.mode.as_str(), "pooled" | "one-shot")
-        || !matches!(options.surface.as_str(), "async" | "blocking" | "raw")
+        || !matches!(options.surface.as_str(), "async" | "blocking" | "raw" | "hyper")
         || !matches!(options.runtime.as_str(), "multi" | "current")
     {
         return Err("invalid mode/surface/runtime".into());
@@ -326,6 +326,58 @@ async fn measure_raw(options: &Options, port: u16) -> Result<Report, DynError> {
     })
 }
 
+/// Hand-written hyper client over one pooled connection: the minimum a
+/// hyper-based client can cost for a keep-alive request, with no pool, no
+/// observer and no response translation above it.
+async fn measure_hyper(options: &Options, port: u16) -> Result<Report, DynError> {
+    use http_body_util::Empty;
+    use hyper::Request;
+    use hyper::body::Bytes;
+    use hyper_util::rt::TokioIo;
+
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+    stream.set_nodelay(true)?;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    // A fresh http1 sender is not usable until the connection has been polled.
+    sender.ready().await?;
+    let mut totals = Vec::with_capacity(options.requests);
+    let mut heads = Vec::with_capacity(options.requests);
+    let mut bodies = Vec::with_capacity(options.requests);
+    for index in 0..options.warmup + options.requests {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/small")
+            .header("Host", format!("127.0.0.1:{port}"))
+            .header("Accept-Encoding", "identity")
+            .body(Empty::<Bytes>::new())?;
+        let start = Instant::now();
+        let response = sender.send_request(request).await?;
+        let head = start.elapsed();
+        let body_start = Instant::now();
+        let body = http_body_util::BodyExt::collect(response.into_body()).await?;
+        assert_eq!(body.to_bytes().len(), options.body_bytes);
+        let body = body_start.elapsed();
+        if index < options.warmup {
+            continue;
+        }
+        totals.push(start.elapsed().as_nanos() as u64);
+        heads.push(head.as_nanos() as u64);
+        bodies.push(body.as_nanos() as u64);
+    }
+    connection_task.abort();
+    Ok(Report {
+        label: "hyper http1 conn (pooled, no pool layer)".to_owned(),
+        requests: options.requests,
+        elapsed: Duration::from_nanos(totals.iter().sum::<u64>()),
+        totals,
+        heads,
+        bodies,
+    })
+}
+
 fn main() -> Result<(), DynError> {
     let options = parse_options()?;
     let body = Arc::new(vec![b'x'; options.body_bytes]);
@@ -338,6 +390,12 @@ fn main() -> Result<(), DynError> {
                 .enable_all()
                 .build()?;
             runtime.block_on(measure_raw(&options, port))?
+        }
+        "hyper" => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(measure_hyper(&options, port))?
         }
         "blocking" => measure_blocking(&options, port)?,
         _ => {
