@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::HeaderValue;
 use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, HOST, PROXY_AUTHORIZATION};
+use http::uri::Authority;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -1141,7 +1142,10 @@ impl TransportLease {
         let Some(mut lease) = self.lease.take() else {
             return;
         };
-        let reusable = reusable && lease.is_live() && lease.peer_is_open();
+        // Returning a connection costs no readiness syscall: a peer that has
+        // gone away is reported by `is_live`, and the next acquire re-checks a
+        // connection that has been idle long enough to be suspect.
+        let reusable = reusable && lease.is_live();
         self.active_exchange.release(reusable);
         lease = if reusable {
             lease.complete(pool::LeaseTerminal::CleanEof)
@@ -1334,30 +1338,16 @@ impl Transport {
         let timeout = request.timeout().unwrap_or(self.default_timeout);
         let started = Instant::now();
         validate_request(&request)?;
-        let host = request
-            .uri()
-            .host()
-            .ok_or_else(|| Error::invalid_url(request.url()))?
-            .to_owned();
         let scheme = request
             .uri()
             .scheme()
             .cloned()
             .ok_or_else(|| Error::invalid_url(request.url()))?;
-        let port = request
-            .uri()
-            .port_u16()
-            .unwrap_or(if scheme == http::uri::Scheme::HTTPS {
-                443
-            } else {
-                80
-            });
         let authority = request
             .uri()
             .authority()
             .ok_or_else(|| Error::invalid_url(request.url()))?
             .clone();
-        let target = authority.as_str().to_owned();
         let (tls, identity) = if scheme == http::uri::Scheme::HTTPS {
             (
                 TlsPoolKey::from_config(&self.tls),
@@ -1369,12 +1359,16 @@ impl Transport {
         let proxy_key = self.proxy.as_ref().map(ProxyKey::from_proxy);
         let target_is_https = scheme == http::uri::Scheme::HTTPS;
         let absolute_form = proxy::uses_absolute_form(self.proxy.as_ref(), target_is_https);
-        let key = PoolKey::new(scheme, authority, proxy_key, tls, identity);
+        // The key normalizes an implicit port into its authority; connection
+        // diagnostics keep reporting the authority exactly as the caller wrote
+        // it, so keep a cheap reference-counted copy of that spelling.
+        let diagnostic_authority = authority.clone();
+        let key = Arc::new(PoolKey::new(scheme, authority, proxy_key, tls, identity));
         #[cfg(test)]
         self.derived_pool_keys
             .lock()
             .expect("derived pool-key observation lock poisoned")
-            .push(key.clone());
+            .push(key.as_ref().clone());
         let mut request = request.into_parts();
         let python_header_names = request.python_header_names.clone();
         if absolute_form
@@ -1401,7 +1395,7 @@ impl Transport {
             total_deadline,
         };
         let mut lease = self
-            .acquire_connection(key, &host, port, &target, establishment_deadlines)
+            .acquire_connection(key, diagnostic_authority, establishment_deadlines)
             .await?;
         let track_body_completion = read_timeout.is_some() || total_timeout.is_some();
         let upload_correlation = self
@@ -1587,10 +1581,8 @@ impl Transport {
 
     async fn acquire_connection(
         &self,
-        key: PoolKey,
-        host: &str,
-        port: u16,
-        target: &str,
+        key: Arc<PoolKey>,
+        authority: Authority,
         deadlines: EstablishmentDeadlines,
     ) -> Result<ConnectionLease> {
         loop {
@@ -1604,7 +1596,12 @@ impl Transport {
                 break;
             };
             let peer_checked_at = {
-                if !lease.is_live() || !lease.peer_is_open() {
+                // `is_live` is free but only as timely as the connection task
+                // is polled, so a pooled connection additionally gets one
+                // readiness syscall here, before it is handed out. The return
+                // path takes none: a connection that died in the pool is
+                // rejected here instead.
+                if !lease.is_live() || (lease.idle_for().is_some() && !lease.peer_is_open()) {
                     TransportLease::new(
                         Arc::clone(&self.pool),
                         lease,
@@ -1653,7 +1650,7 @@ impl Transport {
         }
 
         let lease = self
-            .connect_connection(key, host, port, target, deadlines)
+            .connect_connection(key, authority, deadlines)
             .await?;
         self.observe_pool_acquire(&lease);
         Ok(lease)
@@ -1673,12 +1670,18 @@ impl Transport {
 
     async fn connect_connection(
         &self,
-        key: PoolKey,
-        host: &str,
-        port: u16,
-        target: &str,
+        key: Arc<PoolKey>,
+        authority: Authority,
         deadlines: EstablishmentDeadlines,
     ) -> Result<ConnectionLease> {
+        // Establishment borrows the caller's authority for host, port and
+        // diagnostics, and takes the effective port from the key.
+        let host = authority.host();
+        let target = authority.as_str();
+        let port = key
+            .authority
+            .port_u16()
+            .expect("pool key authority carries an effective port");
         let generation = {
             self.pool
                 .lock()
@@ -1802,7 +1805,12 @@ impl Transport {
                     connection,
                     reservation.promote(),
                 )),
-                None => Ok(ConnectionLease::new(key, generation, connection)),
+                None => Ok(ConnectionLease::new_with_session_runtime(
+                    key,
+                    generation,
+                    connection,
+                    None,
+                )),
             }
         };
         tokio::pin!(establishing);

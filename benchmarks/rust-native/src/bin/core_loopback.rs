@@ -28,6 +28,8 @@ struct Options {
     mode: String,
     surface: String,
     runtime: String,
+    surfaces: Vec<String>,
+    rounds: usize,
 }
 
 fn parse_options() -> Result<Options, DynError> {
@@ -39,6 +41,8 @@ fn parse_options() -> Result<Options, DynError> {
         mode: "pooled".to_owned(),
         surface: "async".to_owned(),
         runtime: "multi".to_owned(),
+        surfaces: Vec::new(),
+        rounds: 1,
     };
     let mut arguments = std::env::args().skip(1);
     while let Some(flag) = arguments.next() {
@@ -51,6 +55,14 @@ fn parse_options() -> Result<Options, DynError> {
             "--mode" => options.mode = value()?,
             "--surface" => options.surface = value()?,
             "--runtime" => options.runtime = value()?,
+            "--surfaces" => {
+                options.surfaces = value()?
+                    .split(',')
+                    .filter(|surface| !surface.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            }
+            "--rounds" => options.rounds = value()?.parse()?,
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
@@ -335,14 +347,22 @@ async fn measure_hyper(options: &Options, port: u16) -> Result<Report, DynError>
     use hyper::body::Bytes;
     use hyper_util::rt::TokioIo;
 
-    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
-    stream.set_nodelay(true)?;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-    let connection_task = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    // A fresh http1 sender is not usable until the connection has been polled.
-    sender.ready().await?;
+    let host = format!("127.0.0.1:{port}");
+    let connect = || async {
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        stream.set_nodelay(true)?;
+        let (sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        // The connection future must be polled before the first request.
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut sender: hyper::client::conn::http1::SendRequest<Empty<Bytes>> = sender;
+        sender.ready().await?;
+        Ok::<_, DynError>(sender)
+    };
+    let mut sender = connect().await?;
+    let mut reconnects = 0usize;
     let mut totals = Vec::with_capacity(options.requests);
     let mut heads = Vec::with_capacity(options.requests);
     let mut bodies = Vec::with_capacity(options.requests);
@@ -350,11 +370,20 @@ async fn measure_hyper(options: &Options, port: u16) -> Result<Report, DynError>
         let request = Request::builder()
             .method("GET")
             .uri("/small")
-            .header("Host", format!("127.0.0.1:{port}"))
+            .header("Host", host.clone())
             .header("Accept-Encoding", "identity")
             .body(Empty::<Bytes>::new())?;
         let start = Instant::now();
-        let response = sender.send_request(request).await?;
+        let response = match sender.send_request(request).await {
+            Ok(response) => response,
+            Err(_) => {
+                // A keep-alive connection can be closed under the baseline by
+                // the fixture; reconnect and keep the measurement loop honest.
+                reconnects += 1;
+                sender = connect().await?;
+                continue;
+            }
+        };
         let head = start.elapsed();
         let body_start = Instant::now();
         let body = http_body_util::BodyExt::collect(response.into_body()).await?;
@@ -367,7 +396,9 @@ async fn measure_hyper(options: &Options, port: u16) -> Result<Report, DynError>
         heads.push(head.as_nanos() as u64);
         bodies.push(body.as_nanos() as u64);
     }
-    connection_task.abort();
+    if reconnects > 0 {
+        eprintln!("hyper baseline reconnected {reconnects} times");
+    }
     Ok(Report {
         label: "hyper http1 conn (pooled, no pool layer)".to_owned(),
         requests: options.requests,
@@ -378,26 +409,21 @@ async fn measure_hyper(options: &Options, port: u16) -> Result<Report, DynError>
     })
 }
 
-fn main() -> Result<(), DynError> {
-    let options = parse_options()?;
-    let body = Arc::new(vec![b'x'; options.body_bytes]);
-    let port = spawn_fixture(Arc::clone(&body))?;
-    let requests = options.requests;
-    let wall = Instant::now();
-    let report = match options.surface.as_str() {
+fn measure_surface(surface: &str, options: &Options, port: u16) -> Result<Report, DynError> {
+    match surface {
         "raw" => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(measure_raw(&options, port))?
+            runtime.block_on(measure_raw(options, port))
         }
         "hyper" => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(measure_hyper(&options, port))?
+            runtime.block_on(measure_hyper(options, port))
         }
-        "blocking" => measure_blocking(&options, port)?,
+        "blocking" => measure_blocking(options, port),
         _ => {
             let runtime = match options.runtime.as_str() {
                 "current" => tokio::runtime::Builder::new_current_thread()
@@ -407,9 +433,77 @@ fn main() -> Result<(), DynError> {
                     .enable_all()
                     .build()?,
             };
-            runtime.block_on(measure_async(&options, port))?
+            runtime.block_on(measure_async(options, port))
         }
-    };
+    }
+}
+
+/// Interleaved rounds of every requested surface.
+///
+/// Alternating surfaces inside one process round makes each round a paired
+/// comparison, so a drifting machine affects every surface of that round
+/// instead of only whichever surface ran while it was quiet.
+fn run_rounds(options: &Options, port: u16) -> Result<(), DynError> {
+    let mut medians: Vec<(String, Vec<f64>, Vec<f64>)> = Vec::new();
+    for surface in &options.surfaces {
+        medians.push((surface.clone(), Vec::new(), Vec::new()));
+    }
+    for round in 0..options.rounds {
+        for (index, surface) in options.surfaces.iter().enumerate() {
+            let report = measure_surface(surface, options, port)?;
+            let mut totals = report.totals.clone();
+            totals.sort_unstable();
+            let p50 = percentile(&totals, 0.50);
+            let mut heads = report.heads.clone();
+            heads.sort_unstable();
+            let mut bodies = report.bodies.clone();
+            bodies.sort_unstable();
+            let head = percentile(&heads, 0.50);
+            let body = percentile(&bodies, 0.50);
+            let elapsed = report.elapsed.as_secs_f64();
+            let rate = report.requests as f64 / elapsed;
+            println!(
+                "round {round} {:<9} p50={:>7.1}us (head {:>6.1} body {:>5.1})  {:>9.0} req/s",
+                surface, p50, head, body, rate
+            );
+            medians[index].1.push(p50);
+            medians[index].2.push(rate);
+        }
+    }
+    println!();
+    println!("surface    median p50   median req/s   vs first");
+    let baseline_p50 = median(&medians[0].1);
+    for (name, p50s, rates) in &medians {
+        let p50 = median(p50s);
+        println!(
+            "{:<10} {:>7.1}us {:>11.0} {:>10.2}x",
+            name, p50,
+            median(rates),
+            p50 / baseline_p50
+        );
+    }
+    Ok(())
+}
+
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    sorted[sorted.len() / 2]
+}
+
+fn main() -> Result<(), DynError> {
+    let options = parse_options()?;
+    let body = Arc::new(vec![b'x'; options.body_bytes]);
+    let port = spawn_fixture(Arc::clone(&body))?;
+    if !options.surfaces.is_empty() {
+        return run_rounds(&options, port);
+    }
+    let requests = options.requests;
+    let wall = Instant::now();
+    let report = measure_surface(&options.surface, &options, port)?;
     let wall = wall.elapsed();
     let fixture_requests = FIXTURE_REQUESTS.load(Ordering::Relaxed);
     report.print(options.body_bytes);
