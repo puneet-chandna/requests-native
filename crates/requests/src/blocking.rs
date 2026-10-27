@@ -44,6 +44,15 @@ impl BlockingRuntimeDriver {
         self.inner.process_id
     }
 
+    /// A reactor handle that can own connection tasks for clients built by this
+    /// driver.
+    fn task_owner(&self) -> Handle {
+        let reactors = &self.inner.reactors;
+        reactors[self.inner.next_reactor.fetch_add(1, Ordering::Relaxed) % reactors.len()]
+            .handle
+            .clone()
+    }
+
     pub fn generation(&self) -> u64 {
         self.inner.generation
     }
@@ -630,8 +639,11 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> RequestResult<Client> {
-        let inner = self.inner.build()?;
         let driver = BlockingRuntimeDriver::process_local().map_err(Error::blocking)?;
+        let inner = self
+            .inner
+            .task_owner(driver.task_owner())
+            .build()?;
         Ok(Client { inner, driver })
     }
 }
@@ -1023,8 +1035,102 @@ where
     T: Send + 'static,
     F: Future<Output = RequestResult<T>> + Send + 'static,
 {
-    let submission = driver.submit(future).map_err(Error::blocking)?;
-    submission.wait().map_err(Error::blocking)?
+    match InlineDriver::run(future) {
+        // The caller's own thread drove the request: no task to spawn, no
+        // channel and no wake for a submitted block of work.
+        Ok(result) => result,
+        Err(future) => {
+            let submission = driver.submit(future).map_err(Error::blocking)?;
+            submission.wait().map_err(Error::blocking)?
+        }
+    }
+}
+
+/// Caller-thread runtime for blocking calls.
+///
+/// A current-thread runtime owns no worker threads: its driver is pumped by the
+/// thread that calls `block_on`, so the request future, its readiness and its
+/// completion stay on the caller. Connection tasks are still owned by the
+/// driver's reactors, which is what keeps pooled connections usable from any
+/// thread.
+struct InlineDriver;
+
+struct InlineDriverState {
+    process_id: u32,
+    runtime: Option<tokio::runtime::Runtime>,
+    running: bool,
+}
+
+impl Default for InlineDriverState {
+    fn default() -> Self {
+        Self {
+            process_id: std::process::id(),
+            runtime: None,
+            running: false,
+        }
+    }
+}
+
+thread_local! {
+    static INLINE_DRIVER: std::cell::RefCell<InlineDriverState> =
+        std::cell::RefCell::new(InlineDriverState::default());
+}
+
+impl InlineDriver {
+    /// Run `future` on this thread, handing it back when the inline driver
+    /// cannot be used.
+    fn run<T, F>(future: F) -> Result<RequestResult<T>, F>
+    where
+        F: Future<Output = RequestResult<T>>,
+    {
+        let mut future = Some(future);
+        let outcome = INLINE_DRIVER.try_with(|cell| {
+            let Ok(mut state) = cell.try_borrow_mut() else {
+                // A nested blocking call already drives this thread.
+                return None;
+            };
+            let process_id = std::process::id();
+            if state.process_id != process_id {
+                // A fork keeps the thread-local value but not a usable runtime.
+                // Dropping a current-thread runtime owns no threads, so the
+                // inherited one is safe to drop here.
+                state.runtime = None;
+                state.running = false;
+                state.process_id = process_id;
+            }
+            if state.running || Handle::try_current().is_ok() {
+                // Blocking from inside a runtime must not drive another one.
+                return None;
+            }
+            if state.runtime.is_none() {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                state.runtime = Some(runtime);
+            }
+            let pending = future.take().expect("inline future is taken once");
+            state.running = true;
+            ensure_submission_process(process_id);
+            // Keep the submitted-work accounting truthful, and keep it released
+            // even when the future panics.
+            OUTSTANDING_SUBMISSIONS.fetch_add(1, Ordering::AcqRel);
+            let outstanding = OutstandingSubmission;
+            let result = {
+                let runtime = state.runtime.as_ref().expect("inline runtime exists");
+                runtime.block_on(pending)
+            };
+            drop(outstanding);
+            state.running = false;
+            Some(result)
+        });
+        match outcome {
+            Ok(Some(result)) => Ok(result),
+            // The thread-local is gone (a shutting-down interpreter) or the
+            // inline driver declined before taking the future.
+            Ok(None) | Err(_) => Err(future.expect("inline future was not taken")),
+        }
+    }
 }
 
 fn copy_frame(buffer: &mut [u8], frame: Bytes, remainder: &mut Option<Bytes>) -> usize {

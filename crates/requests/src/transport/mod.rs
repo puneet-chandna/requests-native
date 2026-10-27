@@ -29,6 +29,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use self::pool::{
@@ -59,6 +60,8 @@ pub(crate) struct Transport {
     default_timeout: Timeout,
     content_codecs: ContentCodecs,
     session_runtime: Option<SessionRuntimeHarness>,
+    /// Runtime that owns connection tasks when the caller must not own them.
+    task_owner: Option<Handle>,
 }
 
 pub(super) trait Connector: Send + Sync {
@@ -953,9 +956,25 @@ impl ConnectionDriver {
         }
     }
 
+    #[cfg(test)]
     fn start(&mut self, task: impl Future<Output = Result<()>> + Send + 'static) {
+        self.start_with_owner(None, task);
+    }
+
+    /// Spawn the connection task on `owner` when one is configured.
+    ///
+    /// The pool is shared, so a connection has to keep running on a runtime
+    /// that outlives whichever caller established it.
+    fn start_with_owner(
+        &mut self,
+        owner: Option<&Handle>,
+        task: impl Future<Output = Result<()>> + Send + 'static,
+    ) {
         debug_assert!(self.task.is_none());
-        self.task = Some(tokio::spawn(task));
+        self.task = Some(match owner {
+            Some(handle) => handle.spawn(task),
+            None => tokio::spawn(task),
+        });
     }
 
     fn observe_response_head(&mut self, observation: ResponseHeadObservation) {
@@ -1277,7 +1296,14 @@ impl Transport {
             default_timeout,
             content_codecs,
             session_runtime,
+            task_owner: None,
         }
+    }
+
+    /// Pin connection tasks to `task_owner` instead of the ambient runtime.
+    pub(crate) fn with_task_owner(mut self, task_owner: Option<Handle>) -> Self {
+        self.task_owner = task_owner;
+        self
     }
 
     pub(crate) fn clear_pool(&self) {
@@ -1325,13 +1351,6 @@ impl Transport {
     fn with_test_establishment_control(mut self, control: Arc<dyn EstablishmentControl>) -> Self {
         self.establishment_control = Some(control);
         self
-    }
-
-    #[cfg(test)]
-    async fn establishment_checkpoint(&self, stage: EstablishmentStage) {
-        if let Some(control) = &self.establishment_control {
-            control.checkpoint(stage).await;
-        }
     }
 
     pub async fn send(&self, request: Request) -> Result<TransportResponse> {
@@ -1668,26 +1687,89 @@ impl Transport {
         }
     }
 
+    /// Establish a connection, on the runtime that will own it when one is
+    /// configured.
+    ///
+    /// A caller that drives its own thread (the blocking API) must not register
+    /// socket I/O with a runtime that dies with the call: the connection
+    /// outlives the request in the pool and is used from other threads.
     async fn connect_connection(
         &self,
         key: Arc<PoolKey>,
         authority: Authority,
         deadlines: EstablishmentDeadlines,
     ) -> Result<ConnectionLease> {
+        let establishment = Establishment {
+            connector: Arc::clone(&self.connector),
+            proxy: self.proxy.clone(),
+            tls: self.tls.clone(),
+            session_runtime: self.session_runtime.clone(),
+            task_owner: self.task_owner.clone(),
+            #[cfg(test)]
+            establishment_control: self.establishment_control.as_ref().map(Arc::clone),
+            generation: {
+                self.pool
+                    .lock()
+                    .expect("transport pool lock poisoned")
+                    .generation_number(&key)
+            },
+            key,
+            authority,
+            deadlines,
+        };
+        match self.task_owner.clone() {
+            Some(owner) => {
+                let establishment = Arc::new(establishment);
+                let establishing = Arc::clone(&establishment);
+                owner
+                    .spawn(async move { establishing.establish().await })
+                    .await
+                    .map_err(Error::connection)?
+            }
+            None => establishment.establish().await,
+        }
+    }
+}
+
+/// One connection establishment, owning everything it needs.
+///
+/// Establishment never borrows the transport: it may run on the runtime that
+/// owns the connection instead of the caller's.
+struct Establishment {
+    connector: Arc<dyn Connector>,
+    proxy: Option<Proxy>,
+    tls: TlsConfig,
+    session_runtime: Option<SessionRuntimeHarness>,
+    task_owner: Option<Handle>,
+    #[cfg(test)]
+    establishment_control: Option<Arc<dyn EstablishmentControl>>,
+    generation: u64,
+    key: Arc<PoolKey>,
+    authority: Authority,
+    deadlines: EstablishmentDeadlines,
+}
+
+impl Establishment {
+    #[cfg(test)]
+    async fn establishment_checkpoint(&self, stage: EstablishmentStage) {
+        if let Some(control) = &self.establishment_control {
+            control.checkpoint(stage).await;
+        }
+    }
+
+    async fn establish(&self) -> Result<ConnectionLease> {
         // Establishment borrows the caller's authority for host, port and
         // diagnostics, and takes the effective port from the key.
+        let key = Arc::clone(&self.key);
+        let authority = &self.authority;
+        let deadlines = self.deadlines;
+        let generation = self.generation;
         let host = authority.host();
         let target = authority.as_str();
         let port = key
             .authority
             .port_u16()
             .expect("pool key authority carries an effective port");
-        let generation = {
-            self.pool
-                .lock()
-                .expect("transport pool lock poisoned")
-                .generation_number(&key)
-        };
         let reservation = self
             .session_runtime
             .as_ref()
@@ -1789,13 +1871,15 @@ impl Transport {
                     #[cfg(test)]
                     self.establishment_checkpoint(EstablishmentStage::Http1)
                         .await;
-                    start_http1(stream, driver, connection_identity).await?
+                    start_http1(stream, driver, connection_identity, self.task_owner.as_ref())
+                        .await?
                 }
                 None => {
                     #[cfg(test)]
                     self.establishment_checkpoint(EstablishmentStage::Http1)
                         .await;
-                    start_http1(stream, driver, connection_identity).await?
+                    start_http1(stream, driver, connection_identity, self.task_owner.as_ref())
+                        .await?
                 }
             };
             match reservation {
@@ -1855,6 +1939,7 @@ async fn start_http1<IO>(
     stream: IO,
     mut driver: ConnectionDriver,
     session_identity: Option<SessionConnectionIdentity>,
+    task_owner: Option<&Handle>,
 ) -> Result<IdleConnection>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1866,7 +1951,9 @@ where
         .await
         .map_err(Error::handshake)?;
     driver.observe_response_head(observation);
-    driver.start(async move { connection.await.map_err(Error::connection_hyper) });
+    driver.start_with_owner(task_owner, async move {
+        connection.await.map_err(Error::connection_hyper)
+    });
     Ok(IdleConnection::network(sender, driver, session_identity))
 }
 
