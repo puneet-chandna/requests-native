@@ -9,6 +9,17 @@
 //! cargo run --release --manifest-path benchmarks/rust-native/Cargo.toml \
 //!     --bin core_loopback -- --requests 20000 --concurrency 1
 //! ```
+//!
+//! `--surfaces` runs several surfaces alternately inside one process and
+//! prints per-round results plus medians and a ratio to the first surface. A
+//! round is then a paired comparison: a machine that drifts or a noisy
+//! neighbour moves every surface of that round together, so the ratios stay
+//! meaningful where cross-run absolute numbers do not.
+//!
+//! ```console
+//! cargo run --release --manifest-path benchmarks/rust-native/Cargo.toml \
+//!     --bin core_loopback -- --surfaces raw,hyper,async,blocking --rounds 3
+//! ```
 
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
