@@ -19,7 +19,7 @@ from datetime import timedelta
 from functools import wraps
 from typing import TYPE_CHECKING, Any, cast
 
-from ._internal_utils import to_native_string
+from ._internal_utils import to_native_string, urlparse_cached
 from ._rust_public import close_owner as _close_public_facade_owner
 from ._rust_public import dispatch as _public_facade_dispatch
 from ._rust_public import rust_public_trial as _rust_public_trial_context
@@ -228,7 +228,7 @@ class SessionRedirectMixin:
         hist: list[Response] = []  # keep track of history
 
         url = self.get_redirect_target(resp)
-        previous_fragment = urlparse(req.url).fragment
+        previous_fragment = urlparse_cached(req.url).fragment
         while url:
             prepared_request = req.copy()
 

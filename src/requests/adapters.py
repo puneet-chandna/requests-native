@@ -38,6 +38,7 @@ from urllib3.util import parse_url
 from urllib3.util.retry import Retry
 
 from .auth import _basic_auth_str
+from ._internal_utils import urlparse_cached
 from .compat import basestring, urlparse
 from .cookies import extract_cookies_to_jar
 from .exceptions import (
@@ -100,7 +101,7 @@ def _urllib3_request_context(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     host_params: dict[str, Any] = {}
     pool_kwargs: dict[str, Any] = {}
-    parsed_request_url = urlparse(request.url)
+    parsed_request_url = urlparse_cached(request.url)
     scheme = parsed_request_url.scheme.lower()
     port = parsed_request_url.port
 
@@ -616,7 +617,7 @@ class HTTPAdapter(BaseAdapter):
         assert _is_prepared(request)
 
         proxy = select_proxy(request.url, proxies)
-        scheme = urlparse(request.url).scheme
+        scheme = urlparse_cached(request.url).scheme
 
         is_proxied_http_request = proxy and scheme != "https"
         using_socks_proxy = False

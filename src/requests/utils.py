@@ -41,6 +41,7 @@ from ._internal_utils import (  # noqa: F401
     _HEADER_VALIDATORS_STR,
     HEADER_VALIDATORS,
     to_native_string,
+    urlparse_cached,
 )
 from ._types import SupportsItems as _SupportsItems
 from .compat import (
@@ -859,7 +860,7 @@ def should_bypass_proxies(url: str, no_proxy: str | None) -> bool:
     no_proxy_arg = no_proxy
     if no_proxy is None:
         no_proxy = get_proxy("no_proxy")
-    parsed = urlparse(url)
+    parsed = urlparse_cached(url)
     hostname = parsed.hostname
 
     if hostname is None:
@@ -937,7 +938,7 @@ def select_proxy(url: str, proxies: dict[str, str] | None) -> str | None:
     :param proxies: A dictionary of schemes or schemes and hosts to proxy URLs
     """
     proxies = proxies or {}
-    urlparts = urlparse(url)
+    urlparts = urlparse_cached(url)
     if urlparts.hostname is None:
         return proxies.get(urlparts.scheme, proxies.get("all"))
 
@@ -1121,7 +1122,7 @@ def get_auth_from_url(url: str) -> tuple[str, str]:
 
     :rtype: (str,str)
     """
-    parsed = urlparse(url)
+    parsed = urlparse_cached(url)
 
     try:
         # except handles parsed.username/password being None

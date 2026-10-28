@@ -8,7 +8,9 @@ which depend on extremely few external helpers (such as compat)
 
 import re
 
-from .compat import builtin_str
+from urllib.parse import ParseResult
+
+from .compat import builtin_str, urlparse
 
 _VALID_HEADER_NAME_RE_BYTE = re.compile(rb"^[^:\s][^:\r\n]*\Z")
 _VALID_HEADER_NAME_RE_STR = re.compile(r"^[^:\s][^:\r\n]*\Z")
@@ -21,6 +23,28 @@ HEADER_VALIDATORS = {
     bytes: _HEADER_VALIDATORS_BYTE,
     str: _HEADER_VALIDATORS_STR,
 }
+
+
+_LAST_PARSED_URL: tuple[str, ParseResult] | None = None
+
+
+def urlparse_cached(url: str) -> ParseResult:
+    """Return ``urlparse(url)``, reusing the parse of the same url string.
+
+    One request consults its own url several times while it is prepared, sent
+    and read back for cookies; those consults follow one another on the same
+    string, so the previous parse answers them. Only that exact string hits the
+    memo, and parse results are immutable.
+
+    :rtype: ParseResult
+    """
+    global _LAST_PARSED_URL
+    memo = _LAST_PARSED_URL
+    if memo is not None and memo[0] == url:
+        return memo[1]
+    parsed = urlparse(url)
+    _LAST_PARSED_URL = (url, parsed)
+    return parsed
 
 
 def to_native_string(string: str | bytes, encoding: str = "ascii") -> str:

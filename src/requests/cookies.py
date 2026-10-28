@@ -16,7 +16,7 @@ from collections.abc import Iterator, MutableMapping
 from http.cookiejar import Cookie, CookieJar, CookiePolicy
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
-from ._internal_utils import to_native_string
+from ._internal_utils import to_native_string, urlparse_cached
 from ._types import is_prepared as _is_prepared
 from .compat import Morsel, cookielib, urlparse, urlunparse
 
@@ -46,7 +46,7 @@ class MockRequest:
         assert _is_prepared(request)
         self._r = request
         self._new_headers: dict[str, str] = {}
-        self.type = urlparse(self._r.url).scheme
+        self.type = urlparse_cached(self._r.url).scheme
 
     def get_type(self) -> str:
         return self.type
