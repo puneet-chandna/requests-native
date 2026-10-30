@@ -50,6 +50,11 @@ fn controlled_connection(
     )
 }
 
+/// The transport hands leases a shared key handle; tests model that handle.
+fn shared(key: &PoolKey) -> Arc<PoolKey> {
+    Arc::new(key.clone())
+}
+
 fn fresh_lease(pool: &Pool, key: PoolKey, connection: IdleConnection) -> ConnectionLease {
     let generation = pool.generation_number(&key);
     ConnectionLease::new(key, generation, connection)
@@ -390,8 +395,8 @@ fn current_generation_clean_eof_returns_idle_up_to_capacity_per_key() {
     assert_eq!(first_generation.idle.len(), 2);
 
     let current_generation = pool.generation_number(&first_key);
-    let first = pool.acquire(&first_key).expect("first idle connection");
-    let second = pool.acquire(&first_key).expect("second idle connection");
+    let first = pool.acquire(&shared(&first_key)).expect("first idle connection");
+    let second = pool.acquire(&shared(&first_key)).expect("second idle connection");
     assert_eq!(first.key(), &first_key);
     assert_eq!(first.generation(), current_generation);
     assert_eq!(first.terminal(), LeaseTerminal::Active);
@@ -402,7 +407,7 @@ fn current_generation_clean_eof_returns_idle_up_to_capacity_per_key() {
         first.connection().controlled_id(),
         second.connection().controlled_id()
     );
-    assert!(pool.acquire(&first_key).is_none());
+    assert!(pool.acquire(&shared(&first_key)).is_none());
     assert_eq!(pool.idle_len(&second_key), 2);
 }
 
@@ -502,9 +507,9 @@ fn separate_pool_instances_isolate_same_key_connections() {
 
     assert_eq!(first_closes.load(Ordering::SeqCst), 1);
     assert_eq!(second_closes.load(Ordering::SeqCst), 0);
-    assert!(first_pool.acquire(&key).is_none());
+    assert!(first_pool.acquire(&shared(&key)).is_none());
     let second = second_pool
-        .acquire(&key)
+        .acquire(&shared(&key))
         .expect("second pool retains its own connection");
     assert_eq!(second.connection().controlled_id(), 2);
     assert_eq!(second.terminal(), LeaseTerminal::Active);

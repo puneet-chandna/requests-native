@@ -122,6 +122,7 @@ pub struct ClientBuilder {
     pool_max_idle_per_host: usize,
     content_codecs: ContentCodecs,
     session_runtime: Option<SessionRuntimeHarness>,
+    task_owner: Option<tokio::runtime::Handle>,
 }
 
 impl Default for ClientBuilder {
@@ -133,6 +134,7 @@ impl Default for ClientBuilder {
             pool_max_idle_per_host: DEFAULT_MAX_IDLE_PER_HOST,
             content_codecs: ContentCodecs::new(true, true),
             session_runtime: None,
+            task_owner: None,
         }
     }
 }
@@ -169,19 +171,34 @@ impl ClientBuilder {
         self
     }
 
+    /// Run connection tasks on `handle` instead of the runtime that happens to
+    /// be current when a connection is established.
+    ///
+    /// A client whose caller drives requests on its own thread (the blocking
+    /// API) must not tie a pooled connection's task to that thread: the pool is
+    /// shared, so a connection has to keep running wherever it is used next.
+    #[doc(hidden)]
+    pub fn task_owner(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.task_owner = Some(handle);
+        self
+    }
+
     pub fn build(self) -> Result<Client> {
         if let Some(proxy) = &self.proxy {
             validate_proxy(proxy)?;
         }
         Ok(Client {
-            transport: Arc::new(Transport::configured_with_session_runtime(
-                self.proxy,
-                self.tls,
-                self.timeout,
-                self.pool_max_idle_per_host,
-                self.content_codecs,
-                self.session_runtime,
-            )),
+            transport: Arc::new(
+                Transport::configured_with_session_runtime(
+                    self.proxy,
+                    self.tls,
+                    self.timeout,
+                    self.pool_max_idle_per_host,
+                    self.content_codecs,
+                    self.session_runtime,
+                )
+                .with_task_owner(self.task_owner),
+            ),
         })
     }
 }

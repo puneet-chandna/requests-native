@@ -503,6 +503,7 @@ def test_pristine_trial_uses_native_response_and_preserves_stream_across_clear()
         assert server.requests == 2
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_exact_admission_falls_back_before_native_pool_creation(monkeypatch):
     marker = object()
     monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
@@ -524,6 +525,7 @@ def test_exact_admission_falls_back_before_native_pool_creation(monkeypatch):
     assert requests._requests_rust._adapter_pool_side_table_trial() == original_count
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_nonreplayable_body_and_class_patch_fall_back(monkeypatch):
     marker = object()
     monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
@@ -540,6 +542,7 @@ def test_nonreplayable_body_and_class_patch_fall_back(monkeypatch):
         assert HTTPAdapter().send(prepared("http://example.test/")) is marker
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_restored_instance_class_and_module_state_readmits_native_trial(monkeypatch):
     marker = object()
     adapter = HTTPAdapter()
@@ -861,6 +864,7 @@ def test_native_raw_initial_url_matches_canonical_request_target(route):
     ],
 )
 @pytest.mark.parametrize("before_constructor", [False, True])
+@pytest.mark.usefixtures("strict_admission")
 def test_replaced_raw_url_helper_dependency_falls_back_before_callbacks(
     monkeypatch, module, name, before_constructor
 ):
@@ -886,6 +890,7 @@ def test_replaced_raw_url_helper_dependency_falls_back_before_callbacks(
 
 
 @pytest.mark.parametrize("name", ["uses_params", "uses_netloc"])
+@pytest.mark.usefixtures("strict_admission")
 def test_mutated_raw_url_parser_sequence_falls_back_before_effects(monkeypatch, name):
     parser = importlib.import_module("urllib.parse")
     request = prepared("http://origin.example/path;")
@@ -1460,6 +1465,7 @@ def test_each_proxy_manager_has_an_independent_native_lru_realm():
         assert len(proxy_two.clients) == 1
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_manager_and_request_shape_mutations_fall_back_then_restore(monkeypatch):
     marker = object()
     adapter = HTTPAdapter()
@@ -1489,6 +1495,7 @@ def test_manager_and_request_shape_mutations_fall_back_then_restore(monkeypatch)
         assert server.requests == 1
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_preused_visible_main_or_proxy_manager_falls_back_then_restores(monkeypatch):
     marker = object()
     adapter = HTTPAdapter()
@@ -1918,6 +1925,7 @@ def test_urllib3_126_stream_returns_whole_decoder_chunks_and_flushes_at_eof():
 
 
 @pytest.mark.parametrize("target", ["proxy_manager_for", "proxy_from_url"])
+@pytest.mark.usefixtures("strict_admission")
 def test_adapter_callable_code_mutation_falls_back_before_proxy_cache_or_socket(
     monkeypatch, target
 ):
@@ -1967,6 +1975,7 @@ def test_adapter_callable_code_mutation_falls_back_before_proxy_cache_or_socket(
         assert server.requests == 1
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_in_place_main_manager_mapping_mutations_fall_back_then_restore(monkeypatch):
     marker = object()
     monkeypatch.setattr(adapters, "_HTTP_ADAPTER_COMPAT_SEND", lambda *a, **k: marker)
@@ -1989,6 +1998,7 @@ def test_in_place_main_manager_mapping_mutations_fall_back_then_restore(monkeypa
         assert server.requests == 1
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_equal_but_distinct_manager_mapping_key_falls_back(monkeypatch):
     marker = object()
     adapter = HTTPAdapter()
@@ -2028,6 +2038,7 @@ def test_pypy_abc_registry_replacement_falls_back(monkeypatch):
     "mutation",
     ["pools_getitem", "key_partial_keywords", "pool_init"],
 )
+@pytest.mark.usefixtures("strict_admission")
 def test_main_manager_behavior_mutations_fall_back_then_restore(monkeypatch, mutation):
     marker = object()
     adapter = HTTPAdapter()
@@ -2045,6 +2056,7 @@ def test_main_manager_behavior_mutations_fall_back_then_restore(monkeypatch, mut
         assert server.requests == 1
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_inherited_pool_base_behavior_mutation_falls_back_then_restores(monkeypatch):
     import urllib3.connectionpool
 
@@ -2077,6 +2089,7 @@ def test_inherited_pool_base_behavior_mutation_falls_back_then_restores(monkeypa
         assert server.requests == 1
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_proxy_manager_partial_behavior_mutation_falls_back_then_restores(monkeypatch):
     marker = object()
     with loopback((200, {}, b"first"), (200, {}, b"restored-proxy-behavior")) as (
@@ -2107,6 +2120,7 @@ def test_proxy_manager_partial_behavior_mutation_falls_back_then_restores(monkey
         assert server.requests == 2
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_socks_manager_partial_behavior_mutation_falls_back_then_restores(monkeypatch):
     if not isinstance(adapters.SOCKSProxyManager, type):
         pytest.skip("PySocks is unavailable")
@@ -2138,6 +2152,7 @@ def test_socks_manager_partial_behavior_mutation_falls_back_then_restores(monkey
         assert observed == {"connections": 1, "requests": 2}
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_proxy_constructor_mutation_falls_back_before_cache_or_socket(monkeypatch):
     import urllib3.poolmanager
 
@@ -2156,6 +2171,7 @@ def test_proxy_constructor_mutation_falls_back_before_cache_or_socket(monkeypatc
     assert adapter.proxy_manager == {}
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_proxy_manager_mutation_after_creation_falls_back_then_restores(monkeypatch):
     marker = object()
     with loopback((200, {}, b"first"), (200, {}, b"restored")) as (server, proxy_url):
@@ -2194,6 +2210,7 @@ def test_proxy_manager_mutation_after_creation_falls_back_then_restores(monkeypa
         assert server.requests == 2
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_nested_main_pool_container_mutations_fall_back_then_restore(monkeypatch):
     marker = object()
     adapter = HTTPAdapter()
@@ -2219,6 +2236,7 @@ def test_nested_main_pool_container_mutations_fall_back_then_restore(monkeypatch
         assert server.requests == 1
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_nested_proxy_manager_mutations_fall_back_then_restore(monkeypatch):
     marker = object()
     with loopback((200, {}, b"first"), (200, {}, b"restored-proxy")) as (
@@ -2279,6 +2297,7 @@ def test_nested_proxy_manager_mutations_fall_back_then_restore(monkeypatch):
         assert server.requests == 2
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_proxy_manager_class_behavior_is_frozen_before_visible_creation(monkeypatch):
     import urllib3.poolmanager
 
@@ -2314,6 +2333,7 @@ def test_proxy_manager_class_behavior_is_frozen_before_visible_creation(monkeypa
         assert server.requests == 1
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_socks_manager_class_behavior_is_frozen_before_visible_creation(monkeypatch):
     socks_manager = adapters.SOCKSProxyManager
     if not isinstance(socks_manager, type):
@@ -2382,6 +2402,7 @@ _ADAPTER_EXCEPTION_MODULE_GLOBALS = [
 
 
 @pytest.mark.parametrize("name", _ADAPTER_EXCEPTION_MODULE_GLOBALS + ["OSError"])
+@pytest.mark.usefixtures("strict_admission")
 def test_adapter_exception_globals_are_frozen_before_native_effects(monkeypatch, name):
     marker = object()
     adapter = HTTPAdapter()
@@ -2398,6 +2419,7 @@ def test_adapter_exception_globals_are_frozen_before_native_effects(monkeypatch,
 
 
 @pytest.mark.parametrize("name", ["MaxRetryError", "ConnectionError"])
+@pytest.mark.usefixtures("strict_admission")
 def test_missing_adapter_exception_globals_fall_back_before_native_effects(
     monkeypatch, name
 ):
@@ -3642,6 +3664,7 @@ def test_concurrent_native_and_python_proxy_admissions_restore_native_proof():
     assert rewrite.observations["side_effects"] == [rewrite_expected]
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_concurrent_native_and_python_direct_admissions_restore_native_proof():
     source = _CONCURRENT_ADAPTER_ADMISSION_CASE.replace(
         "ROUTE", repr("direct"), 1
@@ -4148,6 +4171,7 @@ def test_new_socks_proxy_manager_routing_mutation_is_not_recorded_after_commit(
         "socks_pool_classes_by_scheme",
     ],
 )
+@pytest.mark.usefixtures("strict_admission")
 def test_replaced_live_routing_source_falls_back_before_native_effects(
     monkeypatch, source
 ):
@@ -4326,6 +4350,7 @@ result = None
     "source_name",
     ["pool_classes_by_scheme", "key_fn_by_scheme"],
 )
+@pytest.mark.usefixtures("strict_admission")
 def test_missing_live_routing_source_preserves_authoritative_error_order(
     source_name,
 ):
@@ -4449,6 +4474,7 @@ delattr(adapters, "SOCKSProxyManager")
 )
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_missing_live_socks_manager_preserves_authoritative_error_order():
     case = {"source": _MISSING_LIVE_SOCKS_MANAGER_CASE}
     oracle = run_oracle_case(case)
@@ -4481,6 +4507,7 @@ def test_missing_live_socks_manager_preserves_authoritative_error_order():
     ]
 
 
+@pytest.mark.usefixtures("strict_admission")
 def test_raising_live_socks_manager_observation_uses_authoritative_error():
     case = {"source": _RAISING_LIVE_SOCKS_MANAGER_OBSERVATION_CASE}
     oracle = run_oracle_case(case)

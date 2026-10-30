@@ -177,7 +177,13 @@ impl Response {
 
     pub async fn bytes(self) -> Result<Bytes> {
         let mut body = self.into_body();
-        let mut collected = BytesMut::new();
+        // A declared length is a reliable initial capacity: the body is either
+        // exactly that long or shorter, and one reservation avoids the growth
+        // reallocations of an initially empty buffer.
+        let mut collected = match body.expected_content_length {
+            Some(length) => BytesMut::with_capacity(length.min(usize::MAX as u64) as usize),
+            None => BytesMut::new(),
+        };
         while let Some(chunk) = poll_fn(|context| Pin::new(&mut body).poll_next(context)).await {
             collected.extend_from_slice(&chunk?);
         }

@@ -394,7 +394,29 @@ The unmodified built-in `send()` may use Rust only if:
 4. retry, timeout, proxy, TLS, and certificate values convert without
    narrowing behavior.
 
-Otherwise dispatch through the Python compatibility implementation. Direct
+Otherwise dispatch through the Python compatibility implementation.
+
+Admission runs in one of two modes:
+
+- **Default.** The exact built-in facade is proven once, when the adapter is
+  registered. Each request then re-checks only cheap dispatch facts: the exact
+  adapter and prepared-request types, no visible adapter method override, the
+  stock prepared-request attribute hook, and the identity of every method,
+  module global, exception global, URL helper and URL helper sequence the
+  native path calls into or replaces. A changed identity still selects the
+  Python compatibility path; the recursive walk over class dictionaries,
+  function cells and nested mappings does not run per request.
+- **Strict.** Setting `REQUESTS_NATIVE_STRICT_ADMISSION` to a truthy value (or
+  the private `_set_strict_admission_trial` switch) restores the exhaustive
+  per-request walk described by the rules above, including the recursive
+  behavior proofs, the class-dictionary and module-dictionary comparisons, and
+  the `Retry` instance-shadow scan. The differential tests that pin that
+  contract request strict mode explicitly through the `strict_admission`
+  fixture.
+
+Both modes keep the same manager, pool, retry, timeout, TLS, proxy, cookie and
+response behavior; they differ only in how much of the recorded proof is
+re-validated before Rust takes authority. Direct
 calls to public adapter methods continue to use the visible urllib3 objects.
 Pickling omits Rust shadow state and recreates it lazily. `close()` clears both
 visible and Rust pool generations but does not make the adapter permanently

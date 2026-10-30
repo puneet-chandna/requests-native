@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -91,6 +91,7 @@ struct AdapterState {
     url_helper_sequences: Vec<(String, SequenceProof)>,
     send_globals: Py<PyDict>,
     send_builtins: Py<PyDict>,
+    parse_globals: Py<PyDict>,
     exception_globals: Vec<AdapterGlobalProof>,
 }
 
@@ -362,8 +363,8 @@ fn retry_snapshot(
     retry: &Bound<'_, PyAny>,
 ) -> PyResult<Result<RetrySnapshot, String>> {
     let guard = retry_state(py)?;
-    let retry_module = PyModule::import(py, "urllib3.util.retry")?;
-    let urllib3_module = PyModule::import(py, "urllib3")?;
+    let retry_module = guard.retry_module.bind(py);
+    let urllib3_module = guard.urllib3_module.bind(py);
     let retry_type = guard.retry_type.bind(py);
     if !urllib3_module.as_any().is(guard.urllib3_module.bind(py))
         || !urllib3_module
@@ -372,8 +373,14 @@ fn retry_snapshot(
         || !retry_module.as_any().is(guard.retry_module.bind(py))
         || !retry_module.getattr("Retry")?.is(retry_type)
         || !retry.get_type().as_any().is(retry_type)
-        || !dict_proof_is_pristine(py, &retry_type.getattr("__dict__")?, &guard.class_dict)?
-        || !dict_proof_is_pristine(py, retry_module.dict().as_any(), &guard.module_dict)?
+    {
+        return Ok(Err(
+            "Retry must have the exact urllib3.util.retry.Retry type".to_owned(),
+        ));
+    }
+    if strict_admission()
+        && (!dict_proof_is_pristine(py, &retry_type.getattr("__dict__")?, &guard.class_dict)?
+            || !dict_proof_is_pristine(py, &retry_module.getattr("__dict__")?, &guard.module_dict)?)
     {
         return Ok(Err(
             "Retry must have the exact urllib3.util.retry.Retry type".to_owned(),
@@ -384,11 +391,12 @@ fn retry_snapshot(
         Ok(value) => value,
         Err(_) => return Ok(Err("Retry instance dictionary is unsupported".to_owned())),
     };
-    if guard
-        .class_dict
-        .items
-        .iter()
-        .any(|(name, _)| instance_dict.contains(name).unwrap_or(true))
+    if strict_admission()
+        && guard
+            .class_dict
+            .items
+            .iter()
+            .any(|(name, _)| instance_dict.contains(name).unwrap_or(true))
     {
         return Ok(Err(
             "Retry instance shadows a guarded method or constant".to_owned()
@@ -1400,6 +1408,7 @@ fn initialize_adapter_state(py: Python<'_>) -> PyResult<AdapterState> {
         url_helper_sequences,
         send_globals: send_globals.unbind(),
         send_builtins: send_builtins.unbind(),
+        parse_globals: parse_globals.unbind(),
         exception_globals,
     })
 }
@@ -1408,11 +1417,150 @@ fn adapter_state(py: Python<'_>) -> PyResult<&AdapterState> {
     ADAPTER_STATE.get_or_try_init(py, || initialize_adapter_state(py))
 }
 
+/// Environment switch selecting the exhaustive per-request admission walk.
+pub(crate) const STRICT_ADMISSION_ENV: &str = "REQUESTS_NATIVE_STRICT_ADMISSION";
+
+static STRICT_ADMISSION: AtomicBool = AtomicBool::new(false);
+static STRICT_ADMISSION_READY: AtomicBool = AtomicBool::new(false);
+
+/// Whether the public facade re-walks every recorded proof before each native
+/// send.
+///
+/// The default admits the exact built-in facade when it is registered and then
+/// trusts it, re-checking per request only the cheap shape facts that decide
+/// native versus Python dispatch. Setting `REQUESTS_NATIVE_STRICT_ADMISSION`,
+/// or the private `_set_strict_admission_trial` switch, restores the exhaustive
+/// per-request walk.
+pub(crate) fn strict_admission() -> bool {
+    if !STRICT_ADMISSION_READY.load(Ordering::Acquire) {
+        let enabled = std::env::var_os(STRICT_ADMISSION_ENV).is_some_and(|value| {
+            matches!(
+                value.to_string_lossy().as_ref(),
+                "1" | "true" | "TRUE" | "True" | "yes" | "on"
+            )
+        });
+        STRICT_ADMISSION.store(enabled, Ordering::Release);
+        STRICT_ADMISSION_READY.store(true, Ordering::Release);
+    }
+    STRICT_ADMISSION.load(Ordering::Acquire)
+}
+
+/// Private admission-mode probe for compatibility tests.
+#[pyfunction]
+fn _strict_admission_trial() -> bool {
+    strict_admission()
+}
+
+/// Private admission-mode switch for compatibility tests.
+#[pyfunction]
+fn _set_strict_admission_trial(enabled: bool) {
+    STRICT_ADMISSION.store(enabled, Ordering::Release);
+    STRICT_ADMISSION_READY.store(true, Ordering::Release);
+}
+
+/// Cheap facts that decide whether an exact built-in facade may still use the
+/// native transport: the exact adapter and prepared-request types, no visible
+/// adapter method override, and the stock prepared-request attribute hook.
+fn adapter_shape_is_current(
+    py: Python<'_>,
+    adapter: &Bound<'_, PyAny>,
+    request: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    let state = adapter_state(py)?;
+    let adapter_type = state.adapter_type.bind(py);
+    if !adapter.get_type().as_any().is(adapter_type)
+        || !request
+            .get_type()
+            .as_any()
+            .is(state.prepared_request_type.bind(py))
+    {
+        return Ok(false);
+    }
+    let adapter_dict = adapter.getattr("__dict__")?;
+    let Ok(adapter_dict) = adapter_dict.cast::<PyDict>() else {
+        return Ok(false);
+    };
+    if state
+        .methods
+        .iter()
+        .any(|(name, _)| adapter_dict.contains(name).unwrap_or(true))
+    {
+        return Ok(false);
+    }
+    if !state
+        .prepared_request_type
+        .bind(py)
+        .getattr("__getattribute__")?
+        .is(state.prepared_getattribute.bind(py))
+    {
+        return Ok(false);
+    }
+    // Every name the native path calls into or replaces must still resolve to
+    // the exact object recorded when the adapter was admitted. This is the
+    // identity half of the exhaustive admission walk and costs one attribute
+    // read per dependency; the recursive half stays in strict mode.
+    for (name, proof) in &state.methods {
+        if !adapter_type
+            .getattr(name.as_str())?
+            .is(proof.object.bind(py))
+        {
+            return Ok(false);
+        }
+    }
+    let adapters_module = state.adapters_module.bind(py);
+    for (name, proof) in &state.globals {
+        let current = match adapters_module.getattr(name.as_str()) {
+            Ok(current) => current,
+            Err(_) if name == "SOCKSProxyManager" => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !current.is(proof.object.bind(py)) {
+            return Ok(false);
+        }
+    }
+    for (dictionary, name, proof) in &state.url_helper_dependencies {
+        let Some(current) = dictionary.bind(py).get_item(name)? else {
+            return Ok(false);
+        };
+        if !current.is(proof.object.bind(py)) {
+            return Ok(false);
+        }
+    }
+    let parse_globals = state.parse_globals.bind(py);
+    for (name, proof) in &state.url_helper_sequences {
+        let Some(current) = parse_globals.get_item(name)? else {
+            return Ok(false);
+        };
+        if !current.is(proof.sequence.bind(py)) || current.len()? != proof.items.len() {
+            return Ok(false);
+        }
+    }
+    let send_globals = state.send_globals.bind(py);
+    let send_builtins = state.send_builtins.bind(py);
+    for proof in &state.exception_globals {
+        let current = match proof.location {
+            GlobalLocation::Module => send_globals.get_item(&proof.name)?,
+            GlobalLocation::Builtins if send_globals.contains(&proof.name)? => return Ok(false),
+            GlobalLocation::Builtins => send_builtins.get_item(&proof.name)?,
+        };
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if !current.is(proof.value.bind(py)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn adapter_identity_is_pristine(
     py: Python<'_>,
     adapter: &Bound<'_, PyAny>,
     request: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
+    if !strict_admission() {
+        return adapter_shape_is_current(py, adapter, request);
+    }
     let state = adapter_state(py)?;
     for (dictionary, name, proof) in &state.url_helper_dependencies {
         let Some(current) = dictionary.bind(py).get_item(name)? else {
@@ -1682,6 +1830,11 @@ fn proxy_value(
     if !proxies.is_none() && !proxies.is_exact_instance_of::<PyDict>() {
         return Ok(None);
     }
+    if let Ok(dictionary) = proxies.cast::<PyDict>()
+        && dictionary.is_empty()
+    {
+        return Ok(Some((None, None)));
+    }
     let module = adapter_state(py)?.adapters_module.bind(py);
     let selected = module
         .getattr("select_proxy")?
@@ -1837,7 +1990,8 @@ fn native_send_input(
     cert: &Bound<'_, PyAny>,
     proxies: &Bound<'_, PyAny>,
 ) -> PyResult<Result<NativeSendInput, String>> {
-    if !adapter_identity_is_pristine(py, adapter, request)? {
+    let identity = adapter_identity_is_pristine(py, adapter, request)?;
+    if !identity {
         return Ok(Err("adapter identities are not pristine".to_owned()));
     }
     let config = adapter.getattr("config")?;
@@ -1883,24 +2037,29 @@ fn native_send_input(
     if authority.host().is_empty() {
         return Ok(Err("request URL is unsupported".to_owned()));
     }
-    let Some((headers, header_names)) = request_headers(py, request)? else {
+    let headers_and_names = request_headers(py, request)?;
+    let Some((headers, header_names)) = headers_and_names else {
         return Ok(Err("request headers are unsupported".to_owned()));
     };
     if !request_body_is_supported(request)? {
         return Ok(Err("request body is not proven replayable".to_owned()));
     }
     let retry_object = adapter.getattr("max_retries")?;
-    let retry = match retry_snapshot(py, &retry_object)? {
+    let retry_result = retry_snapshot(py, &retry_object);
+    let retry = match retry_result? {
         Ok(retry) => retry,
         Err(reason) => return Ok(Err(reason)),
     };
-    let Some(timeout) = timeout_value(py, timeout)? else {
+    let timeout_result = timeout_value(py, timeout)?;
+    let Some(timeout) = timeout_result else {
         return Ok(Err("timeout is unsupported".to_owned()));
     };
-    let Some(tls) = tls_value(py, verify, cert)? else {
+    let tls_result = tls_value(py, verify, cert)?;
+    let Some(tls) = tls_result else {
         return Ok(Err("TLS settings are unsupported".to_owned()));
     };
-    let Some((proxy, selected_proxy)) = proxy_value(py, &url, proxies)? else {
+    let proxy_result = proxy_value(py, &url, proxies)?;
+    let Some((proxy, selected_proxy)) = proxy_result else {
         return Ok(Err("proxy settings are unsupported".to_owned()));
     };
     let urllib3_url = if !scheme.eq_ignore_ascii_case("https")
@@ -1922,12 +2081,14 @@ fn native_send_input(
     {
         return Ok(Err("adapter identities changed during admission".to_owned()));
     }
-    let revalidated_retry = match retry_snapshot(py, &adapter.getattr("max_retries")?)? {
-        Ok(retry) => retry,
-        Err(reason) => return Ok(Err(reason)),
-    };
-    if revalidated_retry != retry {
-        return Ok(Err("Retry state changed during admission".to_owned()));
+    if strict_admission() {
+        let revalidated_retry = match retry_snapshot(py, &adapter.getattr("max_retries")?)? {
+            Ok(retry) => retry,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if revalidated_retry != retry {
+            return Ok(Err("Retry state changed during admission".to_owned()));
+        }
     }
     let normalized_scheme = scheme.to_ascii_lowercase();
     if is_stable_urllib3_126(&retry.version)
@@ -1937,7 +2098,8 @@ fn native_send_input(
             "urllib3 1.26 TLS requires the compatibility transport".to_owned()
         ));
     }
-    let Some(body) = request_body(request)? else {
+    let body_result = request_body(request)?;
+    let Some(body) = body_result else {
         return Ok(Err("request body is not proven replayable".to_owned()));
     };
     let normalized_host = request_uri
@@ -2238,7 +2400,25 @@ fn manager_immutable_proof_is_pristine(
 ) -> PyResult<bool> {
     if !manager.is(proof.manager.bind(py))
         || !manager.get_type().as_any().is(proof.manager_type.bind(py))
-        || !behavior_proof_is_pristine(py, manager.get_type().as_any(), &proof.class_behavior)?
+    {
+        return Ok(false);
+    }
+    if !strict_admission() {
+        for (name, expected) in &proof.mappings {
+            if !manager
+                .getattr(name.as_str())?
+                .is(expected.mapping.bind(py))
+            {
+                return Ok(false);
+            }
+        }
+        let pools = manager.getattr("pools")?;
+        return Ok(pools
+            .get_type()
+            .as_any()
+            .is(proof.pools_behavior.object.bind(py)));
+    }
+    if !behavior_proof_is_pristine(py, manager.get_type().as_any(), &proof.class_behavior)?
         || !dict_proof_is_pristine(py, &manager.getattr("__dict__")?, &proof.objects)?
     {
         return Ok(false);
@@ -2269,9 +2449,16 @@ fn manager_pools_proof_is_pristine(
     proof: &ManagerPoolsProof,
 ) -> PyResult<bool> {
     let pools = manager.getattr("pools")?;
-    if !pools.is(proof.pools.bind(py))
-        || !dict_proof_is_pristine(py, &pools.getattr("__dict__")?, &proof.pools_dict)?
-        || !mapping_proof_is_pristine(py, &pools.getattr("_container")?, &proof.pool_container)?
+    if !pools.is(proof.pools.bind(py)) {
+        return Ok(false);
+    }
+    if strict_admission()
+        && (!dict_proof_is_pristine(py, &pools.getattr("__dict__")?, &proof.pools_dict)?
+            || !mapping_proof_is_pristine(
+                py,
+                &pools.getattr("_container")?,
+                &proof.pool_container,
+            )?)
     {
         return Ok(false);
     }
@@ -2811,6 +2998,29 @@ fn registered_adapter_pristine(py: Python<'_>, adapter: &Bound<'_, PyAny>) -> Py
             let snapshot = proxy_managers.copy()?;
             if snapshot.len() != proxy_proofs.len() {
                 return Ok(Some(false));
+            }
+            if !strict_admission() {
+                // The registration-time proofs are trusted; only the visible
+                // manager identities decide native versus Python dispatch.
+                for (url, current) in snapshot.iter() {
+                    if !url.is_exact_instance_of::<PyString>() {
+                        return Ok(Some(false));
+                    }
+                    let Some(expected) = proxy_proofs.get(&url.extract::<String>()?) else {
+                        return Ok(Some(false));
+                    };
+                    if !current.is(expected.proof.manager.bind(py)) {
+                        return Ok(Some(false));
+                    }
+                }
+                return Ok(Some(
+                    referent.is(adapter)
+                        && direct_manager.proof.manager.bind(py).is(&manager)
+                        && manager
+                            .get_type()
+                            .as_any()
+                            .is(direct_manager.proof.manager_type.bind(py)),
+                ));
             }
             for (url, current) in snapshot.iter() {
                 if !url.is_exact_instance_of::<PyString>() {
@@ -3408,18 +3618,46 @@ fn core_history(snapshot: &[HistorySnapshot]) -> Vec<RetryHistory> {
         .collect()
 }
 
+/// Python classes the response bridge constructs for every send, resolved once
+/// per interpreter instead of imported per request.
+struct ResponseHelperState {
+    header_dict: Py<PyAny>,
+    http_message: Py<PyAny>,
+    simple_namespace: Py<PyAny>,
+}
+
+static RESPONSE_HELPERS: PyOnceLock<ResponseHelperState> = PyOnceLock::new();
+
+fn response_helpers(py: Python<'_>) -> PyResult<&ResponseHelperState> {
+    RESPONSE_HELPERS.get_or_try_init(py, || {
+        Ok(ResponseHelperState {
+            header_dict: PyModule::import(py, "urllib3._collections")?
+                .getattr("HTTPHeaderDict")?
+                .unbind(),
+            http_message: PyModule::import(py, "http.client")?
+                .getattr("HTTPMessage")?
+                .unbind(),
+            simple_namespace: PyModule::import(py, "types")?
+                .getattr("SimpleNamespace")?
+                .unbind(),
+        })
+    })
+}
+
+/// Decode one header byte string the way `http.client` does: every byte maps to
+/// the code point with the same value.
+fn header_text(value: &[u8]) -> String {
+    let mut text = String::with_capacity(value.len());
+    for byte in value {
+        text.push(char::from(*byte));
+    }
+    text
+}
+
 fn response_headers(py: Python<'_>, headers: &[(String, Vec<u8>)]) -> PyResult<Py<PyAny>> {
-    let result = PyModule::import(py, "urllib3._collections")?
-        .getattr("HTTPHeaderDict")?
-        .call0()?;
+    let result = response_helpers(py)?.header_dict.bind(py).call0()?;
     for (name, value) in headers {
-        result.call_method1(
-            "add",
-            (
-                name,
-                value.iter().copied().map(char::from).collect::<String>(),
-            ),
-        )?;
+        result.call_method1("add", (name, header_text(value)))?;
     }
     Ok(result.unbind())
 }
@@ -3433,22 +3671,16 @@ fn normalized_response_headers(py: Python<'_>, headers: &HeaderMap) -> PyResult<
 }
 
 fn original_response(py: Python<'_>, headers: &[(String, Vec<u8>)]) -> PyResult<Py<PyAny>> {
-    let message = PyModule::import(py, "http.client")?
-        .getattr("HTTPMessage")?
-        .call0()?;
+    let helpers = response_helpers(py)?;
+    let message = helpers.http_message.bind(py).call0()?;
     for (name, value) in headers {
-        message.call_method1(
-            "add_header",
-            (
-                name,
-                value.iter().copied().map(char::from).collect::<String>(),
-            ),
-        )?;
+        message.call_method1("add_header", (name, header_text(value)))?;
     }
     let kwargs = PyDict::new(py);
     kwargs.set_item("msg", message)?;
-    Ok(PyModule::import(py, "types")?
-        .getattr("SimpleNamespace")?
+    Ok(helpers
+        .simple_namespace
+        .bind(py)
         .call((), Some(&kwargs))?
         .unbind())
 }
@@ -3459,8 +3691,9 @@ fn retry_after(py: Python<'_>, retry: &Bound<'_, PyAny>, headers: &HeaderMap) ->
     }
     let kwargs = PyDict::new(py);
     kwargs.set_item("headers", normalized_response_headers(py, headers)?)?;
-    let response = PyModule::import(py, "types")?
-        .getattr("SimpleNamespace")?
+    let response = response_helpers(py)?
+        .simple_namespace
+        .bind(py)
         .call((), Some(&kwargs))?;
     let value = retry.call_method1("get_retry_after", (response,))?;
     if value.is_none() {
@@ -3932,10 +4165,9 @@ fn build_python_response(
         .get("content-encoding")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let raw_headers = response.raw_headers().to_vec();
-    let overflowing_content_length = overflowing_content_length(&raw_headers);
-    let headers = response_headers(py, &raw_headers)?;
-    let original_response = original_response(py, &raw_headers)?;
+    let overflowing_content_length = overflowing_content_length(response.raw_headers());
+    let headers = response_headers(py, response.raw_headers())?;
+    let original_response = original_response(py, response.raw_headers())?;
     let raw = Py::new(
         py,
         NativeAdapterRaw {
@@ -4099,7 +4331,8 @@ fn native_adapter_leaf(
             },
             |_py, action: AdapterSendAction| -> AdapterSendReply { match action {} },
             |py| py.check_signals(),
-        )?;
+        );
+        let attempt = attempt?;
         let response = match attempt {
             Ok(response) => response,
             Err(error) => {
@@ -4155,7 +4388,7 @@ fn native_adapter_leaf(
             .get("retry-after")
             .is_some_and(|value| !value.as_bytes().is_empty());
         if !retry_state.is_retry(&input.method_name, status, has_retry_after) {
-            return build_python_response(
+            let built = build_python_response(
                 py,
                 adapter,
                 request,
@@ -4163,6 +4396,7 @@ fn native_adapter_leaf(
                 response,
                 &input.urllib3_url,
             );
+            return built;
         }
         let incremented = retry_state.increment(
             RetryReason::Status { status },
@@ -5111,6 +5345,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_adapter_drop_reference_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_send_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_facade_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_strict_admission_trial, module)?)?;
+    module.add_function(wrap_pyfunction!(_set_strict_admission_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_close_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_pool_side_table_trial, module)?)?;
     module.add_function(wrap_pyfunction!(_adapter_fork_reset_trial, module)?)?;

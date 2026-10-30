@@ -3,11 +3,9 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use http::uri::{Authority, Scheme};
 use hyper::client::conn::http1::SendRequest;
@@ -181,6 +179,10 @@ pub(super) enum LeaseTerminal {
 pub(super) struct IdleConnection {
     inner: IdleConnectionInner,
     session_identity: Option<SessionConnectionIdentity>,
+    /// When this connection was returned to the pool. A freshly connected or
+    /// just-used connection has no idle span, so callers can skip a readiness
+    /// probe exactly when the connection has no chance to have gone away.
+    idle_since: Option<std::time::Instant>,
 }
 
 enum IdleConnectionInner {
@@ -228,11 +230,21 @@ impl IdleConnection {
         Self {
             inner: IdleConnectionInner::Network { sender, driver },
             session_identity,
+            idle_since: None,
         }
     }
 
     pub(super) fn session_identity(&self) -> Option<SessionConnectionIdentity> {
         self.session_identity
+    }
+
+    /// Time this connection has been idle in the pool, when it is pooled.
+    pub(super) fn idle_for(&self) -> Option<std::time::Duration> {
+        self.idle_since.map(|since| since.elapsed())
+    }
+
+    pub(super) fn mark_idle(&mut self) {
+        self.idle_since = Some(std::time::Instant::now());
     }
 
     pub(super) fn is_live(&self) -> bool {
@@ -278,6 +290,7 @@ impl IdleConnection {
                 closes,
             }),
             session_identity: None,
+            idle_since: None,
         }
     }
 
@@ -308,7 +321,7 @@ pub(super) struct PoolGeneration {
 
 #[derive(Debug)]
 pub(super) struct ConnectionLease {
-    key: Box<PoolKey>,
+    key: Arc<PoolKey>,
     generation: u64,
     terminal: LeaseTerminal,
     dirty_identity: Option<DirtyLeaseIdentity>,
@@ -336,12 +349,13 @@ pub(super) enum DirtyLeaseCause {
 }
 
 impl ConnectionLease {
+    #[cfg(test)]
     pub(super) fn new(key: PoolKey, generation: u64, connection: IdleConnection) -> Self {
-        Self::new_with_session_runtime(key, generation, connection, None)
+        Self::new_with_session_runtime(Arc::new(key), generation, connection, None)
     }
 
     pub(super) fn new_with_session_runtime(
-        key: PoolKey,
+        key: Arc<PoolKey>,
         generation: u64,
         connection: IdleConnection,
         session_runtime: Option<&SessionRuntimeHarness>,
@@ -352,7 +366,7 @@ impl ConnectionLease {
     }
 
     pub(super) fn new_with_exchange_identity(
-        key: PoolKey,
+        key: Arc<PoolKey>,
         generation: u64,
         connection: IdleConnection,
         identity: SessionExchangeIdentity,
@@ -362,13 +376,13 @@ impl ConnectionLease {
     }
 
     fn with_session_lease_identity(
-        key: PoolKey,
+        key: Arc<PoolKey>,
         generation: u64,
         connection: IdleConnection,
         session_lease_identity: Option<SessionLeaseIdentity>,
     ) -> Self {
         Self {
-            key: Box::new(key),
+            key,
             generation,
             terminal: LeaseTerminal::Active,
             dirty_identity: None,
@@ -438,6 +452,11 @@ impl ConnectionLease {
             .is_some_and(IdleConnection::peer_is_open)
     }
 
+    /// Idle span of a pooled connection, or `None` for a fresh lease.
+    pub(super) fn idle_for(&self) -> Option<std::time::Duration> {
+        self.connection.as_ref().and_then(IdleConnection::idle_for)
+    }
+
     pub(super) fn complete(mut self, terminal: LeaseTerminal) -> Self {
         if self.terminal == LeaseTerminal::Active && terminal != LeaseTerminal::Active {
             self.terminal = terminal;
@@ -479,7 +498,7 @@ impl ConnectionLease {
 pub(super) struct Pool {
     max_idle_per_key: usize,
     generation_number: u64,
-    generations: HashMap<PoolKey, PoolGeneration>,
+    generations: HashMap<Arc<PoolKey>, PoolGeneration>,
     session_runtime: Option<SessionRuntimeHarness>,
 }
 
@@ -522,11 +541,13 @@ impl Pool {
         self.generations.len()
     }
 
-    pub(super) fn acquire(&mut self, key: &PoolKey) -> Option<ConnectionLease> {
+    pub(super) fn acquire(&mut self, key: &Arc<PoolKey>) -> Option<ConnectionLease> {
         let generation = self.generations.get_mut(key)?;
+        // The idle span stays readable on the lease: the acquirer decides
+        // whether the connection has been idle long enough to re-check.
         let connection = generation.idle.pop()?;
         Some(ConnectionLease::new_with_session_runtime(
-            key.clone(),
+            Arc::clone(key),
             self.generation_number,
             connection,
             self.session_runtime.as_ref(),
@@ -544,7 +565,7 @@ impl Pool {
 
         let generation = self
             .generations
-            .entry(lease.key.as_ref().clone())
+            .entry(Arc::clone(&lease.key))
             .or_insert_with(|| PoolGeneration {
                 number: self.generation_number,
                 idle: Vec::new(),
@@ -554,9 +575,9 @@ impl Pool {
         {
             return Some(lease);
         }
-        generation
-            .idle
-            .push(lease.connection.take().expect("reusable lease connection"));
+        let mut connection = lease.connection.take().expect("reusable lease connection");
+        connection.mark_idle();
+        generation.idle.push(connection);
         None
     }
 

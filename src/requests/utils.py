@@ -41,6 +41,7 @@ from ._internal_utils import (  # noqa: F401
     _HEADER_VALIDATORS_STR,
     HEADER_VALIDATORS,
     to_native_string,
+    urlparse_cached,
 )
 from ._types import SupportsItems as _SupportsItems
 from .compat import (
@@ -807,6 +808,41 @@ def set_environ(env_name: str, value: str | None) -> Generator[None, None, None]
                 os.environ[env_name] = old_value
 
 
+_ENVIRONMENT_PROXIES_CACHE: (
+    tuple[int, tuple[tuple[str, str | None], ...], dict[str, str]] | None
+) = None
+
+
+def environment_proxies() -> dict[str, str]:
+    """Return the environment proxies, reusing the previous scan.
+
+    ``getproxies_environment()`` walks every environment variable, and one
+    request consults it more than once. The scan is reused while the entries it
+    reads are unchanged, so an added, removed or changed proxy variable (or a
+    changed ``REQUEST_METHOD``) still rebuilds it. Callers must not mutate the
+    returned mapping.
+
+    :rtype: dict
+    """
+    global _ENVIRONMENT_PROXIES_CACHE
+    cache = _ENVIRONMENT_PROXIES_CACHE
+    if cache is not None:
+        size, watched, proxies = cache
+        if size == len(os.environ) and all(
+            os.environ.get(name) == value for name, value in watched
+        ):
+            return proxies
+    proxies = getproxies_environment()
+    watched = tuple(
+        (name, os.environ.get(name))
+        for name in os.environ
+        if (len(name) > 5 and name[-6] == "_" and name[-5:].lower() == "proxy")
+        or name == "REQUEST_METHOD"
+    )
+    _ENVIRONMENT_PROXIES_CACHE = (len(os.environ), watched, proxies)
+    return proxies
+
+
 def should_bypass_proxies(url: str, no_proxy: str | None) -> bool:
     """
     Returns whether we should bypass proxies or not.
@@ -824,7 +860,7 @@ def should_bypass_proxies(url: str, no_proxy: str | None) -> bool:
     no_proxy_arg = no_proxy
     if no_proxy is None:
         no_proxy = get_proxy("no_proxy")
-    parsed = urlparse(url)
+    parsed = urlparse_cached(url)
     hostname = parsed.hostname
 
     if hostname is None:
@@ -858,11 +894,23 @@ def should_bypass_proxies(url: str, no_proxy: str | None) -> bool:
                 if hostname.endswith(host) or host_with_port.endswith(host):
                     return True
 
-    with set_environ("no_proxy", no_proxy_arg):
+    if proxy_bypass is proxy_bypass_environment:
+        # The environment-only bypass is a function of `no_proxy` alone, which
+        # is the value the matching above already used: pass it directly
+        # instead of scanning the environment again and mutating it.
+        bypass_proxies = environment_proxies()
+        if no_proxy_arg is not None:
+            bypass_proxies = dict(bypass_proxies, no=no_proxy_arg)
         try:
-            bypass = proxy_bypass(hostname)
+            bypass = proxy_bypass_environment(hostname, bypass_proxies)
         except (TypeError, socket.gaierror):
             bypass = False
+    else:
+        with set_environ("no_proxy", no_proxy_arg):
+            try:
+                bypass = proxy_bypass(hostname)
+            except (TypeError, socket.gaierror):
+                bypass = False
 
     if bypass:
         return True
@@ -878,8 +926,9 @@ def get_environ_proxies(url: str, no_proxy: str | None = None) -> dict[str, str]
     """
     if should_bypass_proxies(url, no_proxy=no_proxy):
         return {}
-    else:
-        return getproxies()
+    if getproxies is getproxies_environment:
+        return dict(environment_proxies())
+    return getproxies()
 
 
 def select_proxy(url: str, proxies: dict[str, str] | None) -> str | None:
@@ -889,7 +938,7 @@ def select_proxy(url: str, proxies: dict[str, str] | None) -> str | None:
     :param proxies: A dictionary of schemes or schemes and hosts to proxy URLs
     """
     proxies = proxies or {}
-    urlparts = urlparse(url)
+    urlparts = urlparse_cached(url)
     if urlparts.hostname is None:
         return proxies.get(urlparts.scheme, proxies.get("all"))
 
@@ -1073,7 +1122,7 @@ def get_auth_from_url(url: str) -> tuple[str, str]:
 
     :rtype: (str,str)
     """
-    parsed = urlparse(url)
+    parsed = urlparse_cached(url)
 
     try:
         # except handles parsed.username/password being None

@@ -16,6 +16,7 @@ use std::future::Future;
 use std::io;
 use std::net::Shutdown;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -23,10 +24,12 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::HeaderValue;
 use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, HOST, PROXY_AUTHORIZATION};
+use http::uri::Authority;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use self::pool::{
@@ -57,6 +60,8 @@ pub(crate) struct Transport {
     default_timeout: Timeout,
     content_codecs: ContentCodecs,
     session_runtime: Option<SessionRuntimeHarness>,
+    /// Runtime that owns connection tasks when the caller must not own them.
+    task_owner: Option<Handle>,
 }
 
 pub(super) trait Connector: Send + Sync {
@@ -314,11 +319,34 @@ impl ActiveExchangeGuard {
     }
 }
 
+/// Idle connections are re-probed for a peer close only after a checkout wait
+/// this long; the probe before the wait already covered the immediate case.
+const PEER_RECHECK_INTERVAL: Duration = Duration::from_millis(1);
+
 const MAX_RESPONSE_HEAD_BYTES: usize = 8192 + 4096 * 100;
 const MAX_RESPONSE_HEADERS: usize = 100;
 
-#[derive(Clone, Default)]
-struct ResponseHeadObservation(Arc<Mutex<ResponseHeadState>>);
+/// Per-connection response-head observer.
+///
+/// The generation and request-head-rewrite facts are mirrored into atomics so
+/// the connection I/O polls can consult them without taking the state mutex on
+/// every read and write.
+#[derive(Default)]
+struct ResponseHeadObservation {
+    state: Arc<Mutex<ResponseHeadState>>,
+    generation: Arc<AtomicU64>,
+    rewrite_request_head: Arc<AtomicBool>,
+}
+
+impl Clone for ResponseHeadObservation {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            generation: Arc::clone(&self.generation),
+            rewrite_request_head: Arc::clone(&self.rewrite_request_head),
+        }
+    }
+}
 
 #[derive(Default)]
 struct ResponseHeadState {
@@ -343,8 +371,13 @@ enum ContentLengthNormalization {
 
 impl ResponseHeadObservation {
     fn begin(&self, python_header_names: Option<Vec<String>>) {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         let generation = state.generation.wrapping_add(1);
+        self.rewrite_request_head
+            .store(python_header_names.is_some(), Ordering::Release);
         *state = ResponseHeadState {
             generation,
             active: true,
@@ -361,10 +394,14 @@ impl ResponseHeadObservation {
                     .collect()
             }),
         };
+        self.generation.store(generation, Ordering::Release);
     }
 
     fn observe(&self, bytes: &[u8]) {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         if !state.active {
             return;
         }
@@ -376,12 +413,18 @@ impl ResponseHeadObservation {
     }
 
     fn buffers_python_response_head(&self) -> bool {
-        let state = self.0.lock().expect("response-head observer lock poisoned");
+        let state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         state.active && state.python_header_names.is_some()
     }
 
     fn buffer_python_response_bytes(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         let remaining = MAX_RESPONSE_HEAD_BYTES.saturating_sub(state.captured.len());
         if bytes.len() > remaining {
             let mut passthrough = std::mem::take(&mut state.captured);
@@ -396,7 +439,10 @@ impl ResponseHeadObservation {
     }
 
     fn complete_python_response_on_eof(&self) -> Option<Vec<u8>> {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         if !state.active || state.captured.is_empty() {
             return None;
         }
@@ -414,7 +460,10 @@ impl ResponseHeadObservation {
     }
 
     fn complete_on_eof(&self) -> Option<Vec<u8>> {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         if !state.active || state.captured.is_empty() {
             return None;
         }
@@ -439,7 +488,7 @@ impl ResponseHeadObservation {
     }
 
     fn conflicting_content_length(&self) -> Option<String> {
-        self.0
+        self.state
             .lock()
             .expect("response-head observer lock poisoned")
             .conflicting_content_length
@@ -447,21 +496,30 @@ impl ResponseHeadObservation {
     }
 
     fn take_raw_headers(&self) -> Vec<(String, Vec<u8>)> {
-        let mut state = self.0.lock().expect("response-head observer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         state.captured = Vec::new();
         state.python_header_names = None;
         std::mem::take(&mut state.raw_headers)
     }
 
     fn generation(&self) -> u64 {
-        self.0
-            .lock()
-            .expect("response-head observer lock poisoned")
-            .generation
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Whether the request head for the current exchange may need rewriting,
+    /// which is the only reason `ResponseHeadIo` stages outgoing bytes.
+    fn needs_request_head_rewrite(&self) -> bool {
+        self.rewrite_request_head.load(Ordering::Acquire)
     }
 
     fn rewrite_python_request_head(&self, bytes: &mut Vec<u8>) {
-        let state = self.0.lock().expect("response-head observer lock poisoned");
+        let state = self
+            .state
+            .lock()
+            .expect("response-head observer lock poisoned");
         let Some(names) = &state.python_header_names else {
             return;
         };
@@ -821,11 +879,17 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for ResponseHeadIo<IO> {
         let this = self.get_mut();
         let generation = this.observation.generation();
         if generation != this.generation {
-            debug_assert_eq!(this.outgoing_offset, this.outgoing.len());
             this.outgoing = Vec::new();
             this.outgoing_offset = 0;
             this.outgoing_head_complete = false;
             this.generation = generation;
+        }
+        if !this.observation.needs_request_head_rewrite() {
+            // Without requested Python header spellings the head rewrite is a
+            // no-op, so outgoing bytes need no staging: hyper's own write path
+            // already orders head before body.
+            debug_assert_eq!(this.outgoing_offset, this.outgoing.len());
+            return Pin::new(&mut this.inner).poll_write(context, buffer);
         }
         if this.outgoing_offset < this.outgoing.len() {
             match this.poll_drain_outgoing(context) {
@@ -892,9 +956,25 @@ impl ConnectionDriver {
         }
     }
 
+    #[cfg(test)]
     fn start(&mut self, task: impl Future<Output = Result<()>> + Send + 'static) {
+        self.start_with_owner(None, task);
+    }
+
+    /// Spawn the connection task on `owner` when one is configured.
+    ///
+    /// The pool is shared, so a connection has to keep running on a runtime
+    /// that outlives whichever caller established it.
+    fn start_with_owner(
+        &mut self,
+        owner: Option<&Handle>,
+        task: impl Future<Output = Result<()>> + Send + 'static,
+    ) {
         debug_assert!(self.task.is_none());
-        self.task = Some(tokio::spawn(task));
+        self.task = Some(match owner {
+            Some(handle) => handle.spawn(task),
+            None => tokio::spawn(task),
+        });
     }
 
     fn observe_response_head(&mut self, observation: ResponseHeadObservation) {
@@ -1081,7 +1161,10 @@ impl TransportLease {
         let Some(mut lease) = self.lease.take() else {
             return;
         };
-        let reusable = reusable && lease.is_live() && lease.peer_is_open();
+        // Returning a connection costs no readiness syscall: a peer that has
+        // gone away is reported by `is_live`, and the next acquire re-checks a
+        // connection that has been idle long enough to be suspect.
+        let reusable = reusable && lease.is_live();
         self.active_exchange.release(reusable);
         lease = if reusable {
             lease.complete(pool::LeaseTerminal::CleanEof)
@@ -1213,7 +1296,14 @@ impl Transport {
             default_timeout,
             content_codecs,
             session_runtime,
+            task_owner: None,
         }
+    }
+
+    /// Pin connection tasks to `task_owner` instead of the ambient runtime.
+    pub(crate) fn with_task_owner(mut self, task_owner: Option<Handle>) -> Self {
+        self.task_owner = task_owner;
+        self
     }
 
     pub(crate) fn clear_pool(&self) {
@@ -1263,41 +1353,20 @@ impl Transport {
         self
     }
 
-    #[cfg(test)]
-    async fn establishment_checkpoint(&self, stage: EstablishmentStage) {
-        if let Some(control) = &self.establishment_control {
-            control.checkpoint(stage).await;
-        }
-    }
-
     pub async fn send(&self, request: Request) -> Result<TransportResponse> {
         let timeout = request.timeout().unwrap_or(self.default_timeout);
         let started = Instant::now();
         validate_request(&request)?;
-        let host = request
-            .uri()
-            .host()
-            .ok_or_else(|| Error::invalid_url(request.url()))?
-            .to_owned();
         let scheme = request
             .uri()
             .scheme()
             .cloned()
             .ok_or_else(|| Error::invalid_url(request.url()))?;
-        let port = request
-            .uri()
-            .port_u16()
-            .unwrap_or(if scheme == http::uri::Scheme::HTTPS {
-                443
-            } else {
-                80
-            });
         let authority = request
             .uri()
             .authority()
             .ok_or_else(|| Error::invalid_url(request.url()))?
             .clone();
-        let target = authority.as_str().to_owned();
         let (tls, identity) = if scheme == http::uri::Scheme::HTTPS {
             (
                 TlsPoolKey::from_config(&self.tls),
@@ -1309,12 +1378,16 @@ impl Transport {
         let proxy_key = self.proxy.as_ref().map(ProxyKey::from_proxy);
         let target_is_https = scheme == http::uri::Scheme::HTTPS;
         let absolute_form = proxy::uses_absolute_form(self.proxy.as_ref(), target_is_https);
-        let key = PoolKey::new(scheme, authority, proxy_key, tls, identity);
+        // The key normalizes an implicit port into its authority; connection
+        // diagnostics keep reporting the authority exactly as the caller wrote
+        // it, so keep a cheap reference-counted copy of that spelling.
+        let diagnostic_authority = authority.clone();
+        let key = Arc::new(PoolKey::new(scheme, authority, proxy_key, tls, identity));
         #[cfg(test)]
         self.derived_pool_keys
             .lock()
             .expect("derived pool-key observation lock poisoned")
-            .push(key.clone());
+            .push(key.as_ref().clone());
         let mut request = request.into_parts();
         let python_header_names = request.python_header_names.clone();
         if absolute_form
@@ -1341,7 +1414,7 @@ impl Transport {
             total_deadline,
         };
         let mut lease = self
-            .acquire_connection(key, &host, port, &target, establishment_deadlines)
+            .acquire_connection(key, diagnostic_authority, establishment_deadlines)
             .await?;
         let track_body_completion = read_timeout.is_some() || total_timeout.is_some();
         let upload_correlation = self
@@ -1527,10 +1600,8 @@ impl Transport {
 
     async fn acquire_connection(
         &self,
-        key: PoolKey,
-        host: &str,
-        port: u16,
-        target: &str,
+        key: Arc<PoolKey>,
+        authority: Authority,
         deadlines: EstablishmentDeadlines,
     ) -> Result<ConnectionLease> {
         loop {
@@ -1543,11 +1614,23 @@ impl Transport {
             let Some(mut lease) = candidate else {
                 break;
             };
-            if !lease.is_live() || !lease.peer_is_open() {
-                TransportLease::new(Arc::clone(&self.pool), lease, self.session_runtime.clone())
+            let peer_checked_at = {
+                // `is_live` is free but only as timely as the connection task
+                // is polled, so a pooled connection additionally gets one
+                // readiness syscall here, before it is handed out. The return
+                // path takes none: a connection that died in the pool is
+                // rejected here instead.
+                if !lease.is_live() || (lease.idle_for().is_some() && !lease.peer_is_open()) {
+                    TransportLease::new(
+                        Arc::clone(&self.pool),
+                        lease,
+                        self.session_runtime.clone(),
+                    )
                     .finish_now(false);
-                continue;
-            }
+                    continue;
+                }
+                Instant::now()
+            };
             let ready = {
                 let (sender, _) = lease.connection_mut().network_parts_mut();
                 match deadlines.total_deadline {
@@ -1572,7 +1655,12 @@ impl Transport {
                         .expect("total deadline exists only when timeout is configured"),
                 ));
             };
-            if ready.is_ok() && lease.is_live() && lease.peer_is_open() {
+            // `sender.ready()` normally resolves immediately, so the peer probe
+            // taken just before it still describes the connection. Re-probe only
+            // after a wait long enough for the peer to have gone away in between.
+            let peer_is_open =
+                peer_checked_at.elapsed() < PEER_RECHECK_INTERVAL || lease.peer_is_open();
+            if ready.is_ok() && lease.is_live() && peer_is_open {
                 self.observe_pool_acquire(&lease);
                 return Ok(lease);
             }
@@ -1581,7 +1669,7 @@ impl Transport {
         }
 
         let lease = self
-            .connect_connection(key, host, port, target, deadlines)
+            .connect_connection(key, authority, deadlines)
             .await?;
         self.observe_pool_acquire(&lease);
         Ok(lease)
@@ -1599,20 +1687,89 @@ impl Transport {
         }
     }
 
+    /// Establish a connection, on the runtime that will own it when one is
+    /// configured.
+    ///
+    /// A caller that drives its own thread (the blocking API) must not register
+    /// socket I/O with a runtime that dies with the call: the connection
+    /// outlives the request in the pool and is used from other threads.
     async fn connect_connection(
         &self,
-        key: PoolKey,
-        host: &str,
-        port: u16,
-        target: &str,
+        key: Arc<PoolKey>,
+        authority: Authority,
         deadlines: EstablishmentDeadlines,
     ) -> Result<ConnectionLease> {
-        let generation = {
-            self.pool
-                .lock()
-                .expect("transport pool lock poisoned")
-                .generation_number(&key)
+        let establishment = Establishment {
+            connector: Arc::clone(&self.connector),
+            proxy: self.proxy.clone(),
+            tls: self.tls.clone(),
+            session_runtime: self.session_runtime.clone(),
+            task_owner: self.task_owner.clone(),
+            #[cfg(test)]
+            establishment_control: self.establishment_control.as_ref().map(Arc::clone),
+            generation: {
+                self.pool
+                    .lock()
+                    .expect("transport pool lock poisoned")
+                    .generation_number(&key)
+            },
+            key,
+            authority,
+            deadlines,
         };
+        match self.task_owner.clone() {
+            Some(owner) => {
+                let establishment = Arc::new(establishment);
+                let establishing = Arc::clone(&establishment);
+                owner
+                    .spawn(async move { establishing.establish().await })
+                    .await
+                    .map_err(Error::connection)?
+            }
+            None => establishment.establish().await,
+        }
+    }
+}
+
+/// One connection establishment, owning everything it needs.
+///
+/// Establishment never borrows the transport: it may run on the runtime that
+/// owns the connection instead of the caller's.
+struct Establishment {
+    connector: Arc<dyn Connector>,
+    proxy: Option<Proxy>,
+    tls: TlsConfig,
+    session_runtime: Option<SessionRuntimeHarness>,
+    task_owner: Option<Handle>,
+    #[cfg(test)]
+    establishment_control: Option<Arc<dyn EstablishmentControl>>,
+    generation: u64,
+    key: Arc<PoolKey>,
+    authority: Authority,
+    deadlines: EstablishmentDeadlines,
+}
+
+impl Establishment {
+    #[cfg(test)]
+    async fn establishment_checkpoint(&self, stage: EstablishmentStage) {
+        if let Some(control) = &self.establishment_control {
+            control.checkpoint(stage).await;
+        }
+    }
+
+    async fn establish(&self) -> Result<ConnectionLease> {
+        // Establishment borrows the caller's authority for host, port and
+        // diagnostics, and takes the effective port from the key.
+        let key = Arc::clone(&self.key);
+        let authority = &self.authority;
+        let deadlines = self.deadlines;
+        let generation = self.generation;
+        let host = authority.host();
+        let target = authority.as_str();
+        let port = key
+            .authority
+            .port_u16()
+            .expect("pool key authority carries an effective port");
         let reservation = self
             .session_runtime
             .as_ref()
@@ -1714,13 +1871,15 @@ impl Transport {
                     #[cfg(test)]
                     self.establishment_checkpoint(EstablishmentStage::Http1)
                         .await;
-                    start_http1(stream, driver, connection_identity).await?
+                    start_http1(stream, driver, connection_identity, self.task_owner.as_ref())
+                        .await?
                 }
                 None => {
                     #[cfg(test)]
                     self.establishment_checkpoint(EstablishmentStage::Http1)
                         .await;
-                    start_http1(stream, driver, connection_identity).await?
+                    start_http1(stream, driver, connection_identity, self.task_owner.as_ref())
+                        .await?
                 }
             };
             match reservation {
@@ -1730,7 +1889,12 @@ impl Transport {
                     connection,
                     reservation.promote(),
                 )),
-                None => Ok(ConnectionLease::new(key, generation, connection)),
+                None => Ok(ConnectionLease::new_with_session_runtime(
+                    key,
+                    generation,
+                    connection,
+                    None,
+                )),
             }
         };
         tokio::pin!(establishing);
@@ -1775,6 +1939,7 @@ async fn start_http1<IO>(
     stream: IO,
     mut driver: ConnectionDriver,
     session_identity: Option<SessionConnectionIdentity>,
+    task_owner: Option<&Handle>,
 ) -> Result<IdleConnection>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1786,7 +1951,9 @@ where
         .await
         .map_err(Error::handshake)?;
     driver.observe_response_head(observation);
-    driver.start(async move { connection.await.map_err(Error::connection_hyper) });
+    driver.start_with_owner(task_owner, async move {
+        connection.await.map_err(Error::connection_hyper)
+    });
     Ok(IdleConnection::network(sender, driver, session_identity))
 }
 
@@ -2276,7 +2443,7 @@ mod tests {
         );
         {
             let state = observation
-                .0
+                .state
                 .lock()
                 .expect("response-head observer lock poisoned");
             assert_eq!(state.captured.capacity(), 0);

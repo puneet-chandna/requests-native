@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_core::Stream;
-use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::AbortHandle;
 
 use crate::{
@@ -44,6 +44,15 @@ impl BlockingRuntimeDriver {
         self.inner.process_id
     }
 
+    /// A reactor handle that can own connection tasks for clients built by this
+    /// driver.
+    fn task_owner(&self) -> Handle {
+        let reactors = &self.inner.reactors;
+        reactors[self.inner.next_reactor.fetch_add(1, Ordering::Relaxed) % reactors.len()]
+            .handle
+            .clone()
+    }
+
     pub fn generation(&self) -> u64 {
         self.inner.generation
     }
@@ -64,17 +73,39 @@ impl BlockingRuntimeDriver {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.submit_for_process(future, std::process::id())
+        self.submit_with_notify(future, || {})
     }
 
-    fn submit_for_process<F>(
+    /// Submit a future and run `notify` once its output has been sent to the
+    /// submission channel.
+    ///
+    /// A caller that waits on its own wake signal can use this to be woken
+    /// exactly when the result becomes available instead of polling
+    /// [`BlockingSubmission::try_wait`].
+    #[doc(hidden)]
+    pub fn submit_with_notify<F, N>(
         &self,
         future: F,
+        notify: N,
+    ) -> Result<BlockingSubmission<F::Output>, BlockingDriverError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+        N: Fn() + Send + 'static,
+    {
+        self.submit_for_process(future, notify, std::process::id())
+    }
+
+    fn submit_for_process<F, N>(
+        &self,
+        future: F,
+        notify: N,
         current_process_id: u32,
     ) -> Result<BlockingSubmission<F::Output>, BlockingDriverError>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
+        N: Fn() + Send + 'static,
     {
         if current_process_id != self.process_id() {
             return Err(BlockingDriverError::StaleProcess {
@@ -89,13 +120,18 @@ impl BlockingRuntimeDriver {
         let parent_id = ACTIVE_SUBMISSION_ID.try_with(|active| *active).ok();
         OUTSTANDING_SUBMISSIONS.fetch_add(1, Ordering::AcqRel);
         let outstanding = OutstandingSubmission;
-        let task = self
-            .inner
+        let reactors = &self.inner.reactors;
+        let reactor =
+            &reactors[self.inner.next_reactor.fetch_add(1, Ordering::Relaxed) % reactors.len()];
+        let task = reactor
             .handle
             .spawn(ACTIVE_SUBMISSION_ID.scope(id, async move {
                 let _outstanding = outstanding;
                 let output = future.await;
                 let _ = sender.send(output);
+                // Notify strictly after the channel send so a woken waiter can
+                // observe the buffered result.
+                notify();
             }));
         Ok(BlockingSubmission {
             id,
@@ -346,23 +382,68 @@ impl<T> Drop for BlockingSubmission<T> {
 struct DriverInner {
     process_id: u32,
     generation: u64,
+    reactors: Vec<ReactorHandle>,
+    next_reactor: AtomicUsize,
+}
+
+/// One dedicated reactor thread running a current-thread Tokio runtime.
+///
+/// A current-thread runtime keeps a request's I/O, its wakeups and its
+/// completion on a single thread, which removes the cross-worker handoffs a
+/// multi-thread runtime pays per request. Tasks are spawned onto it through its
+/// handle from any caller thread, so submission keeps the existing shape.
+struct ReactorHandle {
     handle: Handle,
-    _runtime: RuntimeOwner,
+    /// Dropping this sender ends the reactor's `block_on`, which drops its
+    /// runtime on the reactor thread itself.
+    _shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-struct RuntimeOwner {
-    runtime: Option<Runtime>,
-    process_id: u32,
-}
-
-impl Drop for RuntimeOwner {
-    fn drop(&mut self) {
-        if std::process::id() != self.process_id
-            && let Some(runtime) = self.runtime.take()
-        {
-            mem::forget(runtime);
-        }
+impl ReactorHandle {
+    fn start(process_id: u32, index: usize) -> io::Result<Self> {
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (shutdown, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
+        std::thread::Builder::new()
+            .name(format!("requests-reactor-{process_id}-{index}"))
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error));
+                        return;
+                    }
+                };
+                if ready_sender.send(Ok(runtime.handle().clone())).is_err() {
+                    return;
+                }
+                // Drive the runtime forever; every submitted task is polled by
+                // this loop until the driver registry is dropped.
+                runtime.block_on(async move {
+                    let _ = shutdown_receiver.await;
+                });
+            })?;
+        let handle = ready_receiver.recv().map_err(|_| {
+            io::Error::other("reactor thread stopped before publishing its runtime")
+        })??;
+        Ok(Self {
+            handle,
+            _shutdown: Some(shutdown),
+        })
     }
+}
+
+/// How many reactor threads serve blocking submissions in one process.
+///
+/// Each reactor is fully asynchronous, so one thread already serves many
+/// in-flight requests; a small fixed number keeps protocol work parallel
+/// without paying a thread per caller.
+fn reactor_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, |parallelism| parallelism.get().min(4))
+        .max(2)
 }
 
 struct DriverRegistry {
@@ -411,21 +492,18 @@ impl DriverRegistry {
         }
         ensure_submission_process(process_id);
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_io()
-            .enable_time()
-            .thread_name("requests-runtime")
-            .build()?;
+        let reactor_count = reactor_thread_count();
+        let mut reactors = Vec::with_capacity(reactor_count);
+        for index in 0..reactor_count {
+            reactors.push(ReactorHandle::start(process_id, index)?);
+        }
         let generation = (u64::from(process_id) << 32)
             | ((self.next_generation.fetch_add(1, Ordering::Relaxed) + 1) & u64::from(u32::MAX));
         let driver = Arc::new(DriverInner {
             process_id,
             generation,
-            handle: runtime.handle().clone(),
-            _runtime: RuntimeOwner {
-                runtime: Some(runtime),
-                process_id,
-            },
+            reactors,
+            next_reactor: AtomicUsize::new(0),
         });
         *current = Some(Arc::clone(&driver));
         Ok(BlockingRuntimeDriver { inner: driver })
@@ -561,8 +639,11 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> RequestResult<Client> {
-        let inner = self.inner.build()?;
         let driver = BlockingRuntimeDriver::process_local().map_err(Error::blocking)?;
+        let inner = self
+            .inner
+            .task_owner(driver.task_owner())
+            .build()?;
         Ok(Client { inner, driver })
     }
 }
@@ -954,8 +1035,102 @@ where
     T: Send + 'static,
     F: Future<Output = RequestResult<T>> + Send + 'static,
 {
-    let submission = driver.submit(future).map_err(Error::blocking)?;
-    submission.wait().map_err(Error::blocking)?
+    match InlineDriver::run(future) {
+        // The caller's own thread drove the request: no task to spawn, no
+        // channel and no wake for a submitted block of work.
+        Ok(result) => result,
+        Err(future) => {
+            let submission = driver.submit(future).map_err(Error::blocking)?;
+            submission.wait().map_err(Error::blocking)?
+        }
+    }
+}
+
+/// Caller-thread runtime for blocking calls.
+///
+/// A current-thread runtime owns no worker threads: its driver is pumped by the
+/// thread that calls `block_on`, so the request future, its readiness and its
+/// completion stay on the caller. Connection tasks are still owned by the
+/// driver's reactors, which is what keeps pooled connections usable from any
+/// thread.
+struct InlineDriver;
+
+struct InlineDriverState {
+    process_id: u32,
+    runtime: Option<tokio::runtime::Runtime>,
+    running: bool,
+}
+
+impl Default for InlineDriverState {
+    fn default() -> Self {
+        Self {
+            process_id: std::process::id(),
+            runtime: None,
+            running: false,
+        }
+    }
+}
+
+thread_local! {
+    static INLINE_DRIVER: std::cell::RefCell<InlineDriverState> =
+        std::cell::RefCell::new(InlineDriverState::default());
+}
+
+impl InlineDriver {
+    /// Run `future` on this thread, handing it back when the inline driver
+    /// cannot be used.
+    fn run<T, F>(future: F) -> Result<RequestResult<T>, F>
+    where
+        F: Future<Output = RequestResult<T>>,
+    {
+        let mut future = Some(future);
+        let outcome = INLINE_DRIVER.try_with(|cell| {
+            let Ok(mut state) = cell.try_borrow_mut() else {
+                // A nested blocking call already drives this thread.
+                return None;
+            };
+            let process_id = std::process::id();
+            if state.process_id != process_id {
+                // A fork keeps the thread-local value but not a usable runtime.
+                // Dropping a current-thread runtime owns no threads, so the
+                // inherited one is safe to drop here.
+                state.runtime = None;
+                state.running = false;
+                state.process_id = process_id;
+            }
+            if state.running || Handle::try_current().is_ok() {
+                // Blocking from inside a runtime must not drive another one.
+                return None;
+            }
+            if state.runtime.is_none() {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                state.runtime = Some(runtime);
+            }
+            let pending = future.take().expect("inline future is taken once");
+            state.running = true;
+            ensure_submission_process(process_id);
+            // Keep the submitted-work accounting truthful, and keep it released
+            // even when the future panics.
+            OUTSTANDING_SUBMISSIONS.fetch_add(1, Ordering::AcqRel);
+            let outstanding = OutstandingSubmission;
+            let result = {
+                let runtime = state.runtime.as_ref().expect("inline runtime exists");
+                runtime.block_on(pending)
+            };
+            drop(outstanding);
+            state.running = false;
+            Some(result)
+        });
+        match outcome {
+            Ok(Some(result)) => Ok(result),
+            // The thread-local is gone (a shutting-down interpreter) or the
+            // inline driver declined before taking the future.
+            Ok(None) | Err(_) => Err(future.expect("inline future was not taken")),
+        }
+    }
 }
 
 fn copy_frame(buffer: &mut [u8], frame: Bytes, remainder: &mut Option<Bytes>) -> usize {
@@ -1266,7 +1441,7 @@ mod tests {
         let parent_pid = std::process::id();
         let parent = registry.driver_for(parent_pid).unwrap();
 
-        let result = parent.submit_for_process(async {}, parent_pid.wrapping_add(1));
+        let result = parent.submit_for_process(async {}, || {}, parent_pid.wrapping_add(1));
 
         assert!(matches!(
             result,
